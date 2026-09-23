@@ -6230,7 +6230,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
     recordChildInvocation({
       db: args.db,
       parentSessionId: args.parentSessionId,
-      harness: "opencode",
+      harness: getHarness(),
       subagent: "dreamer",
       task: "review-user-memories",
       startedAt,
@@ -7007,7 +7007,7 @@ function recordInvocation(args, startedAt, params) {
   recordChildInvocation({
     db: args.db,
     parentSessionId: args.parentSessionId,
-    harness: "opencode",
+    harness: getHarness(),
     subagent: "dreamer",
     task: "classify-memories",
     startedAt,
@@ -7763,7 +7763,7 @@ Remember: output only the JSON object described by the system prompt.`;
     recordChildInvocation({
       db: args.db,
       parentSessionId: args.parentSessionId,
-      harness: "opencode",
+      harness: getHarness(),
       subagent: "dreamer",
       task: "evaluate-smart-notes",
       startedAt,
@@ -8404,7 +8404,7 @@ async function confirmReadOnly(args, noteId, content, surfaceCondition, leaseSig
     recordChildInvocation({
       db: args.db,
       parentSessionId: args.parentSessionId,
-      harness: "opencode",
+      harness: getHarness(),
       subagent: "dreamer",
       task: "evaluate-smart-notes",
       startedAt,
@@ -8917,7 +8917,7 @@ function recordInvocation2(args, startedAt, params) {
   recordChildInvocation({
     db: args.db,
     parentSessionId: args.parentSessionId,
-    harness: "opencode",
+    harness: getHarness(),
     subagent: "dreamer",
     task: "map-memories",
     startedAt,
@@ -9461,7 +9461,7 @@ function recordInvocation3(args, startedAt, params) {
   recordChildInvocation({
     db: args.db,
     parentSessionId: args.parentSessionId,
-    harness: "opencode",
+    harness: getHarness(),
     subagent: "dreamer",
     task: "refresh-primers",
     startedAt,
@@ -10218,7 +10218,7 @@ function recordInvocation4(args, startedAt, params) {
   recordChildInvocation({
     db: args.db,
     parentSessionId: args.parentSessionId,
-    harness: "opencode",
+    harness: getHarness(),
     subagent: "dreamer",
     task: args.forceBroad ? "verify-broad" : "verify",
     startedAt,
@@ -10776,7 +10776,7 @@ async function runRetrospectiveTask(config, ctx, helpers) {
         recordChildInvocation({
           db,
           parentSessionId: parent,
-          harness: "opencode",
+          harness: getHarness(),
           subagent: "dreamer",
           task: config.task,
           startedAt: helpers.invocationStartedAt,
@@ -10967,7 +10967,7 @@ async function runAgenticTask(config, ctx, helpers) {
       recordChildInvocation({
         db,
         parentSessionId: parent,
-        harness: "opencode",
+        harness: getHarness(),
         subagent: "dreamer",
         task,
         startedAt: invocationStartedAt,
@@ -11737,7 +11737,7 @@ async function runHistorianPrompt(args) {
     return recordChildInvocation({
       db: openDatabase(),
       parentSessionId,
-      harness: "opencode",
+      harness: getHarness(),
       subagent: agentId === HISTORIAN_EDITOR_AGENT ? "historian_editor" : subagentKind ?? "historian",
       startedAt,
       status: params.status,
@@ -13789,7 +13789,7 @@ async function runCompartmentAgent(deps) {
     const invocationId = latest != null && (invocationBaseline == null || latest > invocationBaseline) ? latest : null;
     recordHistorianRun(db, {
       sessionId,
-      harness: "opencode",
+      harness: getHarness(),
       subagentInvocationId: invocationId,
       runKind: telemetry.runKind ?? "incremental",
       status: telemetry.status ?? "failed",
@@ -14195,7 +14195,7 @@ ${chunkText}`,
         const stored = insertPrimerCandidates(db, [
           {
             projectPath: promotionProjectIdentity,
-            harness: "opencode",
+            harness: getHarness(),
             sessionId,
             question: candidate.question,
             sourceCompartmentStart: startC?.startMessage,
