@@ -209,7 +209,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-c3gc6xe0.js";
+} from "./agent-108znazq.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -272,7 +272,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-kjq40qkp.js";
+} from "./agent-4dxcke1k.js";
 import {
   getHarness,
   getDataDir,
@@ -322,7 +322,7 @@ import {
   sessionEvents2,
   setSessionEventsFailureReporter2,
   findEventBySeq2
-} from "./agent-6rr0cza0.js";
+} from "./agent-p7nkw8zz.js";
 import {
   pushNotification2
 } from "./agent-b3eqj1g6.js";
@@ -5557,7 +5557,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
           return isMagicSource2(source) && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
-          const { magicUserMessage } = await import("./session-chs0y9ne.js");
+          const { magicUserMessage } = await import("./session-68ck7efb.js");
           const noteMessage = magicUserMessage(noteText, { kind: MAGIC_SOURCE_KIND2, messageId: noteMarker }, []);
           agent.inject?.(noteMessage);
           markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);

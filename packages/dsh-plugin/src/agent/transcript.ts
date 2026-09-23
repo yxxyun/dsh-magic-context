@@ -715,10 +715,14 @@ export function findKnowledgeBaselineNodeIndices(
 
 /** Build the read-only transcript view (design §3). */
 export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView {
-  // Resolve through the compat seam: the runtime exposes events as
-  // `session.snapshotEvents()`, NOT the `session.events` property the type
-  // stubs declare. Reading the property yielded undefined, which made every
-  // view empty and silently disabled all assistant/tool tagging.
+  // Resolve through the compat seam: for a REAL Session the runtime exposes events
+  // as `session.snapshotEvents()`, NOT the `session.events` property the type stubs
+  // declare (reading the property yielded undefined, which made every view empty and
+  // silently disabled all assistant/tool tagging).
+  //
+  // Note this function is normally called with the port's OWN view literal
+  // (`{events, surface, header}`), which carries `events` and no host methods — so
+  // the seam's `events` fallback is the expected path here, not a degradation.
   const events = sessionEvents(input.session);
   const nodes = Array.isArray(input.session.surface?.nodes)
     ? [...input.session.surface.nodes]

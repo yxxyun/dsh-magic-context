@@ -193,9 +193,14 @@ export function sessionEvents(session: unknown): readonly SessionEvent[] {
     reportSessionEventsFailure(
       `snapshotEvents() returned ${typeof events}, not an array — falling back to the events property`,
     );
-  } else {
-    reportSessionEventsFailure("session has no snapshotEvents() method");
   }
+  // NOTE: a MISSING snapshotEvents() is deliberately NOT reported. This accessor
+  // is also called with the port's own transcript view — the `{events, surface,
+  // header}` literals built in context-plane.ts / historian-wiring.ts — and with
+  // test fakes. Those carry a perfectly good `events` array and no host methods,
+  // so reporting them produced a per-step false alarm that read like a host API
+  // breakage. Absence matters only when there is no `events` array either: that is
+  // the #403 regression, reported below.
   if (Array.isArray(view.events)) return view.events as readonly SessionEvent[];
   reportSessionEventsFailure("session exposes neither snapshotEvents() nor an events array");
   return [];
