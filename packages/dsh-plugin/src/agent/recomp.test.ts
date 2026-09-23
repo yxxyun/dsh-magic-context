@@ -105,7 +105,7 @@ function buildSession(): Session {
 /** Transcript view over the session (message ids for compartment rows). */
 function viewOf(session: Session) {
   return readDshTranscript({
-    session: { events: session.events, surface: session.surface, header: {} },
+    session: { events: session.snapshotEvents(), surface: session.surface, header: {} },
     canonicalSessionId: SESSION_ID,
   });
 }
@@ -115,7 +115,7 @@ function fakeAgent(session: Session, cwd = "C:/proj"): Agent {
   return {
     id: DSH_SESSION_ID,
     options: { provider: "deepseek", model: "deepseek-chat" },
-    session: { events: session.events, surface: session.surface, header: { cwd, id: DSH_SESSION_ID } },
+    session: { events: session.snapshotEvents(), surface: session.surface, header: { cwd, id: DSH_SESSION_ID } },
     followup: () => {},
   } as unknown as Agent;
 }

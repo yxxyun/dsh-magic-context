@@ -62,7 +62,8 @@ import {
 } from "@magic-context/core/hooks/magic-context/wrapup-orchestrator";
 import { describeError } from "@magic-context/core/shared/error-message";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { createUserMessage } from "../compat/dsh-0.1/session";
+import { createUserMessage, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
+import { magicSource, magicUserMessage } from "../compat/dsh-0.1/session";
 import type { DshStorageBootstrap } from "../host/bootstrap";
 import { parseRecompArgs, type CtxCommandSeams } from "./commands";
 import { transcriptRawMessageProvider } from "./historian-wiring";
@@ -273,10 +274,7 @@ export function createDshSessionClient(deps: DshSessionClientDeps): DshSessionCl
     }
     const route = readBodyModel(body?.model) ?? defaultRoute();
     const system = resolveSystemPrompt(body);
-    const user = createUserMessage({
-      content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: "magic-context" },
-    });
+    const user = magicUserMessage(text, magicSource());
 
     const controller = new AbortController();
     const active: { controller: AbortController; external: boolean } = { controller, external: false };

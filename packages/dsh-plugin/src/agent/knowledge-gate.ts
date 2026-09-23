@@ -50,17 +50,13 @@ import { consumeDshDeferredSignals } from "./historian";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import {
-  magicUserMessage,
-  type MagicMessageSource,
-} from "../compat/dsh-0.1/session";
+import { isMagicSource, magicUserMessage, sessionEvents, type MagicMessageSource, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
 import {
   registerPreStepGate,
   type PreStepDecision,
   type PreStepPayload,
 } from "../compat/dsh-0.1/prestep";
-import type { DshStorageBootstrap } from "../host/bootstrap";
-import { sessionEvents } from "../compat/dsh-0.1/session";
+import type { DshStorageBootstrap } from "../host/bootstrap";
 import { trackSessionProjectOnce, sessionProjectPath } from "./session-track";
 import { maybeRunAutoSearchHint, type AutoSearchConfig } from "./auto-search";
 import { isMagicChildSession } from "./worker";
@@ -357,8 +353,7 @@ export async function maybeInjectKnowledge(
   }
 
   const source: MagicMessageSource = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND,
     messageId: blocks.watermark,
     revision: blocks.revision,
     digest: blocks.digest,
@@ -421,8 +416,7 @@ export async function maybeInjectKnowledge(
             `[tool: todowrite #${callId}]\ninput: ${inputText}\n\n` +
             `[tool result: todowrite #${callId}]\noutput: ${part.state.output}`;
           const todoSource: MagicMessageSource = {
-            kind: "plugin",
-            plugin: "magic-context",
+            kind: MAGIC_SOURCE_KIND,
             messageId: todoWatermark,
           };
           const todoMessage = magicUserMessage(todoText, todoSource, []);

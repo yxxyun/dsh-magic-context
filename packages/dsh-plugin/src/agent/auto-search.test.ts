@@ -17,6 +17,8 @@ import {
   type AutoSearchConfig,
 } from "./auto-search";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
+import { isMagicSource } from "../compat/dsh-0.1/session";
 
 const SESSION_ID = "dsh:a1b2c3d4:auto-search-session";
 
@@ -127,8 +129,8 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       expect(text).toContain("<ctx-search-hint>");
       expect(text).toContain("config cache primers");
       const source = hint.source as { kind: string; plugin: string; messageId: string };
-      expect(source.kind).toBe("plugin");
-      expect(source.plugin).toBe("magic-context");
+      expect(source.kind).toBe(MAGIC_SOURCE_KIND);
+      expect(isMagicSource(source)).toBe(true);
       expect(source.messageId).toBe(`mc-auto-search:${message.id}`);
 
       // Decision persisted for replay/resume.
@@ -275,7 +277,7 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       id: "injected-1",
       role: "user" as const,
       content: [{ type: "text" as const, text: "magic context knowledge baseline" }],
-      source: { kind: "plugin" as const, plugin: "magic-context" },
+      source: { kind: MAGIC_SOURCE_KIND },
     } as unknown as UserMessage;
     const prompt = userMessage("the real user question", "real-1");
     const found = extractLatestUserPrompt([injected, prompt]);

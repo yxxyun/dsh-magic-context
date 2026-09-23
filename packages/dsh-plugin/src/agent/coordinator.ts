@@ -28,12 +28,10 @@
  */
 import { randomUUID } from "node:crypto";
 import type { Session } from "@deepseek-ai/dsh-session";
-import {
-  deriveEventMessage,
-  magicUserMessage,
-} from "../compat/dsh-0.1/session";
+import { deriveEventMessage, magicUserMessage, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
 import { readDshTranscript, type MutationPlan } from "./transcript";
 import { sessionEvents } from "../compat/dsh-0.1/session";
+import { SessionSeq } from "@deepseek-ai/dsh-session";
 import {
   getOutboxRecord,
   insertOutboxPending,
@@ -128,15 +126,14 @@ export function applyPlanOps(
       );
     }
     const message = magicUserMessage(op.replacement, {
-      kind: "plugin",
-      plugin: "magic-context",
+      kind: MAGIC_SOURCE_KIND,
       messageId: `mc-op:${plan.opId}`,
       revision: String(plan.generation),
       digest: plan.inputDigest,
     });
     const event = session.append("user/message", message, {
-      surfaceOp: { op: "replace", start: startSeq, end: endSeq },
-      sourceEventSeqs: [...op.shadowedSeqs],
+      surfaceOp: { op: "replace", startSeq: SessionSeq(startSeq), endSeq: SessionSeq(endSeq) },
+      sourceEventSeqs: op.shadowedSeqs.map((seq) => SessionSeq(seq)),
     });
     ackSeq = event.seq;
     void db;
@@ -163,15 +160,14 @@ function applyInsertionMerge(
     .join("\n") ?? "";
   const merged = `${op.replacement}\n${originalText}`;
   const message = magicUserMessage(merged, {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND,
     messageId: `mc-op:${plan.opId}:temporal`,
     revision: String(plan.generation),
     digest: plan.inputDigest,
   });
   const appended = session.append("user/message", message, {
-    surfaceOp: { op: "replace", start: nodeSeq, end: nodeSeq },
-    sourceEventSeqs: [nodeSeq],
+    surfaceOp: { op: "replace", startSeq: SessionSeq(nodeSeq), endSeq: SessionSeq(nodeSeq) },
+    sourceEventSeqs: [SessionSeq(nodeSeq)],
   });
   return appended.seq;
 }

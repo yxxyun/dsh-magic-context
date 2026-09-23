@@ -192,7 +192,7 @@ import {
   deriveMutationPlan,
   resolveDb,
   registerCtxTools
-} from "./agent-hktwgxfm.js";
+} from "./agent-yp89cn0d.js";
 import {
   getHarness,
   ensureCortexKitArtifactGitignore,
@@ -274,13 +274,14 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-hd2pv6wm.js";
+} from "./agent-cbhhxyak.js";
 import {
-  createUserMessage2,
   deriveEventMessage2,
+  MAGIC_SOURCE_KIND2,
+  magicSource2,
   magicUserMessage2,
   sessionEvents2
-} from "./agent-md57b5ck.js";
+} from "./agent-nkqrsrrf.js";
 import {
   pushNotification2
 } from "./agent-b3eqj1g6.js";
@@ -2458,7 +2459,7 @@ function registerSessionProjectTracking(ctx, deps) {
   if (deps.config?.enabled === false)
     return;
   const trackedSessions = new Set;
-  ctx.on("agent/session-start", async (payload) => {
+  ctx.on("agent/created", async (payload) => {
     const { agent } = payload;
     try {
       if (isMagicChildSession(agent))
@@ -2574,7 +2575,7 @@ var AUTO_SEARCH_TIMEOUT_MS = 3000;
 var DEFAULT_SCORE_THRESHOLD = 0.55;
 var DEFAULT_MIN_PROMPT_CHARS = 20;
 function autoSearchHintSource(userMessageId) {
-  return { kind: "plugin", plugin: "magic-context", messageId: `mc-auto-search:${userMessageId}` };
+  return { kind: MAGIC_SOURCE_KIND2, messageId: `mc-auto-search:${userMessageId}` };
 }
 function collectUserText(message) {
   let collected = "";
@@ -2852,8 +2853,7 @@ async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, proj
     return;
   }
   const source = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND2,
     messageId: blocks.watermark,
     revision: blocks.revision,
     digest: blocks.digest
@@ -2896,8 +2896,7 @@ input: ${inputText}
 ` + `[tool result: todowrite #${callId}]
 output: ${part.state.output}`;
           const todoSource = {
-            kind: "plugin",
-            plugin: "magic-context",
+            kind: MAGIC_SOURCE_KIND2,
             messageId: todoWatermark
           };
           const todoMessage = magicUserMessage2(todoText, todoSource, []);
@@ -3150,6 +3149,7 @@ function registerSystemGuidance(ctx, deps = {}) {
 }
 
 // src/agent/coordinator.ts
+import { SessionSeq } from "@deepseek-ai/dsh-session";
 function createCoordinatorState() {
   return { queues: new Map, appliedOps: new Map };
 }
@@ -3188,15 +3188,14 @@ function applyPlanOps(host, session, plan) {
       throw new Error(`magic-context: plan op [${op.start}, ${op.end}) shadowedSeqs ${JSON.stringify(actual)} does not cover the live surface nodes ${JSON.stringify(expected)}`);
     }
     const message = magicUserMessage2(op.replacement, {
-      kind: "plugin",
-      plugin: "magic-context",
+      kind: MAGIC_SOURCE_KIND2,
       messageId: `mc-op:${plan.opId}`,
       revision: String(plan.generation),
       digest: plan.inputDigest
     });
     const event = session.append("user/message", message, {
-      surfaceOp: { op: "replace", start: startSeq, end: endSeq },
-      sourceEventSeqs: [...op.shadowedSeqs]
+      surfaceOp: { op: "replace", startSeq: SessionSeq(startSeq), endSeq: SessionSeq(endSeq) },
+      sourceEventSeqs: op.shadowedSeqs.map((seq) => SessionSeq(seq))
     });
     ackSeq = event.seq;
   }
@@ -3215,15 +3214,14 @@ function applyInsertionMerge(host, session, plan, op) {
   const merged = `${op.replacement}
 ${originalText}`;
   const message = magicUserMessage2(merged, {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND2,
     messageId: `mc-op:${plan.opId}:temporal`,
     revision: String(plan.generation),
     digest: plan.inputDigest
   });
   const appended = session.append("user/message", message, {
-    surfaceOp: { op: "replace", start: nodeSeq, end: nodeSeq },
-    sourceEventSeqs: [nodeSeq]
+    surfaceOp: { op: "replace", startSeq: SessionSeq(nodeSeq), endSeq: SessionSeq(nodeSeq) },
+    sourceEventSeqs: [SessionSeq(nodeSeq)]
   });
   return appended.seq;
 }
@@ -3322,8 +3320,7 @@ function injectNudge(agent, sessionId, kind, text) {
     return;
   }
   const source = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND2,
     messageId: marker
   };
   const message = magicUserMessage2(text, source, []);
@@ -4343,10 +4340,7 @@ function createLlmSummarizeCall(ctx, modelOverride) {
       inputSource: chunk.text,
       memoryEnabled: true
     });
-    const user = createUserMessage2({
-      content: [{ type: "text", text: prompt }],
-      source: { kind: "plugin", plugin: "magic-context" }
-    });
+    const user = magicUserMessage2(prompt, magicSource2());
     let text = "";
     let failed;
     for await (const streamChunk of llm.stream({
@@ -4638,8 +4632,8 @@ async function runContextPlaneStep(state, deps, payload, next) {
           return source?.plugin === "magic-context" && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
-          const { magicUserMessage } = await import("./session-84q6p5q0.js");
-          const noteMessage = magicUserMessage(noteText, { kind: "plugin", plugin: "magic-context", messageId: noteMarker }, []);
+          const { magicUserMessage } = await import("./session-c5n90p3w.js");
+          const noteMessage = magicUserMessage(noteText, { kind: MAGIC_SOURCE_KIND2, messageId: noteMarker }, []);
           agent.inject?.(noteMessage);
           markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
         }
@@ -10880,7 +10874,7 @@ var TOOL_REQUIRING_DREAM_AGENTS = new Set([
   "dreamer-primer-investigator",
   "dreamer-memory-mapper"
 ]);
-var DREAM_SOURCE = { kind: "plugin", plugin: "magic-context" };
+var DREAM_SOURCE = { kind: MAGIC_SOURCE_KIND2 };
 function syntheticToolParts(count) {
   const safe = Math.max(0, Math.floor(count));
   return Array.from({ length: safe }, () => ({
@@ -10938,10 +10932,7 @@ async function streamDreamTurn(ctx, opts) {
   if (llm === undefined) {
     throw new Error("magic-context: llm service unavailable (dreamer wiring)");
   }
-  const user = createUserMessage2({
-    content: [{ type: "text", text: opts.userText }],
-    source: DREAM_SOURCE
-  });
+  const user = magicUserMessage2(opts.userText, DREAM_SOURCE);
   let text = "";
   let failed;
   for await (const chunk of llm.stream({
@@ -15641,10 +15632,7 @@ function createDshSessionClient(deps) {
     }
     const route = readBodyModel(body?.model) ?? defaultRoute();
     const system = resolveSystemPrompt(body);
-    const user = createUserMessage2({
-      content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: "magic-context" }
-    });
+    const user = magicUserMessage2(text, magicSource2());
     const controller = new AbortController;
     const active = { controller, external: false };
     activeBySession.set(sessionId, active);
@@ -15975,10 +15963,7 @@ ${rendered}
         model: selection?.model ?? "deepseek-chat"
       };
     })();
-    const user = createUserMessage2({
-      content: [{ type: "text", text: `${args.prompt}${memoryBlock}` }],
-      source: { kind: "plugin", plugin: "magic-context" }
-    });
+    const user = magicUserMessage2(`${args.prompt}${memoryBlock}`, magicSource2());
     let text = "";
     for await (const chunk of llm.stream({
       provider: route.provider,

@@ -42,8 +42,9 @@ import {
 import {
   deriveEventMessage2,
   textBlock2,
+  isMagicSource2,
   sessionEvents2
-} from "./agent-md57b5ck.js";
+} from "./agent-nkqrsrrf.js";
 
 // src/agent/tools.ts
 import {
@@ -23195,7 +23196,7 @@ function isSyntheticUserMessage(message) {
 }
 function isKnowledgeMessage(message) {
   const source = isRecord4(message.source) ? message.source : null;
-  return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
+  return isMagicSource2(source);
 }
 function isSkillCatalogMessage(message) {
   const source = isRecord4(message.source) ? message.source : null;
@@ -23910,7 +23911,9 @@ function deriveMutationPlan(view, ctx) {
   if (transcript.messages.length > 0) {
     const tagger = createTagger();
     tagger.initFromDb(sessionId, db);
-    const tagged = tagTranscript(sessionId, transcript, tagger, db);
+    const tagged = tagTranscript(sessionId, transcript, tagger, db, {
+      skipPrefixInjection: ctx.skipPrefixInjection === true
+    });
     const recordingTargets = new Map;
     for (const [tagId, target] of tagged.targets) {
       recordingTargets.set(tagId, new RecordingTagTarget(tagId, target));

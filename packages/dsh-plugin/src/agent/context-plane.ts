@@ -13,7 +13,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { DshStorageBootstrap } from "../host/bootstrap";
-import { sessionEvents } from "../compat/dsh-0.1/session";
+import { isMagicSource, MAGIC_SOURCE_KIND, sessionEvents } from "../compat/dsh-0.1/session";
 import {
   registerPreStepGate,
   type PreStepDecision,
@@ -450,7 +450,7 @@ export async function runContextPlaneStep(
           const { magicUserMessage } = await import("../compat/dsh-0.1/session");
           const noteMessage = magicUserMessage(
             noteText,
-            { kind: "plugin", plugin: "magic-context", messageId: noteMarker } as never,
+            { kind: MAGIC_SOURCE_KIND, messageId: noteMarker } as never,
             [],
           );
           (agent as unknown as { inject?: (m: unknown) => void }).inject?.(noteMessage);

@@ -16,6 +16,7 @@ import {
 } from "@deepseek-ai/dsh-llm";
 import {
   Session,
+  SessionSeq,
   type SessionEvent,
   type SessionId,
 } from "@deepseek-ai/dsh-session";
@@ -39,16 +40,63 @@ export function textBlock(text: string): { type: "text"; text: string } {
   return { type: "text", text };
 }
 
+/**
+ * Producer-owned source kind for Magic-injected messages.
+ *
+ * DSH's V4 message format REFUSES `kind: "plugin"` outright — the retired V3
+ * wrapper — and the runtime throws
+ * `format v4 message requires a producer-owned source kind` on adoption, which
+ * blocks the whole turn (messages cannot be sent at all). Third-party producers
+ * must instead use their own identity in the form `plugin:<package>`, which is
+ * exactly what the runtime's own V3→V4 upgrader synthesises via
+ * `producerKind(plugin)` (`return \`plugin:${plugin}\``).
+ *
+ * The runtime validates only that `kind` is a non-empty string other than the
+ * literal `"plugin"`; unknown kinds are explicitly preserved, so this value is
+ * accepted and round-trips. `MessageSource` is a CLOSED union in the type stubs
+ * and does not model custom kinds, so the cast below is the single documented
+ * place where that boundary is crossed — same pattern as the harness identity.
+ */
+export const MAGIC_PLUGIN_PACKAGE = "dsh-magic-context";
+export const MAGIC_SOURCE_KIND = `plugin:${MAGIC_PLUGIN_PACKAGE}`;
+
 /** Source marker for Magic-injected knowledge messages (m0 baseline / m1 deltas). */
 export interface MagicMessageSource {
-  kind: "plugin";
-  plugin: "magic-context";
+  kind: typeof MAGIC_SOURCE_KIND;
   /** Baseline id for watermark de-duplication (PLAN §4.1). */
   messageId?: string;
   /** Render revision (materialization epoch) folded into the watermark. */
   revision?: string;
   /** Content digest (m0+m1) folded into the watermark. */
   digest?: string;
+  /**
+   * Legacy V3 identity. DSH's upgrader drops this field when lifting a V3
+   * wrapper, so it is NOT required for admission — it is kept only so older
+   * persisted rows that still carry it can be recognised.
+   */
+  plugin?: string;
+}
+
+/**
+ * Build a Magic source marker. `plugin` is optional and only meaningful for
+ * rows written before the V3→V4 rename.
+ */
+export function magicSource(
+  extra: Omit<MagicMessageSource, "kind" | "plugin"> = {},
+): MagicMessageSource {
+  return { kind: MAGIC_SOURCE_KIND, ...extra };
+}
+
+/**
+ * Is this source Magic's own? Tolerates both the current producer kind and the
+ * legacy `{ kind: MAGIC_SOURCE_KIND }` shape so previously persisted
+ * sessions keep being recognised.
+ */
+export function isMagicSource(source: unknown): boolean {
+  if (source === null || typeof source !== "object") return false;
+  const s = source as { kind?: unknown; plugin?: unknown };
+  if (s.kind === MAGIC_SOURCE_KIND) return true;
+  return s.kind === "plugin" && s.plugin === "magic-context";
 }
 
 /** Create a Magic-owned user message (knowledge injection / checkpoints). */
@@ -59,7 +107,9 @@ export function magicUserMessage(
 ): UserMessage {
   return createUserMessage({
     content: [textBlock(content), ...extraBlocks],
-    source,
+    // MessageSource is a closed union that does not model `plugin:<pkg>`;
+    // the runtime accepts it (see MAGIC_SOURCE_KIND). Crossed once, here.
+    source: source as never,
   });
 }
 
@@ -75,6 +125,10 @@ export function appendMessage(
  * Surface-replace transaction (the CAS primitive): replace `[start..end]` with
  * one checkpoint message; `sourceEventSeqs` MUST cover every shadowed node.
  * Returns the new surface generation.
+ *
+ * The runtime's replace op takes `{ startSeq, endSeq }` (branded `SessionSeq`),
+ * NOT `{ start, end }`. Passing the old field names meant the runtime read both
+ * as `undefined`, so every surface replace silently failed to apply.
  */
 export function replaceSurfaceRange(
   session: Session,
@@ -84,8 +138,8 @@ export function replaceSurfaceRange(
   sourceEventSeqs: readonly number[],
 ): number {
   const event = session.append("user/message", message, {
-    surfaceOp: { op: "replace", start, end },
-    sourceEventSeqs: [...sourceEventSeqs],
+    surfaceOp: { op: "replace", startSeq: SessionSeq(start), endSeq: SessionSeq(end) },
+    sourceEventSeqs: sourceEventSeqs.map((seq) => SessionSeq(seq)),
   });
   return event.seq;
 }

@@ -31,7 +31,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
-import { magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
+import { magicUserMessage, type MagicMessageSource, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
 
 /** Scan the session event log for the live context window + last input usage. */
 export function scanSessionMetrics(agent: Agent): {
@@ -103,8 +103,7 @@ function injectNudge(
     return;
   }
   const source: MagicMessageSource = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: MAGIC_SOURCE_KIND,
     messageId: marker,
   };
   const message = magicUserMessage(text, source, []);

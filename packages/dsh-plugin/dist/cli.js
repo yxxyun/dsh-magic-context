@@ -3136,7 +3136,7 @@ var {
   safeDump
 } = yaml;
 
-// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-loader@1.0.5+13c53b460909b11d/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js
+// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-loader@1.0.5+47273ca21af64088/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js
 import { createRequire } from "node:module";
 import { Context, Inject, Service, composeError, resolveConfig } from "@deepseek-ai/cordis";
 
@@ -3371,7 +3371,7 @@ var Time;
   Time.template = template;
 })(Time || (Time = {}));
 
-// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-loader@1.0.5+13c53b460909b11d/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js
+// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-loader@1.0.5+47273ca21af64088/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js
 var ModuleLoader;
 (function(ModuleLoader) {
   let _cachedLoader;
@@ -4049,7 +4049,7 @@ var Loader = class extends EntryTree {
   }
 };
 
-// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-include@1.0.9+974cada0d4b01bc3/node_modules/@deepseek-ai/cordis-plugin-include/lib/index.js
+// ../../node_modules/.bun/@deepseek-ai+cordis-plugin-include@1.0.9+d5948656e09941b7/node_modules/@deepseek-ai/cordis-plugin-include/lib/index.js
 import { Service as Service2 } from "@deepseek-ai/cordis";
 import { extname } from "node:path";
 import { access, constants, readFile, rename, writeFile } from "node:fs/promises";

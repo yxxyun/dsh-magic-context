@@ -37,7 +37,7 @@ import {
   resolveCanonicalKey,
   cwdOf,
   resolveProjectIdentity
-} from "./agent-hktwgxfm.js";
+} from "./agent-yp89cn0d.js";
 import {
   hasMeaningfulUserText,
   estimateTokens,
@@ -49,8 +49,9 @@ import {
   sessionLog
 } from "./agent-nb38pbc0.js";
 import {
+  MAGIC_SOURCE_KIND2,
   magicUserMessage2
-} from "./agent-md57b5ck.js";
+} from "./agent-nkqrsrrf.js";
 
 // ../plugin/src/features/magic-context/smart-notes/types.ts
 var SMART_NOTE_CHECK_POLICY_VERSION = 1;
@@ -2095,7 +2096,7 @@ function errorResult(text) {
 
 // src/agent/commands.ts
 var COMPACTION_OFF_UNAVAILABLE = "Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).";
-var MAGIC_SOURCE = { kind: "plugin", plugin: "magic-context" };
+var MAGIC_SOURCE = { kind: MAGIC_SOURCE_KIND2 };
 function modelKeyOf(agent) {
   const { provider, model } = agent.options;
   if (provider && model)

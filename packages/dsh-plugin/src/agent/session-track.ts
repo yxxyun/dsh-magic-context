@@ -73,7 +73,7 @@ export function registerSessionProjectTracking(
   if (deps.config?.enabled === false) return;
   const trackedSessions = new Set<string>();
   ctx.on(
-    "agent/session-start",
+    "agent/created",
     async (payload: { agent: Agent }) => {
       const { agent } = payload;
       try {

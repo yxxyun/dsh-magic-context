@@ -40,7 +40,7 @@ import {
   type AutoSearchHintNoHintReason,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { magicUserMessage } from "../compat/dsh-0.1/session";
+import { MAGIC_SOURCE_KIND, magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
 
 /** Auto-search tuning surfaced in the agent plugin config. */
 export interface AutoSearchConfig {
@@ -58,12 +58,8 @@ export type AutoSearchOutcome =
   | { ok: false; kind: "disabled" | "no-user-message" | "timeout" | "search-failure" };
 
 /** Source marker for the injected hint (messageId = per-user-message id). */
-export function autoSearchHintSource(userMessageId: string): {
-  kind: "plugin";
-  plugin: "magic-context";
-  messageId: string;
-} {
-  return { kind: "plugin", plugin: "magic-context", messageId: `mc-auto-search:${userMessageId}` };
+export function autoSearchHintSource(userMessageId: string): MagicMessageSource {
+  return { kind: MAGIC_SOURCE_KIND, messageId: `mc-auto-search:${userMessageId}` };
 }
 
 /** Concatenate the text blocks of a DSH user message. */

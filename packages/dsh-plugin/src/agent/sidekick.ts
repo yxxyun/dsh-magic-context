@@ -23,7 +23,8 @@ import {
   isEmptySidekickResult,
 } from "@magic-context/core/features/magic-context/sidekick/core";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { createUserMessage } from "../compat/dsh-0.1/session";
+import { createUserMessage, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
+import { magicSource, magicUserMessage } from "../compat/dsh-0.1/session";
 import type { CtxCommandSeams } from "./commands";
 import { resolveDb } from "./tools";
 
@@ -108,10 +109,7 @@ export async function runDshSidekick(
         model: selection?.model ?? "deepseek-chat",
       };
     })();
-    const user = createUserMessage({
-      content: [{ type: "text", text: `${args.prompt}${memoryBlock}` }],
-      source: { kind: "plugin", plugin: "magic-context" },
-    });
+    const user = magicUserMessage(`${args.prompt}${memoryBlock}`, magicSource());
 
     let text = "";
     for await (const chunk of llm.stream({

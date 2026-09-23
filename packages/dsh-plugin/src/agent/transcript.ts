@@ -75,6 +75,7 @@ import type {
 import type { KnowledgeSessionView } from "./knowledge-gate";
 import {
   deriveEventMessage,
+  isMagicSource,
   sessionEvents,
   type SessionEvent,
 } from "../compat/dsh-0.1/session";
@@ -231,10 +232,13 @@ function isSyntheticUserMessage(message: RawMessage): boolean {
   return typeof message.id === "string" && message.id.startsWith(SYNTH_USER_ID_PREFIX);
 }
 
-/** True for Magic-injected knowledge messages (source.plugin === 'magic-context'). */
+/** True for Magic-injected knowledge messages (see isMagicSource). */
 function isKnowledgeMessage(message: Record<string, unknown>): boolean {
   const source = isRecord(message.source) ? message.source : null;
-  return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
+  // isMagicSource tolerates BOTH the current producer kind and the legacy
+  // {kind:"plugin", plugin:"magic-context"} shape, so previously persisted
+  // sessions keep being recognised as Magic-owned.
+  return isMagicSource(source);
 }
 
 /**

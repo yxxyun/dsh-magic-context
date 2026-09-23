@@ -45,7 +45,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import { createUserMessage } from "../compat/dsh-0.1/session";
+import { MAGIC_SOURCE_KIND, magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
 import { DSH_HARNESS } from "dsh-magic-context-adapter";
 import {
   DreamerConfigSchema,
@@ -89,7 +89,7 @@ const TOOL_REQUIRING_DREAM_AGENTS = new Set([
 ]);
 
 /** Magic-owned message source marker for dreamer LLM turns. */
-const DREAM_SOURCE = { kind: "plugin", plugin: "magic-context" } as const;
+const DREAM_SOURCE = { kind: MAGIC_SOURCE_KIND } as const;
 
 /** Wiring deps for {@link registerDshDreamer}. */
 export interface DreamerWiringDeps {
@@ -255,10 +255,7 @@ async function streamDreamTurn(
   if (llm === undefined) {
     throw new Error("magic-context: llm service unavailable (dreamer wiring)");
   }
-  const user = createUserMessage({
-    content: [{ type: "text", text: opts.userText }],
-    source: DREAM_SOURCE,
-  });
+  const user = magicUserMessage(opts.userText, DREAM_SOURCE);
   let text = "";
   let failed: string | undefined;
   for await (const chunk of llm.stream({

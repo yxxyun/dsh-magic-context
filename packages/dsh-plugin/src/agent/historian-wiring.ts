@@ -17,7 +17,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import { createUserMessage, sessionEvents } from "../compat/dsh-0.1/session";
+import { magicSource, magicUserMessage, sessionEvents } from "../compat/dsh-0.1/session";
 import type { SummarizeHook } from "../compat/dsh-0.1/compaction";
 import type { MagicContextHostService, MagicSummarizeHook } from "../index";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
@@ -142,10 +142,7 @@ export function createLlmSummarizeCall(
       inputSource: chunk.text,
       memoryEnabled: true,
     });
-    const user = createUserMessage({
-      content: [{ type: "text", text: prompt }],
-      source: { kind: "plugin", plugin: "magic-context" },
-    });
+    const user = magicUserMessage(prompt, magicSource());
     let text = "";
     let failed: string | undefined;
     for await (const streamChunk of llm.stream({

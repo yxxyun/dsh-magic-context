@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import { SessionSeq } from "@deepseek-ai/dsh-session";
 import {
   createAssistantMessage,
   createUserMessage,
@@ -59,7 +60,7 @@ function makeHost(db: Database): CoordinatorHostView {
 
 function viewOf(session: Session) {
   return readDshTranscript({
-    session: { events: session.events, surface: session.surface, header: {} },
+    session: { events: session.snapshotEvents(), surface: session.surface, header: {} },
     canonicalSessionId: CANONICAL,
   });
 }
@@ -173,7 +174,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       session.append(
         "user/message",
         createUserMessage({ content: [{ type: "text", text: "replacement" }], source: { kind: "user" } }),
-        { surfaceOp: { op: "replace", start: mid, end: mid }, sourceEventSeqs: [mid] },
+        { surfaceOp: { op: "replace", startSeq: SessionSeq(mid), endSeq: SessionSeq(mid) }, sourceEventSeqs: [mid] },
       );
       expect(session.surface.replaceGeneration).toBe(1);
       const outcome = await enqueuePlan(createCoordinatorState(), host, session, plan);
@@ -268,7 +269,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       const nodes = [...session.surface.nodes];
       // The merged node is a user message carrying the marker + the old text.
       const mergedSeq = nodes[0]!;
-      const message = session.events[mergedSeq];
+      const message = session.snapshotEvents()[mergedSeq];
       expect(message.type).toBe("user/message");
       const text = JSON.stringify(message.data);
       expect(text).toContain("<!-- +5m -->");
