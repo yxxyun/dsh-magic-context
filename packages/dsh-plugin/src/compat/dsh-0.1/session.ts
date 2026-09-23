@@ -174,16 +174,85 @@ export function surfaceGeneration(session: Session): number {
  * Prefer the runtime method, fall back to the property (tests, and any runtime
  * that does expose it), and never throw — an unreadable log must degrade to
  * "nothing to tag", not to "the plane is dead".
+ *
+ * Every degradation is reported through {@link setSessionEventsFailureReporter}
+ * so the caller-side fail-open stays non-fatal WITHOUT staying invisible.
  */
 export function sessionEvents(session: unknown): readonly SessionEvent[] {
   const view = session as unknown as {
     snapshotEvents?: () => unknown;
     events?: unknown;
   } | null | undefined;
-  if (view === null || view === undefined) return [];
+  if (view === null || view === undefined) {
+    reportSessionEventsFailure("session view is null/undefined");
+    return [];
+  }
   if (typeof view.snapshotEvents === "function") {
     const events = view.snapshotEvents();
     if (Array.isArray(events)) return events as readonly SessionEvent[];
+    reportSessionEventsFailure(
+      `snapshotEvents() returned ${typeof events}, not an array — falling back to the events property`,
+    );
+  } else {
+    reportSessionEventsFailure("session has no snapshotEvents() method");
   }
-  return Array.isArray(view.events) ? (view.events as readonly SessionEvent[]) : [];
+  if (Array.isArray(view.events)) return view.events as readonly SessionEvent[];
+  reportSessionEventsFailure("session exposes neither snapshotEvents() nor an events array");
+  return [];
+}
+
+/**
+ * Report an unreadable session log to the operator.
+ *
+ * Degrading to `[]` is deliberate (an unreadable log must not kill the plane),
+ * but doing it SILENTLY is what let the `session.events` regression run
+ * undiagnosed: every consumer saw "nothing to do" and no operator saw a reason.
+ * The agent plane installs a reporter that mirrors into magic-context.log.
+ */
+let sessionEventsFailureReporter: ((message: string) => void) | undefined;
+
+/** Install the sink for {@link sessionEvents} degradations (undefined clears it). */
+export function setSessionEventsFailureReporter(
+  reporter: ((message: string) => void) | undefined,
+): void {
+  sessionEventsFailureReporter = reporter;
+}
+
+function reportSessionEventsFailure(message: string): void {
+  try {
+    sessionEventsFailureReporter?.(message);
+  } catch {
+    // Reporting must never be the thing that breaks a read.
+  }
+}
+
+/**
+ * Read one event by its ABSOLUTE seq, tolerating an events array whose index is
+ * not the seq.
+ *
+ * `snapshotEvents()` currently returns the whole log, so `events[seq]` holds and
+ * the fast path always wins. But that alignment is an assumption about the host,
+ * and when it broke the failure was silent in the worst possible way: the
+ * duplicate-id guard read `undefined` for a node that WAS on the surface, so it
+ * answered "not on surface" and let a duplicate through. Scan the array instead
+ * of trusting the index, and report the miss so a future host change is visible.
+ */
+export function findEventBySeq(
+  events: readonly SessionEvent[],
+  seq: number,
+  onMisaligned?: (detail: string) => void,
+): SessionEvent | undefined {
+  const direct = events[seq] as SessionEvent | undefined;
+  if (direct !== undefined && (direct as { seq?: unknown }).seq === seq) return direct;
+  const found = events.find((event) => (event as { seq?: unknown }).seq === seq);
+  if (found !== undefined && onMisaligned !== undefined) {
+    try {
+      onMisaligned(
+        `events[${seq}] does not hold seq ${seq} (array length ${events.length}); recovered by scanning`,
+      );
+    } catch {
+      // Reporting must never break the read it reports on.
+    }
+  }
+  return found;
 }

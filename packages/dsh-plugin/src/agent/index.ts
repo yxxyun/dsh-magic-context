@@ -25,6 +25,7 @@ import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@ma
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
 import type { KnowledgeConfig } from "./knowledge-gate";
+import { setSessionEventsFailureReporter } from "../compat/dsh-0.1/session";
 import { registerSystemGuidance } from "./system-guidance";
 import type { GuidanceConfig } from "./system-guidance";
 import { registerSessionProjectTracking } from "./session-track";
@@ -281,6 +282,13 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     coreLog(message);
     ctx.logger?.info?.(message);
   };
+  // An unreadable session log degrades to "nothing to tag" (fail-open by
+  // contract) — but it must not degrade to silence, which is how the removed
+  // `session.events` getter went unnoticed. Mirror every degradation into the
+  // same sink the rest of the plane uses.
+  setSessionEventsFailureReporter((detail) => {
+    log(`[magic-context] session log unreadable (degraded to empty): ${detail}`);
+  });
   const directory = config.directory ?? process.cwd();
 
   registerSystemGuidance(ctx, { config: config.guidance, log });

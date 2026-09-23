@@ -45,13 +45,24 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
 
 interface FakeAgentHarness {
   agent: KnowledgeAgentView;
+  /**
+   * Messages handed to `agent.inject()`.
+   *
+   * DSH does NOT surface these immediately: it queues them for the NEXT step's
+   * inbox claim, and they reach the surface only when that step's decision is
+   * appended. A fake that lands them at inject() time makes the surface look
+   * like it already carries the baseline, which is exactly why the duplicate-id
+   * guard could pass every test while still failing on a real session.
+   */
   injected: UserMessage[];
   events: Array<Record<string, unknown>>;
   nodes: number[];
   replaceGeneration: number;
+  /** Model the runtime appending a resolved pre-step decision to the surface. */
+  landStep(messages: readonly unknown[]): void;
 }
 
-function makeFakeAgent(directory: string): FakeAgentHarness {
+function makeFakeAgent(directory: string, sessionId = "sess-1"): FakeAgentHarness {
   const injected: UserMessage[] = [];
   const events: Array<Record<string, unknown>> = [];
   const nodes: number[] = [];
@@ -60,8 +71,20 @@ function makeFakeAgent(directory: string): FakeAgentHarness {
     events,
     nodes,
     replaceGeneration: 0,
+    landStep(messages: readonly unknown[]) {
+      for (const message of messages) {
+        events.push({
+          type: "user/message",
+          seq: events.length,
+          time: Date.now(),
+          data: message,
+          surfaceOp: "append",
+        });
+        nodes.push(events.length - 1);
+      }
+    },
     agent: {
-      id: "sess-1" as SessionId,
+      id: sessionId as SessionId,
       options: { provider: "deepseek", model: "deepseek-chat" },
       session: {
         surface: {
@@ -77,18 +100,37 @@ function makeFakeAgent(directory: string): FakeAgentHarness {
       },
       inject(message: UserMessage) {
         injected.push(message);
-        events.push({
-          type: "user/message",
-          seq: events.length,
-          time: Date.now(),
-          data: message,
-          surfaceOp: "append",
-        });
-        nodes.push(events.length - 1);
       },
     },
   };
   return harness;
+}
+
+/**
+ * Host-accurate `next`: the agent loop's default decision is the claimed batch
+ * itself (`messages: claimed`), so the pre-step's mutations are what gets
+ * appended.
+ */
+function runtimeNext(payload: { messages: unknown[] }): () => Promise<PreStepDecision> {
+  return async () => ({ kind: "enter", messages: payload.messages as UserMessage[] });
+}
+
+/** Run one pre-step and append its resolved decision to the fake surface. */
+async function runGate(
+  harness: FakeAgentHarness,
+  state: KnowledgeGateState,
+  deps: KnowledgeGateDeps,
+  messages: unknown[],
+): Promise<PreStepDecision> {
+  const payload = { agent: harness.agent, messages };
+  const decision = await runKnowledgeGateStep(
+    state,
+    deps,
+    payload as never,
+    runtimeNext(payload),
+  );
+  harness.landStep(decision.messages);
+  return decision;
 }
 
 function fakeHost(db: Database, directory: string): KnowledgeGateDeps["host"] {
@@ -254,9 +296,10 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const deps = fakeDeps(db, dir);
       const harness = makeFakeAgent(dir);
 
-      // First process: inject once.
+      // First process: inject once, and let the resolved decision LAND — that
+      // append, not inject() itself, is what puts the baseline on the surface.
       const firstState = createKnowledgeGateState();
-      await runKnowledgeGateStep(firstState, deps, { agent: harness.agent, messages: [userMessage("resume scenario first message")] }, passThroughNext());
+      await runGate(harness, firstState, deps, [userMessage("resume scenario first message")]);
       expect(harness.injected.length).toBe(2);
       const watermark = (harness.injected[0].source as { messageId?: string }).messageId as string;
       expect(isMagicWatermarkOnSurface(harness.agent.session, watermark)).toBe(true);
@@ -264,7 +307,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       // Restart: fresh state (empty Maps) but the same durable log is replayed —
       // the visible surface still carries the watermark → no re-injection.
       const resumedState = createKnowledgeGateState();
-      await runKnowledgeGateStep(resumedState, deps, { agent: harness.agent, messages: [userMessage("post-restart message")] }, passThroughNext());
+      await runGate(harness, resumedState, deps, [userMessage("post-restart message")]);
       expect(harness.injected.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
@@ -288,16 +331,10 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const harness = makeFakeAgent(dir);
       // Mirror the runtime: the pre-step decision's `messages` array is what
       // gets appended to the surface, so `next` returns it verbatim.
-      const runtimeNext = (payload: { messages: readonly UserMessage[] }) =>
-        async (): Promise<PreStepDecision> => ({
-          kind: "enter",
-          messages: payload.messages as UserMessage[],
-        });
-
-      // Step 1 — the gate delivers the baseline through the pre-step decision
-      // (and, in production, also queues the same objects for the next step).
-      const firstPayload = { agent: harness.agent, messages: [userMessage("first message")] };
-      await runKnowledgeGateStep(state, deps, firstPayload, runtimeNext(firstPayload));
+      // Step 1 — the gate delivers the baseline through the pre-step decision,
+      // which the runtime then appends; it ALSO queues the same objects for the
+      // next step.
+      await runGate(harness, state, deps, [userMessage("first message")]);
       expect(harness.injected.length).toBe(2);
       const m0Watermark = (harness.injected[0].source as { messageId?: string }).messageId as string;
       expect(isMagicWatermarkOnSurface(harness.agent.session, m0Watermark)).toBe(true);
@@ -312,6 +349,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       // Only the genuine user turn survives; both queued baseline copies are gone.
       expect(secondPayload.messages).toEqual([turn]);
       expect(harness.injected.length).toBe(2);
+      harness.landStep(decision.messages);
 
       // A Magic message whose watermark is NOT on the surface is never dropped —
       // that queued copy is the fallback delivery for a prepend that never landed.
@@ -322,6 +360,125 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const thirdPayload = { agent: harness.agent, messages: [unseen] };
       await runKnowledgeGateStep(state, deps, thirdPayload, runtimeNext(thirdPayload));
       expect(thirdPayload.messages).toEqual([unseen]);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("does not mint a second baseline when the step batch already carries the watermark", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const identity = resolveKnowledgeProjectPath(dir);
+      insertMemory(db, {
+        projectPath: identity as string,
+        category: "PROJECT_RULES",
+        content: "batch-side duplicate guard content",
+        sourceType: "agent",
+      });
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+      const magicSessionId = deps.host.canonicalKey("sess-1");
+
+      // Pass 1 — the gate queues m0/m1 for the next step, then the turn dies
+      // before the runtime appends the decision. This is the observed shape:
+      // the queued copies exist, the surface does not carry them.
+      const firstPayload = { agent: harness.agent, messages: [userMessage("first message")] };
+      await runKnowledgeGateStep(state, deps, firstPayload, runtimeNext(firstPayload));
+      expect(harness.injected.length).toBe(2);
+      const queued = [...harness.injected];
+      const m0Watermark = (queued[0].source as { messageId?: string }).messageId as string;
+      expect(isMagicWatermarkOnSurface(harness.agent.session, m0Watermark)).toBe(false);
+
+      // A Magic replacement lands, so the surface generation advances and the
+      // gate is no longer memoized for this session — it will reconsider.
+      harness.replaceGeneration += 1;
+      harness.injected.length = 0;
+
+      // Pass 2 — the runtime claims the queued copies into the batch. The
+      // surface cannot see them yet, so without a batch-side check the gate
+      // would mint a SECOND baseline for the same watermark and both would land.
+      const batch: unknown[] = [...queued, userMessage("second turn message")];
+      await runGate(harness, state, deps, batch);
+
+      expect(harness.injected.length).toBe(0);
+      expect(state.injectedGenerations.get(magicSessionId)).toBe(harness.replaceGeneration);
+      const magicIds = harness.events
+        .filter((event) => isMagicSource((event.data as { source?: unknown } | undefined)?.source))
+        .map((event) => (event.data as { id: string }).id);
+      expect(magicIds.length).toBe(2);
+      expect(new Set(magicIds).size).toBe(magicIds.length);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("keeps only the first copy when one batch carries the same watermark twice", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+
+      const watermark = "mc-kb:1:aaaaaaaaaaaaaaaa";
+      const first = magicUserMessage("baseline copy one", { kind: MAGIC_SOURCE_KIND, messageId: watermark });
+      const second = magicUserMessage("baseline copy two", { kind: MAGIC_SOURCE_KIND, messageId: watermark });
+      // Two distinct objects, one watermark: exactly the shape that landed two
+      // surface nodes under a single message id.
+      expect(first.id).not.toBe(second.id);
+
+      const payload = { agent: harness.agent, messages: [first, second] };
+      await runKnowledgeGateStep(state, deps, payload, runtimeNext(payload));
+
+      // The first copy survives; the second is gone (the gate may also have
+      // prepended its own baseline for this generation — that is orthogonal).
+      expect(payload.messages).toContain(first);
+      expect(payload.messages).not.toContain(second);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("does not let one session's pre-step consume another session's injected batch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const identity = resolveKnowledgeProjectPath(dir);
+      insertMemory(db, {
+        projectPath: identity as string,
+        category: "PROJECT_RULES",
+        content: "per-session stash isolation content",
+        sourceType: "agent",
+      });
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const sessionA = makeFakeAgent(dir, "sess-A");
+      const sessionB = makeFakeAgent(dir, "sess-B");
+      const keyA = deps.host.canonicalKey("sess-A");
+
+      // Session A injects and leaves its baseline queued in the gate's stash:
+      // the registration is profile-wide, so that stash must not be reachable
+      // from session B.
+      await maybeInjectKnowledge(state, deps, sessionA.agent, db, keyA, identity, dir);
+      const stashedForA = state.lastInjectedMessages.get(keyA);
+      expect(stashedForA?.length).toBe(2);
+      const idsStashedForA = new Set(stashedForA?.map((message) => (message as { id: string }).id));
+
+      const batchB: unknown[] = [];
+      const payloadB = { agent: sessionB.agent, messages: batchB };
+      const decisionB = await runKnowledgeGateStep(state, deps, payloadB, runtimeNext(payloadB));
+
+      // B's step carries B's own baseline — never A's.
+      for (const message of decisionB.messages as UserMessage[]) {
+        expect(idsStashedForA.has(message.id)).toBe(false);
+      }
+      // A's stash is still there, waiting for A.
+      expect(state.lastInjectedMessages.get(keyA)?.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
     }

@@ -1,9 +1,9 @@
 import"./agent-5gth7qh5.js";
-import"./agent-bqmbqaya.js";
+import"./agent-c3gc6xe0.js";
 import {
   registerCtxCommands
-} from "./agent-98m64s99.js";
-import"./agent-nkqrsrrf.js";
+} from "./agent-kjq40qkp.js";
+import"./agent-6rr0cza0.js";
 
 // src/entries/commands.ts
 var name = "magic-context-commands";

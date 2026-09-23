@@ -209,7 +209,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-bqmbqaya.js";
+} from "./agent-c3gc6xe0.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -272,7 +272,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-98m64s99.js";
+} from "./agent-kjq40qkp.js";
 import {
   getHarness,
   getDataDir,
@@ -319,8 +319,10 @@ import {
   magicSource2,
   isMagicSource2,
   magicUserMessage2,
-  sessionEvents2
-} from "./agent-nkqrsrrf.js";
+  sessionEvents2,
+  setSessionEventsFailureReporter2,
+  findEventBySeq2
+} from "./agent-6rr0cza0.js";
 import {
   pushNotification2
 } from "./agent-b3eqj1g6.js";
@@ -3443,7 +3445,27 @@ ${hintText}`;
 
 // src/agent/knowledge-gate.ts
 function createKnowledgeGateState() {
-  return { injectedGenerations: new Map, trackedSessions: new Set, lastInjectedMessages: [] };
+  return { injectedGenerations: new Map, trackedSessions: new Set, lastInjectedMessages: new Map };
+}
+function injectedStash(state, magicSessionId) {
+  let stash = state.lastInjectedMessages.get(magicSessionId);
+  if (stash === undefined) {
+    stash = [];
+    state.lastInjectedMessages.set(magicSessionId, stash);
+  }
+  return stash;
+}
+function collectMagicWatermarks(messages) {
+  const watermarks = new Set;
+  for (const message of messages) {
+    const source = message?.source;
+    if (source === undefined || source === null || !isMagicSource2(source))
+      continue;
+    const watermark = source.messageId;
+    if (typeof watermark === "string" && watermark.length > 0)
+      watermarks.add(watermark);
+  }
+  return watermarks;
 }
 var M1_EMPTY_PLACEHOLDER = "<session-history-since>(no new content since last materialization)</session-history-since>";
 function sha256Hex(input) {
@@ -3548,10 +3570,10 @@ ${m1Text}` : "";
     digest
   };
 }
-function isMagicWatermarkOnSurface(session, watermark) {
+function isMagicWatermarkOnSurface(session, watermark, onMisaligned) {
   const events = sessionEvents2(session);
   for (const seq of session.surface.nodes) {
-    const event = events[seq];
+    const event = findEventBySeq2(events, seq, onMisaligned);
     if (!event || event.type !== "user/message")
       continue;
     const source = event.data?.source;
@@ -3561,23 +3583,35 @@ function isMagicWatermarkOnSurface(session, watermark) {
   }
   return false;
 }
-function dropAlreadySurfacedMagicMessages(agent, messages) {
+function dropAlreadySurfacedMagicMessages(agent, messages, log) {
+  const seenInBatch = new Set;
   let removed = 0;
-  for (let index = messages.length - 1;index >= 0; index -= 1) {
+  let index = 0;
+  while (index < messages.length) {
     const source = messages[index]?.source;
-    if (!source || !isMagicSource2(source))
+    if (!source || !isMagicSource2(source)) {
+      index += 1;
       continue;
+    }
     const watermark = source.messageId;
-    if (typeof watermark !== "string" || watermark.length === 0)
+    if (typeof watermark !== "string" || watermark.length === 0) {
+      index += 1;
       continue;
-    if (!isMagicWatermarkOnSurface(agent.session, watermark))
+    }
+    const duplicateInBatch = seenInBatch.has(watermark);
+    seenInBatch.add(watermark);
+    const onSurface = isMagicWatermarkOnSurface(agent.session, watermark, (detail) => log?.(`[magic-context] watermark lookup note: ${detail}`));
+    if (!duplicateInBatch && !onSurface) {
+      index += 1;
       continue;
+    }
     messages.splice(index, 1);
     removed += 1;
+    log?.(`[magic-context] dropped redundant Magic message ${watermark} from the pre-step batch ` + `(${duplicateInBatch ? "already earlier in this batch" : "already on the surface"})`);
   }
   return removed;
 }
-async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, forceMaterialize = false) {
+async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, forceMaterialize = false, incomingWatermarks) {
   if (deps.config.enabled === false)
     return;
   const generation = agent.session.surface.replaceGeneration;
@@ -3586,8 +3620,16 @@ async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, proj
   const blocks = materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, directory, agent, forceMaterialize);
   if (blocks === null)
     return;
-  if (isMagicWatermarkOnSurface(agent.session, blocks.watermark)) {
+  if (isMagicWatermarkOnSurface(agent.session, blocks.watermark, (detail) => deps.log?.(`[magic-context] watermark lookup note: ${detail}`))) {
     state.injectedGenerations.set(magicSessionId, generation);
+    return;
+  }
+  const baselineM0 = blocks.watermark;
+  const baselineM1 = `${blocks.watermark}:m1`;
+  if (incomingWatermarks !== undefined && (incomingWatermarks.has(baselineM0) || incomingWatermarks.has(baselineM1))) {
+    const which = incomingWatermarks.has(baselineM0) ? baselineM0 : baselineM1;
+    state.injectedGenerations.set(magicSessionId, generation);
+    deps.log?.(`[magic-context] knowledge injection skipped for ${magicSessionId}@gen${generation}: ` + `the incoming step batch already carries ${which}`);
     return;
   }
   const source = {
@@ -3639,14 +3681,17 @@ output: ${part.state.output}`;
           };
           const todoMessage = magicUserMessage2(todoText, todoSource, []);
           agent.inject(todoMessage);
-          state.lastInjectedMessages.push(todoMessage);
+          injectedStash(state, magicSessionId).push(todoMessage);
         }
       }
     }
   } catch {}
   state.injectedGenerations.set(magicSessionId, generation);
-  if (state.lastInjectedMessages.length === 0) {
-    state.lastInjectedMessages = [m0Message, m1Message];
+  const stash = injectedStash(state, magicSessionId);
+  if (stash.length === 0) {
+    stash.push(m0Message, m1Message);
+  } else {
+    deps.log?.(`[magic-context] baseline prepend skipped for ${magicSessionId}@gen${generation}: ` + `stash already holds ${stash.length} message(s) (todo replay)`);
   }
   deps.log?.(`[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`);
 }
@@ -3665,7 +3710,10 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
     if (isMagicChildSession(agent)) {
       return await next();
     }
-    dropAlreadySurfacedMagicMessages(agent, payload.messages);
+    const dropped = dropAlreadySurfacedMagicMessages(agent, payload.messages, deps.log);
+    if (dropped > 0) {
+      deps.log?.(`[magic-context] pre-step batch: dropped ${dropped} redundant Magic message(s)`);
+    }
     const bootstrap = await deps.host.ready;
     if (bootstrap.kind === "ok") {
       const db = bootstrap.db;
@@ -3674,11 +3722,13 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
       const projectPath = resolveKnowledgeProjectPath(directory);
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
       const deferred = consumeDshDeferredSignals(magicSessionId);
-      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization);
-      if (state.lastInjectedMessages.length > 0) {
-        const injected = state.lastInjectedMessages;
-        state.lastInjectedMessages = [];
-        payload.messages.unshift(...injected);
+      const incomingWatermarks = collectMagicWatermarks(payload.messages);
+      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization, incomingWatermarks);
+      const stash = state.lastInjectedMessages.get(magicSessionId);
+      if (stash !== undefined && stash.length > 0) {
+        state.lastInjectedMessages.delete(magicSessionId);
+        payload.messages.unshift(...stash);
+        deps.log?.(`[magic-context] prepended ${stash.length} injected Magic message(s) for ${magicSessionId}`);
       }
       maybeRunAutoSearchHint({
         db,
@@ -5506,7 +5556,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
           return isMagicSource2(source) && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
-          const { magicUserMessage } = await import("./session-c5n90p3w.js");
+          const { magicUserMessage } = await import("./session-chs0y9ne.js");
           const noteMessage = magicUserMessage(noteText, { kind: MAGIC_SOURCE_KIND2, messageId: noteMarker }, []);
           agent.inject?.(noteMessage);
           markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
@@ -18029,6 +18079,9 @@ function apply(ctx, config = {}) {
     log(message);
     ctx.logger?.info?.(message);
   };
+  setSessionEventsFailureReporter2((detail) => {
+    log2(`[magic-context] session log unreadable (degraded to empty): ${detail}`);
+  });
   const directory = config.directory ?? process.cwd();
   registerSystemGuidance(ctx, { config: config.guidance, log: log2 });
   registerSessionProjectTracking(ctx, {

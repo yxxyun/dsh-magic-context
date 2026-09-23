@@ -1,8 +1,8 @@
 import {
   registerCtxTools
-} from "./agent-bqmbqaya.js";
+} from "./agent-c3gc6xe0.js";
 import"./agent-5gth7qh5.js";
-import"./agent-nkqrsrrf.js";
+import"./agent-6rr0cza0.js";
 
 // src/entries/tools.ts
 var name = "magic-context-tools";

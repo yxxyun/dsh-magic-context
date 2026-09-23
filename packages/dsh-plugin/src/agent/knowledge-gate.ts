@@ -66,7 +66,7 @@ import { consumeDshDeferredSignals } from "./historian";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { isMagicSource, magicUserMessage, sessionEvents, type MagicMessageSource, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
+import { isMagicSource, magicUserMessage, sessionEvents, findEventBySeq, type MagicMessageSource, MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
 import {
   registerPreStepGate,
   type PreStepDecision,
@@ -126,12 +126,49 @@ export interface KnowledgeGateState {
   readonly injectedGenerations: Map<string, number>;
   /** sessionId → project attribution already recorded for. */
   readonly trackedSessions: Set<string>;
-  /** Messages injected by the most recent pass (first-round prepend). */
-  lastInjectedMessages: unknown[];
+  /**
+   * sessionId → messages injected by THAT session's most recent pass.
+   *
+   * Keyed by session because this state is owned by the registration, which is
+   * created once per profile and therefore shared by every session and every
+   * agent in it. A bare array here let one session's baseline be prepended into
+   * another session's step (the guard then checks the WRONG session's surface,
+   * finds no watermark, and lets it through), and let a second session's
+   * assignment drop the first session's stash entirely.
+   */
+  readonly lastInjectedMessages: Map<string, unknown[]>;
 }
 
 export function createKnowledgeGateState(): KnowledgeGateState {
-  return { injectedGenerations: new Map(), trackedSessions: new Set(), lastInjectedMessages: [] };
+  return { injectedGenerations: new Map(), trackedSessions: new Set(), lastInjectedMessages: new Map() };
+}
+
+/** The per-session prepend stash, created on first use. */
+function injectedStash(state: KnowledgeGateState, magicSessionId: string): unknown[] {
+  let stash = state.lastInjectedMessages.get(magicSessionId);
+  if (stash === undefined) {
+    stash = [];
+    state.lastInjectedMessages.set(magicSessionId, stash);
+  }
+  return stash;
+}
+
+/**
+ * The Magic watermarks already present in an incoming step batch.
+ *
+ * This is the batch-side half of the de-dup question. The surface cannot answer
+ * it: messages claimed into this step are appended to the surface only AFTER the
+ * pre-step decision resolves, so at decision time they exist nowhere but here.
+ */
+function collectMagicWatermarks(messages: readonly unknown[]): Set<string> {
+  const watermarks = new Set<string>();
+  for (const message of messages) {
+    const source = (message as { source?: MagicMessageSource | { kind?: string } } | undefined)?.source;
+    if (source === undefined || source === null || !isMagicSource(source)) continue;
+    const watermark = (source as MagicMessageSource).messageId;
+    if (typeof watermark === "string" && watermark.length > 0) watermarks.add(watermark);
+  }
+  return watermarks;
 }
 
 /** The session surface slice the gate reads (test-friendly structural view). */
@@ -312,14 +349,19 @@ export function materializeKnowledgeBlocks(
  * message with this watermark is already a live surface node (resume replay —
  * the durable log still carries it, so a restarted process must not re-inject).
  * Replaced (shadowed) nodes do not count, so a compacted session re-injects.
+ *
+ * `onMisaligned` reports a seq lookup that had to fall back to a scan. That is
+ * not noise: an off-by-index read here silently answers "not on surface", which
+ * is precisely how a duplicate id got past this guard.
  */
 export function isMagicWatermarkOnSurface(
   session: KnowledgeSessionView,
   watermark: string,
+  onMisaligned?: (detail: string) => void,
 ): boolean {
   const events = sessionEvents(session);
   for (const seq of session.surface.nodes) {
-    const event = events[seq] as
+    const event = findEventBySeq(events, seq, onMisaligned) as
       | { type?: string; data?: { source?: MagicMessageSource | { kind?: string } } }
       | undefined;
     if (!event || event.type !== "user/message") continue;
@@ -336,15 +378,21 @@ export function isMagicWatermarkOnSurface(
 }
 
 /**
- * Remove from the incoming pre-step batch every Magic message whose watermark is
- * already a LIVE surface node, and return how many were removed.
+ * Remove from the incoming pre-step batch every Magic message that would land a
+ * DUPLICATE surface node, and return how many were removed. Two independent
+ * reasons, both of which must hold:
  *
- * This is the invariant that makes the inject()+prepend pair safe: DSH appends
- * the pre-step decision's `messages` to the surface, and `agent.inject()` queues
- * the same objects for the next step — without this guard the next step claims
- * them and appends a second node carrying an unchanged message id. The client
- * keys conversation nodes by that id, so the duplicate silently breaks the
- * conversation view (memory #411).
+ *  1. the watermark is already a LIVE surface node — DSH appends the pre-step
+ *     decision's `messages` to the surface while `agent.inject()` queues the
+ *     same objects for the next step, so the next step claims them and appends a
+ *     second node carrying an unchanged message id;
+ *  2. the watermark appears EARLIER IN THIS SAME BATCH — the batch can carry the
+ *     same baseline from more than one producer in one step, which lands two
+ *     nodes with one message id just as surely.
+ *
+ * The client keys conversation nodes by that id, so either duplicate throws
+ * "conversation Context ... received more than one start Match" and the whole
+ * conversation renders empty (memory #411).
  *
  * Shadowed (replaced/compacted) nodes do not count — a new surface generation
  * legitimately re-delivers the same watermark — and messages without a
@@ -353,22 +401,54 @@ export function isMagicWatermarkOnSurface(
 export function dropAlreadySurfacedMagicMessages(
   agent: KnowledgeAgentView,
   messages: unknown[],
+  log?: (message: string) => void,
 ): number {
+  const seenInBatch = new Set<string>();
   let removed = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
+  let index = 0;
+  while (index < messages.length) {
     const source = (messages[index] as { source?: MagicMessageSource | { kind?: string } } | undefined)
       ?.source;
-    if (!source || !isMagicSource(source)) continue;
+    if (!source || !isMagicSource(source)) {
+      index += 1;
+      continue;
+    }
     const watermark = (source as MagicMessageSource).messageId;
-    if (typeof watermark !== "string" || watermark.length === 0) continue;
-    if (!isMagicWatermarkOnSurface(agent.session, watermark)) continue;
+    if (typeof watermark !== "string" || watermark.length === 0) {
+      index += 1;
+      continue;
+    }
+    const duplicateInBatch = seenInBatch.has(watermark);
+    seenInBatch.add(watermark);
+    const onSurface = isMagicWatermarkOnSurface(agent.session, watermark, (detail) =>
+      log?.(`[magic-context] watermark lookup note: ${detail}`),
+    );
+    if (!duplicateInBatch && !onSurface) {
+      index += 1;
+      continue;
+    }
     messages.splice(index, 1);
     removed += 1;
+    log?.(
+      `[magic-context] dropped redundant Magic message ${watermark} from the pre-step batch ` +
+        `(${duplicateInBatch ? "already earlier in this batch" : "already on the surface"})`,
+    );
   }
   return removed;
 }
 
-/** Inject the knowledge baseline once per (session, surface generation). */
+/**
+ * Inject the knowledge baseline once per (session, surface generation).
+ *
+ * `incomingWatermarks` are the Magic watermarks already present in the step
+ * batch this pass is about to decide on. They are a THIRD place the same
+ * baseline can already be, next to "on the surface" and "in this gate's stash",
+ * and the only one that is invisible from `agent.session`: the previous pass's
+ * `agent.inject()` is delivered as THIS step's claim, and the surface append has
+ * not happened yet when the decision runs. Checking only the surface made the
+ * gate keep the claimed copy AND create a fresh one, landing two nodes with one
+ * watermark — the duplicate-id class that empties the conversation view.
+ */
 export async function maybeInjectKnowledge(
   state: KnowledgeGateState,
   deps: KnowledgeGateDeps,
@@ -378,6 +458,7 @@ export async function maybeInjectKnowledge(
   projectPath: string | undefined,
   directory: string | undefined,
   forceMaterialize = false,
+  incomingWatermarks?: ReadonlySet<string>,
 ): Promise<void> {
   if (deps.config.enabled === false) return;
   const generation = agent.session.surface.replaceGeneration;
@@ -394,9 +475,29 @@ export async function maybeInjectKnowledge(
   );
   if (blocks === null) return;
 
-  if (isMagicWatermarkOnSurface(agent.session, blocks.watermark)) {
+  if (isMagicWatermarkOnSurface(agent.session, blocks.watermark, (detail) =>
+    deps.log?.(`[magic-context] watermark lookup note: ${detail}`),
+  )) {
     // Resume: the persisted surface already carries this exact baseline.
     state.injectedGenerations.set(magicSessionId, generation);
+    return;
+  }
+
+  const baselineM0 = blocks.watermark;
+  const baselineM1 = `${blocks.watermark}:m1`;
+  if (
+    incomingWatermarks !== undefined &&
+    (incomingWatermarks.has(baselineM0) || incomingWatermarks.has(baselineM1))
+  ) {
+    // The same baseline is already riding this step's batch, so injecting again
+    // would land a second node under one watermark. Remember the generation so
+    // the next step does not retry: the batch copy is this generation's delivery.
+    const which = incomingWatermarks.has(baselineM0) ? baselineM0 : baselineM1;
+    state.injectedGenerations.set(magicSessionId, generation);
+    deps.log?.(
+      `[magic-context] knowledge injection skipped for ${magicSessionId}@gen${generation}: ` +
+        `the incoming step batch already carries ${which}`,
+    );
     return;
   }
 
@@ -469,7 +570,7 @@ export async function maybeInjectKnowledge(
           };
           const todoMessage = magicUserMessage(todoText, todoSource, []);
           agent.inject(todoMessage);
-          state.lastInjectedMessages.push(todoMessage);
+          injectedStash(state, magicSessionId).push(todoMessage);
         }
       }
     }
@@ -478,8 +579,17 @@ export async function maybeInjectKnowledge(
   }
   state.injectedGenerations.set(magicSessionId, generation);
   // 首轮 pre-step 前置用：本次 LLM 调用即可见（Pi transform unshift 语义）。
-  if (state.lastInjectedMessages.length === 0) {
-    state.lastInjectedMessages = [m0Message, m1Message];
+  const stash = injectedStash(state, magicSessionId);
+  if (stash.length === 0) {
+    stash.push(m0Message, m1Message);
+  } else {
+    // The stash is non-empty only because the todo replay above pushed into it.
+    // Say so out loud: this coupling means a todo replay silently changes
+    // whether the baseline is prepended to THIS step or only delivered next step.
+    deps.log?.(
+      `[magic-context] baseline prepend skipped for ${magicSessionId}@gen${generation}: ` +
+        `stash already holds ${stash.length} message(s) (todo replay)`,
+    );
   }
   deps.log?.(
     `[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`,
@@ -510,10 +620,14 @@ export async function runKnowledgeGateStep(
     if (isMagicChildSession(agent as unknown as import("@deepseek-ai/dsh-agent").Agent)) {
       return await next();
     }
-    // Never append a Magic message the live surface already carries: this is
-    // what keeps the inject()+prepend pair from creating duplicate surface ids
-    // (see the module header and dropAlreadySurfacedMagicMessages).
-    dropAlreadySurfacedMagicMessages(agent, payload.messages as unknown[]);
+    // Never append a Magic message the live surface already carries, and never
+    // append the same watermark twice in one batch: together these are what keep
+    // the inject()+prepend pair from creating duplicate surface ids (see the
+    // module header and dropAlreadySurfacedMagicMessages).
+    const dropped = dropAlreadySurfacedMagicMessages(agent, payload.messages as unknown[], deps.log);
+    if (dropped > 0) {
+      deps.log?.(`[magic-context] pre-step batch: dropped ${dropped} redundant Magic message(s)`);
+    }
     const bootstrap = await deps.host.ready;
     if (bootstrap.kind === "ok") {
       const db = bootstrap.db;
@@ -527,16 +641,34 @@ export async function runKnowledgeGateStep(
       // Historian 发布后的 deferred-materialization 信号（Pi parity）：下一轮
       // pre-step 强制 HARD 物化 → m0 折叠 m1 并渲染 <session-history>。
       const deferred = consumeDshDeferredSignals(magicSessionId);
+      // What this batch already carries — the one place the baseline can be that
+      // the surface cannot show yet (claimed-but-unappended messages).
+      const incomingWatermarks = collectMagicWatermarks(payload.messages as unknown[]);
       // Knowledge baseline (once per surface generation; forced after publish).
-      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization);
+      await maybeInjectKnowledge(
+        state,
+        deps,
+        agent,
+        db,
+        magicSessionId,
+        projectPath,
+        directory,
+        deferred.materialization,
+        incomingWatermarks,
+      );
       // Pi transform 语义：首轮注入的消息前置到本次调用的消息列表（立即可见）。
       // 前置即写入 surface（运行时把 decision.messages 追加为表面节点），而
       // agent.inject 又把这些同一批对象排进下一步的 inbox —— 下一步的
       // dropAlreadySurfacedMagicMessages 会丢弃这份冗余副本，避免重复 id。
-      if (state.lastInjectedMessages.length > 0) {
-        const injected = state.lastInjectedMessages;
-        state.lastInjectedMessages = [];
-        (payload.messages as unknown[]).unshift(...injected);
+      // 快照按 session 取：这份状态是 profile 级的，裸数组会让一个会话的批次
+      // 被另一个会话（或子代理）的前置消费掉。
+      const stash = state.lastInjectedMessages.get(magicSessionId);
+      if (stash !== undefined && stash.length > 0) {
+        state.lastInjectedMessages.delete(magicSessionId);
+        (payload.messages as unknown[]).unshift(...(stash as UserMessage[]));
+        deps.log?.(
+          `[magic-context] prepended ${stash.length} injected Magic message(s) for ${magicSessionId}`,
+        );
       }
 
       // Auto-search hint on the incoming user message — fire-and-forget so the
