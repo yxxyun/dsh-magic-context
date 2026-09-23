@@ -5471,12 +5471,13 @@ function previewTagPayloadMessages(db, sessionId, messages, log) {
         out.push(raw);
         continue;
       }
-      if (tagger.getTag(sessionId, msg.id, "message") !== undefined) {
+      const contentId = `${msg.id}:p0`;
+      if (tagger.getTag(sessionId, contentId, "message") !== undefined) {
         out.push(raw);
         continue;
       }
       const text = typeof textPart.text === "string" ? textPart.text : "";
-      const tag = tagger.assignTag(sessionId, msg.id, "message", Buffer.byteLength(text), db);
+      const tag = tagger.assignTag(sessionId, contentId, "message", Buffer.byteLength(text), db);
       if (tag === undefined || tag <= 0) {
         out.push(raw);
         continue;

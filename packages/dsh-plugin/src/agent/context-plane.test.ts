@@ -110,6 +110,75 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
     }
   });
 
+  it("previews §N§ with the message's OWN tag number, not a second tag row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = buildSession();
+      const agent = { id: session.id, session };
+      const deps: ContextPlaneDeps = {
+        host: {
+          ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
+          canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
+        },
+        config: { protectedTags: 0 },
+        log: () => {},
+      };
+
+      // The pre-step batch is what the runtime appends to the surface, and the
+      // preview rewrites it IN PLACE. Supplying it is the whole point: without a
+      // `messages` payload the preview never runs and the bug is invisible
+      // (the previous test passes `{ agent }` only, so it cannot catch this).
+      const batchMessage = createUserMessage({
+        content: [{ type: "text", text: "batch message body" }],
+        source: { kind: "user" },
+      });
+      const messages: unknown[] = [batchMessage];
+      const decision: PreStepDecision = { reject: false, messages: messages as never };
+
+      const state = createContextPlaneState();
+      await runContextPlaneStep(
+        state,
+        deps,
+        { agent: agent as never, messages } as never,
+        async () => decision,
+      );
+
+      const sessionKey = "dsh:a1b2c3d4:sess-plane";
+      const tags = getTagsBySession(db, sessionKey) as Array<{
+        messageId: string;
+        tagNumber: number;
+      }>;
+
+      // The preview wrote a §N§ prefix into the message the surface will carry.
+      // It REPLACES the array contents with shallow copies, so read the rebuilt
+      // entry, not the reference we passed in.
+      const rebuilt = messages[0] as { content: Array<{ text: string }> };
+      const prefixed = /^\u00a7(\d+)\u00a7 /.exec(rebuilt.content[0].text);
+      expect(prefixed).not.toBeNull();
+      const prefixedNumber = Number(prefixed?.[1]);
+
+      // It must be backed by the tag row for THIS message's content id — the
+      // tagger's key space is `${messageId}:p0` (shared/tag-transcript.ts:283).
+      // Keying on the bare id here made the preview miss the tag the normal pass
+      // had already created, assign a SECOND one, and stamp that fresh number on
+      // the surface: one live message owned both §1§ and §472§, and the §1§ the
+      // model saw pointed at unrelated content.
+      const tagRow = tags.find((tag) => tag.messageId === `${batchMessage.id}:p0`);
+      expect(tagRow).toBeDefined();
+      expect(tagRow?.tagNumber).toBe(prefixedNumber);
+
+      // And no tag may be duplicated across key forms for this message.
+      const owning = tags.filter(
+        (tag) => tag.messageId === batchMessage.id || tag.messageId.startsWith(`${batchMessage.id}:`),
+      );
+      expect(owning.length).toBe(1);
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
+
   it("is fail-open: a broken host bootstrap still passes the step through", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
     try {

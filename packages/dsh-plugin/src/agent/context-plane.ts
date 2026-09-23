@@ -288,8 +288,9 @@ function maybeFireHistorian(
  * First-call §N§ preview (Pi transform parity): the pre-step message list is
  * deep-frozen and the surface CAS replace only lands on the NEXT pass, so the
  * very first LLM call would otherwise see untagged messages. Assign tags via
- * the shared tagger (idempotent — later passes reuse the same tag numbers by
- * message id) and rebuild the frozen messages with the `§N§ ` prefix.
+ * the shared tagger (idempotent — later passes reuse the same tag numbers,
+ * because both paths key on the same CONTENT id `${id}:p0`) and rebuild the
+ * frozen messages with the `§N§ ` prefix.
  * Never throws (fail-open); Magic-sourced messages (mc-kb / hints) are skipped.
  */
 function previewTagPayloadMessages(
@@ -320,12 +321,21 @@ function previewTagPayloadMessages(
         out.push(raw);
         continue;
       }
-      if (tagger.getTag(sessionId, msg.id, "message") !== undefined) {
+      // The tagger keys message text by its CONTENT id — `${messageId}:p${textOrdinal}`
+      // (shared/tag-transcript.ts:283), which for the first text part is `:p0` — NOT by
+      // the bare message id. Looking up and assigning under the bare id could never
+      // match the tag the normal pass had already created for the same message, so this
+      // preview silently assigned a SECOND tag and stamped that fresh number onto the
+      // text the runtime then appended to the surface. Observed live: one user message
+      // owned both §1§ (bare id, created here) and §472§ (`:p0`, created by the normal
+      // path), and the §1§ the model saw pointed at unrelated content.
+      const contentId = `${msg.id}:p0`;
+      if (tagger.getTag(sessionId, contentId, "message") !== undefined) {
         out.push(raw);
         continue;
       }
       const text = typeof textPart.text === "string" ? textPart.text : "";
-      const tag = tagger.assignTag(sessionId, msg.id, "message", Buffer.byteLength(text), db);
+      const tag = tagger.assignTag(sessionId, contentId, "message", Buffer.byteLength(text), db);
       if (tag === undefined || tag <= 0) {
         out.push(raw);
         continue;
