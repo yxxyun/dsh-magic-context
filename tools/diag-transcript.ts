@@ -71,6 +71,19 @@ function run(label: string, surface: unknown): void {
   if (samplePart !== null) {
     console.log("sample assistant part:", JSON.stringify(samplePart).slice(0, 200));
   }
+  // Tool parts: is the OUTPUT actually carried? A zero-length output is what
+  // makes every tag land with byte_size = 0.
+  let toolParts = 0, toolWithOutput = 0, toolOutputBytes = 0, emptyOutputs = 0;
+  for (const m of view.messages) {
+    for (const p of (m as { parts?: Array<{ type?: string; state?: { output?: unknown } }> }).parts ?? []) {
+      if (p.type !== "tool") continue;
+      toolParts += 1;
+      const out = p.state?.output;
+      if (typeof out === "string" && out.length > 0) { toolWithOutput += 1; toolOutputBytes += Buffer.byteLength(out, "utf8"); }
+      else if (out !== undefined) emptyOutputs += 1;
+    }
+  }
+  console.log(`tool parts     : ${toolParts}  withOutput=${toolWithOutput}  emptyOutput=${emptyOutputs}  totalOutputBytes=${toolOutputBytes}`);
 }
 
 // 1. exactly what the plugin passes when agent.session.surface is populated

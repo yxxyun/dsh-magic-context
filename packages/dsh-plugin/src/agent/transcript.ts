@@ -348,9 +348,22 @@ function toolResultParts(
   }
   if (!callId) return [];
 
+  // DSH delivers tool output as a PLAIN `{type:"text", text}` block directly in
+  // `content` — there is no `{type:"tool-result", content:[…]}` wrapper.
+  // Searching only for the wrapper matched nothing, so every tool result was
+  // synthesised with `state.output = ""`. That is why every dsh tool tag was
+  // written with byte_size = 0, leaving size-driven reclamation (ctx_reduce
+  // nudges, caveman compression, emergency drop tiers) nothing to reason about.
+  // Accept BOTH shapes: the plain text block DSH actually emits, and the
+  // wrapped form other harnesses use.
   const fragments: string[] = [];
   for (const block of content) {
-    if (!isRecord(block) || block.type !== "tool-result") continue;
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      fragments.push(block.text);
+      continue;
+    }
+    if (block.type !== "tool-result") continue;
     const inner = block.content;
     if (!Array.isArray(inner)) continue;
     for (const fragment of inner) {

@@ -102,6 +102,9 @@ import {
   getRawSessionMessageCount,
   getRawSessionTagKeysThrough,
   readSessionChunk,
+  getMessageIndexReconciliationStartOrdinal,
+  isMessageIndexReconciledThrough,
+  indexMessagesAfterOrdinal,
   queueM0Mutation,
   queueMemoryMutation,
   recordProtectedTailPublicationFloor,
@@ -188,11 +191,12 @@ import {
   buildChannel2Reminder,
   buildChannel1Reminder,
   createTagger,
+  convertDshEventsToRawMessages,
   readDshTranscript,
   deriveMutationPlan,
   resolveDb,
   registerCtxTools
-} from "./agent-yp89cn0d.js";
+} from "./agent-89gq5dda.js";
 import {
   getHarness,
   ensureCortexKitArtifactGitignore,
@@ -216,13 +220,14 @@ import {
   getContextStoreUuid,
   parseCompartmentOutput,
   bumpEpochsForWorkspaceMembers,
+  scheduleAfterBootQuiet,
   getErrorMessage,
   describeError,
   getSchemaFenceRejection,
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion,
   openDatabase
-} from "./agent-8w60yqpt.js";
+} from "./agent-z992kvg4.js";
 import {
   resolveCacheTtl,
   deriveTriggerBudget,
@@ -274,7 +279,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-cbhhxyak.js";
+} from "./agent-8z9wzard.js";
 import {
   deriveEventMessage2,
   MAGIC_SOURCE_KIND2,
@@ -3148,6 +3153,106 @@ function registerSystemGuidance(ctx, deps = {}) {
   ctx.effect(() => dispose);
 }
 
+// ../plugin/src/features/magic-context/message-index-async.ts
+function isDatabaseLockedError(error) {
+  if (!error || typeof error !== "object")
+    return false;
+  const e = error;
+  if (typeof e.code === "string") {
+    if (e.code === "SQLITE_BUSY" || e.code === "SQLITE_LOCKED")
+      return true;
+  }
+  if (typeof e.message === "string") {
+    if (/database is locked/i.test(e.message))
+      return true;
+    if (/sqlite_(busy|locked)/i.test(e.message))
+      return true;
+  }
+  return false;
+}
+var RECONCILIATION_BATCH_SIZE = 100;
+var reconciledSessions = new Set;
+var reconciliationScheduledSessions = new Set;
+var sessionLocks = new Map;
+var incrementalTimers = new Map;
+var pendingIncrementalKeys = new Set;
+var completedIncrementalKeys = new Set;
+function defer(fn) {
+  const immediate = globalThis.setImmediate;
+  if (typeof immediate === "function") {
+    immediate(fn);
+    return;
+  }
+  setTimeout(fn, 0);
+}
+function yieldToEventLoop() {
+  return new Promise((resolve) => defer(resolve));
+}
+function runWithSessionLock(sessionId, operation) {
+  const previous = sessionLocks.get(sessionId) ?? Promise.resolve();
+  const run = previous.catch(() => {
+    return;
+  }).then(async () => {
+    await operation();
+  });
+  sessionLocks.set(sessionId, run);
+  run.finally(() => {
+    if (sessionLocks.get(sessionId) === run) {
+      sessionLocks.delete(sessionId);
+    }
+  }).catch(() => {
+    return;
+  });
+  return run;
+}
+function logIndexingError(sessionId, action, error) {
+  if (isDatabaseLockedError(error)) {
+    sessionLog(sessionId, `message FTS async ${action} skipped (database busy; will retry on next reconciliation)`);
+    return;
+  }
+  sessionLog(sessionId, `message FTS async ${action} failed: ${error instanceof Error ? error.message : String(error)}`);
+  log(`[message-index-async] ${action} failed for ${sessionId}:`, error);
+}
+async function reconcileSessionIndex(db, sessionId, readMessages) {
+  await runWithSessionLock(sessionId, async () => {
+    if (reconciledSessions.has(sessionId))
+      return;
+    let fallbackSnapshot = null;
+    const finalWatermark = readMessages.getCount ? readMessages.getCount(sessionId) : (fallbackSnapshot = readMessages(sessionId)).length;
+    let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+    while (cursor < finalWatermark) {
+      const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
+      const messages = readMessages.readPage ? readMessages.readPage(sessionId, cursor, RECONCILIATION_BATCH_SIZE, finalWatermark) : (fallbackSnapshot ?? []).filter((message) => message.ordinal > cursor && message.ordinal <= pageEnd);
+      indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd);
+      const nextCursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+      if (nextCursor <= cursor)
+        break;
+      cursor = nextCursor;
+      if (cursor < finalWatermark) {
+        await yieldToEventLoop();
+      }
+    }
+    if (isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
+      reconciledSessions.add(sessionId);
+    }
+  });
+}
+function scheduleReconciliation(db, sessionId, readMessages) {
+  if (reconciledSessions.has(sessionId) || reconciliationScheduledSessions.has(sessionId)) {
+    return;
+  }
+  reconciliationScheduledSessions.add(sessionId);
+  scheduleAfterBootQuiet(() => {
+    defer(() => {
+      reconcileSessionIndex(db, sessionId, readMessages).catch((error) => {
+        logIndexingError(sessionId, "reconciliation", error);
+      }).finally(() => {
+        reconciliationScheduledSessions.delete(sessionId);
+      });
+    });
+  });
+}
+
 // src/agent/coordinator.ts
 import { SessionSeq } from "@deepseek-ai/dsh-session";
 function createCoordinatorState() {
@@ -4638,6 +4743,10 @@ async function runContextPlaneStep(state, deps, payload, next) {
           markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
         }
       }
+    } catch {}
+    try {
+      const readMessages = () => convertDshEventsToRawMessages(sessionEvents2(agent.session));
+      scheduleReconciliation(db, canonicalSessionId, readMessages);
     } catch {}
     const historian = deps.historian;
     if (historian !== undefined && historian.config?.enabled !== false) {

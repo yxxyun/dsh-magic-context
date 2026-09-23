@@ -3,7 +3,7 @@ import {
   resolveCortexKitUserConfigPath,
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion
-} from "./agent-8w60yqpt.js";
+} from "./agent-z992kvg4.js";
 
 // src/host/remote.ts
 import { existsSync, readFileSync } from "node:fs";

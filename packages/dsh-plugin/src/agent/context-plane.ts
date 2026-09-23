@@ -14,6 +14,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { DshStorageBootstrap } from "../host/bootstrap";
 import { isMagicSource, MAGIC_SOURCE_KIND, sessionEvents } from "../compat/dsh-0.1/session";
+import { scheduleReconciliation } from "@magic-context/core/features/magic-context/message-index-async";
 import {
   registerPreStepGate,
   type PreStepDecision,
@@ -32,6 +33,7 @@ import {
 import {
   deriveMutationPlan,
   readDshTranscript,
+  convertDshEventsToRawMessages,
   type PlanContext,
 } from "./transcript";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
@@ -463,6 +465,19 @@ export async function runContextPlaneStep(
 
     // Historian plane: evaluate the context-pressure trigger and fire the
     // background compartment pass (fire-and-forget; never blocks the step).
+    // History indexing. The shared indexer is what ctx_search's message
+    // corpus is built from; OpenCode schedules it from its transform hook, and
+    // the DSH port had no equivalent, so message_history_index stayed empty and
+    // ctx_search could only ever find memories and notes. Fire-and-forget — the
+    // indexer defers and never blocks the step.
+    try {
+      const readMessages = (() =>
+        convertDshEventsToRawMessages(sessionEvents(agent.session))) as never;
+      scheduleReconciliation(db, canonicalSessionId, readMessages);
+    } catch {
+      // Indexing must never break the pre-step chain.
+    }
+
     const historian = deps.historian;
     if (historian !== undefined && historian.config?.enabled !== false) {
       maybeFireHistorian(historian, db, canonicalSessionId, agent, deps.directory);
