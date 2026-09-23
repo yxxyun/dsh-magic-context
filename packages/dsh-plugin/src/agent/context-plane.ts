@@ -386,6 +386,13 @@ export async function runContextPlaneStep(
         db,
         protectedTags: deps.config?.protectedTags ?? 20,
         heuristicCleanup: deps.heuristicCleanup,
+        // Tag without prefixing — see PlanContext.skipPrefixInjection. Prefix
+        // injection rewrites message text, forcing a surface replace per
+        // prefixed message; activating that against an existing session rewrites
+        // the entire conversation in one pre-step and the session stops
+        // accepting messages. Tags, and therefore drops and ctx_reduce, do not
+        // depend on the prefix.
+        skipPrefixInjection: true,
       } satisfies PlanContext);
 
       // Health guard. An empty transcript WHILE the session has events is the

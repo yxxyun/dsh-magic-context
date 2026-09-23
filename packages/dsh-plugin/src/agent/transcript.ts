@@ -167,6 +167,20 @@ export interface PlanContext {
   readonly protectedTags?: number;
   /** Injectable clock; reserved for later stages (decay/nudge). Unused by this slice. */
   readonly now?: () => number;
+  /**
+   * Tag the transcript WITHOUT writing `§N§ ` prefixes into message text.
+   *
+   * Tag rows and TagTargets are still created either way — only the
+   * agent-visible prefix is suppressed (see tagTranscript's own contract). The
+   * DSH port runs with this ON because prefix injection mutates message text,
+   * which forces a surface replace for every newly prefixed message. Activating
+   * the tagger against an existing session means prefixing every untagged
+   * message at once, and on a 600-node surface that turns the pre-step into a
+   * full-conversation rewrite that never converges — the session stops
+   * accepting messages entirely. Tagging itself is cheap, bounded DB work and
+   * carries no such risk, so we take the tags and leave the surface alone.
+   */
+  readonly skipPrefixInjection?: boolean;
   /** Heuristic cleanup config (Pi/OpenCode parity): routine dedup + optional
    *  caveman text compression. Emergency tier runs only on force passes and is
    *  intentionally not wired here. */
@@ -1265,7 +1279,9 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
   if (transcript.messages.length > 0) {
     const tagger = createTagger();
     tagger.initFromDb(sessionId, db);
-    const tagged = tagTranscript(sessionId, transcript, tagger, db);
+    const tagged = tagTranscript(sessionId, transcript, tagger, db, {
+      skipPrefixInjection: ctx.skipPrefixInjection === true,
+    });
 
     // Wrap the shared targets: recording targets delegate to them, and the
     // shared targets call our recording parts — every mutation is recorded.

@@ -192,7 +192,7 @@ import {
   deriveMutationPlan,
   resolveDb,
   registerCtxTools
-} from "./agent-9zm01x6r.js";
+} from "./agent-hktwgxfm.js";
 import {
   getHarness,
   ensureCortexKitArtifactGitignore,
@@ -274,7 +274,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-jkdfesgp.js";
+} from "./agent-hd2pv6wm.js";
 import {
   createUserMessage2,
   deriveEventMessage2,
@@ -4603,7 +4603,8 @@ async function runContextPlaneStep(state, deps, payload, next) {
       const plan = deriveMutationPlan(view, {
         db,
         protectedTags: deps.config?.protectedTags ?? 20,
-        heuristicCleanup: deps.heuristicCleanup
+        heuristicCleanup: deps.heuristicCleanup,
+        skipPrefixInjection: true
       });
       const sessionEventCount = sessionEvents2(agent.session).length;
       if (view.messages.length === 0 && sessionEventCount > 0) {
