@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { createHash } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
@@ -375,7 +376,7 @@ function recordInvocation(
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: getHarness(),
         subagent: "dreamer",
         task: "map-memories",
         startedAt,

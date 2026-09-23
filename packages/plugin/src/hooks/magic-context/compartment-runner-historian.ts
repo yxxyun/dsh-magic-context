@@ -1,3 +1,4 @@
+import { getHarness } from "../../shared/harness";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian";
@@ -340,7 +341,7 @@ async function runHistorianPrompt(args: {
         return recordChildInvocation({
             db: openDatabase(),
             parentSessionId,
-            harness: "opencode",
+            harness: getHarness(),
             subagent:
                 agentId === HISTORIAN_EDITOR_AGENT
                     ? "historian_editor"

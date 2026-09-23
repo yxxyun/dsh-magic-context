@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { DREAMER_PRIMER_INVESTIGATOR_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
@@ -346,7 +347,7 @@ function recordInvocation(
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: getHarness(),
         subagent: "dreamer",
         task: "refresh-primers",
         startedAt,

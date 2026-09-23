@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 
@@ -928,7 +929,7 @@ async function runRetrospectiveTask(
                 recordChildInvocation({
                     db,
                     parentSessionId: parent,
-                    harness: "opencode",
+                    harness: getHarness(),
                     subagent: "dreamer",
                     task: config.task,
                     startedAt: helpers.invocationStartedAt,
@@ -1234,7 +1235,7 @@ async function runAgenticTask(
             recordChildInvocation({
                 db,
                 parentSessionId: parent,
-                harness: "opencode",
+                harness: getHarness(),
                 subagent: "dreamer",
                 task,
                 startedAt: invocationStartedAt,

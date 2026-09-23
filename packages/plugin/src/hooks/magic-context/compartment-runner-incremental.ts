@@ -52,6 +52,7 @@ import { getLatestHistorianInvocationId } from "../../features/magic-context/sto
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { normalizeSDKResponse } from "../../shared";
 import { describeError } from "../../shared/error-message";
+import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
@@ -134,7 +135,12 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 : null;
         recordHistorianRun(db, {
             sessionId,
-            harness: "opencode",
+            // The harness is a boot-time constant per plugin instance (the agent
+            // plane locks it via setHarness before any DB write). Hardcoding
+            // "opencode" here mislabelled every incremental run — including DSH
+            // ones — because this runner is the path /ctx-wrapup and automatic
+            // compaction use. The recomp runner already reads getHarness().
+            harness: getHarness(),
             subagentInvocationId: invocationId,
             runKind: telemetry.runKind ?? "incremental",
             status: telemetry.status ?? "failed",
@@ -897,7 +903,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 const stored = insertPrimerCandidates(db, [
                     {
                         projectPath: promotionProjectIdentity,
-                        harness: "opencode",
+                        harness: getHarness(),
                         sessionId,
                         question: candidate.question,
                         sourceCompartmentStart: startC?.startMessage,

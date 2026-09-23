@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
@@ -144,7 +145,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         recordChildInvocation({
             db: args.db,
             parentSessionId: args.parentSessionId,
-            harness: "opencode",
+            harness: getHarness(),
             // subagent: "dreamer" + task: "user memories" so the dashboard's
             // dream-run token enrichment (filters subagent='dreamer', GROUP BY
             // task) maps this invocation's tokens to the "user memories" row.

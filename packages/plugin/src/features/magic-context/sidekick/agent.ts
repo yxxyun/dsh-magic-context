@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { SIDEKICK_AGENT } from "../../../agents/sidekick";
 import type { SidekickConfig } from "../../../config/schema/magic-context";
@@ -41,7 +42,7 @@ export async function runSidekick(deps: {
             recordChildInvocation({
                 db: openDatabase(),
                 parentSessionId: deps.sessionId,
-                harness: "opencode",
+                harness: getHarness(),
                 subagent: "sidekick",
                 startedAt,
                 status: params.status,

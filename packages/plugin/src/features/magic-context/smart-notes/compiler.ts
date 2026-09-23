@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { createHash } from "node:crypto";
 
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
@@ -91,7 +92,7 @@ Remember: output only the JSON object described by the system prompt.`;
         recordChildInvocation({
             db: args.db,
             parentSessionId: args.parentSessionId,
-            harness: "opencode",
+            harness: getHarness(),
             // Dashboard token rollups group dream-task invocations under the
             // historical dreamer bucket. The session.prompt agent is still the
             // no-tool smart-note compiler.

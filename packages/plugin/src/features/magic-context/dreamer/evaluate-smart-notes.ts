@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
@@ -441,7 +442,7 @@ async function confirmReadOnly(
         recordChildInvocation({
             db: args.db,
             parentSessionId: args.parentSessionId,
-            harness: "opencode",
+            harness: getHarness(),
             // Dashboard token rollups group dream-task invocations under the
             // historical "dreamer" bucket. The actual child agent remains the
             // no-tool SMART_NOTE_COMPILER_AGENT passed to session.prompt below.

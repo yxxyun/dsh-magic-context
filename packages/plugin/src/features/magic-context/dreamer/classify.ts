@@ -1,3 +1,4 @@
+import { getHarness } from "../../../shared/harness";
 import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
@@ -635,7 +636,7 @@ function recordInvocation(
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: getHarness(),
         subagent: "dreamer",
         task: "classify-memories",
         startedAt,
