@@ -7,6 +7,25 @@ import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
+import type { SynapseLaneDescriptor } from "../features/magic-context/memory/embedding-synapse";
+import type { ConfigParseFailure } from "./config-diagnostics";
+import type { LoggerDiagnostics } from "./logger";
+
+export interface TailHygieneStatus {
+    /** Tokens in active, non-protected tail content that the agent can reclaim. */
+    u: number;
+    /** Spent tool outputs contributing positive tokens to U in this baseline. */
+    reclaimableToolOutputCount?: number;
+    /** Tokens in rendered-tail content eligible for hygiene accounting in the same scan. */
+    t: number;
+    /** Reclaimable-to-eligible token ratio, clamped to 0–1 and shared by both nudge mechanisms. */
+    severity: number;
+    /** False until a fresh scan runs after existing tail content changes, preventing stale measurements. */
+    evaluable: boolean;
+    generationInvalidated: boolean;
+    baselineGeneration: number;
+    computedAt: number;
+}
 
 export interface SidebarSnapshot {
     sessionId: string;
@@ -38,6 +57,8 @@ export interface SidebarSnapshot {
     cacheTtl: string;
     /** Persistent runtime failure shown directly in the sidebar when non-null. */
     lastTransformError: string | null;
+    /** Durable history-compression failure count used to select the stable summary warning. */
+    historianFailureCount?: number;
     lastDreamerRunAt: number | null;
     projectIdentity: string | null;
     compartmentTokens: number;
@@ -77,6 +98,8 @@ export interface SidebarSnapshot {
      * shows this as "Tool Definitions".
      */
     toolDefinitionTokens: number;
+    /** Persisted reclaimable (U) and eligible (T) token counts used by both nudge mechanisms. */
+    tailHygiene?: TailHygieneStatus;
     /**
      * Effective execute-threshold percentage for this session's active model,
      * after per-model resolution and the tokens→percentage conversion (when
@@ -124,10 +147,30 @@ export interface SidebarSnapshot {
 }
 
 export interface StatusDetail extends SidebarSnapshot {
+    /** True when Rust authority has rerouted host tool and historian paths to the module. */
+    hostBackendsModuleSide?: boolean;
+    /** Host cursor compared with the module changefeed frontier. */
+    memoryMirror?: {
+        cursor: number;
+        cursorUpdatedAt: number | null;
+        cursorAgeMs: number | null;
+        liveRows: number;
+        feedHead: number | null;
+        pendingRows: number | null;
+        stalled: boolean;
+        code: "MC-M01" | null;
+    };
+    /** A durable host marker whose live module status no longer reports module ownership. */
+    memoryAuthorityMismatch?: boolean;
+    /** User-owned model profile selected for this project, or null for the base config. */
+    activeProfile: string | null;
     tagCounter: number;
     activeTags: number;
     droppedTags: number;
     totalTags: number;
+    /** False when Rust authority supplies only the exact total; active/dropped host-mirror
+     *  counts are not presented as module truth. Omitted by older RPC servers means true. */
+    tagCountsAuthoritative?: boolean;
     activeBytes: number;
     lastResponseTime: number;
     lastNudgeTokens: number;
@@ -135,6 +178,19 @@ export interface StatusDetail extends SidebarSnapshot {
     isSubagent: boolean;
     pendingOps: Array<{ tagId: number; operation: string }>;
     contextLimit: number;
+    windowGeometry?: {
+        usableSoft: number;
+        usableHard: number;
+        geometry: "shared_upfront" | "shared_truncating" | "separate";
+        derivation: {
+            window: number;
+            reserve: number;
+            reserveSource: "output_catalog" | "output_config" | "wall_margin" | "none";
+            geometry: "shared_upfront" | "shared_truncating" | "separate";
+            windowSource: "catalog" | "overlay" | "provider" | "detected";
+            absoluteWall: number;
+        };
+    };
     /**
      * Parsed cache TTL in ms. -1 = never expires (cacheTtl "never"; Infinity
      * cannot ride JSON-RPC and 0 would be indistinguishable from unset). The
@@ -146,6 +202,11 @@ export interface StatusDetail extends SidebarSnapshot {
      *  (only meaningful when lastResponseTime > 0); N = live countdown. */
     cacheRemainingMs: number;
     cacheExpired: boolean;
+    /** Reports whether the displayed TTL came from config, persisted session metadata,
+     *  or the default; cache scheduling still uses the TTL stored in session metadata. */
+    cacheTtlSource?: "config" | "session" | "default";
+    cacheTtlModelKey?: string;
+    configParseFailures?: ConfigParseFailure[];
     /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on
      *  this lane. Redundant with cacheTtlMs === -1; kept as the readable form. */
     cacheNeverExpires?: boolean;
@@ -170,6 +231,8 @@ export interface StatusDetail extends SidebarSnapshot {
     toastDurationMs: number;
     /** One-line status data for the experimental memory mural. */
     mural?: { present: boolean; ageMs: number | null };
+    /** Runtime logger write failures observed by this plugin process. */
+    loggerDiagnostics: LoggerDiagnostics;
     /**
      * Stable storage-version probe: "which schema is the DB at, which fence does
      * this binary carry". Field names are deliberately snake_case, mirroring the
@@ -178,6 +241,12 @@ export interface StatusDetail extends SidebarSnapshot {
      * (the plugin owns it), so this surface supplies the live DB value; the module
      * surface supplies the module-store value instead.
      */
+    /** Search-indexing coverage and current command state for the default status summary. */
+    embedding?: {
+        state: "off" | "running" | "paused" | "stopped" | "ready" | "waiting";
+        indexed: number;
+        total: number;
+    };
     storage_versions: {
         /**
          * Persisted schema version of context.db (MAX of schema_migrations).
@@ -196,10 +265,125 @@ export interface EmbedDetail {
     enabled: boolean;
     model: string;
     provider: string;
+    synapseDescriptor?: SynapseLaneDescriptor;
     session: { embedded: number; total: number };
     memories: { embedded: number; total: number };
     commits: { embedded: number; total: number; gitEnabled: boolean };
     statusText: string;
+}
+
+export interface DebugProcessMemoryUsage {
+    rss: number;
+    heapTotal: number;
+    heapUsed: number;
+    external: number;
+    arrayBuffers: number;
+}
+
+export interface DebugSessionHolderCount {
+    sessionId: string;
+    lkgBytes: number;
+    taggerAssignments: number;
+    taggerToolAccounting: number;
+    wireRawMessages: number;
+    wireMessages: number;
+    wireContentSnapshots: number;
+    wireEstimatedBytes: number;
+}
+
+export interface DebugMemoryHolders {
+    lkgSlots: {
+        count: number;
+        totalBytes: number;
+    };
+    taggerCache: {
+        sessionCount: number;
+        assignmentEntries: number;
+        toolAccountingEntries: number;
+        loadSignatureEntries: number;
+    };
+    wireCache: {
+        snapshots: number;
+        rawContentSnapshots: number;
+        estimatedBytes: number;
+    };
+    compartmentMirrors: {
+        entries: number;
+    };
+    messageIndexQueue: {
+        queueLength: number;
+        reconciliationScheduled: number;
+        incrementalTimers: number;
+        pendingIncremental: number;
+        activeSessionLocks: number;
+        completedIncrementalKeys: number;
+        activeBufferMessages: number;
+        activeBufferBytes: number;
+    };
+    sessions: DebugSessionHolderCount[];
+}
+
+export interface DebugSqliteConnectionMemoryStats {
+    sequence: number;
+    filename: string;
+    readonly: boolean;
+    pageSize: number | null;
+    pageCount: number | null;
+    freelistCount: number | null;
+    cacheSize: number | null;
+    cacheSizeUnit: "pages" | "kib" | null;
+    cacheUpperBoundBytes: number | null;
+    mmapSizeBytes: number | null;
+    walFileBytes: number | null;
+    shmFileBytes: number | null;
+    fts5TableCount: number | null;
+    journalMode: string | null;
+}
+
+export interface DebugNativeMemoryUsage {
+    sqlite: {
+        connectionCount: number;
+        cacheUpperBoundBytes: number;
+        mmapUpperBoundBytes: number;
+        walFileBytes: number;
+        shmFileBytes: number;
+        sqliteStatusApi: "unavailable";
+        connections: DebugSqliteConnectionMemoryStats[];
+    };
+    tokenizer: {
+        loaded: boolean;
+        loadAttempted: boolean;
+        tableBytes: number | null;
+        tablePath: string | null;
+    };
+    localEmbedding: {
+        loaded: boolean;
+        providerCount: number;
+        models: string[];
+        runtimes: Array<"native" | "wasm">;
+        modelCacheBytes: number | null;
+        rssDeltaAtLoad: number;
+        externalDeltaAtLoad: number;
+        arrayBuffersDeltaAtLoad: number;
+    };
+    quickJs: {
+        loadAttempted: boolean;
+        loaded: boolean;
+    };
+}
+
+export interface DebugMemoryUsageResponse {
+    pid: number;
+    bunVersion: string;
+    memoryUsage: DebugProcessMemoryUsage;
+    native: DebugNativeMemoryUsage;
+    holders: DebugMemoryHolders;
+}
+
+export interface DebugHeapSnapshotResponse extends DebugMemoryUsageResponse {
+    path: string;
+    format: "jsc" | "v8";
+    snapshotVersion?: number;
 }
 
 export interface RpcNotificationMessage {

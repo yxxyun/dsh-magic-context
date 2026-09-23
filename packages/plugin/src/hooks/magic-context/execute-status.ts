@@ -1,18 +1,44 @@
-import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "../../config/schema/magic-context";
+import {
+    DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+    type MagicContextConfig,
+} from "../../config/schema/magic-context";
 import { getCompartments } from "../../features/magic-context/compartment-storage";
 import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../../features/magic-context/dreamer/task-registry";
 import { formatDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-registry";
+import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import { formatCacheTtlDisplay, resolveCacheTtlDisplay } from "../../shared/cache-ttl-display";
+import {
+    type ConfigParseFailure,
+    formatConfigParseStatusLine,
+} from "../../shared/config-diagnostics";
+import { getMagicContextStorageResolution } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
+import {
+    formatOpenCodeDbMissingStatusLine,
+    formatOpenCodeDbReadFailureStatusLine,
+    getOpenCodeDbReadFailure,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
+import type { TailHygieneStatus } from "../../shared/rpc-types";
+import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status";
 import type { Database } from "../../shared/sqlite";
+import { renderUserStatusSummary } from "../../shared/status-summary";
+import { formatTailHygiene } from "../../shared/tail-hygiene-status";
+import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
+import {
+    formatWindowDerivationLine,
+    type WindowGeometryResult,
+} from "../../shared/window-geometry";
 import {
     getProactiveCompartmentTriggerPercentage,
     POST_DROP_TARGET_RATIO,
@@ -51,7 +77,6 @@ function formatExecuteThreshold(detail: ExecuteThresholdDetail, contextLimit: nu
 export function executeStatus(
     db: Database,
     sessionId: string,
-    protectedTags: number,
     executeThresholdPercentageConfig:
         | number
         | { default: number; [modelKey: string]: number } = DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
@@ -61,6 +86,17 @@ export function executeStatus(
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined },
     contextLimit?: number,
     dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
+    windowGeometry?: WindowGeometryResult,
+    tailHygiene?: TailHygieneStatus,
+    contextUsage?: { inputTokens: number; percentage: number },
+    rustMode = false,
+    display?: {
+        cacheTtlConfig: MagicContextConfig["cache_ttl"];
+        cacheTtlConfigured: boolean;
+        configParseFailures: ConfigParseFailure[];
+        diagnostics?: boolean;
+        compactionEnabled?: boolean;
+    },
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -77,22 +113,37 @@ export function executeStatus(
         },
     );
     const executeThresholdPercentage = thresholdDetail.percentage;
+    const openCodeDbResolution = resolveOpenCodeDbPath();
+    const openCodeDbReadFailure = getOpenCodeDbReadFailure();
+    const openCodeDbStatusLine = !openCodeDbPathExists(openCodeDbResolution)
+        ? formatOpenCodeDbMissingStatusLine(openCodeDbResolution)
+        : openCodeDbReadFailure?.path === openCodeDbResolution.path
+          ? formatOpenCodeDbReadFailureStatusLine(openCodeDbReadFailure)
+          : null;
     try {
         const meta = getOrCreateSessionMeta(db, sessionId);
         const tags = getTagsBySession(db, sessionId);
         const pendingOps = getPendingOps(db, sessionId);
+        const protectionWindow = getProtectionWindowForSession(db, sessionId);
 
         const activeTags = tags.filter((t) => t.status === "active");
         const droppedTags = tags.filter((t) => t.status === "dropped");
         const totalBytes = activeTags.reduce((sum, t) => sum + t.byteSize, 0);
 
+        const ttlDisplay = resolveCacheTtlDisplay({
+            configured: display?.cacheTtlConfig ?? "5m",
+            configuredExplicitly: display?.cacheTtlConfigured === true,
+            modelKey: liveModelKey,
+            sessionValue: meta.cacheTtl,
+            sessionModelKey: meta.lastObservedModelKey,
+        });
         let ttlMs: number;
         try {
-            ttlMs = parseCacheTtl(meta.cacheTtl);
+            ttlMs = parseCacheTtl(ttlDisplay.value);
         } catch (error) {
             sessionLog(
                 sessionId,
-                `invalid cache_ttl "${meta.cacheTtl}" in ctx-status; falling back to default 5m`,
+                `invalid cache_ttl "${ttlDisplay.value}" in ctx-status; falling back to default 5m`,
                 error,
             );
             ttlMs = parseCacheTtl("5m");
@@ -105,14 +156,22 @@ export function executeStatus(
             executeThresholdPercentage,
         );
 
+        const displayInputTokens = contextUsage?.inputTokens ?? meta.lastInputTokens;
+        const displayPercentage = contextUsage?.percentage ?? meta.lastContextPercentage;
         const displayContextLimit =
             contextLimit && contextLimit > 0
                 ? contextLimit
-                : meta.lastContextPercentage > 0
-                  ? Math.round(meta.lastInputTokens / (meta.lastContextPercentage / 100))
+                : displayPercentage > 0
+                  ? Math.round(displayInputTokens / (displayPercentage / 100))
                   : 0;
 
+        const parseFailureLines = (display?.configParseFailures ?? []).map(
+            formatConfigParseStatusLine,
+        );
         const lines: string[] = [
+            ...(openCodeDbStatusLine ? [openCodeDbStatusLine, ""] : []),
+            ...parseFailureLines,
+            ...(parseFailureLines.length > 0 ? [""] : []),
             "## Magic Status",
             "",
             `**Session:** ${sessionId}`,
@@ -128,21 +187,36 @@ export function executeStatus(
             `- Total queued: ${pendingOps.length}`,
             "",
             ...(meta.lastTransformError
-                ? ["### Last Transform Error", `- ${meta.lastTransformError}`, ""]
+                ? ["### Warning", `- ${renderUserFacingFailure("transform_update_failed")}`, ""]
                 : []),
             "### Cache TTL",
-            `- Configured: ${meta.cacheTtl}`,
+            `- ${formatCacheTtlDisplay(ttlDisplay)}`,
             `- Last response: ${meta.lastResponseTime > 0 ? `${Math.round(elapsed / 1000)}s ago` : "never"}`,
-            `- Remaining: ${cacheExpired ? "expired" : ttlMs === Number.POSITIVE_INFINITY ? "never expires (always-warm lane)" : `${Math.round(remainingMs / 1000)}s`}`,
+            `- Remaining: ${cacheExpired ? "expired" : ttlMs === Number.POSITIVE_INFINITY ? "never (MC never assumes expiry — external cache-keep)" : `${Math.round(remainingMs / 1000)}s`}`,
             `- Queue will auto-execute: ${cacheExpired ? "yes (cache expired)" : ttlMs === Number.POSITIVE_INFINITY ? `when context >= ${executeThresholdPercentage}%` : `when TTL expires or context >= ${executeThresholdPercentage}%`}`,
             "",
             "### Execute Threshold",
             `- Execute threshold: ${formatExecuteThreshold(thresholdDetail, displayContextLimit)}`,
-            `- Last input tokens: ${meta.lastInputTokens.toLocaleString()} tokens`,
+            `- Last input tokens: ${displayInputTokens.toLocaleString()} tokens`,
             "",
-            `**Protected tags:** ${protectedTags}`,
+            `**Protected tool tags:** ${protectionWindow.status.protectedCount} (${protectionWindow.status.protectedMass.toLocaleString()} tokens)`,
+            `**Protection floor:** ${protectionWindow.status.floor.toLocaleString()} tokens`,
             `**Subagent session:** ${meta.isSubagent}`,
         ];
+
+        const storage = getMagicContextStorageResolution();
+        lines.push("", `**Storage:** ${storage.path} (${storage.source})`);
+
+        if (rustMode) lines.push("", "### Rust Mode", `- ${RUST_MODE_HOST_PATHS_LINE}`);
+
+        if (tailHygiene !== undefined) {
+            lines.push(
+                "",
+                "### Tail Hygiene",
+                `- Reclaimable / eligible: ${formatTailHygiene(tailHygiene)}`,
+                "- Reasoning is excluded from both terms.",
+            );
+        }
 
         if (dreamer?.backlog && Object.keys(dreamer.backlog).length > 0) {
             lines.push(
@@ -157,13 +231,16 @@ export function executeStatus(
             );
         }
 
-        if (meta.lastContextPercentage > 0 || meta.lastInputTokens > 0) {
+        if (displayPercentage > 0 || displayInputTokens > 0) {
             lines.push(
                 "",
                 "### Context Usage",
-                `- Last percentage: ${meta.lastContextPercentage.toFixed(1)}%`,
-                `- Last input tokens: ${meta.lastInputTokens.toLocaleString()}`,
+                `- Last percentage: ${displayPercentage.toFixed(1)}%`,
+                `- Last input tokens: ${displayInputTokens.toLocaleString()}`,
                 `- Resolved context limit: ${displayContextLimit > 0 ? displayContextLimit.toLocaleString() : "unknown"}`,
+                ...(windowGeometry
+                    ? [`- ${formatWindowDerivationLine(displayInputTokens, windowGeometry)}`]
+                    : []),
                 `- Proactive compartment evaluation: ${proactiveCompartmentTrigger}%`,
                 `- Post-drop target for historian: ${(executeThresholdPercentage * POST_DROP_TARGET_RATIO).toFixed(0)}% (${executeThresholdPercentage}% * ${POST_DROP_TARGET_RATIO})`,
                 `- Commit cluster trigger: ${commitClusterTrigger?.enabled !== false ? `enabled (min ${commitClusterTrigger?.min_clusters ?? 3} clusters)` : "disabled"}, tail-size trigger: > 3x compartment budget`,
@@ -194,6 +271,41 @@ export function executeStatus(
         const budgetUsage = budgetTokens
             ? ((historyBlockTokens / budgetTokens) * 100).toFixed(0)
             : null;
+
+        if (display?.diagnostics === false) {
+            return renderUserStatusSummary(
+                {
+                    inputTokens: displayInputTokens,
+                    usableContextTokens: displayContextLimit,
+                    usagePercentage: displayPercentage,
+                    cacheLifetime: formatCacheTtlDisplay(ttlDisplay).replace(/^Cache TTL:\s*/, ""),
+                    automaticCompressionThreshold:
+                        display?.compactionEnabled === false ? null : thresholdDetail.percentage,
+                    compression: {
+                        state: meta.compartmentInProgress
+                            ? "compressing"
+                            : compartments.length > 0
+                              ? "ready"
+                              : "waiting",
+                        historyBlockCount: compartments.length,
+                    },
+                    reclaimable: {
+                        toolOutputCount: tailHygiene?.reclaimableToolOutputCount ?? 0,
+                        tokens: tailHygiene?.u ?? 0,
+                    },
+                    memoryCount: 0,
+                    noteCount: 0,
+                    embedding: { state: "waiting", indexed: 0, total: 0 },
+                    warnings: [
+                        ...(meta.lastTransformError ? (["transform_update_failed"] as const) : []),
+                        ...(parseFailureLines.length > 0
+                            ? (["configuration_warning"] as const)
+                            : []),
+                    ],
+                },
+                "markdown",
+            );
+        }
 
         lines.push(
             "",
@@ -228,7 +340,10 @@ export function executeStatus(
 
         return lines.join("\n");
     } catch (error) {
-        sessionLog(sessionId, "ctx-status failed:", error);
-        return `Error: Failed to read context status. ${getErrorMessage(error)}`;
+        sessionLog(
+            sessionId,
+            `ctx-status failed code=${userFacingFailureCode("status_unavailable")}: ${getErrorMessage(error)}`,
+        );
+        return `Error: ${renderUserFacingFailure("status_unavailable")}`;
     }
 }

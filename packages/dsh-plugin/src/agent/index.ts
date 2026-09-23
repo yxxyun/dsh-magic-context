@@ -18,7 +18,7 @@
  * service is optional and read via ctx.get-style structural access.
  */
 import type { Context } from "@deepseek-ai/cordis";
-import { setDshHarness } from "dsh-magic-context-adapter";
+import { DSH_HARNESS, setDshHarness } from "dsh-magic-context-adapter";
 import { loadPluginConfig, type MagicContextPluginConfig } from "@magic-context/core/config";
 import { log as coreLog } from "@magic-context/core/shared/logger";
 import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@magic-context/core/config/agent-disable";
@@ -46,10 +46,10 @@ import {
 } from "./historian";
 import { dshDreamSeams, registerDshDreamer } from "./dreamer";
 import { createRecompSeams } from "./recomp";
-import { createSidekickSeam } from "./sidekick";
 import { createEmbedSeam } from "./embed";
 import { dshModelRefToCanonical } from "dsh-magic-context-adapter";
 import { modelSupportsVision } from "@magic-context/core/shared/models-dev-cache";
+import { resolveHistorianModel } from "@magic-context/core/shared/model-resolution";
 import type { KnowledgeAgentView } from "./knowledge-gate";
 
 /**
@@ -196,11 +196,10 @@ export function bridgeMagicConfig(
     historian: {
       ...config.historian,
       executeThresholdPercentage: config.historian?.executeThresholdPercentage ?? threshold,
-      model:
-        config.historian?.model ??
-        (typeof (cfg.historian as { model?: unknown } | undefined)?.model === "string"
-          ? (cfg.historian as { model: string }).model
-          : undefined),
+      // v0.42.6 resolves the historian model from the per-harness config blocks
+      // (historian.opencode / .pi / .omp). "dsh" inherits the OpenCode block, so
+      // the configured historian.opencode.model finally takes effect on DSH.
+      model: resolveHistorianModel(cfg, DSH_HARNESS).primary?.model,
       commitClusterTrigger:
         config.historian?.commitClusterTrigger ??
         (commitCluster !== undefined
@@ -367,7 +366,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   };
   registerCtxTools(ctx, { ...runtime, ...(config.tools ?? {}) });
 
-  // Phase 4 seams: dreamer / sidekick / recomp. The seam factories need the
+  // Phase 4 seams: dreamer / recomp. The seam factories need the
   // shared DB, which the host bootstrap resolves asynchronously; fill the
   // seams lazily once `host.ready` settles (the commands read them at
   // invocation time and answer "not wired" until then).
@@ -399,11 +398,6 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     get runUpgrade() {
       return (seams.get("recomp") as ReturnType<typeof createRecompSeams> | undefined)?.runUpgrade;
     },
-    // The sidekick seam resolves the DB itself at call time (host fallback).
-    runSidekick: createSidekickSeam(ctx, {
-      canonicalKey: (dshSessionId: string) => host.canonicalKey(dshSessionId),
-      log,
-    }),
     // The embed seam receives the DB at call time (no host dependency).
     runEmbedDrain: createEmbedSeam({ log }),
   });

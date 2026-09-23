@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ContextLimitProvenance } from "../../shared/context-limit-provenance";
-import { detectOverflow, extractErrorMessage, parseReportedLimit } from "./overflow-detection";
+import {
+    detectOverflow,
+    detectThinkingBindingMismatch,
+    extractErrorMessage,
+    parseReportedLimit,
+} from "./overflow-detection";
 
 describe("overflow-detection / extractErrorMessage", () => {
     test("returns message from Error instance", () => {
@@ -108,6 +113,56 @@ describe("overflow-detection / detectOverflow", () => {
     });
 });
 
+describe("overflow-detection / detectThinkingBindingMismatch", () => {
+    test("matches the documented Fable 5.1 400 shape", () => {
+        const detection = detectThinkingBindingMismatch({
+            status: 400,
+            error: {
+                type: "invalid_request_error",
+                message:
+                    'messages.4.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".',
+            },
+        });
+
+        expect(detection).toEqual({
+            isBindingMismatch: true,
+            matchedPattern: "bound to a different conversation",
+        });
+    });
+
+    test("extracts a provider-supplied offending message id when present", () => {
+        expect(
+            detectThinkingBindingMismatch({
+                status: 400,
+                error: {
+                    message: "The block is bound to a different conversation",
+                    message_id: "assistant-with-bound-block",
+                },
+            }).messageId,
+        ).toBe("assistant-with-bound-block");
+    });
+
+    test("tolerates provider prefix and suffix drift but rejects unrelated 400s", () => {
+        expect(
+            detectThinkingBindingMismatch(
+                "invalid_request_error: thinking block is BOUND TO A DIFFERENT CONVERSATION; retry without it",
+            ).isBindingMismatch,
+        ).toBe(true);
+        expect(
+            detectThinkingBindingMismatch({
+                status: 400,
+                message: "thinking block signature is invalid",
+            }).isBindingMismatch,
+        ).toBe(false);
+        expect(
+            detectThinkingBindingMismatch({
+                status: 500,
+                message: "The block is bound to a different conversation",
+            }).isBindingMismatch,
+        ).toBe(false);
+    });
+});
+
 describe("overflow-detection / parseReportedLimit", () => {
     test("extracts from 'maximum prompt length' (xAI)", () => {
         expect(parseReportedLimit("the maximum prompt length is 256000 tokens")).toEqual({
@@ -169,5 +224,31 @@ describe("overflow-detection / parseReportedLimit", () => {
         // Prefer 'maximum context length is N' over the fallback 'max.*context.*N' pattern
         const msg = "maximum context length is 128000 tokens (limit 999)";
         expect(parseReportedLimit(msg)).toEqual({ value: 128000, provenance: "combined" });
+    });
+});
+
+describe("llama.cpp context-size limit extraction", () => {
+    // The old greedy pattern (/context size.*(\d+)/) backtracked to a
+    // single-digit capture that the plausibility clamp discarded, so these
+    // messages detected overflow but silently lost the limit value.
+    test("extracts the limit from llama.cpp-style messages", () => {
+        expect(
+            parseReportedLimit(
+                "context size has been exceeded: limit 200000 tokens, you sent 214311",
+            ),
+        ).toMatchObject({ value: 200000, provenance: "combined" });
+        expect(parseReportedLimit("context size exceeded: 128000 tokens maximum")).toMatchObject({
+            value: 128000,
+            provenance: "combined",
+        });
+    });
+
+    test("does not capture a number more than 40 chars past the phrase", () => {
+        // Guards the anchor: distant numbers (e.g. request ids) must not bind.
+        expect(
+            parseReportedLimit(
+                "context size problem occurred while handling the request submitted at position 99999999 tokens",
+            ),
+        ).toBeUndefined();
     });
 });

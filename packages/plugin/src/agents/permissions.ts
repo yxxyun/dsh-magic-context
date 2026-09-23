@@ -5,7 +5,7 @@ import { log } from "../shared/logger";
  *
  * # Why this exists
  *
- * Hidden agents (`historian`, `historian-editor`, `dreamer`, `sidekick`) are
+ * Hidden agents (`historian`, `historian-editor`, `dreamer`) are
  * registered with `mode: "primary"` and `hidden: true`: primary mode keeps
  * them out of OpenCode's general Task candidate list, while hidden keeps them
  * out of the UI picker. Those flags do NOT restrict which tools the spawned
@@ -63,13 +63,6 @@ import { log } from "../shared/logger";
  *     dreamer task variants. `task` / `edit` / `write` / `webfetch` /
  *     `websearch` remain denied — dreamer must not spawn subagents
  *     or commit changes.
- *
- *   - **sidekick**: `ctx_search`, plus the read-only AFT
- *     navigation tools `aft_outline` and `aft_zoom`. Sidekick's job
- *     is augmenting user prompts via memory retrieval — see
- *     `features/magic-context/sidekick/agent.ts`. AFT navigation lets
- *     it pull symbol-scoped structural context for prompts that
- *     reference a specific file or symbol.
  */
 
 /**
@@ -123,9 +116,11 @@ function isPermissionMap(value: unknown): value is Record<string, unknown> {
  * Add final `permission.task` denies for Magic Context's internal workers.
  *
  * OpenCode accepts either a whole-permission action or a pattern map for
- * `permission.task`; its evaluator uses the last matching rule. Normalize the
- * whole-permission form, retain every unrelated user rule, then append our
- * exact agent-id denies after both the user's task patterns and any `*` rule.
+ * `permission.task`; its visibility evaluator uses the last matching rule.
+ * Normalize the whole-permission form, retain unrelated user rules, then append
+ * our exact agent-id denies. When the ambient task policy has a wildcard deny,
+ * re-emit that wildcard after the named denies so the Task tool is hidden rather
+ * than shown as a callable-but-refused tool.
  */
 export function denyTaskRoutingToAgents(
     permission: unknown,
@@ -143,8 +138,12 @@ export function denyTaskRoutingToAgents(
           ? task
           : {};
     const internalAgentIdSet = new Set(internalAgentIds);
+    const hasAmbientWildcardDeny = configuredTask["*"] === "deny";
     const retainedTask = Object.fromEntries(
-        Object.entries(configuredTask).filter(([agentId]) => !internalAgentIdSet.has(agentId)),
+        Object.entries(configuredTask).filter(
+            ([agentId]) =>
+                !internalAgentIdSet.has(agentId) && (agentId !== "*" || !hasAmbientWildcardDeny),
+        ),
     );
 
     return {
@@ -152,6 +151,10 @@ export function denyTaskRoutingToAgents(
         task: {
             ...retainedTask,
             ...Object.fromEntries(internalAgentIds.map((agentId) => [agentId, "deny"])),
+            // OpenCode's Permission.disabled uses findLast. Re-inserting the
+            // ambient wildcard after our named routing denies keeps its whole-tool
+            // deny as the final match and makes the Task tool invisible.
+            ...(hasAmbientWildcardDeny ? { "*": "deny" } : {}),
         },
     };
 }
@@ -232,20 +235,6 @@ export function applyDisallowedTools(
 // read/write/bash, no memory) — both in `dreamer.ts` alongside the other
 // per-task allow-lists (mapper/classifier/etc).
 
-/**
- * Tools the sidekick agent needs. Sidekick is a read-only memory
- * retriever for `/ctx-aug` — it queries the project's memory store
- * through `ctx_search` only. Keep `ctx_memory` out of this list because
- * its OpenCode tool definition is mutation-capable for primary agents.
- *
- * Also allow `aft_outline` and `aft_zoom` so sidekick can pull
- * lightweight structural context about a file or symbol when the
- * user's prompt references it directly — token-efficient navigation
- * without dragging in whole files.
- *
- * Still denied: spawning subagents, edits, bash, web fetches.
- */
-
 export const DREAMER_RETROSPECTIVE_ALLOWED_TOOLS = ["ctx_search"] as const;
 
 /**
@@ -270,5 +259,3 @@ export const DREAMER_PRIMER_INVESTIGATOR_ALLOWED_TOOLS = [
  * performed only when the compiled check runs through the host capability API.
  */
 export const SMART_NOTE_COMPILER_ALLOWED_TOOLS = [] as const;
-
-export const SIDEKICK_ALLOWED_TOOLS = ["ctx_search", "aft_outline", "aft_zoom"] as const;

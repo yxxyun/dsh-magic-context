@@ -1,5 +1,6 @@
 import type { PiThinkingLevel } from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
 import { nextDueAtMs } from "./cron";
 import {
@@ -18,6 +19,7 @@ import {
 import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
 import {
     compareTaskOrder,
+    type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
     leaseKeyFor,
@@ -34,8 +36,8 @@ export interface DreamTaskRuntimeConfig {
     task: DreamTaskName;
     /** Cron string; `""` = disabled (never due). */
     schedule: string;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     thinkingLevel?: PiThinkingLevel;
     language?: string;
     timeoutMinutes: number;
@@ -49,9 +51,18 @@ export interface TaskExecOutcome {
      *  MAX_TASK_RETRIES; a permanent failure advances to the next cron slot. */
     transient?: boolean;
     error?: string;
+    /** Structured user-facing diagnostic while `error` remains the legacy value
+     *  persisted in task schedule state. */
+    failureDetail?: string;
+    /** Successful task detail surfaced by a manual `/ctx-dream` run. */
+    detail?: string;
+    /** Run-local backlog when a task's scope differs from its next scheduled scope. */
+    backlog?: DreamTaskBacklog;
     schedulePatch?: {
         /** retrospective content watermark (max message ts scanned this run). */
         retrospectiveWatermarkMs?: number | null;
+        /** Task-local JSON state committed only after successful execution. */
+        taskStateJson?: string;
     };
 }
 
@@ -195,23 +206,25 @@ function advanceAfterRun(
     status: "completed" | "failed" | "skipped",
     error: string | null,
     schedulePatch?: TaskExecOutcome["schedulePatch"],
+    startedAt?: number,
 ): void {
     writeTaskScheduleState(db, {
         projectPath: projectIdentity,
         task: due.config.task,
-        // last_run_at means "last SUCCESSFUL run" — the cutoff for "changed since"
-        // gates (maintain-docs). A failed or skipped run did NOT process the
-        // work, so the cutoff must NOT advance past it (mirrors v1, where
-        // last_dream_at only advanced when a task succeeded).
+        // last_run_at = the start of the last SUCCESSFUL run — the cutoff for
+        // "changed since" gates. A message/compartment that landed DURING the run
+        // (after the start) is newer than the cutoff, so it re-triggers the gate next
+        // slot instead of being silently skipped. Failed/skipped runs never advance it.
         lastRunAt:
             status === "completed"
-                ? finishedAt
+                ? (startedAt ?? finishedAt)
                 : readLastRunAt(db, projectIdentity, due.config.task),
         nextDueAt: nextDueAtMs(due.config.schedule, finishedAt, due.scheduledAt),
         schedule: due.config.schedule,
         lastStatus: status,
         lastError: error,
         retryCount: 0,
+        taskStateJson: schedulePatch?.taskStateJson,
         retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
     });
 }
@@ -284,7 +297,7 @@ interface DomainGroupCallbacks {
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
     leaseWaitMs?: number;
-    onRan?: (task: DreamTaskName) => void;
+    onRan?: (task: DreamTaskName, detail?: string, backlog?: DreamTaskBacklog) => void;
     onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
@@ -357,6 +370,7 @@ async function runDomainGroup(
             }
 
             let outcome: TaskExecOutcome;
+            const startedAt = Date.now();
             try {
                 outcome = await executor(due.config, {
                     db,
@@ -379,11 +393,12 @@ async function runDomainGroup(
                     "completed",
                     null,
                     outcome.schedulePatch,
+                    startedAt,
                 );
-                cb?.onRan?.(due.config.task);
+                cb?.onRan?.(due.config.task, outcome.detail, outcome.backlog);
             } else if (outcome.transient) {
                 recordTransientFailure(db, projectIdentity, due, finishedAt, outcome.error ?? null);
-                cb?.onFailed?.(due.config.task, outcome.error);
+                cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             } else {
                 advanceAfterRun(
                     db,
@@ -393,7 +408,7 @@ async function runDomainGroup(
                     "failed",
                     outcome.error ?? null,
                 );
-                cb?.onFailed?.(due.config.task, outcome.error);
+                cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             }
         }
     } finally {
@@ -412,6 +427,8 @@ export interface ManualRunResult {
     failed: string[];
     /** User-visible error details for failed tasks, including incomplete backlogs. */
     failureDetails?: string[];
+    /** User-visible detail from successful tasks. */
+    details?: string[];
     /** Read-only backlog snapshot before the selected tasks started. */
     backlogBefore: DreamTaskBacklogMap;
     /** Read-only backlog snapshot after the selected tasks finished or were skipped. */
@@ -438,6 +455,7 @@ export async function runManualDream(
         deferredBusy: [],
         failed: [],
         failureDetails: [],
+        details: [],
         backlogBefore: {},
         backlogAfter: {},
     };
@@ -496,6 +514,7 @@ export async function runManualDream(
     }
 
     const groups = new Map<string, DueTask[]>();
+    const runLocalBacklogs: DreamTaskBacklogMap = {};
     for (const d of gated) {
         const kind = leaseKindFor(d.config.task);
         const arr = groups.get(kind) ?? [];
@@ -508,7 +527,11 @@ export async function runManualDream(
             runDomainGroup({ ...deps, executor: deps.executor }, group, {
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
-                onRan: (t) => result.ran.push(t),
+                onRan: (t, detail, backlog) => {
+                    result.ran.push(t);
+                    if (detail) result.details?.push(detail);
+                    if (backlog) runLocalBacklogs[t] = backlog;
+                },
                 onFailed: (task, error) => {
                     result.failed.push(task);
                     if (error) result.failureDetails?.push(`${task}: ${error}`);
@@ -517,7 +540,10 @@ export async function runManualDream(
             }),
         ),
     );
-    result.backlogAfter = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogAfter = {
+        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames),
+        ...runLocalBacklogs,
+    };
     return result;
 }
 

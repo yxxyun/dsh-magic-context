@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import type { Database } from "../../shared/sqlite";
-import { clearCompressionDepth } from "./compression-depth-storage";
-import { clearIndexedMessages } from "./message-index";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { resolveIsSubagentFromOpenCodeDb } from "./resolve-subagent-fallback";
 import {
     BOOLEAN_META_KEYS,
@@ -14,6 +14,7 @@ import {
     SESSION_META_SELECT_COLUMNS,
     toSessionMeta,
 } from "./storage-meta-shared";
+import { deleteSessionScopedRows } from "./storage-session-tables";
 import type { SessionMeta } from "./types";
 
 const SESSION_META_FALLBACK_SELECTS: Partial<
@@ -135,7 +136,11 @@ export function updateSessionMeta(
             values.push(value ? 1 : 0);
         } else if (typeof value === "string" || typeof value === "number") {
             setClauses.push(`${column} = ?`);
-            values.push(value);
+            values.push(
+                key === "lastObservedModelKey" && typeof value === "string"
+                    ? piModelRefToCanonical(value)
+                    : value,
+            );
         }
     }
 
@@ -172,14 +177,37 @@ export interface PendingSessionCleanupRetryResult {
     failedSessionIds: string[];
 }
 
-export function markSessionCleanupPending(db: Database, sessionId: string): void {
-    db.prepare(
-        `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
-         VALUES (?, ?, ?, NULL)
-         ON CONFLICT(session_id) DO UPDATE SET
-             harness = excluded.harness,
-             requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)`,
-    ).run(sessionId, getHarness(), Date.now());
+function rustCleanupHarness(): string {
+    return `${getHarness()}:rust`;
+}
+
+export function markSessionCleanupPending(
+    db: Database,
+    sessionId: string,
+    rustModuleCleanupRequired = false,
+): boolean {
+    const row = db
+        .prepare(
+            `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
+             VALUES (?, ?, ?, NULL)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 harness = CASE
+                     WHEN pending_session_cleanup.harness LIKE '%:rust'
+                         THEN pending_session_cleanup.harness
+                     ELSE excluded.harness
+                 END,
+                 requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)
+             RETURNING harness`,
+        )
+        .get(
+            sessionId,
+            rustModuleCleanupRequired ? rustCleanupHarness() : getHarness(),
+            Date.now(),
+        ) as { harness: string };
+
+    // The Rust suffix means module-owned state must be deleted before host rows.
+    // Replaying the event in TypeScript mode cannot make host-only cleanup safe.
+    return row.harness.endsWith(":rust");
 }
 
 export function retryPendingSessionCleanups(
@@ -188,7 +216,11 @@ export function retryPendingSessionCleanups(
 ): PendingSessionCleanupRetryResult {
     const rows = db
         .prepare(
-            "SELECT session_id FROM pending_session_cleanup ORDER BY requested_at ASC, session_id ASC LIMIT ?",
+            `SELECT session_id
+             FROM pending_session_cleanup
+             WHERE harness NOT LIKE '%:rust'
+             ORDER BY requested_at ASC, session_id ASC
+             LIMIT ?`,
         )
         .all(Math.max(1, Math.floor(limit))) as Array<{ session_id: string }>;
     const failedSessionIds: string[] = [];
@@ -207,38 +239,55 @@ export function retryPendingSessionCleanups(
     return { attempted: rows.length, cleared, failedSessionIds };
 }
 
-export function clearSession(db: Database, sessionId: string): void {
-    // Every session-scoped table must be cleared here; the structural storage-db
-    // test discovers tables with session_id and seeds each one to enforce this list.
+export async function retryPendingRustSessionCleanupsForProject(
+    db: Database,
+    projectPath: string,
+    deleteSession: (sessionId: string) => Promise<void>,
+    limit = 200,
+): Promise<PendingSessionCleanupRetryResult> {
+    const harness = getHarness();
+    const rows = db
+        .prepare(
+            `SELECT pending.session_id
+             FROM pending_session_cleanup pending
+             JOIN session_projects projects
+               ON projects.session_id = pending.session_id
+              AND projects.harness = ?
+             WHERE pending.harness = ?
+               AND projects.project_path = ?
+             ORDER BY pending.requested_at ASC, pending.session_id ASC
+             LIMIT ?`,
+        )
+        .all(harness, rustCleanupHarness(), projectPath, Math.max(1, Math.floor(limit))) as Array<{
+        session_id: string;
+    }>;
+    const failedSessionIds: string[] = [];
+    let cleared = 0;
+    for (const row of rows) {
+        try {
+            db.prepare(
+                "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
+            ).run(Date.now(), row.session_id);
+            await deleteSession(row.session_id);
+            clearSession(db, row.session_id, true);
+            cleared += 1;
+        } catch {
+            failedSessionIds.push(row.session_id);
+        }
+    }
+    return { attempted: rows.length, cleared, failedSessionIds };
+}
+
+export function clearSession(
+    db: Database,
+    sessionId: string,
+    rustModuleCleanupAcknowledged = false,
+): void {
+    const transactionStartedAt = performance.now();
     db.transaction(() => {
-        db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM source_contents WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM tool_owner_backfill_state WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM tags WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM session_meta WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM session_projects WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM compartment_chunk_embeddings WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
-        clearCompressionDepth(db, sessionId);
-        db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM compartment_state_lease WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM notes WHERE session_id = ? AND type = 'session'").run(sessionId);
-        db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM user_memory_candidates WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM primer_candidates WHERE session_id = ?").run(sessionId);
-        // v2: m[0]/m[1] delta log + historian-extracted events are session-scoped
-        // and must be cleared on session deletion (both have session_id). Without
-        // this they leak orphaned rows when a session is deleted.
-        db.prepare("DELETE FROM m0_mutation_log WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM compartment_events WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM subagent_invocations WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM historian_runs WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM plugin_messages WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM transform_decisions WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM synapse_batch_ledger WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM embedding_measurement_corpus WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM pending_session_cleanup WHERE session_id = ?").run(sessionId);
-        clearIndexedMessages(db, sessionId);
+        deleteSessionScopedRows(db, [sessionId], undefined, {
+            rustModuleCleanupAcknowledged,
+        });
     })();
+    logSlowWriteTransaction("clear-session", transactionStartedAt);
 }

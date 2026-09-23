@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
+import { escalationBands } from "../../shared/escalation-bands";
 import { Database } from "../../shared/sqlite";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -145,6 +146,30 @@ describe("emergency drain catch-up latch", () => {
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
     });
 
+    it("arms, holds, and exits across every raised T+2 force-band threshold", () => {
+        const t = 5_600_000;
+        for (let threshold = 84; threshold <= 90; threshold += 1) {
+            const sessionId = `${SID}-${threshold}`;
+            const force = escalationBands(threshold).forceMaterializationPercentage;
+            expect(force).toBe(threshold + 2);
+
+            reserve(db, sessionId, force - 1, t, { executeThreshold: threshold });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(0);
+
+            reserve(db, sessionId, force, t + 1, { executeThreshold: threshold });
+            const armedAt = loadProtectedTailMeta(db, sessionId).emergencyDrainActive;
+            expect(armedAt).toBe(t + 1);
+
+            reserve(db, sessionId, force - 1, t + 2, { executeThreshold: threshold });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(armedAt);
+
+            reserve(db, sessionId, threshold - 10.1, t + 3, {
+                executeThreshold: threshold,
+            });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(0);
+        }
+    });
+
     it("suppresses the bypass during the historian-failure backoff window", () => {
         const t = 6_000_000;
         exhaustWindowBudget(db, SID, 96, t);
@@ -156,6 +181,16 @@ describe("emergency drain catch-up latch", () => {
         expect(blocked.ok).toBe(false);
         // After the backoff window: bypass resumes.
         const allowed = reserve(db, SID, 96, t + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS + 20);
+        expect(allowed.ok).toBe(true);
+        expect(allowed.overQuotaBypass).toBe(true);
+    });
+
+    it("does not let a future failure timestamp suppress catch-up indefinitely", () => {
+        const t = 6_500_000;
+        exhaustWindowBudget(db, SID, 96, t);
+        recordHistorianDrainFailure(db, SID, t + 7 * 24 * 60 * 60_000);
+
+        const allowed = reserve(db, SID, 96, t + 20);
         expect(allowed.ok).toBe(true);
         expect(allowed.overQuotaBypass).toBe(true);
     });

@@ -8,12 +8,19 @@ import { createElement as _$createElement } from "opentui:runtime-module:%40open
 import { createComponent as _$createComponent } from "opentui:runtime-module:%40opentui%2Fsolid";
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
-import { createMemo } from "opentui:runtime-module:solid-js";
+import { createMemo, createSignal } from "opentui:runtime-module:solid-js";
+import { renderUserStatusSummary, statusSummaryFromDetail } from "../shared/status-summary";
+import { renderUserFacingFailure, userFacingFailureCode } from "../shared/user-facing-codes";
 import { createSidebarContentSlot, kickRecompProgressRefresh, refreshSidebarSnapshot } from "./slots/sidebar-content";
 import packageJson from "../../package.json";
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade } from "./data/context-db";
 import { startNotificationSocket, stopNotificationSocket } from "./data/notification-socket";
+import { formatCacheTtlDisplay } from "../shared/cache-ttl-display";
+import { formatConfigParseStatusLine } from "../shared/config-diagnostics";
 import { formatThresholdPercent } from "../shared/format-threshold";
+import { formatTailHygiene } from "../shared/tail-hygiene-status";
+import { RUST_MODE_HOST_PATHS_LINE } from "../shared/rust-mode-status";
+import { formatWindowDerivationLine } from "../shared/window-geometry";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off";
 import { isCompactionEnabled } from "../config/agent-disable";
 import { loadPluginConfig } from "../config";
@@ -133,8 +140,10 @@ const R = props => (() => {
 })();
 const StatusDialog = props => {
   const theme = createMemo(() => props.api.theme.current);
+  const [diagnostics, setDiagnostics] = createSignal(props.diagnostics === true);
   const t = () => theme();
   const s = () => props.s;
+  const summaryLines = () => renderUserStatusSummary(statusSummaryFromDetail(s()), "plain").split("\n").slice(1);
   const compactionOff = () => s().compaction_enabled === false;
 
   // Prefer the RPC-provided model context limit (what the sidebar shows) so the
@@ -231,19 +240,12 @@ const StatusDialog = props => {
       _el$0 = _$createTextNode(`v`),
       _el$1 = _$createElement("box"),
       _el$10 = _$createElement("text"),
-      _el$11 = _$createTextNode(` / `),
-      _el$12 = _$createTextNode(` tokens`),
-      _el$13 = _$createElement("box"),
-      _el$14 = _$createElement("box"),
-      _el$15 = _$createElement("box"),
-      _el$16 = _$createElement("box"),
-      _el$17 = _$createElement("text");
+      _el$11 = _$createTextNode(` Diagnostics`),
+      _el$12 = _$createElement("box"),
+      _el$13 = _$createElement("text");
     _$insertNode(_el$4, _el$5);
     _$insertNode(_el$4, _el$1);
-    _$insertNode(_el$4, _el$13);
-    _$insertNode(_el$4, _el$14);
-    _$insertNode(_el$4, _el$15);
-    _$insertNode(_el$4, _el$16);
+    _$insertNode(_el$4, _el$12);
     _$setProp(_el$4, "flexDirection", "column");
     _$setProp(_el$4, "width", "100%");
     _$setProp(_el$4, "paddingLeft", 2);
@@ -262,120 +264,178 @@ const StatusDialog = props => {
     _$insertNode(_el$9, _el$0);
     _$insert(_el$9, () => packageJson.version, null);
     _$insertNode(_el$1, _el$10);
-    _$setProp(_el$1, "flexDirection", "row");
-    _$setProp(_el$1, "justifyContent", "space-between");
     _$setProp(_el$1, "width", "100%");
-    _$insert(_el$1, (() => {
-      var _c$ = _$memo(() => !!compactionOff());
-      return () => _c$() ? (() => {
-        var _el$19 = _$createElement("text"),
-          _el$20 = _$createElement("b");
-        _$insertNode(_el$19, _el$20);
-        _$insert(_el$20, () => nativeCompactionContextLabel(s()));
-        _$effect(_$p => _$setProp(_el$19, "fg", t().accent, _$p));
-        return _el$19;
-      })() : (() => {
-        var _el$21 = _$createElement("text"),
-          _el$22 = _$createElement("b"),
-          _el$23 = _$createTextNode(`%`),
-          _el$24 = _$createTextNode(` / `),
-          _el$25 = _$createTextNode(`%`);
-        _$insertNode(_el$21, _el$22);
-        _$insertNode(_el$21, _el$24);
-        _$insertNode(_el$21, _el$25);
-        _$insertNode(_el$22, _el$23);
-        _$insert(_el$22, () => s().usagePercentage.toFixed(1), _el$23);
-        _$insert(_el$21, () => formatThresholdPercent(s().executeThreshold), _el$25);
-        _$insert(_el$21, () => s().executeThresholdClamped ? "*" : "", null);
-        _$effect(_$p => _$setProp(_el$21, "fg", s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent, _$p));
-        return _el$21;
-      })();
-    })(), _el$10);
+    _$setProp(_el$1, "justifyContent", "flex-end");
+    _$setProp(_el$1, "onMouseDown", () => setDiagnostics(!diagnostics()));
     _$insertNode(_el$10, _el$11);
-    _$insertNode(_el$10, _el$12);
-    _$insert(_el$10, () => fmt(s().inputTokens), _el$11);
-    _$insert(_el$10, (() => {
-      var _c$2 = _$memo(() => contextLimit() > 0);
-      return () => _c$2() ? fmt(contextLimit()) : "?";
-    })(), _el$12);
-    _$setProp(_el$13, "width", "100%");
-    _$setProp(_el$13, "flexDirection", "row");
-    _$setProp(_el$13, "height", 1);
-    _$insert(_el$13, () => barSegments().map(seg => (() => {
-      var _el$26 = _$createElement("box");
-      _$setProp(_el$26, "flexBasis", 0);
-      _$setProp(_el$26, "height", 1);
-      _$effect(_p$ => {
-        var _v$7 = seg.label,
-          _v$8 = Math.max(1, seg.tokens),
-          _v$9 = seg.color;
-        _v$7 !== _p$.e && (_p$.e = _$setProp(_el$26, "key", _v$7, _p$.e));
-        _v$8 !== _p$.t && (_p$.t = _$setProp(_el$26, "flexGrow", _v$8, _p$.t));
-        _v$9 !== _p$.a && (_p$.a = _$setProp(_el$26, "backgroundColor", _v$9, _p$.a));
-        return _p$;
-      }, {
-        e: undefined,
-        t: undefined,
-        a: undefined
-      });
-      return _el$26;
-    })()));
-    _$setProp(_el$14, "flexDirection", "column");
-    _$insert(_el$14, () => breakdownSegments().segs.map(seg => {
-      const pct = (seg.tokens / breakdownSegments().total * 100).toFixed(1);
-      return (() => {
-        var _el$27 = _$createElement("box"),
-          _el$28 = _$createElement("text"),
-          _el$29 = _$createTextNode(` `),
-          _el$30 = _$createElement("text"),
-          _el$31 = _$createTextNode(` (`),
-          _el$32 = _$createTextNode(`%)`);
-        _$insertNode(_el$27, _el$28);
-        _$insertNode(_el$27, _el$30);
-        _$setProp(_el$27, "width", "100%");
-        _$setProp(_el$27, "flexDirection", "row");
-        _$setProp(_el$27, "justifyContent", "space-between");
-        _$insertNode(_el$28, _el$29);
-        _$insert(_el$28, () => seg.label, _el$29);
-        _$insert(_el$28, () => seg.detail ?? "", null);
-        _$insertNode(_el$30, _el$31);
-        _$insertNode(_el$30, _el$32);
-        _$insert(_el$30, () => fmt(seg.tokens), _el$31);
-        _$insert(_el$30, pct, _el$32);
-        _$effect(_p$ => {
-          var _v$0 = seg.label,
-            _v$1 = seg.color,
-            _v$10 = t().textMuted;
-          _v$0 !== _p$.e && (_p$.e = _$setProp(_el$27, "key", _v$0, _p$.e));
-          _v$1 !== _p$.t && (_p$.t = _$setProp(_el$28, "fg", _v$1, _p$.t));
-          _v$10 !== _p$.a && (_p$.a = _$setProp(_el$30, "fg", _v$10, _p$.a));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined,
-          a: undefined
-        });
-        return _el$27;
-      })();
-    }));
+    _$insert(_el$10, () => diagnostics() ? "[x]" : "[ ]", _el$11);
     _$insert(_el$4, (() => {
-      var _c$3 = _$memo(() => !!(!compactionOff() && s().recompProgress));
-      return () => _c$3() && (() => {
+      var _c$ = _$memo(() => !!!diagnostics());
+      return () => _c$() ? (() => {
+        var _el$15 = _$createElement("box");
+        _$setProp(_el$15, "flexDirection", "column");
+        _$setProp(_el$15, "width", "100%");
+        _$insert(_el$15, () => summaryLines().map(line => (() => {
+          var _el$16 = _$createElement("text");
+          _$insert(_el$16, line);
+          return _el$16;
+        })()));
+        return _el$15;
+      })() : [_$memo(() => s().configParseFailures.map(failure => (() => {
+        var _el$30 = _$createElement("text");
+        _$insert(_el$30, () => formatConfigParseStatusLine(failure));
+        _$effect(_$p => _$setProp(_el$30, "fg", t().error, _$p));
+        return _el$30;
+      })())), (() => {
+        var _el$17 = _$createElement("box"),
+          _el$18 = _$createElement("text"),
+          _el$19 = _$createTextNode(` / `),
+          _el$20 = _$createTextNode(` tokens`);
+        _$insertNode(_el$17, _el$18);
+        _$setProp(_el$17, "flexDirection", "row");
+        _$setProp(_el$17, "justifyContent", "space-between");
+        _$setProp(_el$17, "width", "100%");
+        _$insert(_el$17, (() => {
+          var _c$2 = _$memo(() => !!compactionOff());
+          return () => _c$2() ? (() => {
+            var _el$31 = _$createElement("text"),
+              _el$32 = _$createElement("b");
+            _$insertNode(_el$31, _el$32);
+            _$insert(_el$32, () => nativeCompactionContextLabel(s()));
+            _$effect(_$p => _$setProp(_el$31, "fg", t().accent, _$p));
+            return _el$31;
+          })() : (() => {
+            var _el$33 = _$createElement("text"),
+              _el$34 = _$createElement("b"),
+              _el$35 = _$createTextNode(`%`),
+              _el$36 = _$createTextNode(` / `),
+              _el$37 = _$createTextNode(`%`);
+            _$insertNode(_el$33, _el$34);
+            _$insertNode(_el$33, _el$36);
+            _$insertNode(_el$33, _el$37);
+            _$insertNode(_el$34, _el$35);
+            _$insert(_el$34, () => s().usagePercentage.toFixed(1), _el$35);
+            _$insert(_el$33, () => formatThresholdPercent(s().executeThreshold), _el$37);
+            _$insert(_el$33, () => s().executeThresholdClamped ? "*" : "", null);
+            _$effect(_$p => _$setProp(_el$33, "fg", s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent, _$p));
+            return _el$33;
+          })();
+        })(), _el$18);
+        _$insertNode(_el$18, _el$19);
+        _$insertNode(_el$18, _el$20);
+        _$insert(_el$18, () => fmt(s().inputTokens), _el$19);
+        _$insert(_el$18, (() => {
+          var _c$3 = _$memo(() => contextLimit() > 0);
+          return () => _c$3() ? fmt(contextLimit()) : "?";
+        })(), _el$20);
+        _$effect(_$p => _$setProp(_el$18, "fg", compactionOff() ? t().accent : s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent, _$p));
+        return _el$17;
+      })(), _$memo(() => _$memo(() => !!s().windowGeometry)() && (() => {
+        var _el$38 = _$createElement("text");
+        _$insert(_el$38, () => formatWindowDerivationLine(s().inputTokens, s().windowGeometry));
+        _$effect(_$p => _$setProp(_el$38, "fg", t().textMuted, _$p));
+        return _el$38;
+      })()), (() => {
+        var _el$21 = _$createElement("box");
+        _$setProp(_el$21, "width", "100%");
+        _$setProp(_el$21, "flexDirection", "row");
+        _$setProp(_el$21, "height", 1);
+        _$insert(_el$21, () => barSegments().map(seg => (() => {
+          var _el$39 = _$createElement("box");
+          _$setProp(_el$39, "flexBasis", 0);
+          _$setProp(_el$39, "height", 1);
+          _$effect(_p$ => {
+            var _v$7 = seg.label,
+              _v$8 = Math.max(1, seg.tokens),
+              _v$9 = seg.color;
+            _v$7 !== _p$.e && (_p$.e = _$setProp(_el$39, "key", _v$7, _p$.e));
+            _v$8 !== _p$.t && (_p$.t = _$setProp(_el$39, "flexGrow", _v$8, _p$.t));
+            _v$9 !== _p$.a && (_p$.a = _$setProp(_el$39, "backgroundColor", _v$9, _p$.a));
+            return _p$;
+          }, {
+            e: undefined,
+            t: undefined,
+            a: undefined
+          });
+          return _el$39;
+        })()));
+        return _el$21;
+      })(), (() => {
+        var _el$22 = _$createElement("box"),
+          _el$23 = _$createElement("text");
+        _$insertNode(_el$22, _el$23);
+        _$setProp(_el$22, "flexDirection", "column");
+        _$insert(_el$22, () => breakdownSegments().segs.map(seg => {
+          const pct = (seg.tokens / breakdownSegments().total * 100).toFixed(1);
+          return (() => {
+            var _el$40 = _$createElement("box"),
+              _el$41 = _$createElement("text"),
+              _el$42 = _$createTextNode(` `),
+              _el$43 = _$createElement("text"),
+              _el$44 = _$createTextNode(` (`),
+              _el$45 = _$createTextNode(`%)`);
+            _$insertNode(_el$40, _el$41);
+            _$insertNode(_el$40, _el$43);
+            _$setProp(_el$40, "width", "100%");
+            _$setProp(_el$40, "flexDirection", "row");
+            _$setProp(_el$40, "justifyContent", "space-between");
+            _$insertNode(_el$41, _el$42);
+            _$insert(_el$41, () => seg.label, _el$42);
+            _$insert(_el$41, () => seg.detail ?? "", null);
+            _$insertNode(_el$43, _el$44);
+            _$insertNode(_el$43, _el$45);
+            _$insert(_el$43, () => fmt(seg.tokens), _el$44);
+            _$insert(_el$43, pct, _el$45);
+            _$effect(_p$ => {
+              var _v$0 = seg.label,
+                _v$1 = seg.color,
+                _v$10 = t().textMuted;
+              _v$0 !== _p$.e && (_p$.e = _$setProp(_el$40, "key", _v$0, _p$.e));
+              _v$1 !== _p$.t && (_p$.t = _$setProp(_el$41, "fg", _v$1, _p$.t));
+              _v$10 !== _p$.a && (_p$.a = _$setProp(_el$43, "fg", _v$10, _p$.a));
+              return _p$;
+            }, {
+              e: undefined,
+              t: undefined,
+              a: undefined
+            });
+            return _el$40;
+          })();
+        }), _el$23);
+        _$insertNode(_el$23, _$createTextNode(`Conversation includes reasoning; hygiene excludes it`));
+        _$insert(_el$22, (() => {
+          var _c$4 = _$memo(() => s().tailHygiene !== undefined);
+          return () => _c$4() && _$createComponent(R, {
+            get t() {
+              return t();
+            },
+            l: "Hygiene",
+            get v() {
+              return formatTailHygiene(s().tailHygiene);
+            },
+            get fg() {
+              return _$memo(() => !!s().tailHygiene.evaluable)() ? t().accent : t().warning;
+            }
+          });
+        })(), null);
+        _$effect(_$p => _$setProp(_el$23, "fg", t().textMuted, _$p));
+        return _el$22;
+      })(), _$memo(() => _$memo(() => !!(!compactionOff() && s().recompProgress))() && (() => {
         const p = s().recompProgress;
         // Label follows the flow that started the run, so a plain
         // /ctx-recomp never reads as an "Upgrade" (dogfood 2026-06-04).
         const verb = p.kind === "upgrade" ? "Upgrade" : p.kind === "embed" ? "Embed" : "Recomp";
         return (() => {
-          var _el$33 = _$createElement("box"),
-            _el$34 = _$createElement("text"),
-            _el$35 = _$createElement("b");
-          _$insertNode(_el$33, _el$34);
-          _$setProp(_el$33, "marginTop", 1);
-          _$setProp(_el$33, "width", "100%");
-          _$setProp(_el$33, "flexDirection", "column");
-          _$insertNode(_el$34, _el$35);
-          _$insert(_el$35, verb);
-          _$insert(_el$33, () => {
+          var _el$46 = _$createElement("box"),
+            _el$47 = _$createElement("text"),
+            _el$48 = _$createElement("b");
+          _$insertNode(_el$46, _el$47);
+          _$setProp(_el$46, "marginTop", 1);
+          _$setProp(_el$46, "width", "100%");
+          _$setProp(_el$46, "flexDirection", "column");
+          _$insertNode(_el$47, _el$48);
+          _$insert(_el$48, verb);
+          _$insert(_el$46, () => {
             if (p.phase === "recomp") {
               const frac = p.totalMessages > 0 ? p.processedMessages / p.totalMessages : 0;
               const width = 24;
@@ -475,417 +535,495 @@ const StatusDialog = props => {
               }
             });
           }, null);
-          _$effect(_$p => _$setProp(_el$34, "fg", t().text, _$p));
-          return _el$33;
+          _$effect(_$p => _$setProp(_el$47, "fg", t().text, _$p));
+          return _el$46;
         })();
-      })();
-    })(), _el$15);
-    _$setProp(_el$15, "flexDirection", "row");
-    _$setProp(_el$15, "width", "100%");
-    _$setProp(_el$15, "marginTop", 1);
-    _$setProp(_el$15, "gap", 4);
-    _$insert(_el$15, (() => {
-      var _c$4 = _$memo(() => !!compactionOff());
-      return () => _c$4() ? (() => {
-        var _el$36 = _$createElement("box"),
-          _el$37 = _$createElement("text"),
-          _el$38 = _$createElement("b");
-        _$insertNode(_el$36, _el$37);
-        _$setProp(_el$36, "flexDirection", "column");
-        _$setProp(_el$36, "flexGrow", 1);
-        _$setProp(_el$36, "flexBasis", 0);
-        _$insertNode(_el$37, _el$38);
-        _$insertNode(_el$38, _$createTextNode(`Knowledge`));
-        _$insert(_el$36, () => compactionOffSidebarRows(s()).map(row => _$createComponent(R, {
+      })()), _$memo(() => _$memo(() => !!s().hostBackendsModuleSide)() && (() => {
+        var _el$49 = _$createElement("box"),
+          _el$50 = _$createElement("text"),
+          _el$51 = _$createElement("b"),
+          _el$53 = _$createElement("text");
+        _$insertNode(_el$49, _el$50);
+        _$insertNode(_el$49, _el$53);
+        _$setProp(_el$49, "marginTop", 1);
+        _$setProp(_el$49, "width", "100%");
+        _$setProp(_el$49, "flexDirection", "column");
+        _$insertNode(_el$50, _el$51);
+        _$insertNode(_el$51, _$createTextNode(`Rust Mode`));
+        _$insert(_el$53, RUST_MODE_HOST_PATHS_LINE);
+        _$effect(_p$ => {
+          var _v$11 = t().text,
+            _v$12 = t().textMuted;
+          _v$11 !== _p$.e && (_p$.e = _$setProp(_el$50, "fg", _v$11, _p$.e));
+          _v$12 !== _p$.t && (_p$.t = _$setProp(_el$53, "fg", _v$12, _p$.t));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined
+        });
+        return _el$49;
+      })()), (() => {
+        var _el$25 = _$createElement("box");
+        _$setProp(_el$25, "flexDirection", "row");
+        _$setProp(_el$25, "width", "100%");
+        _$setProp(_el$25, "marginTop", 1);
+        _$setProp(_el$25, "gap", 4);
+        _$insert(_el$25, (() => {
+          var _c$5 = _$memo(() => !!compactionOff());
+          return () => _c$5() ? (() => {
+            var _el$54 = _$createElement("box"),
+              _el$55 = _$createElement("text"),
+              _el$56 = _$createElement("b");
+            _$insertNode(_el$54, _el$55);
+            _$setProp(_el$54, "flexDirection", "column");
+            _$setProp(_el$54, "flexGrow", 1);
+            _$setProp(_el$54, "flexBasis", 0);
+            _$insertNode(_el$55, _el$56);
+            _$insertNode(_el$56, _$createTextNode(`Knowledge`));
+            _$insert(_el$54, () => compactionOffSidebarRows(s()).map(row => _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              get l() {
+                return row.label;
+              },
+              get v() {
+                return row.value;
+              },
+              get fg() {
+                return _$memo(() => row.label === "Memories")() ? t().accent : t().textMuted;
+              }
+            })), null);
+            _$insert(_el$54, (() => {
+              var _c$8 = _$memo(() => s().readySmartNoteCount > 0);
+              return () => _c$8() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Smart Notes",
+                get v() {
+                  return `${s().readySmartNoteCount} ready`;
+                },
+                get fg() {
+                  return t().accent;
+                }
+              });
+            })(), null);
+            _$insert(_el$54, (() => {
+              var _c$9 = _$memo(() => !!s().lastDreamerRunAt);
+              return () => _c$9() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Dreamer",
+                get v() {
+                  return `last ${relTime(s().lastDreamerRunAt)}`;
+                },
+                get fg() {
+                  return t().textMuted;
+                }
+              });
+            })(), null);
+            _$effect(_$p => _$setProp(_el$55, "fg", t().text, _$p));
+            return _el$54;
+          })() : [(() => {
+            var _el$58 = _$createElement("box"),
+              _el$59 = _$createElement("text"),
+              _el$60 = _$createElement("b"),
+              _el$62 = _$createElement("box"),
+              _el$63 = _$createElement("text"),
+              _el$64 = _$createElement("b"),
+              _el$66 = _$createElement("box"),
+              _el$67 = _$createElement("text"),
+              _el$68 = _$createElement("b"),
+              _el$70 = _$createElement("box"),
+              _el$71 = _$createElement("text"),
+              _el$72 = _$createElement("b");
+            _$insertNode(_el$58, _el$59);
+            _$insertNode(_el$58, _el$62);
+            _$insertNode(_el$58, _el$66);
+            _$insertNode(_el$58, _el$70);
+            _$setProp(_el$58, "flexDirection", "column");
+            _$setProp(_el$58, "flexGrow", 1);
+            _$setProp(_el$58, "flexBasis", 0);
+            _$insertNode(_el$59, _el$60);
+            _$insertNode(_el$60, _$createTextNode(`Tags`));
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Active",
+              get v() {
+                return _$memo(() => s().tagCountsAuthoritative === false)() ? "n/a (module total only)" : `${s().activeTags} (~${fmtBytes(s().activeBytes)})`;
+              }
+            }), _el$62);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Dropped",
+              get v() {
+                return _$memo(() => s().tagCountsAuthoritative === false)() ? "n/a (module total only)" : String(s().droppedTags);
+              }
+            }), _el$62);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Total",
+              get v() {
+                return String(s().totalTags);
+              },
+              get fg() {
+                return t().textMuted;
+              }
+            }), _el$62);
+            _$insertNode(_el$62, _el$63);
+            _$setProp(_el$62, "marginTop", 1);
+            _$insertNode(_el$63, _el$64);
+            _$insertNode(_el$64, _$createTextNode(`Pending Queue`));
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Drops",
+              get v() {
+                return String(s().pendingOpsCount);
+              },
+              get fg() {
+                return _$memo(() => s().pendingOpsCount > 0)() ? t().warning : t().textMuted;
+              }
+            }), _el$66);
+            _$insertNode(_el$66, _el$67);
+            _$setProp(_el$66, "marginTop", 1);
+            _$insertNode(_el$67, _el$68);
+            _$insertNode(_el$68, _$createTextNode(`Cache TTL`));
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Configured",
+              get v() {
+                return formatCacheTtlDisplay({
+                  value: s().cacheTtl,
+                  source: s().cacheTtlSource,
+                  modelKey: s().cacheTtlModelKey
+                }).replace(/^Cache TTL: /, "");
+              }
+            }), _el$70);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Last response",
+              get v() {
+                return _$memo(() => s().lastResponseTime > 0)() ? `${Math.round(elapsed() / 1000)}s ago` : "never";
+              }
+            }), _el$70);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Remaining",
+              get v() {
+                return _$memo(() => !!s().cacheExpired)() ? "expired" : _$memo(() => !!s().cacheNeverExpires)() ? "never (MC never assumes expiry — external cache-keep)" : `${Math.round(s().cacheRemainingMs / 1000)}s`;
+              },
+              get fg() {
+                return _$memo(() => !!s().cacheExpired)() ? t().warning : t().textMuted;
+              }
+            }), _el$70);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Auto-execute",
+              get v() {
+                return _$memo(() => !!s().cacheExpired)() ? "yes (expired)" : _$memo(() => !!s().cacheNeverExpires)() ? `at ≥${formatThresholdPercent(s().executeThreshold)}%` : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`;
+              },
+              get fg() {
+                return t().textMuted;
+              }
+            }), _el$70);
+            _$insertNode(_el$70, _el$71);
+            _$setProp(_el$70, "marginTop", 1);
+            _$insertNode(_el$71, _el$72);
+            _$insertNode(_el$72, _$createTextNode(`Memory`));
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Active",
+              get v() {
+                return String(s().memoryCount);
+              },
+              get fg() {
+                return t().accent;
+              }
+            }), null);
+            _$insert(_el$58, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Injected",
+              get v() {
+                return String(s().memoryBlockCount);
+              },
+              get fg() {
+                return t().textMuted;
+              }
+            }), null);
+            _$effect(_p$ => {
+              var _v$13 = t().text,
+                _v$14 = t().text,
+                _v$15 = t().text,
+                _v$16 = t().text;
+              _v$13 !== _p$.e && (_p$.e = _$setProp(_el$59, "fg", _v$13, _p$.e));
+              _v$14 !== _p$.t && (_p$.t = _$setProp(_el$63, "fg", _v$14, _p$.t));
+              _v$15 !== _p$.a && (_p$.a = _$setProp(_el$67, "fg", _v$15, _p$.a));
+              _v$16 !== _p$.o && (_p$.o = _$setProp(_el$71, "fg", _v$16, _p$.o));
+              return _p$;
+            }, {
+              e: undefined,
+              t: undefined,
+              a: undefined,
+              o: undefined
+            });
+            return _el$58;
+          })(), (() => {
+            var _el$74 = _$createElement("box"),
+              _el$75 = _$createElement("text"),
+              _el$76 = _$createElement("b"),
+              _el$78 = _$createElement("box"),
+              _el$79 = _$createElement("text"),
+              _el$80 = _$createElement("b"),
+              _el$82 = _$createElement("box"),
+              _el$83 = _$createElement("text"),
+              _el$84 = _$createElement("b");
+            _$insertNode(_el$74, _el$75);
+            _$insertNode(_el$74, _el$78);
+            _$insertNode(_el$74, _el$82);
+            _$setProp(_el$74, "flexDirection", "column");
+            _$setProp(_el$74, "flexGrow", 1);
+            _$setProp(_el$74, "flexBasis", 0);
+            _$insertNode(_el$75, _el$76);
+            _$insertNode(_el$76, _$createTextNode(`Reductions`));
+            _$insert(_el$74, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Execute threshold",
+              get v() {
+                return `${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`;
+              }
+            }), _el$78);
+            _$insert(_el$74, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Last reduce anchor",
+              get v() {
+                return `${fmt(s().lastNudgeTokens)} tok`;
+              }
+            }), _el$78);
+            _$insertNode(_el$78, _el$79);
+            _$setProp(_el$78, "marginTop", 1);
+            _$insertNode(_el$79, _el$80);
+            _$insertNode(_el$80, _$createTextNode(`Context Details`));
+            _$insert(_el$74, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Protected tags",
+              get v() {
+                return String(s().protectedTagCount);
+              },
+              get fg() {
+                return t().textMuted;
+              }
+            }), _el$82);
+            _$insert(_el$74, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "Subagent",
+              get v() {
+                return s().isSubagent ? "yes" : "no";
+              },
+              get fg() {
+                return t().textMuted;
+              }
+            }), _el$82);
+            _$insertNode(_el$82, _el$83);
+            _$setProp(_el$82, "marginTop", 1);
+            _$insertNode(_el$83, _el$84);
+            _$insertNode(_el$84, _$createTextNode(`History Compression`));
+            _$insert(_el$74, (() => {
+              var _c$0 = _$memo(() => typeof s().boundaryPresent === "boolean");
+              return () => _c$0() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Boundary",
+                get v() {
+                  return s().boundaryPresent ? "present" : "absent";
+                }
+              });
+            })(), null);
+            _$insert(_el$74, (() => {
+              var _c$1 = _$memo(() => s().coverageOrdinal !== undefined);
+              return () => _c$1() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Coverage ordinal",
+                get v() {
+                  return _$memo(() => s().coverageOrdinal == null)() ? "none" : String(s().coverageOrdinal);
+                }
+              });
+            })(), null);
+            _$insert(_el$74, (() => {
+              var _c$10 = _$memo(() => typeof s().boundaryPresent === "boolean");
+              return () => _c$10() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Compartments",
+                get v() {
+                  return String(s().compartmentCount);
+                }
+              });
+            })(), null);
+            _$insert(_el$74, _$createComponent(R, {
+              get t() {
+                return t();
+              },
+              l: "History block",
+              get v() {
+                return `~${fmt(s().historyBlockTokens)} tok`;
+              }
+            }), null);
+            _$insert(_el$74, (() => {
+              var _c$11 = _$memo(() => s().compressionBudget != null);
+              return () => _c$11() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Budget",
+                get v() {
+                  return `~${fmt(s().compressionBudget)} tok (${s().compressionUsage} used)`;
+                }
+              });
+            })(), null);
+            _$insert(_el$74, (() => {
+              var _c$12 = _$memo(() => !!s().lastDreamerRunAt);
+              return () => _c$12() && _$createComponent(R, {
+                get t() {
+                  return t();
+                },
+                l: "Dreamer",
+                get v() {
+                  return `last ${relTime(s().lastDreamerRunAt)}`;
+                },
+                get fg() {
+                  return t().textMuted;
+                }
+              });
+            })(), null);
+            _$effect(_p$ => {
+              var _v$17 = t().text,
+                _v$18 = t().text,
+                _v$19 = t().text;
+              _v$17 !== _p$.e && (_p$.e = _$setProp(_el$75, "fg", _v$17, _p$.e));
+              _v$18 !== _p$.t && (_p$.t = _$setProp(_el$79, "fg", _v$18, _p$.t));
+              _v$19 !== _p$.a && (_p$.a = _$setProp(_el$83, "fg", _v$19, _p$.a));
+              return _p$;
+            }, {
+              e: undefined,
+              t: undefined,
+              a: undefined
+            });
+            return _el$74;
+          })()];
+        })());
+        return _el$25;
+      })(), _$memo(() => _$memo(() => !!s().lastTransformError)() && (() => {
+        var _el$86 = _$createElement("box"),
+          _el$87 = _$createElement("text");
+        _$insertNode(_el$86, _el$87);
+        _$setProp(_el$86, "marginTop", 1);
+        _$setProp(_el$86, "width", "100%");
+        _$insert(_el$87, () => renderUserFacingFailure("transform_update_failed"));
+        _$effect(_$p => _$setProp(_el$87, "fg", t().error, _$p));
+        return _el$86;
+      })()), (() => {
+        var _el$26 = _$createElement("box"),
+          _el$27 = _$createElement("text"),
+          _el$28 = _$createElement("b");
+        _$insertNode(_el$26, _el$27);
+        _$setProp(_el$26, "marginTop", 1);
+        _$setProp(_el$26, "width", "100%");
+        _$insertNode(_el$27, _el$28);
+        _$insertNode(_el$28, _$createTextNode(`Logger`));
+        _$insert(_el$26, _$createComponent(R, {
           get t() {
             return t();
           },
-          get l() {
-            return row.label;
-          },
+          l: "Swallowed writes",
           get v() {
-            return row.value;
+            return String(s().loggerDiagnostics?.swallowedWriteCount ?? 0);
           },
           get fg() {
-            return _$memo(() => row.label === "Memories")() ? t().accent : t().textMuted;
+            return _$memo(() => (s().loggerDiagnostics?.swallowedWriteCount ?? 0) > 0)() ? t().error : t().textMuted;
           }
-        })), null);
-        _$insert(_el$36, (() => {
-          var _c$6 = _$memo(() => s().readySmartNoteCount > 0);
+        }), null);
+        _$insert(_el$26, (() => {
+          var _c$6 = _$memo(() => !!s().loggerDiagnostics?.lastErrorMessage);
           return () => _c$6() && _$createComponent(R, {
             get t() {
               return t();
             },
-            l: "Smart Notes",
+            l: "Warning",
             get v() {
-              return `${s().readySmartNoteCount} ready`;
+              return renderUserFacingFailure("status_unavailable");
             },
             get fg() {
-              return t().accent;
+              return t().error;
             }
           });
         })(), null);
-        _$insert(_el$36, (() => {
-          var _c$7 = _$memo(() => !!s().lastDreamerRunAt);
+        _$insert(_el$26, (() => {
+          var _c$7 = _$memo(() => !!s().loggerDiagnostics?.lastErrorTime);
           return () => _c$7() && _$createComponent(R, {
             get t() {
               return t();
             },
-            l: "Dreamer",
+            l: "Last error time",
             get v() {
-              return `last ${relTime(s().lastDreamerRunAt)}`;
+              return s().loggerDiagnostics.lastErrorTime;
             },
             get fg() {
               return t().textMuted;
             }
           });
         })(), null);
-        _$effect(_$p => _$setProp(_el$37, "fg", t().text, _$p));
-        return _el$36;
-      })() : [(() => {
-        var _el$40 = _$createElement("box"),
-          _el$41 = _$createElement("text"),
-          _el$42 = _$createElement("b"),
-          _el$44 = _$createElement("box"),
-          _el$45 = _$createElement("text"),
-          _el$46 = _$createElement("b"),
-          _el$48 = _$createElement("box"),
-          _el$49 = _$createElement("text"),
-          _el$50 = _$createElement("b"),
-          _el$52 = _$createElement("box"),
-          _el$53 = _$createElement("text"),
-          _el$54 = _$createElement("b");
-        _$insertNode(_el$40, _el$41);
-        _$insertNode(_el$40, _el$44);
-        _$insertNode(_el$40, _el$48);
-        _$insertNode(_el$40, _el$52);
-        _$setProp(_el$40, "flexDirection", "column");
-        _$setProp(_el$40, "flexGrow", 1);
-        _$setProp(_el$40, "flexBasis", 0);
-        _$insertNode(_el$41, _el$42);
-        _$insertNode(_el$42, _$createTextNode(`Tags`));
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Active",
-          get v() {
-            return `${s().activeTags} (~${fmtBytes(s().activeBytes)})`;
-          }
-        }), _el$44);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Dropped",
-          get v() {
-            return String(s().droppedTags);
-          }
-        }), _el$44);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Total",
-          get v() {
-            return String(s().totalTags);
-          },
-          get fg() {
-            return t().textMuted;
-          }
-        }), _el$44);
-        _$insertNode(_el$44, _el$45);
-        _$setProp(_el$44, "marginTop", 1);
-        _$insertNode(_el$45, _el$46);
-        _$insertNode(_el$46, _$createTextNode(`Pending Queue`));
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Drops",
-          get v() {
-            return String(s().pendingOpsCount);
-          },
-          get fg() {
-            return _$memo(() => s().pendingOpsCount > 0)() ? t().warning : t().textMuted;
-          }
-        }), _el$48);
-        _$insertNode(_el$48, _el$49);
-        _$setProp(_el$48, "marginTop", 1);
-        _$insertNode(_el$49, _el$50);
-        _$insertNode(_el$50, _$createTextNode(`Cache TTL`));
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Configured",
-          get v() {
-            return s().cacheTtl;
-          }
-        }), _el$52);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Last response",
-          get v() {
-            return _$memo(() => s().lastResponseTime > 0)() ? `${Math.round(elapsed() / 1000)}s ago` : "never";
-          }
-        }), _el$52);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Remaining",
-          get v() {
-            return _$memo(() => !!s().cacheExpired)() ? "expired" : _$memo(() => !!s().cacheNeverExpires)() ? "never expires (always-warm lane)" : `${Math.round(s().cacheRemainingMs / 1000)}s`;
-          },
-          get fg() {
-            return _$memo(() => !!s().cacheExpired)() ? t().warning : t().textMuted;
-          }
-        }), _el$52);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Auto-execute",
-          get v() {
-            return _$memo(() => !!s().cacheExpired)() ? "yes (expired)" : _$memo(() => !!s().cacheNeverExpires)() ? `at ≥${formatThresholdPercent(s().executeThreshold)}%` : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`;
-          },
-          get fg() {
-            return t().textMuted;
-          }
-        }), _el$52);
-        _$insertNode(_el$52, _el$53);
-        _$setProp(_el$52, "marginTop", 1);
-        _$insertNode(_el$53, _el$54);
-        _$insertNode(_el$54, _$createTextNode(`Memory`));
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Active",
-          get v() {
-            return String(s().memoryCount);
-          },
-          get fg() {
-            return t().accent;
-          }
-        }), null);
-        _$insert(_el$40, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Injected",
-          get v() {
-            return String(s().memoryBlockCount);
-          },
-          get fg() {
-            return t().textMuted;
-          }
-        }), null);
-        _$effect(_p$ => {
-          var _v$11 = t().text,
-            _v$12 = t().text,
-            _v$13 = t().text,
-            _v$14 = t().text;
-          _v$11 !== _p$.e && (_p$.e = _$setProp(_el$41, "fg", _v$11, _p$.e));
-          _v$12 !== _p$.t && (_p$.t = _$setProp(_el$45, "fg", _v$12, _p$.t));
-          _v$13 !== _p$.a && (_p$.a = _$setProp(_el$49, "fg", _v$13, _p$.a));
-          _v$14 !== _p$.o && (_p$.o = _$setProp(_el$53, "fg", _v$14, _p$.o));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined,
-          a: undefined,
-          o: undefined
-        });
-        return _el$40;
-      })(), (() => {
-        var _el$56 = _$createElement("box"),
-          _el$57 = _$createElement("text"),
-          _el$58 = _$createElement("b"),
-          _el$60 = _$createElement("box"),
-          _el$61 = _$createElement("text"),
-          _el$62 = _$createElement("b"),
-          _el$64 = _$createElement("box"),
-          _el$65 = _$createElement("text"),
-          _el$66 = _$createElement("b");
-        _$insertNode(_el$56, _el$57);
-        _$insertNode(_el$56, _el$60);
-        _$insertNode(_el$56, _el$64);
-        _$setProp(_el$56, "flexDirection", "column");
-        _$setProp(_el$56, "flexGrow", 1);
-        _$setProp(_el$56, "flexBasis", 0);
-        _$insertNode(_el$57, _el$58);
-        _$insertNode(_el$58, _$createTextNode(`Reductions`));
-        _$insert(_el$56, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Execute threshold",
-          get v() {
-            return `${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`;
-          }
-        }), _el$60);
-        _$insert(_el$56, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Last reduce anchor",
-          get v() {
-            return `${fmt(s().lastNudgeTokens)} tok`;
-          }
-        }), _el$60);
-        _$insertNode(_el$60, _el$61);
-        _$setProp(_el$60, "marginTop", 1);
-        _$insertNode(_el$61, _el$62);
-        _$insertNode(_el$62, _$createTextNode(`Context Details`));
-        _$insert(_el$56, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Protected tags",
-          get v() {
-            return String(s().protectedTagCount);
-          },
-          get fg() {
-            return t().textMuted;
-          }
-        }), _el$64);
-        _$insert(_el$56, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "Subagent",
-          get v() {
-            return s().isSubagent ? "yes" : "no";
-          },
-          get fg() {
-            return t().textMuted;
-          }
-        }), _el$64);
-        _$insertNode(_el$64, _el$65);
-        _$setProp(_el$64, "marginTop", 1);
-        _$insertNode(_el$65, _el$66);
-        _$insertNode(_el$66, _$createTextNode(`History Compression`));
-        _$insert(_el$56, (() => {
-          var _c$8 = _$memo(() => typeof s().boundaryPresent === "boolean");
-          return () => _c$8() && _$createComponent(R, {
-            get t() {
-              return t();
-            },
-            l: "Boundary",
-            get v() {
-              return s().boundaryPresent ? "present" : "absent";
-            }
-          });
-        })(), null);
-        _$insert(_el$56, (() => {
-          var _c$9 = _$memo(() => s().coverageOrdinal !== undefined);
-          return () => _c$9() && _$createComponent(R, {
-            get t() {
-              return t();
-            },
-            l: "Coverage ordinal",
-            get v() {
-              return _$memo(() => s().coverageOrdinal == null)() ? "none" : String(s().coverageOrdinal);
-            }
-          });
-        })(), null);
-        _$insert(_el$56, (() => {
-          var _c$0 = _$memo(() => typeof s().boundaryPresent === "boolean");
-          return () => _c$0() && _$createComponent(R, {
-            get t() {
-              return t();
-            },
-            l: "Compartments",
-            get v() {
-              return String(s().compartmentCount);
-            }
-          });
-        })(), null);
-        _$insert(_el$56, _$createComponent(R, {
-          get t() {
-            return t();
-          },
-          l: "History block",
-          get v() {
-            return `~${fmt(s().historyBlockTokens)} tok`;
-          }
-        }), null);
-        _$insert(_el$56, (() => {
-          var _c$1 = _$memo(() => s().compressionBudget != null);
-          return () => _c$1() && _$createComponent(R, {
-            get t() {
-              return t();
-            },
-            l: "Budget",
-            get v() {
-              return `~${fmt(s().compressionBudget)} tok (${s().compressionUsage} used)`;
-            }
-          });
-        })(), null);
-        _$insert(_el$56, (() => {
-          var _c$10 = _$memo(() => !!s().lastDreamerRunAt);
-          return () => _c$10() && _$createComponent(R, {
-            get t() {
-              return t();
-            },
-            l: "Dreamer",
-            get v() {
-              return `last ${relTime(s().lastDreamerRunAt)}`;
-            },
-            get fg() {
-              return t().textMuted;
-            }
-          });
-        })(), null);
-        _$effect(_p$ => {
-          var _v$15 = t().text,
-            _v$16 = t().text,
-            _v$17 = t().text;
-          _v$15 !== _p$.e && (_p$.e = _$setProp(_el$57, "fg", _v$15, _p$.e));
-          _v$16 !== _p$.t && (_p$.t = _$setProp(_el$61, "fg", _v$16, _p$.t));
-          _v$17 !== _p$.a && (_p$.a = _$setProp(_el$65, "fg", _v$17, _p$.a));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined,
-          a: undefined
-        });
-        return _el$56;
+        _$effect(_$p => _$setProp(_el$27, "fg", t().text, _$p));
+        return _el$26;
       })()];
-    })());
-    _$insert(_el$4, (() => {
-      var _c$5 = _$memo(() => !!s().lastTransformError);
-      return () => _c$5() && (() => {
-        var _el$68 = _$createElement("box"),
-          _el$69 = _$createElement("text"),
-          _el$70 = _$createTextNode(`⚠ `);
-        _$insertNode(_el$68, _el$69);
-        _$setProp(_el$68, "marginTop", 1);
-        _$setProp(_el$68, "width", "100%");
-        _$insertNode(_el$69, _el$70);
-        _$insert(_el$69, () => s().lastTransformError, null);
-        _$effect(_$p => _$setProp(_el$69, "fg", t().error, _$p));
-        return _el$68;
-      })();
-    })(), _el$16);
-    _$insertNode(_el$16, _el$17);
-    _$setProp(_el$16, "marginTop", 1);
-    _$setProp(_el$16, "justifyContent", "flex-end");
-    _$setProp(_el$16, "width", "100%");
-    _$insertNode(_el$17, _$createTextNode(`Esc to close`));
+    })(), _el$12);
+    _$insertNode(_el$12, _el$13);
+    _$setProp(_el$12, "marginTop", 1);
+    _$setProp(_el$12, "justifyContent", "flex-end");
+    _$setProp(_el$12, "width", "100%");
+    _$insertNode(_el$13, _$createTextNode(`Esc to close`));
     _$effect(_p$ => {
       var _v$3 = t().accent,
         _v$4 = t().textMuted,
-        _v$5 = compactionOff() ? t().accent : s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent,
+        _v$5 = diagnostics() ? t().accent : t().textMuted,
         _v$6 = t().textMuted;
       _v$3 !== _p$.e && (_p$.e = _$setProp(_el$6, "fg", _v$3, _p$.e));
       _v$4 !== _p$.t && (_p$.t = _$setProp(_el$9, "fg", _v$4, _p$.t));
       _v$5 !== _p$.a && (_p$.a = _$setProp(_el$10, "fg", _v$5, _p$.a));
-      _v$6 !== _p$.o && (_p$.o = _$setProp(_el$17, "fg", _v$6, _p$.o));
+      _v$6 !== _p$.o && (_p$.o = _$setProp(_el$13, "fg", _v$6, _p$.o));
       return _p$;
     }, {
       e: undefined,
@@ -928,7 +1066,7 @@ async function showRecompDialog(api, targetSessionId = getSessionId(api)) {
     });
     return false;
   }
-  const countResult = await getCompartmentCount(sessionId);
+  const countResult = await getCompartmentCount(sessionId, api.state.path.directory ?? "");
   // Ack only after the dialog is actually shown for the same active session;
   // route switches while the RPC detail load is in flight must leave it pending.
   if (getSessionId(api) !== sessionId) return false;
@@ -943,7 +1081,7 @@ async function showRecompDialog(api, targetSessionId = getSessionId(api)) {
   api.ui.dialog.replace(() => _$createComponent(api.ui.DialogConfirm, {
     title: "\u26A0\uFE0F Recomp Confirmation",
     get message() {
-      return [count === 0 ? "This session has no compartments yet — recomp will build them from raw history." : `You have ${count} compartments.`, "", "Recomp will regenerate all compartments and facts from raw history.", "This may take a long time and consume significant tokens.", "", "Proceed?"].join("\n");
+      return [count === 0 ? "This session has no compartments yet — recomp will build them from raw history." : `You have ${count} compartments.`, "", "Recomp will rebuild the compressed history from raw history. Saved memories are not changed.", "This may take a long time and consume significant tokens.", "", "Proceed?"].join("\n");
     },
     onConfirm: async () => {
       const requested = await requestRecomp(sessionId);
@@ -1017,7 +1155,7 @@ function showUpgradeDialog(api, resume, targetSessionId = getSessionId(api)) {
   }));
   return true;
 }
-async function showStatusDialog(api, targetSessionId = getSessionId(api)) {
+async function showStatusDialog(api, targetSessionId = getSessionId(api), initialDiagnostics = false) {
   const sessionId = targetSessionId;
   if (!sessionId) {
     showToast(api, {
@@ -1028,11 +1166,22 @@ async function showStatusDialog(api, targetSessionId = getSessionId(api)) {
   }
   const directory = api.state.path.directory ?? "";
   const modelKey = getModelKeyFromMessages(api, sessionId);
-  const detail = await loadStatusDetail(sessionId, directory, modelKey);
+  const result = await loadStatusDetail(sessionId, directory, modelKey);
   if (getSessionId(api) !== sessionId) return false;
+  if (!result.ok) {
+    console.error(`[magic-context] status unavailable code=${userFacingFailureCode("status_unavailable")}: ${result.error}`);
+    showToast(api, {
+      message: renderUserFacingFailure("status_unavailable"),
+      variant: "warning"
+    });
+    return false;
+  }
   api.ui.dialog.replace(() => _$createComponent(StatusDialog, {
     api: api,
-    s: detail
+    get s() {
+      return result.detail;
+    },
+    diagnostics: initialDiagnostics
   }));
   return true;
 }
@@ -1041,31 +1190,31 @@ const EmbedDialog = props => {
   const t = () => theme();
   const lines = () => props.detail.statusText.split("\n");
   return (() => {
-    var _el$71 = _$createElement("box"),
-      _el$72 = _$createElement("box"),
-      _el$73 = _$createElement("text"),
-      _el$74 = _$createElement("b");
-    _$insertNode(_el$71, _el$72);
-    _$setProp(_el$71, "flexDirection", "column");
-    _$setProp(_el$71, "width", "100%");
-    _$setProp(_el$71, "paddingLeft", 2);
-    _$setProp(_el$71, "paddingRight", 2);
-    _$setProp(_el$71, "paddingTop", 1);
-    _$setProp(_el$71, "paddingBottom", 1);
-    _$insertNode(_el$72, _el$73);
-    _$setProp(_el$72, "justifyContent", "center");
-    _$setProp(_el$72, "width", "100%");
-    _$setProp(_el$72, "marginBottom", 1);
-    _$insertNode(_el$73, _el$74);
-    _$insertNode(_el$74, _$createTextNode(`Embedding`));
-    _$insert(_el$71, () => lines().map(line => (() => {
-      var _el$76 = _$createElement("text");
-      _$insert(_el$76, line);
-      _$effect(_$p => _$setProp(_el$76, "fg", t().text, _$p));
-      return _el$76;
+    var _el$88 = _$createElement("box"),
+      _el$89 = _$createElement("box"),
+      _el$90 = _$createElement("text"),
+      _el$91 = _$createElement("b");
+    _$insertNode(_el$88, _el$89);
+    _$setProp(_el$88, "flexDirection", "column");
+    _$setProp(_el$88, "width", "100%");
+    _$setProp(_el$88, "paddingLeft", 2);
+    _$setProp(_el$88, "paddingRight", 2);
+    _$setProp(_el$88, "paddingTop", 1);
+    _$setProp(_el$88, "paddingBottom", 1);
+    _$insertNode(_el$89, _el$90);
+    _$setProp(_el$89, "justifyContent", "center");
+    _$setProp(_el$89, "width", "100%");
+    _$setProp(_el$89, "marginBottom", 1);
+    _$insertNode(_el$90, _el$91);
+    _$insertNode(_el$91, _$createTextNode(`Embedding`));
+    _$insert(_el$88, () => lines().map(line => (() => {
+      var _el$93 = _$createElement("text");
+      _$insert(_el$93, line);
+      _$effect(_$p => _$setProp(_el$93, "fg", t().text, _$p));
+      return _el$93;
     })()), null);
-    _$effect(_$p => _$setProp(_el$73, "fg", t().accent, _$p));
-    return _el$71;
+    _$effect(_$p => _$setProp(_el$90, "fg", t().accent, _$p));
+    return _el$88;
   })();
 };
 async function showEmbedDialog(api, targetSessionId = getSessionId(api)) {
@@ -1131,11 +1280,11 @@ function renderTuiProbeCustomArm(api, result) {
     api.ui.dialog.replace(() => {
       try {
         return (() => {
-          var _el$77 = _$createElement("box"),
-            _el$78 = _$createElement("text");
-          _$insertNode(_el$77, _el$78);
-          _$insertNode(_el$78, _$createTextNode(`probe`));
-          return _el$77;
+          var _el$94 = _$createElement("box"),
+            _el$95 = _$createElement("text");
+          _$insertNode(_el$94, _el$95);
+          _$insertNode(_el$95, _$createTextNode(`probe`));
+          return _el$94;
         })();
       } catch (error) {
         result.customThrew = probeErrorMessage(error);
@@ -1208,11 +1357,11 @@ function reportTuiProbe(api, result) {
   if (result.customThrew === null) {
     try {
       api.ui.dialog.replace(() => (() => {
-        var _el$80 = _$createElement("box"),
-          _el$81 = _$createElement("text");
-        _$insertNode(_el$80, _el$81);
-        _$insert(_el$81, summary);
-        return _el$80;
+        var _el$97 = _$createElement("box"),
+          _el$98 = _$createElement("text");
+        _$insertNode(_el$97, _el$98);
+        _$insert(_el$98, summary);
+        return _el$97;
       })());
       return;
     } catch (error) {
@@ -1464,7 +1613,7 @@ const tui = async (api, _options, meta) => {
     const action = n.payload?.action;
     const stillActive = () => getRpcGeneration() === generation && getSessionId(api) === requestedSessionId;
     if (action === "show-status-dialog") {
-      return stillActive() && (await showStatusDialog(api, requestedSessionId));
+      return stillActive() && (await showStatusDialog(api, requestedSessionId, n.payload?.diagnostics === true));
     }
     if (action === "show-recomp-dialog") {
       return stillActive() && (await showRecompDialog(api, requestedSessionId));

@@ -2,20 +2,24 @@ import { getHarness } from "../../../shared/harness";
 import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { withContentLanguageDirective } from "../../../agents/language-directive";
+import { createV1HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
+import {
+    type HiddenCompletion,
+    type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
+    type HiddenRunHandle,
+} from "../../../hooks/magic-context/compartment-runner-types";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import {
-    extractLatestAssistantText,
-    hasLengthCappedOutput,
-} from "../../../shared/assistant-message-extractor";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
-import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { hasShareabilitySensitiveText } from "../../../shared/redaction";
-import { modelBodyField } from "../../../shared/resolve-fallbacks";
+import { modelBodyField, toModelEntry } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { renderCapabilityRefusal } from "../../../shared/user-facing-codes";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -29,6 +33,7 @@ import {
     type ClassifyAnchorMemory,
     type ClassifyPromptMemory,
     parseClassifyManifest,
+    validateClassifyManifest,
 } from "./classify-prompt";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -98,7 +103,8 @@ export class ClassifyModuleFailureError extends Error {
 
 export interface ClassifyArgs {
     db: Database;
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     projectIdentity: string;
     parentSessionId: string | undefined;
     sessionDirectory: string;
@@ -106,8 +112,9 @@ export interface ClassifyArgs {
     leaseKey: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
+    language?: string;
     /** Present only for rust-mode projects whose memories authority is MODULE. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
@@ -328,6 +335,11 @@ async function classifyOneChunk(
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
+    let handle: HiddenRunHandle | null = null;
+    const executor =
+        args.hiddenCompletionExecutor ??
+        createV1HiddenCompletionExecutor(args.client, args.db, args.sessionDirectory);
+    let promptSettled = false;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
     try {
@@ -342,22 +354,23 @@ async function classifyOneChunk(
             return run;
         }
 
-        const createResponse = await createChildSessionWithFence({
-            client: args.client,
-            db: args.db,
+        handle = await executor.open({
             parentSessionId: args.parentSessionId,
+            agent: DREAMER_CLASSIFIER_AGENT,
+            kind: "dreamer-task",
+            system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
+            model: args.model,
+            configuredModels: [...(args.model ? [args.model] : []), ...(args.fallbackModels ?? [])],
+            timeoutMs: sliceMs,
             title: "magic-context-dream-classify",
             directory: args.sessionDirectory,
+            metadata: { task: "classify-memories" },
         });
-        const created = shared.normalizeSDKResponse(
-            createResponse,
-            null as { id?: string } | null,
-            {
-                preferResponseOnMissingData: true,
-            },
-        );
-        agentSessionId = typeof created?.id === "string" ? created.id : null;
+        agentSessionId = handle.id || null;
         if (!agentSessionId) throw new Error("Could not create classify session.");
+        // The retry callbacks close over the opened run; bind it once so the closures
+        // see the resolved handle rather than the nullable slot it was assigned to.
+        const opened = handle;
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
@@ -366,33 +379,34 @@ async function classifyOneChunk(
                 query: { directory: args.sessionDirectory },
                 body: {
                     agent: DREAMER_CLASSIFIER_AGENT,
-                    system: CLASSIFY_SYSTEM_PROMPT,
+                    system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
                     ...modelBodyField(args.model),
                     parts: [{ type: "text", text: prompt, synthetic: true }],
                 },
             },
             {
+                transport: Object.assign(
+                    (request: import("../../../shared/model-suggestion-retry").PromptArgs) =>
+                        executor.attempt(opened, request),
+                    { childSessionId: opened.childSessionId },
+                ),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:classify-memories",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
-                validateOutput: (messages) => {
-                    if (hasLengthCappedOutput(messages)) {
+                fetchOutput: () => executor.collect(opened, 50),
+                validateOutput: (completion) => {
+                    const messages = completion.messages ?? [];
+                    if (completion.lengthCapped) {
                         throw new Error("classify returned length-capped output");
                     }
-                    const text = extractLatestAssistantText(messages);
+                    const text = completion.text;
                     if (!text) throw new Error("classify returned no output");
                     try {
-                        parseClassifyManifest(text);
+                        validateClassifyManifest(
+                            text,
+                            new Set(chunk.map((candidate) => candidate.id)),
+                        );
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
                             messages,
@@ -405,8 +419,13 @@ async function classifyOneChunk(
                 },
             },
         );
+        promptSettled = true;
 
-        recordInvocation(args, startedAt, { status: "completed", messages: run.output });
+        recordInvocation(args, startedAt, {
+            status: "completed",
+            messages: run.output.messages,
+            completion: run.output,
+        });
         return applyClassifications(
             args,
             chunk.map((candidate) => candidate.contextMemory),
@@ -423,23 +442,23 @@ async function classifyOneChunk(
         // A MODULE-authority failure is not safe to downgrade to the guarded
         // TypeScript child path. Surface it so the scheduler records a
         // transient failure and retries the same task instead.
-        if (moduleRoute || signal.aborted || failure instanceof DreamerProviderOutputFailureError)
+        if (
+            moduleRoute ||
+            failure instanceof HiddenCompletionRefusal ||
+            signal.aborted ||
+            failure instanceof DreamerProviderOutputFailureError ||
+            (shared.getPromptFailureDetail(failure)?.failureClass !== "parse_failed" &&
+                shared.getPromptFailureDetail(failure) !== null)
+        )
             throw failure;
         return { classified: 0, changed: 0 };
     } finally {
-        // Delete on success AND failure (the failed child still holds the
-        // memory-pool snapshot from the prompt). keep_subagents still honored —
-        // memory-pool text, not raw user transcripts.
-        if (agentSessionId && !shouldKeepSubagents()) {
-            await args.client.session
-                .delete({
-                    path: { id: agentSessionId },
-                    query: { directory: args.sessionDirectory },
-                })
-                .catch((e: unknown) => {
-                    log(`[dreamer] classify session cleanup failed: ${getErrorMessage(e)}`);
-                });
-        }
+        await executor.close(handle, {
+            promptSettled,
+            privacySensitive: true,
+            context: "[dreamer] classify",
+            log,
+        });
     }
 }
 
@@ -457,6 +476,11 @@ async function runClassifyThroughModule(
         memories: chunk.map(toPromptMemory),
         anchors,
     });
+    const modelChain = [args.model, ...(args.fallbackModels ?? [])]
+        .map(toModelEntry)
+        .filter((entry) => entry !== undefined)
+        .map((entry) => entry.model);
+    const resolvedModelChain = [...new Set(modelChain)];
     const response = await args.moduleClient?.call({
         sessionId: args.moduleSessionId as string,
         projectRoot: args.moduleProjectRoot as string,
@@ -474,6 +498,7 @@ async function runClassifyThroughModule(
                 .digest("hex")
                 .slice(0, 24)}`,
             authority_generation: args.moduleAuthorityGeneration,
+            ...(resolvedModelChain.length > 0 ? { model_chain: resolvedModelChain } : {}),
             payload: {
                 prompt_body: prompt,
                 items: chunk.map((candidate) => ({
@@ -495,11 +520,9 @@ async function runClassifyThroughModule(
     if ((result as { truncated?: unknown }).truncated === true) {
         throw new Error("classify returned length-capped output");
     }
-    const parsed = parseClassifyManifest(manifestText);
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
+    const parsed = validateClassifyManifest(
+        manifestText,
         new Set(chunk.map((candidate) => candidate.id)),
-        "classify",
     );
     const rows = parsed.map((entry) => {
         const candidate = chunk.find((item) => item.id === entry.id);
@@ -537,12 +560,12 @@ async function runClassifyThroughModule(
         });
     } catch (error) {
         if (isRustAuthorityDrainingError(error)) {
-            throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+            throw new Error(renderCapabilityRefusal("memory_write"));
         }
         throw error;
     }
     if (isRustAuthorityDrainingError(applied)) {
-        throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+        throw new Error(renderCapabilityRefusal("memory_write"));
     }
     const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
     if (!applyResult || typeof applyResult !== "object") {
@@ -630,18 +653,30 @@ export function applyClassifications(
 function recordInvocation(
     args: ClassifyArgs,
     startedAt: number,
-    params: { status: "completed" | "failed"; messages?: unknown[]; error?: unknown },
+    params: {
+        status: "completed" | "failed";
+        messages?: unknown[];
+        error?: unknown;
+        completion?: HiddenCompletion;
+    },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: getHarness(),
+        harness: args.hiddenCompletionExecutor?.capabilities.harness ?? getHarness(),
         subagent: "dreamer",
         task: "classify-memories",
         startedAt,
         status: params.status,
         messages: params.messages,
+        ...(params.completion && !params.completion.messages
+            ? {
+                  tokens: params.completion.usage,
+                  providerId: params.completion.providerId,
+                  modelId: params.completion.modelId,
+              }
+            : {}),
         error: params.error,
     });
 }

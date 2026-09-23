@@ -63,6 +63,7 @@ export interface CavemanCleanupResult {
     compressedToFull: number;
     compressedToUltra: number;
     mutatedTextTags: number;
+    textReductions: Array<{ tagNumber: number; removedCharacters: number }>;
 }
 
 /**
@@ -90,19 +91,22 @@ export function applyCavemanCleanup(
     db: ContextDatabase,
     targets: Map<number, TagTarget>,
     tags: TagEntry[],
-    config: CavemanCleanupConfig & { protectedTags: number },
+    config: CavemanCleanupConfig & { protectedCutoff: number | null },
 ): CavemanCleanupResult {
     const result: CavemanCleanupResult = {
         compressedToLite: 0,
         compressedToFull: 0,
         compressedToUltra: 0,
         mutatedTextTags: 0,
+        textReductions: [],
     };
 
     if (!config.enabled) return result;
 
-    const maxTag = tags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
-    const protectedCutoff = maxTag - config.protectedTags;
+    // Build the eligible list: active message tags older than the exact window
+    // cutoff. A null cutoff means there are no protected tool rows, so no
+    // tag-number threshold applies.
+    const protectedCutoff = config.protectedCutoff;
 
     // Build the eligible list: active message tags outside protected tail with
     // a byte_size at least min_chars. byte_size is the current length in
@@ -113,7 +117,7 @@ export function applyCavemanCleanup(
             (tag) =>
                 tag.type === "message" &&
                 tag.status === "active" &&
-                tag.tagNumber <= protectedCutoff &&
+                (protectedCutoff === null || tag.tagNumber < protectedCutoff) &&
                 tag.byteSize >= config.minChars,
         )
         // Sort by tag_number ascending — oldest first. This matches the
@@ -175,8 +179,18 @@ export function applyCavemanCleanup(
             // the current text — e.g. the text had no caveman-droppable words).
             // Without this, that tag would be re-evaluated on every execute
             // pass forever, producing log noise and burning DB transactions.
+            const priorContent = target.getContent?.();
             const didMutate = target.setContent(compressed);
-            if (didMutate) result.mutatedTextTags += 1;
+            if (didMutate) {
+                result.mutatedTextTags += 1;
+                result.textReductions.push({
+                    tagNumber: tag.tagNumber,
+                    removedCharacters: Math.max(
+                        0,
+                        (priorContent?.length ?? originalText.length) - compressed.length,
+                    ),
+                });
+            }
             updateCavemanDepth(db, sessionId, tag.tagNumber, targetDepth);
             if (targetDepth === DEPTH_LITE) result.compressedToLite += 1;
             else if (targetDepth === DEPTH_FULL) result.compressedToFull += 1;

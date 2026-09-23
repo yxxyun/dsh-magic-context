@@ -42,6 +42,16 @@ function callBodies(src: string, name: string): string[] {
     return src.match(new RegExp(`${name}\\((?:[^()]*,\\s*)?\\{[\\s\\S]*?\\n\\s*\\}\\)`, "g")) ?? [];
 }
 
+/**
+ * A call site attributes the row correctly when it reads the boot-time harness
+ * directly, or defers to a hidden-completion executor that does. Upstream
+ * v0.42.6 introduced the executor form; the DSH port supplies no executor, so
+ * the core falls back to createV1HiddenCompletionExecutor — which is why THAT
+ * capability must also report getHarness() (guarded below).
+ */
+const ATTRIBUTED = [/harness: getHarness\(\)/, /harness: [\w?.]*capabilities\.harness/];
+const attributesHarness = (call: string): boolean => ATTRIBUTED.some((re) => re.test(call));
+
 const incrementalPath = join(import.meta.dir, "compartment-runner-incremental.ts");
 const recompPath = join(import.meta.dir, "compartment-runner-recomp.ts");
 
@@ -54,7 +64,7 @@ test("every recordHistorianRun call site reads harness from getHarness()", () =>
         const calls = callBodies(src, "recordHistorianRun");
         expect(calls.length).toBeGreaterThan(0);
         for (const call of calls) {
-            expect(`${name}: ${call}`).toContain("harness: getHarness()");
+            expect(`${name}: ${attributesHarness(call)}`).toBe(`${name}: true`);
         }
     }
 });
@@ -65,7 +75,7 @@ test("every recordChildInvocation call site reads harness from getHarness()", ()
         const src = readFileSync(file, "utf8");
         for (const call of callBodies(src, "recordChildInvocation")) {
             total += 1;
-            expect(`${file}: ${call}`).toContain("harness: getHarness()");
+            expect(`${file}: ${attributesHarness(call)}`).toBe(`${file}: true`);
         }
     }
     // Guards against the scan silently matching nothing.
@@ -91,4 +101,19 @@ test("both runners import getHarness from the shared harness module", () => {
     ] as const) {
         expect(`${name}: ${readFileSync(path, "utf8").includes("shared/harness")}`).toBe(`${name}: true`);
     }
+});
+
+test("the V1 hidden-completion executor capability reports the boot-time harness", () => {
+    // This ONE literal is the root cause of the executor-driven sites: the DSH
+    // port supplies no executor, so every runner falls back to this factory and
+    // inherits its capabilities. A literal here re-poisons classify,
+    // compress-cues, compartment-runner-historian and compartment-runner-incremental
+    // at once, which is why it gets its own guard rather than relying on the
+    // call-site scans above.
+    const src = readFileSync(
+        join(import.meta.dir, "compartment-runner-historian.ts"),
+        "utf8",
+    );
+    expect(src).toContain("capabilities: { tools: true, harness: getHarness() }");
+    expect(src).not.toMatch(/capabilities:\s*\{\s*tools:\s*true,\s*harness:\s*["'`]/);
 });

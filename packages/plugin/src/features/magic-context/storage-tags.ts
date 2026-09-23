@@ -1,6 +1,17 @@
+import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
+
+declare module "./types" {
+    interface TagEntry {
+        id?: number;
+        tokenCount?: number | null;
+    }
+}
+
+export type { TagEntry } from "./types";
 
 const insertTagStatements = new WeakMap<Database, PreparedStatement>();
 const updateTagStatusStatements = new WeakMap<Database, PreparedStatement>();
@@ -10,7 +21,11 @@ const getTagNumbersByMessageIdStatements = new WeakMap<Database, PreparedStateme
 const deleteTagsByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxTagNumberBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
+const getAssignableTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const hasPiFallbackMessageTagStatements = new WeakMap<Database, PreparedStatement>();
+
+const WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX = "__mc_whitespace_assistant_inert__:";
+const WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX = "mc:whitespace-assistant:";
 
 function getInsertTagStatement(db: Database): PreparedStatement {
     let stmt = insertTagStatements.get(db);
@@ -116,6 +131,8 @@ export interface MessageTokenTotal {
 }
 
 const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
+const RECENT_OWNER_SCAN_PAGE_SIZE = 128;
+const recentTagOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
 function ownerMessageIdForTagRow(row: {
     type: string;
@@ -126,6 +143,63 @@ function ownerMessageIdForTagRow(row: {
         return row.tool_owner_message_id ?? row.message_id;
     }
     return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+}
+
+function getRecentTagOwnerStatement(db: Database): PreparedStatement {
+    let statement = recentTagOwnerStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT type, message_id, tool_owner_message_id
+             FROM tags
+             WHERE session_id = ?
+             ORDER BY tag_number DESC, id DESC
+             LIMIT ? OFFSET ?`,
+        );
+        recentTagOwnerStatements.set(db, statement);
+    }
+    return statement;
+}
+
+/**
+ * Return known message owners in descending persisted tag order. Paging stops
+ * as soon as the requested number of distinct owners is found, so the common
+ * newest-20 lookup does not materialize a long session's complete tag table.
+ * Dropped and compacted rows remain part of the chronology by design.
+ */
+export function getRecentTagOwnerMessageIds(
+    db: Database,
+    sessionId: string,
+    maxOwners: number,
+): Set<string> {
+    const recent = new Set<string>();
+    if (!Number.isFinite(maxOwners) || maxOwners <= 0) return recent;
+
+    const statement = getRecentTagOwnerStatement(db);
+    let offset = 0;
+    while (recent.size < maxOwners) {
+        const rows = statement.all(sessionId, RECENT_OWNER_SCAN_PAGE_SIZE, offset) as Array<{
+            type: unknown;
+            message_id: unknown;
+            tool_owner_message_id: unknown;
+        }>;
+        for (const row of rows) {
+            if (typeof row.type !== "string" || typeof row.message_id !== "string") continue;
+            const ownerId =
+                row.type === "tool"
+                    ? typeof row.tool_owner_message_id === "string"
+                        ? row.tool_owner_message_id
+                        : null
+                    : row.message_id.replace(CONTENT_ID_SUFFIX, "");
+            // Reclaim selectors withhold legacy tool rows whose owner is unknown.
+            // Skip them here too so they do not consume a known-owner slot.
+            if (!ownerId || recent.has(ownerId)) continue;
+            recent.add(ownerId);
+            if (recent.size >= maxOwners) break;
+        }
+        if (rows.length < RECENT_OWNER_SCAN_PAGE_SIZE) break;
+        offset += rows.length;
+    }
+    return recent;
 }
 
 /**
@@ -146,31 +220,19 @@ export interface ActiveTagTokenAggregate {
 }
 
 /**
- * @param protectedTags When > 0, the `toolOutput` (reclaimable) total EXCLUDES
- * the top-N active tag numbers — the exact set `ctx_reduce` refuses to drop (it
- * defers the N highest active tag numbers; see ctx-reduce/tools.ts). The nudge's
- * "reclaimable" figure must match what the agent can actually drop, or it nags
- * about protected tail output the agent cannot act on (re-firing forever).
- * `conversation`/`toolCall` are NOT narrowed — they feed `usable`, the full
- * working range, where protected content still counts. Default 0 = no exclusion.
+ * `protectedCutoff` is the canonical token-window suffix cutoff. Reclaimable
+ * tool output excludes rows at or above it; null applies no threshold.
+ * `conversation`/`toolCall` are not narrowed because protected content remains
+ * part of the live working range.
  */
 export function getActiveTagTokenAggregate(
     db: Database,
     sessionId: string,
-    protectedTags = 0,
+    protectedCutoff: number | null = null,
 ): ActiveTagTokenAggregate {
-    // Reclaimable tool output excludes the protected top-N tags. The cutoff is
-    // the N-th highest active tag number; a tag is droppable iff its number is
-    // strictly below it. When there are fewer than N active tags the subquery
-    // yields NULL → `tag_number < NULL` is never true → reclaimable 0 (everything
-    // protected), which is correct. protectedTags <= 0 takes the unfiltered path.
     const toolOutputExpr =
-        protectedTags > 0
-            ? `COALESCE(SUM(CASE WHEN type = 'tool' AND tag_number < (
-                    SELECT tag_number FROM tags
-                    WHERE session_id = ? AND status = 'active'
-                    ORDER BY tag_number DESC LIMIT 1 OFFSET ?
-                ) THEN COALESCE(token_count, 0) ELSE 0 END), 0)`
+        protectedCutoff !== null
+            ? `COALESCE(SUM(CASE WHEN type = 'tool' AND tag_number < ? THEN COALESCE(token_count, 0) ELSE 0 END), 0)`
             : `COALESCE(SUM(CASE WHEN type = 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)`;
     const sql = `SELECT
                 COALESCE(SUM(CASE WHEN type != 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)
@@ -180,7 +242,7 @@ export function getActiveTagTokenAggregate(
                 COALESCE(SUM(CASE WHEN token_count IS NULL THEN 1 ELSE 0 END), 0) AS null_count
              FROM tags
              WHERE session_id = ? AND status = 'active'`;
-    const params = protectedTags > 0 ? [sessionId, protectedTags - 1, sessionId] : [sessionId];
+    const params = protectedCutoff !== null ? [protectedCutoff, sessionId] : [sessionId];
     const row = db.prepare(sql).get(...params) as
         | { conversation: number; tool_call: number; tool_output: number; null_count: number }
         | undefined;
@@ -203,90 +265,98 @@ export interface AgeReclaimToolTag extends ToolReclaimHintTag {
 }
 
 /**
- * Oldest active tool tags the agent can actually drop (excludes the protected
- * newest active tag window, matching ctx_reduce/applyPendingOperations). Used
- * only to render lightweight nudge hints; it never mutates tag state.
+ * Oldest active tool tags the agent can actually drop. The supplied set is the
+ * exact canonical token-window membership used by ctx_reduce and pending-op
+ * application. This reader only renders lightweight hints; it never mutates.
  */
 /**
- * Tools whose output is task / plan STATE, never appropriate to surface as a
- * "you could drop this" hint regardless of size. `todowrite` is the agent's
- * working plan: the canonical todo state is the synthetic todowrite we inject
- * (and protect from dropping), so suggesting the agent drop a todowrite output
- * is both pointless and confusing. Name-excluded (not just floor-excluded)
- * because a todowrite output can be several hundred tokens, above the floor.
+ * Tool results that are useful to coordinate with but are poor suggestions for
+ * a context-reduction hint. This only filters guidance; the agent can still
+ * explicitly drop any of these tags.
  */
-const RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"] as const;
+const RECLAIM_HINT_EXCLUDED_TOOLS = new Set([
+    "ask",
+    "bash_kill",
+    "bash_status",
+    "board",
+    "task",
+    "todoread",
+    "todowrite",
+    "work",
+]);
 
 /**
  * A reclaim hint should point at MEANINGFULLY reclaimable output, not a
- * 30-token status line or a tiny control-plane call (ctx_reduce, bash_status,
- * check_comments…). Tags whose cached token total is known AND below this are
- * skipped. A tag with NO cached token count is NOT excluded by the floor (we
- * cannot size it, so we never hide a potentially-large output).
+ * 30-token status line or a tiny control-plane call. Tags whose cached token
+ * total is known AND below this are skipped. A tag with NO cached token count
+ * is NOT excluded by the floor (we cannot size it, so we never hide a
+ * potentially-large output).
  */
 export const AGE_RECLAIM_MIN_TOKENS = 250;
 
-// Constant-folded literal list (the names are compile-time constants, never
-// user input), so the prepared SQL text stays static across calls.
-const RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map(
-    (name) => `'${name.replace(/'/g, "''")}'`,
-).join(", ");
+function isReclaimHintExcludedTool(toolName: string | null): boolean {
+    if (!toolName) return false;
+    const normalized = toolName.toLowerCase().replace(/^mcp_/, "");
+    return normalized.startsWith("ctx_") || RECLAIM_HINT_EXCLUDED_TOOLS.has(normalized);
+}
 
 export function getOldestActiveUnprotectedToolTags(
     db: Database,
     sessionId: string,
-    protectedTags = 0,
+    protectedTagNumbers: ReadonlySet<number> = new Set(),
     limit = 4,
 ): ToolReclaimHintTag[] {
     if (limit <= 0) return [];
     const boundedLimit = Math.max(1, Math.min(10, Math.floor(limit)));
-    const whereProtected =
-        protectedTags > 0
-            ? `AND tag_number < (
-                    SELECT tag_number FROM tags
-                    WHERE session_id = ? AND status = 'active'
-                    ORDER BY tag_number DESC LIMIT 1 OFFSET ?
-                )`
-            : "";
-    // Drop task/plan-state tools (todowrite) and trivially-small outputs (below
-    // the token floor) from the hint, since they are not worth a drop suggestion.
     // Unsized tags (both token columns NULL) pass the floor clause so a
-    // not-yet-backfilled large output is never wrongly hidden.
-    const excludeStateTools = RECLAIM_HINT_EXCLUDED_LIST
-        ? `AND (tool_name IS NULL OR tool_name NOT IN (${RECLAIM_HINT_EXCLUDED_LIST}))`
-        : "";
+    // not-yet-backfilled large output is never wrongly hidden. Tier selection
+    // is applied after the SQL query so it reuses the emergency-drop classifier.
     const valueFloor = `AND (
             (token_count IS NULL AND input_token_count IS NULL)
             OR (COALESCE(token_count, 0) + COALESCE(input_token_count, 0)) >= ?
         )`;
-    const params =
-        protectedTags > 0
-            ? [sessionId, AGE_RECLAIM_MIN_TOKENS, sessionId, protectedTags - 1, boundedLimit]
-            : [sessionId, AGE_RECLAIM_MIN_TOKENS, boundedLimit];
+    const params = [sessionId, AGE_RECLAIM_MIN_TOKENS];
     const rows = db
         .prepare(
             `SELECT tag_number, tool_name
              FROM tags
-             WHERE session_id = ? AND status = 'active' AND type = 'tool'
-             ${excludeStateTools}
-             ${valueFloor}
-             ${whereProtected}
-             ORDER BY tag_number ASC, id ASC
-             LIMIT ?`,
+               WHERE session_id = ? AND status = 'active' AND type = 'tool'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pending_ops
+                        WHERE pending_ops.session_id = tags.session_id
+                          AND pending_ops.tag_id = tags.tag_number
+                          AND pending_ops.operation = 'drop'
+                    )
+                     ${valueFloor}
+              ORDER BY tag_number ASC, id ASC`,
         )
         .all(...params) as Array<{ tag_number?: unknown; tool_name?: unknown }>;
     return rows
-        .filter((row) => typeof row.tag_number === "number")
+        .filter(
+            (row): row is { tag_number: number; tool_name?: unknown } =>
+                typeof row.tag_number === "number",
+        )
         .map((row) => ({
-            tagNumber: row.tag_number as number,
+            tagNumber: row.tag_number,
             toolName: typeof row.tool_name === "string" ? row.tool_name : null,
-        }));
+        }))
+        .filter(
+            (tag) =>
+                !protectedTagNumbers.has(tag.tagNumber) && !isReclaimHintExcludedTool(tag.toolName),
+        )
+        .sort(
+            (left, right) =>
+                resolveToolTier(right.toolName) - resolveToolTier(left.toolName) ||
+                left.tagNumber - right.tagNumber,
+        )
+        .slice(0, boundedLimit);
 }
 
 const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedStatement>();
 
 /**
- * Return active tool tags with the same persisted token estimate used by reclaim hints.
+ * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
+ * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -309,7 +379,7 @@ export function getActiveToolTagsForAgeReclaim(
         token_count?: unknown;
         input_token_count?: unknown;
     }>;
-    return rows
+    const tags = rows
         .filter((row) => typeof row.tag_number === "number")
         .map((row) => {
             const outputTokens = typeof row.token_count === "number" ? row.token_count : null;
@@ -324,6 +394,8 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
+    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
 }
 
 /**
@@ -432,7 +504,7 @@ function getUpdateTagTokenCountStatement(db: Database): PreparedStatement {
     let stmt = updateTagTokenCountStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "UPDATE tags SET token_count = ? WHERE session_id = ? AND tag_number = ?",
+            "UPDATE tags SET token_count = MAX(COALESCE(token_count, 0), ?) WHERE session_id = ? AND tag_number = ?",
         );
         updateTagTokenCountStatements.set(db, stmt);
     }
@@ -619,9 +691,12 @@ export function backfillTagTokenCounts(
 ): void {
     db.prepare(
         `UPDATE tags
-            SET token_count = ?, input_token_count = ?, reasoning_token_count = ?
+            SET token_count = CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(token_count, 0), ?) ELSE token_count END,
+                input_token_count = ?,
+                reasoning_token_count = ?
             WHERE session_id = ? AND tag_number = ? AND token_count IS NULL`,
     ).run(
+        counts.tokenCount ?? null,
         counts.tokenCount ?? null,
         counts.inputTokenCount ?? null,
         counts.reasoningTokenCount ?? null,
@@ -633,7 +708,12 @@ export function backfillTagTokenCounts(
 function getUpdateTagMessageIdStatement(db: Database): PreparedStatement {
     let stmt = updateTagMessageIdStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare("UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ?");
+        stmt = db.prepare(
+            `UPDATE tags SET message_id = ?
+             WHERE session_id = ?
+               AND tag_number = ?
+               AND message_id NOT LIKE '${WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX}%'`,
+        );
         updateTagMessageIdStatements.set(db, stmt);
     }
     return stmt;
@@ -683,6 +763,28 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
+function getAssignableTagNumberByMessageIdStatement(db: Database): PreparedStatement {
+    let stmt = getAssignableTagNumberByMessageIdStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT tag_number FROM tags
+             WHERE session_id = ?
+               AND message_id = ?
+               AND NOT (
+                   status = 'compacted'
+                   AND COALESCE(
+                       entry_fingerprint LIKE '${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}%',
+                       0
+                   ) = 1
+               )
+             ORDER BY tag_number ASC
+             LIMIT 1`,
+        );
+        getAssignableTagNumberByMessageIdStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
 interface TagRow {
     id: number;
     message_id: string;
@@ -697,6 +799,7 @@ interface TagRow {
     tag_number: number;
     caveman_depth: number | null;
     tool_owner_message_id: string | null;
+    token_count?: number | null;
 }
 
 interface TagNumberRow {
@@ -727,6 +830,7 @@ function toTagEntry(row: TagRow): TagEntry {
     const status = row.status === "dropped" || row.status === "compacted" ? row.status : "active";
 
     return {
+        id: row.id,
         tagNumber: row.tag_number,
         messageId: row.message_id,
         type,
@@ -754,6 +858,7 @@ function toTagEntry(row: TagRow): TagEntry {
         // backfill populate this column at runtime; see plan v3.3.1.
         toolOwnerMessageId:
             typeof row.tool_owner_message_id === "string" ? row.tool_owner_message_id : null,
+        tokenCount: typeof row.token_count === "number" ? row.token_count : null,
     };
 }
 
@@ -825,6 +930,61 @@ export function updateTagStatus(
     status: TagEntry["status"],
 ): void {
     getUpdateTagStatusStatement(db).run(status, sessionId, tagId);
+}
+
+export interface InertWhitespaceAssistantTag {
+    tagNumber: number;
+    contentId: string;
+}
+
+/**
+ * Remove a legacy whitespace-only assistant tag from reclaim accounting while retaining
+ * enough identity to replay its pre-deploy prefix without occupying the live part id.
+ */
+export function markWhitespaceAssistantTagInert(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+    contentId: string,
+): void {
+    db.prepare(
+        `UPDATE tags
+         SET status = 'compacted',
+             message_id = ?,
+             entry_fingerprint = ?
+         WHERE session_id = ? AND tag_number = ? AND type = 'message'`,
+    ).run(
+        `${WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX}${tagNumber}`,
+        `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${contentId}`,
+        sessionId,
+        tagNumber,
+    );
+}
+
+/** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
+export function getInertWhitespaceAssistantTags(
+    db: Database,
+    sessionId: string,
+): InertWhitespaceAssistantTag[] {
+    const rows = db
+        .prepare(
+            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+             FROM tags
+             WHERE session_id = ?
+               AND type = 'message'
+               AND status = 'compacted'
+               AND entry_fingerprint LIKE ?`,
+        )
+        .all(sessionId, `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}%`) as Array<{
+        tagNumber: number;
+        entryFingerprint: string;
+    }>;
+    return rows.flatMap((row) => {
+        const contentId = row.entryFingerprint.slice(
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+        );
+        return contentId.length > 0 ? [{ tagNumber: row.tagNumber, contentId }] : [];
+    });
 }
 
 export function updateTagDropMode(
@@ -922,6 +1082,7 @@ export function adoptFallbackTagMessageId(
     oldFallbackMessageId: string,
     newRealMessageId: string,
 ): boolean {
+    if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) return false;
     const result = db
         .prepare(
             `UPDATE tags SET message_id = ?
@@ -1311,6 +1472,9 @@ export function adoptPiFallbackMessageTag(
     oldFallbackMessageId: string,
     newRealMessageId: string,
 ): PiFallbackTagAdoptionResult {
+    if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
+        return { action: "skipped" };
+    }
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
         survivor === null ||
@@ -1357,6 +1521,44 @@ export function adoptPiFallbackMessageTag(
         tagNumber: realSurvivor.tagNumber,
         deletedTagNumbers,
     };
+}
+
+/**
+ * Retire tags minted from rows removed by an in-memory compartment trim. The
+ * rows never reach the served tail, so leaving them active would leak into
+ * reclaim hints and hygiene accounting. Repeated calls are idempotent.
+ */
+export function markTagsCompactedByMessageIds(
+    db: Database,
+    sessionId: string,
+    messageIds: Iterable<string>,
+): number {
+    const update = db.prepare(
+        `UPDATE tags
+         SET status = 'compacted'
+         WHERE session_id = ?
+           AND status IN ('active', 'dropped')
+           AND (
+               message_id = ?
+               OR message_id LIKE ? ESCAPE '\\'
+               OR message_id LIKE ? ESCAPE '\\'
+               OR tool_owner_message_id = ?
+           )`,
+    );
+    return db.transaction(() => {
+        let changed = 0;
+        for (const messageId of new Set(messageIds)) {
+            const escaped = escapeLikePattern(messageId);
+            changed += update.run(
+                sessionId,
+                messageId,
+                `${escaped}:p%`,
+                `${escaped}:file%`,
+                messageId,
+            ).changes;
+        }
+        return changed;
+    })();
 }
 
 /**
@@ -1459,6 +1661,16 @@ export function getTagNumberByMessageId(
     messageId: string,
 ): number | null {
     const row = getTagNumberByMessageIdStatement(db).get(sessionId, messageId);
+    return isTagNumberRow(row) ? row.tag_number : null;
+}
+
+/** Look up a live tag assignment without reviving a retired whitespace framing row. */
+export function getAssignableTagNumberByMessageId(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): number | null {
+    const row = getAssignableTagNumberByMessageIdStatement(db).get(sessionId, messageId);
     return isTagNumberRow(row) ? row.tag_number : null;
 }
 
@@ -1573,8 +1785,8 @@ export function deriveTagLoadFloor(
 // migration v10's tool_owner_message_id) — every TagEntry-producing
 // reader must include the new column or downstream callers will see
 // undefined where they expect a typed field.
-const TAG_SELECT_COLUMNS =
-    "id, message_id, type, status, drop_mode, tool_name, input_byte_size, byte_size, reasoning_byte_size, session_id, tag_number, caveman_depth, tool_owner_message_id";
+export const TAG_SELECT_COLUMNS =
+    "id, message_id, type, status, drop_mode, tool_name, input_byte_size, byte_size, reasoning_byte_size, session_id, tag_number, caveman_depth, tool_owner_message_id, token_count";
 
 export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = db
@@ -1607,6 +1819,7 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
 // apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
+const getNullOwnerToolTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getDroppedTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxDroppedTagNumberStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -1662,11 +1875,56 @@ export function getActiveTagsBySession(db: Database, sessionId: string): TagEntr
 }
 
 /**
+ * Attribution rows for final rendered-tail accounting. Active, non-protected
+ * rows identify reclaimable token mass (U). Legacy tool rows with no owner are
+ * included regardless of status so duplicate call IDs remain visible and the
+ * orphan resolver can reject ambiguous matches.
+ */
+export function getTailHygieneTags(db: Database, sessionId: string): TagEntry[] {
+    const active = getActiveTagsBySession(db, sessionId);
+    let orphanStatement = getNullOwnerToolTagsBySessionStatements.get(db);
+    if (!orphanStatement) {
+        orphanStatement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags
+             WHERE session_id = ? AND type = 'tool' AND tool_owner_message_id IS NULL
+             ORDER BY tag_number ASC, id ASC`,
+        );
+        getNullOwnerToolTagsBySessionStatements.set(db, orphanStatement);
+    }
+    const seen = new Set(active.map((tag) => `${tag.tagNumber}\0${tag.messageId}\0${tag.type}`));
+    for (const row of orphanStatement.all(sessionId).filter(isTagRow)) {
+        const orphan = toTagEntry(row);
+        const key = `${orphan.tagNumber}\0${orphan.messageId}\0${orphan.type}`;
+        if (!seen.has(key)) active.push(orphan);
+    }
+    return active;
+}
+
+/**
  * Return only dropped tags for a session. The partial dropped-tag index avoids
  * loading active and compacted history when a force seed only needs drop state.
  */
-export function getDroppedTagsBySession(db: Database, sessionId: string): TagEntry[] {
-    const rows = getDroppedTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
+export function getDroppedTagsBySession(
+    db: Database,
+    sessionId: string,
+    scope?: { ownerIds: readonly string[]; messageAddresses: readonly string[] },
+): TagEntry[] {
+    // Filter before hydrating tag rows: a long folded history can dwarf the servable tail.
+    const rows = (
+        scope
+            ? db
+                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags
+        WHERE session_id = ? AND status = 'dropped'
+          AND ((type = 'tool' AND tool_owner_message_id IN (SELECT value FROM json_each(?)))
+            OR (type != 'tool' AND message_id IN (SELECT value FROM json_each(?))))
+        ORDER BY tag_number ASC, id ASC`)
+                  .all(
+                      sessionId,
+                      JSON.stringify(scope.ownerIds),
+                      JSON.stringify(scope.messageAddresses),
+                  )
+            : getDroppedTagsBySessionStatement(db).all(sessionId)
+    ).filter(isTagRow);
     return rows.map(toTagEntry);
 }
 
@@ -1689,7 +1947,7 @@ export function getTagsForPendingOperations(
     db: Database,
     sessionId: string,
     pendingTagNumbers: readonly number[],
-    protectedTags: number,
+    protectedCount: number,
     recentToolWindow: number,
 ): TagEntry[] {
     const byNumber = new Map<number, TagEntry>();
@@ -1708,7 +1966,7 @@ export function getTagsForPendingOperations(
         `SELECT ${TAG_SELECT_COLUMNS} FROM tags
          WHERE session_id = ? AND status = 'active'
          ORDER BY tag_number DESC, id DESC LIMIT ?`,
-        protectedTags,
+        protectedCount,
     );
     addRows(
         `SELECT ${TAG_SELECT_COLUMNS} FROM tags

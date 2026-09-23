@@ -1,19 +1,28 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import {
     appendCompartments,
     replaceAllCompartmentState,
 } from "../../features/magic-context/compartment-storage";
+import { archiveExpiredMemories } from "../../features/magic-context/dreamer/expire-memories";
+import { acquireLeaseWithAcquisition } from "../../features/magic-context/dreamer/lease";
+import { leaseKeyFor } from "../../features/magic-context/dreamer/task-registry";
 import {
+    archiveMemory,
     getMemoriesByProject,
     insertMemory,
     setMemoryClassification,
+    supersededMemory,
+    updateMemoryContent,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { __projectDocsHashTest } from "../../features/magic-context/project-docs-hash";
 import { unifiedSearch } from "../../features/magic-context/search";
 import {
     bumpSessionFactsVersion,
@@ -23,6 +32,7 @@ import {
     setProjectState,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -69,6 +79,21 @@ function makeProjectDir(): string {
     const dir = mkdtempSync(join(tmpdir(), "mc-renderer-test-"));
     tempDirs.push(dir);
     return dir;
+}
+
+function createUserMemoryTable(): void {
+    db.exec(`
+        CREATE TABLE user_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            promoted_at INTEGER NOT NULL,
+            source_candidate_ids TEXT DEFAULT '[]',
+            source_candidate_provenance TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    `);
 }
 
 function createOpenCodeMessageTimes(rows: Array<{ id: string; timestamp: number }>): void {
@@ -319,6 +344,41 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         expect(firstPart.text).toContain("</session-history>");
         expect(firstPart.text).toContain("test directive");
         expect(firstPart.text).toContain("original");
+    });
+});
+
+describe("prepareCompartmentInjection — cross-database cache isolation", () => {
+    it("does not replay a block rendered from a different database", () => {
+        // The injection cache is process-global and keyed by session id alone,
+        // while the value it holds is rendered FROM a database. Two independent
+        // stores that share a session id must not see each other's blocks.
+        const first = makeDb();
+        try {
+            insertMemory(first, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "MEMORY-ONLY-IN-FIRST-DATABASE",
+            });
+            const populated = prepareCompartmentInjection(
+                first,
+                SESSION_ID,
+                [userMessage("m1", "hi")],
+                true,
+                PROJECT_PATH,
+            );
+            expect(populated?.block).toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
+        } finally {
+            closeQuietly(first);
+        }
+
+        // Second store: same session id, no memories, and a DEFER pass — the
+        // path that replays the cached injection.
+        db = makeDb();
+        const messages: MessageLike[] = [userMessage("m1", "hi")];
+        const replayed = prepareCompartmentInjection(db, SESSION_ID, messages, false, PROJECT_PATH);
+
+        expect(replayed?.block ?? "").not.toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
+        expect(replayed).toBeNull();
     });
 });
 
@@ -1426,12 +1486,20 @@ describe("m[0]/m[1] materialization", () => {
         expect(renderedText(second[0])).not.toContain("FLAG_OFF_STRUCTURE_DOCS");
     });
 
-    it("folds current project docs on the next natural HARD materialization", () => {
+    it("keeps SOFT bytes stable across a docs edit and adopts it on the next HARD fold", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         writeFileSync(join(projectDirectory, "ARCHITECTURE.md"), "# Old architecture\n");
         const state = readStateFromMeta();
-        const first = [userMessage("m1", "hello")];
+        __projectDocsHashTest.reset();
+        const stableSignals = {
+            systemHash: "sys-v1",
+            modelKey: "model-v1",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const input = [userMessage("m1", "identical input")];
+        const first = structuredClone(input) as MessageLike[];
         injectM0M1({
             db,
             sessionId: SESSION_ID,
@@ -1439,56 +1507,60 @@ describe("m[0]/m[1] materialization", () => {
             state,
             projectPath: PROJECT_PATH,
             projectDirectory,
-            hardSignals: {
-                systemHash: "sys-v1",
-                modelKey: "model-v1",
-                cacheExpired: false,
-                lastResponseTime: 0,
-            },
+            hardSignals: stableSignals,
         });
         expect(renderedText(first[0])).toContain("Old architecture");
-        expect(
-            mustMaterialize({
-                db,
-                sessionId: SESSION_ID,
-                state,
-                projectPath: PROJECT_PATH,
-                projectDirectory,
-                injectDocs: false,
-                hardSignals: {
-                    systemHash: "sys-v1",
-                    modelKey: "model-v1",
-                    cacheExpired: false,
-                    lastResponseTime: 0,
-                },
-            }),
-        ).toEqual({ value: false, reason: null });
+        expect(__projectDocsHashTest.readCount()).toBe(1);
 
+        const softBeforeEdit = structuredClone(input) as MessageLike[];
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: softBeforeEdit,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: stableSignals,
+        });
         writeFileSync(
             join(projectDirectory, "ARCHITECTURE.md"),
             "# Updated architecture\nFresh docs folded on hard bust.\n",
         );
-        const second = [userMessage("m2", "hello again")];
-        const result = injectM0M1({
+        const softAfterEdit = structuredClone(input) as MessageLike[];
+        const softResult = injectM0M1({
             db,
             sessionId: SESSION_ID,
-            messages: second,
+            messages: softAfterEdit,
             state,
             projectPath: PROJECT_PATH,
             projectDirectory,
-            hardSignals: {
-                systemHash: "sys-v2",
-                modelKey: "model-v1",
-                cacheExpired: false,
-                lastResponseTime: 0,
-            },
+            hardSignals: stableSignals,
+        });
+        const digest = (messages: MessageLike[]) =>
+            createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+        expect(softResult.m0RematerializedThisPass).toBe(false);
+        expect(digest(softAfterEdit)).toBe(digest(softBeforeEdit));
+        expect(renderedText(softAfterEdit[0])).toContain("Old architecture");
+        expect(__projectDocsHashTest.readCount()).toBe(1);
+
+        const hard = structuredClone(input) as MessageLike[];
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: hard,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: { ...stableSignals, systemHash: "sys-v2" },
         });
 
         expect(result.m0RematerializedThisPass).toBe(true);
         expect(result.decision.reason).toBe("system_hash");
-        expect(renderedText(second[0])).toContain("Updated architecture");
-        expect(renderedText(second[0])).toContain("Fresh docs folded on hard bust.");
-        expect(renderedText(second[0])).not.toContain("Old architecture");
+        expect(renderedText(hard[0])).toContain("Updated architecture");
+        expect(renderedText(hard[0])).toContain("Fresh docs folded on hard bust.");
+        expect(renderedText(hard[0])).not.toContain("Old architecture");
+        expect(digest(hard)).not.toBe(digest(softAfterEdit));
+        expect(__projectDocsHashTest.readCount()).toBe(2);
     });
 
     it("classify writes stay cache-neutral until the next natural HARD materialization", () => {
@@ -1953,21 +2025,20 @@ describe("m[0]/m[1] materialization", () => {
         ).toBe(false);
     });
 
-    it("injectM0M1 does NOT render <project-memory> when projectPath is undefined (memory.enabled=false config bypass guard)", () => {
-        // Regression: when memory.enabled=false the caller passes projectPath
-        // undefined (projectIdentity is deliberately undefined). materializeM0
-        // renders <project-memory> purely on projectPath presence, so the old
-        // `projectIdentity ?? deps.projectPath` fallback re-supplied the launch
-        // path and injected project memories despite the config being OFF. With
-        // the fallback removed, projectPath stays undefined and no memory renders.
+    it("suppresses every memory-derived surface when memory.enabled=false", () => {
+        // Regression: the caller deliberately omits projectPath when memory is
+        // disabled, but user-profile and mural rendering used separate ungated
+        // reads. Cover the baseline, delta, and multipart mural together.
         db = makeDb();
         const projectDirectory = makeProjectDir();
-        // Seed memories that WOULD render if the path leaked through.
+        createUserMemoryTable();
         insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
-            content: "Should NOT appear when memory disabled",
+            content: "project memory must not leak when disabled",
         });
+        insertUserMemory(db, "profile baseline must not leak", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
         const state = readStateFromMeta();
         const messages = [userMessage("m1", "hello")];
 
@@ -1978,12 +2049,137 @@ describe("m[0]/m[1] materialization", () => {
             state,
             projectPath: undefined,
             projectDirectory,
+            memoryEnabled: false,
+            mural: {
+                enabled: true,
+                supportsVision: true,
+                dataUrl: "data:image/png;base64,cHJvZmlsZS1tdXJhbA==",
+            },
         });
 
         expect(result.injected).toBe(true);
         const m0 = renderedText(messages[0]);
         expect(m0).not.toContain("<project-memory>");
-        expect(m0).not.toContain("Should NOT appear when memory disabled");
+        expect(m0).not.toContain("project memory must not leak when disabled");
+        expect(m0).not.toContain("<user-profile>");
+        expect(m0).not.toContain("profile baseline must not leak");
+        expect(m0).not.toContain("<memory-mural>");
+        expect(messages[0].parts).toHaveLength(1);
+
+        // A cache-busting m[1] refresh sees a newer profile version but must not
+        // turn it into a <new-user-profile> delta while memory remains disabled.
+        insertUserMemory(db, "profile delta must not leak", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
+        const refreshed = [userMessage("m2", "again")];
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: refreshed,
+            state,
+            projectPath: undefined,
+            projectDirectory,
+            memoryEnabled: false,
+            isCacheBustingPass: true,
+        });
+        const m1 = renderedText(refreshed[1]);
+        expect(m1).not.toContain("<new-user-profile>");
+        expect(m1).not.toContain("profile delta must not leak");
+    });
+
+    it("uses an immediate render-config HARD path for a memory-on to memory-off transition", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        createUserMemoryTable();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "transition project fact",
+        });
+        insertUserMemory(db, "transition profile fact", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const state = readStateFromMeta();
+
+        const on = [userMessage("m1", "before")];
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: on,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            memoryEnabled: true,
+            hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
+        });
+        expect(renderedText(on[0])).toContain("transition profile fact");
+
+        const off = [userMessage("m2", "after")];
+        const transition = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: off,
+            state,
+            projectPath: undefined,
+            projectDirectory,
+            memoryEnabled: false,
+            // The system hook publishes its changed hash after message transform.
+            // Keep the old hash here to prove the memory gate itself prevents a
+            // one-request replay of the memory-bearing cache.
+            hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
+        });
+        expect(transition.decision.reason).toBe("render_config");
+        expect(transition.m0RematerializedThisPass).toBe(true);
+        expect(renderedText(off[0])).not.toContain("transition profile fact");
+        const suppressedBytes = transition.m0Bytes?.toString("utf8");
+
+        // When injection is deferred, replay the frozen suppressed m[0] unchanged instead of rendering it again.
+        const defer = [userMessage("m3", "still off")];
+        const replay = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: defer,
+            state,
+            projectPath: undefined,
+            projectDirectory,
+            memoryEnabled: false,
+            hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
+        });
+        expect(replay.m0RematerializedThisPass).toBe(false);
+        expect(replay.m0Bytes?.toString("utf8")).toBe(suppressedBytes);
+        expect(renderedText(defer[0])).not.toContain("transition profile fact");
+    });
+
+    it("keeps the memory-on m[0]/m[1] shape byte-identical", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        createUserMemoryTable();
+        insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "memory-on project fact",
+        });
+        insertUserMemory(db, "memory-on profile fact", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+
+        const defaultRender = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        const explicitlyEnabledRender = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            memoryEnabled: true,
+        });
+
+        expect(explicitlyEnabledRender.m0Text).toBe(defaultRender.m0Text);
+        expect(explicitlyEnabledRender.m1Text).toBe(defaultRender.m1Text);
+        expect(defaultRender.m0Text).toContain("memory-on profile fact");
+        expect(defaultRender.m0Text).toContain("memory-on project fact");
     });
 
     it("injectM0M1 still injects history when materialization contention exhausts with NO cached baseline (no throw, no empty history)", () => {
@@ -2315,6 +2511,106 @@ describe("m[0]/m[1] materialization", () => {
         expect(result.m0RematerializedThisPass).toBe(false);
         expect(renderedText(second[0])).toBe(firstM0);
         expect(result.m1Text).toContain("no new content since last materialization");
+    });
+
+    it("keeps expiry-transition defer bytes pinned until the next cache-busting delta", async () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        replaceAllCompartmentState(
+            db,
+            SESSION_ID,
+            [
+                {
+                    sequence: 1,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "m0",
+                    endMessageId: "m0",
+                    title: "large baseline",
+                    content: "baseline ".repeat(300),
+                },
+            ],
+            [],
+        );
+        const expiresAt = Date.now() + 60_000;
+        const expiring = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "KNOWN_ISSUES",
+            content: "A TTL memory remains frozen in the cached baseline. ".repeat(100),
+            expiresAt,
+        });
+        const state = readStateFromMeta();
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m1", "initial")],
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: true,
+        });
+
+        const firstDefer = [userMessage("m2", "defer before expiry transition")];
+        const before = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: firstDefer,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: false,
+        });
+        const holderId = "expiry-cache-proof";
+        const leaseKey = leaseKeyFor("curate", PROJECT_PATH);
+        const leaseAcquisition = acquireLeaseWithAcquisition(db, holderId, leaseKey);
+        expect(leaseAcquisition).not.toBeNull();
+        await archiveExpiredMemories({
+            db,
+            projectIdentity: PROJECT_PATH,
+            holderId,
+            leaseKey,
+            leaseAcquisition: leaseAcquisition!,
+            now: expiresAt + 1,
+        });
+
+        const secondDefer = [userMessage("m3", "defer after expiry transition")];
+        const after = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: secondDefer,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: false,
+        });
+        const pin = (result: { m0Bytes: Buffer | null; m1Text: string | null }): string =>
+            createHash("sha256")
+                .update(result.m0Bytes ?? Buffer.alloc(0))
+                .update("\0")
+                .update(result.m1Text ?? "")
+                .digest("hex");
+        const beforePin = pin(before);
+        const afterPin = pin(after);
+
+        expect(beforePin).toBe("4eaba563c2a26f33c8e4087f199a0e31620b6e3d7adc8981b5c2d88a12fe10d4");
+        expect(afterPin).toBe(beforePin);
+        expect(after.m0RematerializedThisPass).toBe(false);
+        expect(db.prepare("SELECT status FROM memories WHERE id = ?").get(expiring.id)).toEqual({
+            status: "archived",
+        });
+
+        const bust = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m4", "cache bust")],
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: true,
+        });
+        expect(bust.m0Bytes).toEqual(after.m0Bytes);
+        expect(bust.m1Text).toContain("<memory-updates>");
+        expect(bust.m1Text).toContain(`<removed id="${expiring.id}"/>`);
     });
 
     it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
@@ -2718,6 +3014,140 @@ describe("m[0]/m[1] materialization", () => {
         expect(revoke).not.toContain("foreign visibility memory below watermark");
     });
 
+    it("matches the module delta bytes across interleaved update, archive, and cross-watermark merge", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const initialMemories = [
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "original alpha",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "archive beta",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "merge source gamma",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "merge target delta",
+            }),
+        ];
+        expect(initialMemories.map((memory) => memory.id)).toEqual([1, 2, 3, 4]);
+        const [updated, archived, foldedSource, mergeTarget] = initialMemories;
+        const state = readStateFromMeta();
+        const hard = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(hard.snapshotMarkers.maxMemoryId).toBe(mergeTarget.id);
+        expect(hard.renderedMemoryIds).toEqual([1, 2, 3, 4]);
+
+        updateMemoryContent(db, updated.id, "updated <alpha> & stable", "updated-alpha");
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: updated.id,
+            category: "CONSTRAINTS",
+            newContent: "updated <alpha> & stable",
+            queuedAt: 10,
+        });
+        archiveMemory(db, archived.id);
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "archive",
+            targetMemoryId: archived.id,
+            queuedAt: 11,
+        });
+
+        const firstDefer = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        const fixture = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/memory-update-delta-parity.json",
+                ),
+                "utf8",
+            ),
+        ) as { first_delta: string; second_delta: string; reconciled_m0: string };
+        const block = (text: string, tag: string): string | undefined =>
+            text.match(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`))?.[0];
+        expect(block(firstDefer, "memory-updates")).toBe(fixture.first_delta);
+
+        const lateSource = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "late merge source epsilon",
+        });
+        expect(lateSource.id).toBeGreaterThan(hard.snapshotMarkers.maxMemoryId);
+        supersededMemory(db, foldedSource.id, mergeTarget.id);
+        supersededMemory(db, lateSource.id, mergeTarget.id);
+        updateMemoryContent(db, mergeTarget.id, "merged <delta> & sources", "merged-delta-sources");
+        for (const source of [foldedSource, lateSource]) {
+            queueMemoryMutation(db, {
+                projectPath: PROJECT_PATH,
+                mutationType: "superseded",
+                targetMemoryId: source.id,
+                supersededById: mergeTarget.id,
+                queuedAt: 20 + source.id,
+            });
+        }
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: mergeTarget.id,
+            category: "CONSTRAINTS",
+            newContent: "merged <delta> & sources",
+            queuedAt: 30,
+        });
+
+        const secondDefer = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        expect(block(secondDefer, "memory-updates")).toBe(fixture.second_delta);
+
+        const reconciled = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(block(reconciled.m0Text, "project-memory")).toBe(fixture.reconciled_m0);
+        expect(reconciled.m1Text).not.toContain("<memory-updates>");
+    });
+
     it("renders memory mutation removals on cache-busting pass and replays them on defer", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
@@ -2828,6 +3258,55 @@ describe("m[0]/m[1] materialization", () => {
 
         expect(renderedText(bust[1])).not.toContain("<memory-updates>");
         expect(renderedText(bust[1])).not.toContain("Updated but not resident.");
+    });
+
+    it("renders the recategorize category on <updated> in memory-updates", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const memory = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONFIG_VALUES",
+            content: "old category fact",
+        });
+        const state = readStateFromMeta();
+        const hard = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(hard.renderedMemoryIds).toEqual([memory.id]);
+
+        db.prepare(
+            "UPDATE memories SET content = ?, category = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+        ).run("new category fact", "CONSTRAINTS", "new-category-fact", Date.now(), memory.id);
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: memory.id,
+            category: "CONSTRAINTS",
+            newContent: "new category fact",
+            queuedAt: 10,
+        });
+
+        const m1 = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        const updates = m1.match(/<memory-updates>[\s\S]*?<\/memory-updates>/)?.[0];
+        expect(updates).toContain(
+            `<updated id="${memory.id}" category="CONSTRAINTS">new category fact</updated>`,
+        );
     });
 
     it("reconcile rematerialization advances the memory mutation cursor and omits memory-updates", () => {
@@ -2992,5 +3471,92 @@ describe("m[0]/m[1] materialization", () => {
         expect(renderedText(bust[0])).toBe(baselineM0);
         expect(result.m1Text).toContain("docs-hash-only CAS delta memory");
         expect(renderedText(bust[1])).toContain("docs-hash-only CAS delta memory");
+    });
+    it("records NULL for an unmaterialized tool-set baseline", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const baselineSignals = {
+            systemHash: "sys-tool-observation-null",
+            modelKey: "model-tool-observation-null",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const state = readStateFromMeta();
+
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: baselineSignals,
+        });
+
+        // Simulate a cached m[0] created before tool-set telemetry existed.
+        state.cachedM0ToolSetHash = null;
+        db.prepare(
+            "UPDATE session_meta SET cached_m0_tool_set_hash = NULL WHERE session_id = ?",
+        ).run(SESSION_ID);
+
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                hardSignals: { ...baselineSignals, toolSetHash: "tools-v2" },
+            }),
+        ).toEqual({
+            value: false,
+            reason: null,
+            m0ToolSetHashPrev: null,
+            m0ToolSetHashNew: "tools-v2",
+        });
+    });
+
+    it("persists observed tool-set hashes without turning tool changes into a fold trigger", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const baselineSignals = {
+            systemHash: "sys-tool-observation",
+            modelKey: "model-tool-observation",
+            toolSetHash: "tools-v1",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const state = readStateFromMeta();
+
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: baselineSignals,
+        });
+
+        expect(state.cachedM0ToolSetHash).toBe("tools-v1");
+        expect(
+            db
+                .prepare("SELECT cached_m0_tool_set_hash FROM session_meta WHERE session_id = ?")
+                .get(SESSION_ID),
+        ).toEqual({ cached_m0_tool_set_hash: "tools-v1" });
+
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                hardSignals: { ...baselineSignals, toolSetHash: "tools-v2" },
+            }),
+        ).toEqual({
+            value: false,
+            reason: null,
+            m0ToolSetHashPrev: "tools-v1",
+            m0ToolSetHashNew: "tools-v2",
+        });
     });
 });

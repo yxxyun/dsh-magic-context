@@ -61,6 +61,7 @@ export const MEASUREMENT_CORPUS_SESSION_ROW_CAP = 2000;
 export function recordEmbeddingMeasurement(
     db: Database,
     input: EmbeddingMeasurementInput,
+    cap = MEASUREMENT_CORPUS_SESSION_ROW_CAP,
 ): boolean {
     const queryTextHash = normalizedQueryHash(input.queryText);
     const dedupKey = queryTextHash;
@@ -108,7 +109,7 @@ export function recordEmbeddingMeasurement(
                 )
                 .get(input.sessionId) as { count: number }
         ).count;
-        const overflow = rowCount - MEASUREMENT_CORPUS_SESSION_ROW_CAP;
+        const overflow = rowCount - cap;
         if (overflow > 0) {
             db.prepare(
                 `DELETE FROM embedding_measurement_corpus
@@ -142,8 +143,11 @@ export interface SynapseBatchLedgerInput {
     requestKey: string;
 }
 
-export function beginSynapseBatchLedger(db: Database, input: SynapseBatchLedgerInput): void {
-    const now = Date.now();
+export function beginSynapseBatchLedger(
+    db: Database,
+    input: SynapseBatchLedgerInput,
+    now = Date.now(),
+): void {
     db.prepare(
         `INSERT INTO synapse_batch_ledger
             (session_id, project_path, scope, manifest_json, request_key, status, created_at, updated_at)
@@ -167,10 +171,11 @@ export function finishSynapseBatchLedger(
     sessionId: string,
     requestKey: string,
     status: "complete" | "partial" | "failed",
+    now = Date.now(),
 ): void {
     db.prepare(
         "UPDATE synapse_batch_ledger SET status = ?, updated_at = ? WHERE session_id = ? AND request_key = ?",
-    ).run(status, Date.now(), sessionId, requestKey);
+    ).run(status, now, sessionId, requestKey);
 }
 
 /** Retention for synapse_batch_ledger rows keyed by a project's synthetic

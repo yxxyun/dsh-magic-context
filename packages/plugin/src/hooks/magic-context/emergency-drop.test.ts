@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import {
     type EmergencyDropTag,
     planEmergencyDrop,
@@ -70,7 +71,7 @@ describe("resolveToolTier", () => {
 describe("planEmergencyDrop — guards", () => {
     const base = {
         maxTag: 10,
-        protectedTags: 0,
+        protectedCutoff: null,
         hasPriorDrop: false,
         priorInputSample: 0,
     };
@@ -122,7 +123,7 @@ describe("planEmergencyDrop — floorTags/tags split", () => {
             tags: toolTags,
             floorTags: [...toolTags, ...messageTags],
             maxTag: 200,
-            protectedTags: 0,
+            protectedCutoff: null,
             currentTotalInputTokens: 170_000,
             ceilingTokens: 130_000,
             priorInputSample: 0,
@@ -147,7 +148,7 @@ describe("planEmergencyDrop — floorTags/tags split", () => {
             tags: toolTags,
             floorTags: [...toolTags, ...messageTags],
             maxTag: 60,
-            protectedTags: 0,
+            protectedCutoff: null,
             currentTotalInputTokens: 300_000,
             ceilingTokens: 200_000,
             priorInputSample: 0,
@@ -168,7 +169,7 @@ describe("planEmergencyDrop — target math", () => {
         const plan = planWithFloor({
             tags,
             maxTag: 10,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 30_000,
@@ -185,7 +186,7 @@ describe("planEmergencyDrop — target math", () => {
         const plan = planWithFloor({
             tags,
             maxTag: 20,
-            protectedTags: 2,
+            protectedCutoff: 19,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 10_000,
@@ -199,14 +200,14 @@ describe("planEmergencyDrop — target math", () => {
         expect(plan.tagNumbers).not.toContain(20);
     });
 
-    it("is idempotent across consecutive ≥85% passes on the same usage sample (no over-drop)", () => {
+    it("latches the whole force-pressure episode across fresh usage samples", () => {
         // 20 T3 tags × 1000 bytes (≈250 tokens each). currentTotal 100k, ceiling
         // 60k. First pass drops down to target and latches the usage sample.
         const tags = Array.from({ length: 20 }, (_, i) => tag(i + 1, "bash", 1000));
         const first = planWithFloor({
             tags,
             maxTag: 20,
-            protectedTags: 0,
+            protectedCutoff: null,
             currentTotalInputTokens: 100_000,
             ceilingTokens: 60_000,
             hasPriorDrop: false,
@@ -219,27 +220,28 @@ describe("planEmergencyDrop — target math", () => {
         const second = planWithFloor({
             tags,
             maxTag: 20,
-            protectedTags: 0,
+            protectedCutoff: null,
             currentTotalInputTokens: 100_000, // unchanged — provider hasn't re-measured
             ceilingTokens: 60_000,
             hasPriorDrop: true,
             priorInputSample: 100_000, // latched from the first drop
         });
         expect(second.shouldDrop).toBe(false);
-        expect(second.reason).toContain("same-input-sample");
-        // A FRESH (lower) sample releases the latch so it can re-evaluate.
+        expect(second.reason).toContain("pressure-episode-latched");
+        // A fresh provider sample is still the same pressure LEVEL, not a new
+        // application edge. The caller explicitly rearms only after force-band
+        // exit or an independent provider-visible mutation.
         const third = planWithFloor({
             tags,
             maxTag: 20,
-            protectedTags: 0,
-            currentTotalInputTokens: 95_000, // new measured pressure
+            protectedCutoff: null,
+            currentTotalInputTokens: 95_000,
             ceilingTokens: 60_000,
             hasPriorDrop: true,
             priorInputSample: 100_000,
         });
-        // Released (not the same-sample no-op); may or may not drop depending on
-        // remaining tail, but it is NOT short-circuited by the latch.
-        expect(third.reason).not.toContain("same-input-sample");
+        expect(third.shouldDrop).toBe(false);
+        expect(third.reason).toContain("pressure-episode-latched");
     });
 
     it("counts tool input + reasoning bytes in BOTH floor and reclaim (no under-evict)", () => {
@@ -252,7 +254,7 @@ describe("planEmergencyDrop — target math", () => {
         const plan = planWithFloor({
             tags: [big, small],
             maxTag: 2,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             // tail = (400+40000+8000 + 800) × 0.25 = 12300; floor = 20000-12300
@@ -274,6 +276,23 @@ describe("planEmergencyDrop — target math", () => {
 });
 
 describe("planEmergencyDrop — tier ordering", () => {
+    it("protects newest ctx_reduce exemplars in the emergency band instead of evicting them as T3", () => {
+        const tags = Array.from({ length: 5 }, (_, index) => tag(index + 1, "ctx_reduce", 4_000));
+        const plan = planWithFloor({
+            tags,
+            maxTag: 5,
+            protectedCutoff: null,
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 6_000,
+            ceilingTokens: 1_000,
+        });
+
+        expect(plan.shouldDrop).toBe(true);
+        expect(plan.tagNumbers).toEqual([1, 2]);
+        expect(CTX_REDUCE_KEEP).toBe(3);
+    });
+
     it("drops T3 before T2 before T1", () => {
         // Mix of tiers, all same size. reclaim forces dropping several.
         const tags = [
@@ -289,7 +308,7 @@ describe("planEmergencyDrop — tier ordering", () => {
         const plan = planWithFloor({
             tags,
             maxTag: 6,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 6_000,
@@ -307,7 +326,7 @@ describe("planEmergencyDrop — tier ordering", () => {
         const plan = planWithFloor({
             tags,
             maxTag: 10,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 20_000, // tail = 10×2000 = 20000
@@ -327,7 +346,7 @@ describe("planEmergencyDrop — tier ordering", () => {
         const plan = planWithFloor({
             tags,
             maxTag: 2,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 4_000,
@@ -355,9 +374,11 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
         const plan = planWithFloor({
             tags,
             maxTag: 10,
-            protectedTags: 0,
-            hasPriorDrop: true,
-            priorInputSample: 0, // fresh sample (0) ≠ current → latch released
+            protectedCutoff: null,
+            hasPriorDrop: false,
+            // The caller reset the episode latch to 0 because another mutation
+            // already priced this pass, so newly eligible tags may ride it.
+            priorInputSample: 0,
             currentTotalInputTokens: 10_000,
             ceilingTokens: 1_000,
         });
@@ -374,7 +395,7 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
         const plan = planWithFloor({
             tags,
             maxTag: 5,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: true,
             priorInputSample: 0,
             currentTotalInputTokens: 10_000,
@@ -394,12 +415,91 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
         const plan = planWithFloor({
             tags,
             maxTag: 3,
-            protectedTags: 0,
+            protectedCutoff: null,
             hasPriorDrop: false,
             priorInputSample: 0,
             currentTotalInputTokens: 3_000,
             ceilingTokens: 200,
         });
         expect(plan.tagNumbers).not.toContain(1);
+    });
+});
+
+describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#423 parity)", () => {
+    it("consumes exact tag-number cutoff directly in tag-number coordinate space", () => {
+        const tags = Array.from({ length: 10 }, (_, i) => tag(i + 1, "bash", 2000));
+        // Cutoff = 8 in tag-number coordinate space. Tags 8, 9, 10 are protected.
+        const plan = planWithFloor({
+            tags,
+            maxTag: 10,
+            protectedCutoff: 8,
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 10_000,
+            ceilingTokens: 2_000,
+            usagePercentage: 85,
+        });
+
+        expect(plan.shouldDrop).toBe(true);
+        expect(plan.tagNumbers).toContain(1);
+        expect(plan.tagNumbers).not.toContain(8);
+        expect(plan.tagNumbers).not.toContain(9);
+        expect(plan.tagNumbers).not.toContain(10);
+    });
+
+    it("branches on absent cutoff (null) applying no tag-number threshold (empty window)", () => {
+        const tags = [tag(1, "bash", 10_000), tag(2, "bash", 10_000)];
+        const plan = planWithFloor({
+            tags,
+            maxTag: 2,
+            protectedCutoff: null, // absent cutoff
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 20_000,
+            ceilingTokens: 10_000,
+            usagePercentage: 85,
+        });
+
+        expect(plan.shouldDrop).toBe(true);
+        expect(plan.tagNumbers).toContain(1);
+        expect(plan.tagNumbers).toContain(2);
+    });
+
+    it("yields the window at >=95% usage (#423 parity)", () => {
+        const tags = [tag(1, "bash", 10_000), tag(2, "bash", 10_000), tag(3, "bash", 10_000)];
+        // Cutoff 1 would normally protect tags 1, 2, 3
+        const plan = planWithFloor({
+            tags,
+            maxTag: 3,
+            protectedCutoff: 1,
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 20_000,
+            ceilingTokens: 10_000,
+            usagePercentage: 95, // absolute emergency >= 95% -> window yields
+        });
+
+        expect(plan.shouldDrop).toBe(true);
+        // Window yielded -> tags are dropped
+        expect(plan.tagNumbers.length).toBeGreaterThan(0);
+    });
+
+    it("at 94% a fully-protected candidate set degrades to noop('no-candidates') without consuming episode latch", () => {
+        const tags = [tag(10, "bash", 10_000), tag(11, "bash", 10_000)];
+        // Cutoff 10 protects all candidate tags
+        const plan = planWithFloor({
+            tags,
+            maxTag: 11,
+            protectedCutoff: 10,
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 20_000,
+            ceilingTokens: 10_000,
+            usagePercentage: 94, // 94% < 95% -> window does NOT yield
+        });
+
+        expect(plan.shouldDrop).toBe(false);
+        expect(plan.reason).toBe("no-candidates");
+        // Episode latch remains unconsumed (plan returned shouldDrop: false)
     });
 });

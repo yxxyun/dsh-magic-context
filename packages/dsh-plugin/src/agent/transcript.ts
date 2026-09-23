@@ -64,6 +64,7 @@ import {
   getPendingOps,
   getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
+import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import type {
@@ -1288,7 +1289,11 @@ function planReasoningReplay(
 export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): MutationPlan | null {
   const db = ctx.db;
   const sessionId = view.sessionId;
-  const protectedTags = Math.max(0, Math.floor(ctx.protectedTags ?? 0));
+  // v0.42.6 replaced the newest-N protected_tags count with an exact
+  // token-window membership set (+ cutoff) derived from the tag population.
+  const protectionWindow = getProtectionWindowForSession(db, sessionId);
+  const protectedTagNumbers = protectionWindow.protectedTagNumbers;
+  const protectedCutoff = protectionWindow.cutoff;
 
   const ops: MutationOp[] = [...planTemporalMarkers(view)];
 
@@ -1315,7 +1320,7 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
       sessionId,
       db,
       recordingTargets,
-      protectedTags,
+      protectedTagNumbers,
       preloadedTags,
       preloadedPendingOps,
     );
@@ -1338,7 +1343,8 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
           recordingTargets,
           messageTagNumbers,
           {
-            protectedTags,
+            protectedTagNumbers,
+            protectedCutoff,
             caveman: cleanupCfg.caveman,
           },
           preloadedTags,

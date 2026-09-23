@@ -1,11 +1,15 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
-import { getCompartments } from "../../features/magic-context/compartment-storage";
+import {
+    appendCompartments,
+    getCompartments,
+    getLastCompartmentEndMessage,
+} from "../../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
 import { runMigrations } from "../../features/magic-context/migrations";
@@ -14,6 +18,7 @@ import { reserveProtectedTailDrainTokens } from "../../features/magic-context/st
 import { getPrimerCandidatesForProject } from "../../features/magic-context/storage-primers";
 import { getUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import type { PluginContext } from "../../plugin/types";
+import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runCompartmentAgent } from "./compartment-runner";
@@ -125,6 +130,12 @@ function historianXml(): string {
 <facts><PROJECT_RULES>
 * Keep regression tests around wrapup promotion.
 </PROJECT_RULES></facts>
+<events>
+<causal_incident at_compartment="1">
+<summary>Wrapup promotion regression</summary>
+<disposition>fixed</disposition>
+</causal_incident>
+</events>
 <user_observations>
 * User prefers regression tests for wrapup behavior.
 </user_observations>
@@ -152,20 +163,26 @@ function twoCompartmentHistorianXml(): string {
 </output>`;
 }
 
-function client(output = historianXml()): PluginContext["client"] {
+function client(
+    output = historianXml(),
+    beforeHistorianCollect?: () => void,
+): PluginContext["client"] {
     return {
         session: {
             get: mock(async () => ({ data: { directory: "/tmp/wrapup-runner" } })),
             create: mock(async () => ({ data: { id: `child-${Math.random()}` } })),
             prompt: mock(async () => ({})),
-            messages: mock(async () => ({
-                data: [
-                    {
-                        info: { role: "assistant", time: { created: 1 } },
-                        parts: [{ type: "text", text: output }],
-                    },
-                ],
-            })),
+            messages: mock(async () => {
+                beforeHistorianCollect?.();
+                return {
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [{ type: "text", text: output }],
+                        },
+                    ],
+                };
+            }),
             delete: mock(async () => ({})),
         },
     } as unknown as PluginContext["client"];
@@ -199,12 +216,13 @@ async function runWithLease(args: {
     refreshBoundarySnapshot?: Parameters<typeof runCompartmentAgent>[0]["refreshBoundarySnapshot"];
     historianChunkTokens?: number;
     output?: string;
+    beforeHistorianCollect?: () => void;
 }) {
     const holderId = `holder-${Math.random()}`;
     expect(acquireCompartmentLease(args.db, args.sessionId, holderId)).not.toBeNull();
     try {
         await runCompartmentAgent({
-            client: client(args.output),
+            client: client(args.output, args.beforeHistorianCollect),
             db: args.db,
             sessionId: args.sessionId,
             historianChunkTokens: args.historianChunkTokens ?? 10_000,
@@ -219,6 +237,7 @@ async function runWithLease(args: {
             compartmentLeaseHolderId: holderId,
             forceKeepLastCompartment: args.forceKeepLastCompartment,
             forceDrainQuota: args.forceDrainQuota,
+            preserveInjectionCacheUntilConsumed: true,
             refreshBoundarySnapshot: args.refreshBoundarySnapshot,
         });
     } finally {
@@ -251,9 +270,85 @@ describe("runCompartmentAgent wrapup controls", () => {
                 } else {
                     expect(getMemoriesByProject(db, project).length).toBeGreaterThan(0);
                 }
+                const row = db
+                    .prepare(
+                        "SELECT facts_emitted, events_emitted, facts_by_category_json FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                    )
+                    .get(sessionId) as {
+                    facts_emitted: number;
+                    events_emitted: number;
+                    facts_by_category_json: string;
+                };
+                expect(row.facts_emitted).toBe(1);
+                expect(row.events_emitted).toBe(1);
+                expect(JSON.parse(row.facts_by_category_json)).toEqual(
+                    expect.objectContaining({
+                        facts_promoted: forceKeepLastCompartment ? 0 : 1,
+                        events_published: forceKeepLastCompartment ? 0 : 1,
+                    }),
+                );
             } finally {
                 closeQuietly(db);
             }
+        }
+    });
+
+    it("refuses to mint a compartment whose raw boundary disappeared during the historian run", async () => {
+        const db = createDb();
+        const sessionId = "ses-boundary-disappeared";
+        const messages = rawMessages(3);
+        const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        try {
+            await withProviderMessages(sessionId, messages, () =>
+                runWithLease({
+                    db,
+                    sessionId,
+                    snapshot: wrapupSnapshot(db, sessionId),
+                    forceKeepLastCompartment: true,
+                    forceDrainQuota: true,
+                    beforeHistorianCollect: () => {
+                        messages.splice(0, 1);
+                    },
+                }),
+            );
+
+            expect(getCompartments(db, sessionId)).toHaveLength(0);
+            expect(logSpy).toHaveBeenCalledWith(
+                sessionId,
+                expect.stringContaining(
+                    "historian publish refused: sequence=0 side=start missing_id=m-1",
+                ),
+            );
+        } finally {
+            logSpy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
+    it("logs why the final weak-lookahead window skips unanchored promotion", async () => {
+        const db = createDb();
+        const sessionId = "ses-force-final-log";
+        const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        try {
+            await withProvider(sessionId, 3, () =>
+                runWithLease({
+                    db,
+                    sessionId,
+                    snapshot: wrapupSnapshot(db, sessionId),
+                    forceKeepLastCompartment: true,
+                    forceDrainQuota: true,
+                }),
+            );
+
+            expect(logSpy).toHaveBeenCalledWith(
+                sessionId,
+                expect.stringContaining(
+                    "historian unanchored promotion skipped: reason=weak_lookahead_final_compartment",
+                ),
+            );
+        } finally {
+            logSpy.mockRestore();
+            closeQuietly(db);
         }
     });
 
@@ -401,4 +496,57 @@ describe("runCompartmentAgent wrapup controls", () => {
             closeQuietly(db);
         }
     });
+});
+
+it("persists progress past an ignored notice and reasoning-only head without consuming the protected tail", async () => {
+    const db = createDb();
+    const sessionId = "ses-filtered-noise-head";
+    const messages = rawMessages(4);
+    messages[1].parts = [
+        {
+            type: "text",
+            text: "⏳ Context at 114% — Magic Context is comparting history…",
+            ignored: true,
+        },
+    ];
+    messages[2].role = "assistant";
+    messages[2].parts = [{ type: "reasoning", text: "aborted thought" }];
+    appendCompartments(db, sessionId, [
+        {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 1,
+            startMessageId: "m-1",
+            endMessageId: "m-1",
+            title: "Prior",
+            content: "Prior content",
+            p1: "Prior content",
+        },
+    ]);
+    try {
+        await withProviderMessages(sessionId, messages, async () => {
+            expect(readSessionChunk(sessionId, 10_000, 2, 4).messageCount).toBe(0);
+            const snapshot = {
+                ...wrapupSnapshot(db, sessionId, 114),
+                offset: 2,
+                protectedTailStart: 4,
+                eligibleEndOrdinal: 4,
+                rawRangeFingerprint: "",
+            };
+            await runWithLease({ db, sessionId, snapshot, forceDrainQuota: true });
+            expect(getLastCompartmentEndMessage(db, sessionId)).toBe(3);
+            expect(getCompartments(db, sessionId)).toHaveLength(2);
+            expect(wrapupSnapshot(db, sessionId, 114).offset).toBe(4);
+            await runWithLease({
+                db,
+                sessionId,
+                snapshot: { ...snapshot, offset: 4 },
+                forceDrainQuota: true,
+            });
+            expect(getCompartments(db, sessionId)).toHaveLength(2);
+            expect(readSessionChunk(sessionId, 10_000, 4, 5).text).toContain("message 4");
+        });
+    } finally {
+        closeQuietly(db);
+    }
 });

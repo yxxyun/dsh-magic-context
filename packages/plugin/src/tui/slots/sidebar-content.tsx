@@ -105,6 +105,16 @@ function compactTokens(value: number): string {
     return String(value)
 }
 
+/**
+ * Sidebar form of the tail-hygiene reading: the reclaimable share and the
+ * two masses it is computed from, in the same compact token unit as the
+ * breakdown rows so the value fits beside its label at sidebar width. The
+ * long, unit-spelled form stays in the status dialog.
+ */
+function hygieneValue(status: { severity: number; u: number; t: number }): string {
+    return `${(status.severity * 100).toFixed(1)}% · ${compactTokens(status.u)}/${compactTokens(status.t)}`
+}
+
 function relativeTime(ms: number): string {
     const diff = Date.now() - ms
     if (diff < 60_000) return "just now"
@@ -239,7 +249,7 @@ const TokenBreakdown = (props: {
             key: "conv",
             tokens: s.conversationTokens,
             color: COLORS.conversation,
-            label: "Conversation",
+                label: "Conversation",
         })
 
         // Tool Calls = tool_use/tool_result/tool/tool-invocation parts in messages
@@ -787,16 +797,23 @@ const SidebarContent = (props: {
                                     <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
                                 </text>
                             )}
-                            {/* Right: absolute token usage vs the model's
-                                full context window (separate from the
-                                execute threshold so users still know how
-                                much headroom remains beyond compaction). */}
+                            {/* Right: absolute token usage against the usable
+                                scheduler window — the same denominator as the
+                                percentage and nudge/trigger scheduling. */}
                             <text fg={contextSummaryColor()}>
                                 {compactTokens(s()!.inputTokens)} / {compactTokens(s()!.contextLimit)}
                             </text>
                         </box>
                     )}
                     <TokenBreakdown theme={props.theme} snapshot={s()!} collapsed={collapsed()} />
+                    {s()!.tailHygiene !== undefined && (
+                        <StatRow
+                            theme={props.theme}
+                            label="Hygiene"
+                            value={hygieneValue(s()!.tailHygiene!)}
+                            warning={!s()!.tailHygiene!.evaluable}
+                        />
+                    )}
                 </box>
             )}
 

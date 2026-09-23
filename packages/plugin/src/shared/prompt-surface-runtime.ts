@@ -2,7 +2,6 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import {
-    type ConfigHarness,
     cortexKitUserConfigBasePath,
     resolveLegacyConfigSourcesForHarness,
 } from "../config/migrate-config-location";
@@ -13,6 +12,8 @@ import {
     CTX_REDUCE_LIGHT_DESCRIPTION,
     CTX_SEARCH_LIGHT_DESCRIPTION,
 } from "../tools/light-descriptions";
+import type { HarnessId } from "./harness";
+import { piModelRefToCanonical } from "./harness-provider-map";
 import { detectConfigFile } from "./jsonc-parser";
 import {
     type PromptSurfaceConfig,
@@ -79,6 +80,7 @@ export interface PromptSurfaceRegistrationSelection {
 export interface PromptSurfaceRuntime {
     resolveRegistration: (
         config: PromptSurfaceConfig | undefined,
+        modelKey?: string,
     ) => PromptSurfaceRegistrationSelection;
     resolveGuidance: (
         config: PromptSurfaceConfig | undefined,
@@ -87,7 +89,7 @@ export interface PromptSurfaceRuntime {
 }
 
 export interface CreatePromptSurfaceRuntimeOptions {
-    harness?: ConfigHarness;
+    harness?: HarnessId;
     directory?: string;
     /** Explicit test/integration seam; production derives the USER config directory. */
     userConfigDirectory?: string;
@@ -104,7 +106,11 @@ function resolveUserConfigDirectory(options: CreatePromptSurfaceRuntimeOptions):
     if (options.harness) {
         const legacy = resolveLegacyConfigSourcesForHarness(
             options.directory ?? process.cwd(),
-            options.harness,
+            options.harness === "omp"
+                ? "pi"
+                : options.harness === "opencode2"
+                  ? "opencode"
+                  : options.harness,
         ).user.find((source) => existsSync(source.path));
         if (legacy) return dirname(legacy.path);
     }
@@ -179,11 +185,12 @@ export function createPromptSurfaceRuntime(
     };
 
     return {
-        resolveRegistration(config) {
-            // OpenCode and Pi expose one immutable provider tool map per host
-            // registration. Model routes are intentionally ignored here: only the
-            // registration owner's default and user-tier overrides can choose text.
-            const { preset } = resolvePromptSurface(config, undefined);
+        resolveRegistration(config, modelKey) {
+            // OpenCode 1.x and Pi expose one immutable provider tool map per host
+            // registration, so callers omit modelKey and only the default preset
+            // can choose text. OpenCode 2 rewrites draft.tools per request and
+            // passes the draft model so the same resolver honors model routes.
+            const { preset } = resolvePromptSurface(config, modelKey);
 
             const overrides = config?.tool_descriptions ?? {};
             for (const [toolId, description] of Object.entries(overrides)) {
@@ -229,30 +236,48 @@ interface GuidanceEpoch {
     selection: PromptSurfaceGuidanceSelection;
 }
 
-/** Freeze preset selection and materialized override bytes for one model-key epoch. */
-export function createPromptSurfaceGuidanceEpochCache(runtime: PromptSurfaceRuntime): {
+export interface PromptSurfaceGuidanceEpochCache {
     resolve: (
         sessionId: string,
         config: PromptSurfaceConfig | undefined,
         modelKey: string | undefined,
     ) => PromptSurfaceGuidanceSelection;
     clear: (sessionId: string) => void;
-} {
-    const epochs = new Map<string, GuidanceEpoch>();
+}
 
-    return {
+const guidanceEpochCacheByRuntime = new WeakMap<
+    PromptSurfaceRuntime,
+    PromptSurfaceGuidanceEpochCache
+>();
+
+/**
+ * Freeze preset selection and materialized override bytes for one model-key epoch.
+ * Every hook using the same runtime also shares this cache, so a file edit cannot
+ * make the system hook and Rust adapter observe different bytes within one epoch.
+ */
+export function createPromptSurfaceGuidanceEpochCache(
+    runtime: PromptSurfaceRuntime,
+): PromptSurfaceGuidanceEpochCache {
+    const shared = guidanceEpochCacheByRuntime.get(runtime);
+    if (shared) return shared;
+
+    const epochs = new Map<string, GuidanceEpoch>();
+    const cache: PromptSurfaceGuidanceEpochCache = {
         resolve(sessionId, config, modelKey) {
+            const canonicalModelKey = modelKey ? piModelRefToCanonical(modelKey) : undefined;
             const cached = epochs.get(sessionId);
-            if (cached && cached.config === config && cached.modelKey === modelKey) {
+            if (cached && cached.config === config && cached.modelKey === canonicalModelKey) {
                 return cached.selection;
             }
 
-            const selection = runtime.resolveGuidance(config, modelKey);
-            epochs.set(sessionId, { config, modelKey, selection });
+            const selection = runtime.resolveGuidance(config, canonicalModelKey);
+            epochs.set(sessionId, { config, modelKey: canonicalModelKey, selection });
             return selection;
         },
         clear(sessionId) {
             epochs.delete(sessionId);
         },
     };
+    guidanceEpochCacheByRuntime.set(runtime, cache);
+    return cache;
 }

@@ -3,8 +3,12 @@ import { getSourceContents, saveSourceContent } from "../../features/magic-conte
 import {
     adoptNullOwnerToolTag,
     getCandidateToolOwners,
+    getInertWhitespaceAssistantTags,
     getNullOwnerToolTag,
+    getTagById,
+    getTagNumberByMessageId,
     getToolTagNumberByOwner,
+    markWhitespaceAssistantTagInert,
     pickNearestPriorOwner,
 } from "../../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/tagger";
@@ -229,6 +233,8 @@ export type TagTarget = {
     /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
      * targets only; absent on message/file targets. */
     canDrop?: () => boolean;
+    /** A full arc removal would strand or merge native reasoning, so keep a paired skeleton. */
+    requiresToolArcSkeleton?: boolean;
     /** Non-mutating read of the tool invocation's input object (e.g. to read
      * `ctx_note`'s action or an edit's filePath for supersession selection).
      * Tool targets only; null when no invocation part is present. */
@@ -372,6 +378,27 @@ export interface TagMessagesOptions {
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
 
+const COMMIT_LOOKBACK = 5;
+
+/**
+ * Detect commit announcements in the same recent assistant window used by tagging.
+ * Rust authority skips the host tag walk, so this pure scan lets both authorities
+ * drive the shared durable note-nudge trigger without mirror-writing tag state.
+ */
+export function hasRecentAssistantCommit(messages: readonly MessageLike[]): boolean {
+    const firstRecentIndex = Math.max(0, messages.length - COMMIT_LOOKBACK);
+    for (let messageIndex = firstRecentIndex; messageIndex < messages.length; messageIndex += 1) {
+        const message = messages[messageIndex];
+        if (message?.info.role !== "assistant") continue;
+        for (const part of message.parts) {
+            if (isTextPart(part) && textMentionsRecentCommit((part as { text: string }).text)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 export function tagMessages(
     sessionId: string,
     messages: MessageLike[],
@@ -405,6 +432,27 @@ export function tagMessages(
     // (the same `unknown` instance walked twice in the loop).
     const ownerByPartKey = new Map<unknown, { ownerMsgId: string; callId: string }>();
     const batch = new ToolMutationBatch(messages);
+    // Inert whitespace rows are replayed by (message, whitespace rank), not by
+    // session-wide number membership: after a part-id remap the ordinal fallback
+    // offers whichever inert row sits at the current ordinal, and two inert parts
+    // in one message would otherwise swap their `§N§` digits on the wire.
+    const inertWhitespaceTagNumbers = new Set<number>();
+    const inertWhitespaceTagsByMessage = new Map<
+        string,
+        Array<{ partIndex: number; tagNumber: number }>
+    >();
+    for (const tag of getInertWhitespaceAssistantTags(db, sessionId)) {
+        inertWhitespaceTagNumbers.add(tag.tagNumber);
+        tagger.bindTag(sessionId, tag.contentId, tag.tagNumber);
+        const scoped = /^(.*):p(\d+)$/.exec(tag.contentId);
+        if (!scoped) continue;
+        const list = inertWhitespaceTagsByMessage.get(scoped[1]) ?? [];
+        list.push({ partIndex: Number(scoped[2]), tagNumber: tag.tagNumber });
+        inertWhitespaceTagsByMessage.set(scoped[1], list);
+    }
+    for (const list of inertWhitespaceTagsByMessage.values()) {
+        list.sort((left, right) => left.partIndex - right.partIndex);
+    }
     const assignments = tagger.getAssignments(sessionId);
     const resolver = createExistingTagResolver(sessionId, tagger, db);
     const tGetSourceContents = performance.now();
@@ -417,8 +465,7 @@ export function tagMessages(
     let precedingThinkingParts: ThinkingLikePart[] = [];
     let lastReduceMessageIndex = -1;
     const RECENT_REDUCE_LOOKBACK = 10;
-    const COMMIT_LOOKBACK = 5;
-    let commitDetected = false;
+    const commitDetected = hasRecentAssistantCommit(messages);
 
     // Intentional: we deliberately do NOT wrap this walk in db.transaction(...).
     // Each tagger.assignTag() owns its own atomic SAVEPOINT (insert + counter
@@ -457,6 +504,7 @@ export function tagMessages(
         const messageHasTextPart = message.parts.some(isTextPart);
         let textOrdinal = 0;
         let fileOrdinal = 0;
+        let whitespaceRank = 0;
 
         for (let partIndex = 0; partIndex < message.parts.length; partIndex += 1) {
             const part = message.parts[partIndex];
@@ -597,10 +645,96 @@ export function tagMessages(
                 const textPart = part;
                 const thinkingParts = messageThinkingParts;
                 const contentId = `${messageId}:p${partIndex}`;
-                // Resolver pre-warms any tag-id-fallback bindings (e.g. when
-                // OpenCode re-assigns part IDs); the assigned tag below uses
-                // those bindings if the resolver populated them.
-                resolver.resolve(messageId, "message", contentId, textOrdinal);
+                const whitespaceOnlyAssistant =
+                    message.info.role === "assistant" &&
+                    stripTagPrefix(textPart.text).trim().length === 0;
+                // New whitespace-only assistant parts are provider framing, not reclaimable
+                // content. A pre-deploy row is different: replay its existing prefix forever
+                // so deployment never changes signed-adjacent bytes, but retire the row from
+                // active accounting because ctx_reduce cannot reclaim provider framing.
+                let existingTagId: number | undefined;
+                if (whitespaceOnlyAssistant) {
+                    const persistedWhitespaceTag = getTagNumberByMessageId(
+                        db,
+                        sessionId,
+                        contentId,
+                    );
+                    const rankedInertTag =
+                        inertWhitespaceTagsByMessage.get(messageId)?.[whitespaceRank];
+                    // Reuse a retired whitespace tag only at its original part index or
+                    // next to a thinking part, where whitespace is provider framing. A
+                    // blank added after a completed step must remain untagged instead of
+                    // inheriting an older prefix.
+                    const canReplayRankedTag =
+                        rankedInertTag?.partIndex === partIndex ||
+                        isThinkingPart(message.parts[partIndex - 1]) ||
+                        isThinkingPart(message.parts[partIndex + 1]);
+                    const inertForThisPart = canReplayRankedTag
+                        ? rankedInertTag?.tagNumber
+                        : undefined;
+                    whitespaceRank += 1;
+                    if (inertForThisPart !== undefined) {
+                        // Bind by rank, bypassing the ordinal fallback: after a remap the
+                        // fallback offers whichever row sits at the current text ordinal,
+                        // which is the wrong inert row whenever a real text part moved.
+                        tagger.bindTag(sessionId, contentId, inertForThisPart);
+                        existingTagId = inertForThisPart;
+                    } else {
+                        existingTagId = resolver.resolve(
+                            messageId,
+                            "message",
+                            contentId,
+                            textOrdinal,
+                            { accept: (tagNumber) => tagNumber === persistedWhitespaceTag },
+                        );
+                    }
+                    if (existingTagId === undefined) {
+                        const persisted = getTagNumberByMessageId(db, sessionId, contentId);
+                        if (
+                            persisted !== null &&
+                            !getSourceContents(db, sessionId, [persisted]).has(persisted)
+                        ) {
+                            tagger.bindTag(sessionId, contentId, persisted);
+                            existingTagId = persisted;
+                        }
+                    }
+                    if (existingTagId === undefined) {
+                        // Preserve text ordinals even when framing is not tagged. Otherwise an
+                        // old whitespace row can be rebound to a later real text part by the
+                        // part-id fallback on the next pass.
+                        textOrdinal += 1;
+                        continue;
+                    }
+                    const existingTag = getTagById(db, sessionId, existingTagId);
+                    if (existingTag?.type !== "message") {
+                        tagger.unbindTag(sessionId, contentId);
+                        textOrdinal += 1;
+                        continue;
+                    }
+                    if (existingTag.status === "active") {
+                        markWhitespaceAssistantTagInert(db, sessionId, existingTagId, contentId);
+                        inertWhitespaceTagNumbers.add(existingTagId);
+                    }
+                } else {
+                    // Resolver pre-warms any tag-id-fallback bindings (e.g. when OpenCode
+                    // re-assigns part IDs); the assigned tag below uses those bindings. Inert
+                    // whitespace rows are replay-only and must never migrate onto real text.
+                    const resolved = resolver.resolve(
+                        messageId,
+                        "message",
+                        contentId,
+                        textOrdinal,
+                        { accept: (tagNumber) => !inertWhitespaceTagNumbers.has(tagNumber) },
+                    );
+                    if (
+                        resolved === undefined &&
+                        inertWhitespaceTagNumbers.has(
+                            tagger.getTag(sessionId, contentId, "message") ?? -1,
+                        )
+                    ) {
+                        tagger.unbindTag(sessionId, contentId);
+                    }
+                }
                 const reasoningBytes = textOrdinal === 0 ? getReasoningByteSize(thinkingParts) : 0;
                 const reasoningTokens =
                     textOrdinal === 0 ? getReasoningTokenCount(thinkingParts) : 0;
@@ -804,23 +938,6 @@ export function tagMessages(
 
         if (message.info.role === "assistant" && !messageHasTextPart) {
             precedingThinkingParts = messageThinkingParts;
-        }
-
-        // Detect commit hashes in recent assistant text (last COMMIT_LOOKBACK messages)
-        if (
-            !commitDetected &&
-            message.info.role === "assistant" &&
-            messages.length - msgIndex <= COMMIT_LOOKBACK
-        ) {
-            for (const part of message.parts) {
-                if (isTextPart(part)) {
-                    const text = (part as { text: string }).text;
-                    if (textMentionsRecentCommit(text)) {
-                        commitDetected = true;
-                        break;
-                    }
-                }
-            }
         }
     }
 

@@ -10,6 +10,7 @@ import { getDirtyIndexFloor } from "./message-index";
 import {
     __resetMessageIndexAsyncForTests,
     clearSessionTracking,
+    getMessageIndexQueueHeapStats,
     isSessionReconciled,
     scheduleClearAndReindex,
     scheduleIncrementalIndex,
@@ -66,6 +67,16 @@ function pagedReader(
     });
 }
 
+async function waitForCondition(condition: () => boolean, ceilingMs = 10_000): Promise<void> {
+    const start = Date.now();
+    while (!condition()) {
+        if (Date.now() - start > ceilingMs) {
+            throw new Error("waitForCondition ceiling exceeded");
+        }
+        await wait(10);
+    }
+}
+
 function wait(ms = 0): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -108,6 +119,7 @@ describe("message-index-async", () => {
     let db: Database;
 
     beforeEach(() => {
+        setBootQuietPeriodForTests(null);
         __resetMessageIndexAsyncForTests();
         db = createTestDb();
     });
@@ -131,7 +143,11 @@ describe("message-index-async", () => {
             return messages;
         });
 
-        await wait(20);
+        // Poll for completion instead of a fixed wall-clock wait: the async
+        // reconciler's scheduling latency is unbounded under CI load, while the
+        // property under test (two schedules dedupe to ONE read) is load-independent
+        // once the work has actually run.
+        await waitForCondition(() => isSessionReconciled("ses-async"));
 
         expect(reads).toBe(1);
         expect(countRows(db, "ses-async")).toBe(1);
@@ -143,7 +159,10 @@ describe("message-index-async", () => {
         scheduleReconciliation(db, "ses-overlap", () => messages);
         scheduleIncrementalIndex(db, "ses-overlap", "m-1", () => messages[0] ?? null);
 
-        await wait(140);
+        await waitForCondition(() => countMessageRows(db, "ses-overlap", "m-1") >= 1);
+        // Settle briefly so a late double-insert would still be caught before the
+        // uniqueness assertion (the defect direction is MORE rows, not fewer).
+        await wait(40);
 
         expect(countMessageRows(db, "ses-overlap", "m-1")).toBe(1);
     });
@@ -201,7 +220,7 @@ describe("message-index-async", () => {
         const original = message("m-retry-edit", 1, "stale before retry", 1);
         const edited = message("m-retry-edit", 1, "fresh after retry", 2);
         scheduleReconciliation(db, "ses-retry-edit", () => [original]);
-        await wait(20);
+        await waitUntil(() => isSessionReconciled("ses-retry-edit"));
 
         const originalExec = db.exec.bind(db);
         let failCommit = true;
@@ -214,14 +233,16 @@ describe("message-index-async", () => {
         }) as typeof db.exec;
 
         scheduleIncrementalIndex(db, "ses-retry-edit", edited.id, edited);
-        await wait(140);
+        // The failed commit records a dirty floor asynchronously; wait for that
+        // transition instead of a fixed delay, which loses under CI load.
+        await waitUntil(() => getDirtyIndexFloor(db, "ses-retry-edit") === 1);
         expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBe(1);
         expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual(["m-retry-edit"]);
         expect(searchMessageIds(db, "ses-retry-edit", "fresh")).toEqual([]);
 
         (db as unknown as { exec: typeof db.exec }).exec = originalExec;
         scheduleReconciliation(db, "ses-retry-edit", () => [edited]);
-        await wait(20);
+        await waitUntil(() => getDirtyIndexFloor(db, "ses-retry-edit") === null);
 
         expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBeNull();
         expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual([]);
@@ -251,7 +272,7 @@ describe("message-index-async", () => {
             message("m-3", 3, "gamma later incremental succeeds"),
         ];
         scheduleReconciliation(db, "ses-hole", () => [fullHistory[0]!]);
-        await wait(20);
+        await waitUntil(() => isSessionReconciled("ses-hole"));
         expect(isSessionReconciled("ses-hole")).toBe(true);
 
         scheduleIncrementalIndex(db, "ses-hole", "m-2", () => fullHistory[1] ?? null);
@@ -277,18 +298,39 @@ describe("message-index-async", () => {
         const messages = Array.from({ length: 201 }, (_, index) =>
             message(`m-${index + 1}`, index + 1, `message ${index + 1}`),
         );
-        let timerRan = false;
+        // The product yields between pages with setImmediate, and a zero-delay timer
+        // armed during page 1 is not guaranteed to run before page 2 (immediates run
+        // ahead of timers whose 1ms has not elapsed). Record the page each callback
+        // observed at fire time and assert the timer ran before the LAST page: that is
+        // the yield property, and it does not depend on immediate-vs-timer ordering.
+        // An assertion inside the reader would abort reconciliation and surface as
+        // an unrelated timeout, so the check happens after the run.
+        let timerPage: number | null = null;
+        let observedBufferBytes = 0;
+        let observedBufferMessages = 0;
         let pageCount = 0;
         const reader = pagedReader(messages, () => {
             pageCount += 1;
-            if (pageCount === 1) setTimeout(() => (timerRan = true), 0);
-            if (pageCount === 2) expect(timerRan).toBe(true);
+            if (pageCount === 1) {
+                setTimeout(() => {
+                    timerPage = pageCount;
+                    const stats = getMessageIndexQueueHeapStats();
+                    observedBufferBytes = stats.activeBufferBytes;
+                    observedBufferMessages = stats.activeBufferMessages;
+                }, 0);
+            }
         });
 
         scheduleReconciliation(db, "ses-pages", reader);
         await waitUntil(() => isSessionReconciled("ses-pages"));
 
         expect(pageCount).toBe(3);
+        expect(timerPage).not.toBeNull();
+        expect(timerPage as number).toBeLessThan(3);
+        expect(observedBufferBytes).toBeGreaterThan(0);
+        expect(observedBufferMessages).toBeGreaterThan(0);
+        expect(observedBufferMessages).toBeLessThanOrEqual(100);
+        expect(getMessageIndexQueueHeapStats().activeBufferBytes).toBe(0);
         expect(countRows(db, "ses-pages")).toBe(201);
         expect(isSessionReconciled("ses-pages")).toBe(true);
     });
@@ -299,7 +341,7 @@ describe("message-index-async", () => {
             message("m-2", 2, "recovered after marker failure"),
         ];
         scheduleReconciliation(db, "ses-marker-failure", () => [history[0]!]);
-        await wait(20);
+        await waitUntil(() => isSessionReconciled("ses-marker-failure"));
         expect(isSessionReconciled("ses-marker-failure")).toBe(true);
 
         const originalPrepare = db.prepare.bind(db);
@@ -314,13 +356,15 @@ describe("message-index-async", () => {
         }) as typeof db.prepare;
 
         scheduleIncrementalIndex(db, "ses-marker-failure", "m-2", () => history[1] ?? null);
-        await wait(140);
+        // The failed marker write must clear the reconciled latch; poll for that
+        // transition instead of assuming the async write lands inside a fixed sleep.
+        await waitUntil(() => !isSessionReconciled("ses-marker-failure"));
         expect(isSessionReconciled("ses-marker-failure")).toBe(false);
         expect(countMessageRows(db, "ses-marker-failure", "m-2")).toBe(0);
 
         (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
         scheduleReconciliation(db, "ses-marker-failure", () => history);
-        await wait(20);
+        await waitUntil(() => countMessageRows(db, "ses-marker-failure", "m-2") === 1);
         expect(countMessageRows(db, "ses-marker-failure", "m-2")).toBe(1);
     });
 
@@ -372,9 +416,26 @@ describe("message-index-async", () => {
         scheduleClearAndReindex(db, sessionId, readSurviving);
         expect(isSessionReconciled(sessionId)).toBe(false);
 
-        await wait(80);
+        // Wait for the observable outcome, not a scheduling order. Both queued
+        // callbacks fire after the same boot-quiet deadline and may run in
+        // either order, and both interleaves are correct by design:
+        //   reconcile -> clear+rebuild: the clear invalidates the finished
+        //     reconciliation under the session lock and rebuilds (reads = 2);
+        //   clear+rebuild -> reconcile: the rebuild marks the session
+        //     reconciled and the stale reconciliation hits the idempotency
+        //     guard and skips (reads = 1).
+        // Pinning reads === 2 encoded the first order only, so the second
+        // (legal) interleave timed out with a perfectly correct index. The
+        // contract is the end state: the survivor row is indexed and the
+        // session is re-marked reconciled.
+        await waitUntil(
+            () =>
+                isSessionReconciled(sessionId) &&
+                countMessageRows(db, sessionId, "m-survivor") === 1,
+        );
 
-        expect(reads).toBe(2);
+        expect(reads).toBeGreaterThanOrEqual(1);
+        expect(reads).toBeLessThanOrEqual(2);
         expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);
         expect(isSessionReconciled(sessionId)).toBe(true);
     });
@@ -392,7 +453,7 @@ describe("message-index-async", () => {
 
     it("clearSessionTracking releases module state", async () => {
         scheduleReconciliation(db, "ses-track", () => [message("m-1", 1, "alpha")]);
-        await wait(20);
+        await waitUntil(() => isSessionReconciled("ses-track"));
         expect(isSessionReconciled("ses-track")).toBe(true);
 
         clearSessionTracking("ses-track");

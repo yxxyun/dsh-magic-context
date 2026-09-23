@@ -80,6 +80,34 @@ describe("prompt-surface runtime", () => {
         expect(changedModel.primaryOverride).toBe(second);
     });
 
+    it("shares one frozen guidance epoch between the system hook and Rust adapter", () => {
+        const directory = tempDir();
+        const path = join(directory, "guidance.md");
+        const first = "## Magic Context\n\nShared first epoch";
+        const second = "## Magic Context\n\nShared second epoch";
+        writeFileSync(path, first);
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: directory,
+            warn: () => undefined,
+        });
+        const systemEpochs = createPromptSurfaceGuidanceEpochCache(runtime);
+        const adapterEpochs = createPromptSurfaceGuidanceEpochCache(runtime);
+        const config = {
+            default: "full" as const,
+            guidance_override_path: "guidance.md",
+        };
+
+        const systemInitial = systemEpochs.resolve("session", config, "provider/model");
+        writeFileSync(path, second);
+        const adapterDeferred = adapterEpochs.resolve("session", config, "provider/model");
+        expect(adapterDeferred).toBe(systemInitial);
+        expect(adapterDeferred.primaryOverride).toBe(first);
+
+        adapterEpochs.clear("session");
+        const systemNextEpoch = systemEpochs.resolve("session", config, "provider/model");
+        expect(systemNextEpoch.primaryOverride).toBe(second);
+    });
+
     it("uses registration default, applies known overrides, and reports invalid IDs", () => {
         const warnings: string[] = [];
         const runtime = createPromptSurfaceRuntime({
@@ -117,6 +145,26 @@ describe("prompt-surface runtime", () => {
         expect(registration.descriptionFor("ctx_search", "Full search")).toBe("User light search");
         expect(registration.descriptionFor("ctx_reduce", "Full reduce")).toBe(
             LIGHT_TOOL_DESCRIPTIONS.ctx_reduce,
+        );
+    });
+
+    it("honors model routes for tool text when a model key is supplied", () => {
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: tempDir(),
+            warn: () => undefined,
+        });
+        const config = {
+            default: "full" as const,
+            models: { "provider/light": "light" as const },
+        };
+        const processScoped = runtime.resolveRegistration(config);
+        const perModel = runtime.resolveRegistration(config, "provider/light");
+
+        expect(processScoped.preset).toBe("full");
+        expect(processScoped.descriptionFor("ctx_search", "Full search")).toBe("Full search");
+        expect(perModel.preset).toBe("light");
+        expect(perModel.descriptionFor("ctx_search", "Full search")).toBe(
+            LIGHT_TOOL_DESCRIPTIONS.ctx_search,
         );
     });
 

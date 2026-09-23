@@ -6,6 +6,7 @@ import {
     isConsumerReconnectTransient,
     Priority,
     type RouteHandle,
+    type RouteOpenOptions,
     type RouteTarget,
     SocketClosedError,
     SocketTimeoutError,
@@ -16,6 +17,7 @@ import type {
     AuthorityDrainResponse,
     AuthorityStatus,
     ChangefeedPage,
+    ChangefeedRow,
 } from "../../features/magic-context/context-authority";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
@@ -24,9 +26,43 @@ import { isRecord } from "../../shared/record-type-guard";
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
+/**
+ * Longest connection-backoff remainder a pass will wait through instead of
+ * failing. The backoff latch escalates 1s → 2s → 4s → 8s → 16s → 30s, so this
+ * budget admits the short rungs that follow an ordinary module bounce (a
+ * restart typically re-arms within seconds) while the 16s/30s rungs of a
+ * durably-down daemon still fail fast. A turn lost to a one-second latch
+ * remainder is exactly the outage LKG/raw fallbacks cannot recover, because
+ * the module is usually back before the user can retry manually.
+ */
+const CONNECT_BACKOFF_WAIT_BUDGET_MS = 12_000;
+/** Spread concurrent waiters so they do not hit the daemon on one instant. */
+const CONNECT_BACKOFF_WAIT_JITTER_MS = 100;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
-const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
+export const TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS = 5_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 15_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS = 2;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS = 90_000;
+
+/**
+ * Cold execution includes full projection and native encoding after the final page lands.
+ * The hermetic 9.6k-message/8k-tool cold gate completes module-side in 8.0s at load 9 and
+ * 10.2s at load 18 after the cold-path fixes, and this box routinely runs at load 40+ during
+ * release gates. A 15s floor plus two milliseconds per message keeps ~3x margin over the
+ * measured cold time (30s for ENGRAM's 7.4k messages, 34s for ASTRO's 9.6k); a miss is no
+ * longer fatal because a completed series the requester abandoned is adopted by the next
+ * identical pass, but each miss still costs the user one refused turn.
+ */
+export function transformColdStartExecuteTimeoutMs(seedMessageCount: number): number {
+    const messages = Number.isSafeInteger(seedMessageCount) ? Math.max(0, seedMessageCount) : 0;
+    return Math.min(
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS,
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS +
+            messages * TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS,
+    );
+}
+
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
@@ -34,7 +70,8 @@ const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
-function getDefaultConnectionFile(): string {
+/** Platform connection file used when resolved configuration has no subc block. */
+export function getDefaultSubcConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -74,6 +111,16 @@ function isStaleOrDeadRouteFailure(error: unknown): boolean {
     });
 }
 
+function isDeadlineFailure(error: unknown): boolean {
+    if (error instanceof SocketTimeoutError) return true;
+    return errorChainSome(error, (current) => {
+        const code = typeof current.code === "string" ? current.code : "";
+        return ["ETIMEDOUT", "request_deadline", "deadline_exceeded_no_drop_observed"].includes(
+            code,
+        );
+    });
+}
+
 function isConnectionFailure(error: unknown): boolean {
     if (
         error instanceof SocketClosedError ||
@@ -101,6 +148,19 @@ function isConnectionFailure(error: unknown): boolean {
             ].includes(code) ||
             /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
         );
+    });
+}
+
+function routeOpenWithoutAmbientConsumerIdentity(
+    client: SubcClient,
+    target: RouteTarget,
+    identity: BindIdentity,
+    options: Omit<RouteOpenOptions, "consumerIdentity"> = {},
+): Promise<RouteHandle> {
+    return client.routeOpen(target, identity, {
+        ...options,
+        // Inherited SUBC_* credentials identify a daemon-supervised module, not this independent host.
+        consumerIdentity: null,
     });
 }
 
@@ -154,6 +214,15 @@ interface OpeningRoute {
     promise: Promise<EnsuredRoute>;
 }
 
+export interface ModuleCallTimings {
+    lane: number;
+    route: number;
+    encode: number;
+    issue: number;
+    responseWait: number;
+    settle: number;
+}
+
 export class SubcModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -182,11 +251,13 @@ export class SubcModuleTransport {
     private connectionGeneration = 0;
     private stateSyncCapabilityCache: {
         generation: number;
-        capabilities: { state_sync_deltas?: boolean };
+        capabilities: { state_sync_deltas?: boolean; state_sync_resume?: boolean };
     } | null = null;
 
     /** Returns the capability snapshot for the currently live SUBC connection. */
-    getCachedStateSyncCapabilities(): { state_sync_deltas?: boolean } | undefined {
+    getCachedStateSyncCapabilities():
+        | { state_sync_deltas?: boolean; state_sync_resume?: boolean }
+        | undefined {
         const cached = this.stateSyncCapabilityCache;
         if (!cached || cached.generation !== this.connectionGeneration) return undefined;
         return cached.capabilities;
@@ -200,7 +271,7 @@ export class SubcModuleTransport {
     async stateSyncCapabilities(args: {
         sessionId: string;
         projectRoot: string;
-    }): Promise<{ state_sync_deltas?: boolean }> {
+    }): Promise<{ state_sync_deltas?: boolean; state_sync_resume?: boolean }> {
         const cached = this.getCachedStateSyncCapabilities();
         if (cached) return cached;
         const response = await this.call({
@@ -212,18 +283,21 @@ export class SubcModuleTransport {
         const raw = isRecord(response) ? response : {};
         const value = isRecord(raw.result) ? raw.result : raw;
         const epochs = isRecord(value.epochs) ? value.epochs : {};
-        const capabilities = { state_sync_deltas: epochs.state_sync_deltas === true };
+        const capabilities = {
+            state_sync_deltas: epochs.state_sync_deltas === true,
+            ...(epochs.state_sync_resume === true ? { state_sync_resume: true } : {}),
+        };
         this.stateSyncCapabilityCache = { generation: this.connectionGeneration, capabilities };
         return capabilities;
     }
 
     constructor(
-        connectionFile?: string,
+        connectionFile: string,
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = MODULE_SEND_TIMEOUT_MS,
         routeSessionPrefix = "",
     ) {
-        this.connectionFile = connectionFile ?? getDefaultConnectionFile();
+        this.connectionFile = connectionFile;
         this.moduleId = moduleId;
         this.requestTimeoutMs = requestTimeoutMs;
         this.routeSessionPrefix = routeSessionPrefix;
@@ -252,6 +326,14 @@ export class SubcModuleTransport {
         deadlineMs: number,
         detail: string,
     ): Promise<T> {
+        // The race can abandon `operation` (deadline fires first, or the caller's
+        // catch invalidates the connection). A later rejection of the abandoned
+        // promise — close() failing every pending request with "client closed" —
+        // would then be UNHANDLED and Bun prints a crash-shaped stack to the
+        // host's stderr. Subscribe a no-op handler up front: the race still
+        // receives the original settlement, and a post-race rejection is
+        // delivered here instead of the process-level unhandled hook.
+        operation.catch(() => {});
         const remainingMs = deadlineMs - Date.now();
         if (remainingMs <= 0) throw this.deadlineError(detail);
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -400,6 +482,8 @@ export class SubcModuleTransport {
             | "authority.drain_flip"
             | "authority.drain_finish"
             | "mirror.pull"
+            | "mirror.memory"
+            | "memory.identity.ack"
             | "ctx_note"
             | "ctx_memory"
             | "note.evaluate"
@@ -408,21 +492,42 @@ export class SubcModuleTransport {
             | "dreamer.run_task"
             | "memory.set_classification";
         body: unknown;
+        /** Per-call durations; responseWait includes the client's opaque receive and decode. */
+        onTimings?: (timings: ModuleCallTimings) => void;
         signal?: AbortSignal;
         /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
         generationSensitive?: boolean;
         /** Producer-backed calls can outlive the default transport budget. */
         timeoutMs?: number;
+        /** Distinguishes cheap page admission from the cold execute on the completed series. */
+        attemptClass?: "transform_page_upload" | "transform_series_execute";
+        /**
+         * Bypass the per-session correctness lane only for a health probe or a
+         * content-addressed transform resend. The ordinary request keeps owning
+         * the lane while the probe determines whether the module is alive.
+         */
+        bypassSessionLane?: boolean;
     }): Promise<unknown> {
+        const callStartedAt = performance.now();
+        const timings: ModuleCallTimings = {
+            lane: 0,
+            route: 0,
+            encode: 0,
+            issue: 0,
+            responseWait: 0,
+            settle: 0,
+        };
         const wrapupInFlight = (this.wrapupSessions.get(args.sessionId) ?? 0) > 0;
         const attemptTimeoutMs =
             args.timeoutMs ??
             (args.method === "session.wrapup" ||
             (args.method === "session.status" && wrapupInFlight)
                 ? MAX_WRAPUP_REQUEST_BUDGET_MS
-                : args.method === "transform"
-                  ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
-                  : this.requestTimeoutMs);
+                : args.attemptClass === "transform_series_execute"
+                  ? TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS
+                  : args.method === "transform"
+                    ? Math.min(this.requestTimeoutMs, TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS)
+                    : this.requestTimeoutMs);
         const tracksWrapup = args.method === "session.wrapup";
         if (tracksWrapup) {
             this.wrapupSessions.set(
@@ -437,23 +542,48 @@ export class SubcModuleTransport {
             else this.wrapupSessions.delete(args.sessionId);
         };
         const laneDeadlineMs = Date.now() + attemptTimeoutMs;
-        let releaseLane: (() => void) | undefined;
+        let releaseLane: () => void = () => {};
         try {
-            releaseLane = await this.acquireCorrectnessLane(
-                args.sessionId,
-                args.signal,
-                laneDeadlineMs,
-            );
+            if (!args.bypassSessionLane) {
+                releaseLane = await this.acquireCorrectnessLane(
+                    args.sessionId,
+                    args.signal,
+                    laneDeadlineMs,
+                );
+            }
         } catch (error) {
             finishWrapupTracking();
+            if (args.method === "state_sync" && isDeadlineFailure(error)) {
+                const body = isRecord(args.body) ? args.body : {};
+                throw Object.assign(
+                    new Error(
+                        `state_sync timeout stage=correctness_lane page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                    ),
+                    {
+                        code: "state_sync_timeout",
+                        stage: "correctness_lane",
+                        page: body.seed_batch_index ?? 0,
+                        pages: body.seed_batch_total ?? 1,
+                        series: body.seed_id ?? null,
+                        cause: error,
+                    },
+                );
+            }
             throw error;
         }
-        let activeAttemptClient: SubcClient | null = null;
-        const onAbort = () => this.invalidateConnection(activeAttemptClient ?? this.client);
+        timings.lane = performance.now() - callStartedAt;
+        let rejectAbort!: (reason: unknown) => void;
+        const aborted = new Promise<never>((_resolve, reject) => {
+            rejectAbort = reject;
+        });
+        aborted.catch(() => {});
+        // Cancellation abandons only this request. The shared socket may still be serving
+        // other sessions, and the module may durably finish the abandoned operation.
+        const onAbort = () =>
+            rejectAbort(args.signal?.reason ?? new Error("module transport call aborted"));
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
-                activeAttemptClient = null;
                 let ensuredRoute: EnsuredRoute | null = null;
                 try {
                     if (args.signal?.aborted) {
@@ -462,24 +592,39 @@ export class SubcModuleTransport {
                     // Each attempt gets its own timeout, apart from the queue wait limit, so a dead
                     // socket can hit the deadline and still be replaced on one reconnect.
                     const attemptDeadlineMs = Date.now() + attemptTimeoutMs;
+                    const routeStartedAt = performance.now();
                     ensuredRoute = await this.ensureRoute(
                         args.sessionId,
                         args.projectRoot,
                         attemptDeadlineMs,
+                        args.signal,
                     );
-                    activeAttemptClient = ensuredRoute.client;
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
+                    timings.route += performance.now() - routeStartedAt;
+                    const encodeStartedAt = performance.now();
+                    // Pre-encoded JSON retains the JSON frame flag; binary denotes an opaque
+                    // request protocol, not a preference for how the reply is decoded.
+                    const body =
+                        args.body instanceof Uint8Array
+                            ? args.body
+                            : Buffer.from(JSON.stringify(args.body));
+                    timings.encode += performance.now() - encodeStartedAt;
+                    const issueStartedAt = performance.now();
+                    const request = ensuredRoute.client.request(ensuredRoute.route, body, {
+                        priority: Priority.Background,
+                        admissionClass: AdmissionClass.Normal,
+                        timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                    });
+                    timings.issue += performance.now() - issueStartedAt;
+                    const waitStartedAt = performance.now();
                     const response = await this.beforeDeadline(
-                        ensuredRoute.client.request(ensuredRoute.route, args.body, {
-                            priority: Priority.Background,
-                            admissionClass: AdmissionClass.Normal,
-                            timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
-                        }),
+                        Promise.race([request, aborted]),
                         attemptDeadlineMs,
                         "waiting for the module response",
                     );
+                    timings.responseWait += performance.now() - waitStartedAt;
                     if (
                         this.client !== ensuredRoute.client ||
                         this.connectionGeneration !== ensuredRoute.generation
@@ -490,6 +635,32 @@ export class SubcModuleTransport {
                     }
                     return response;
                 } catch (error) {
+                    if (args.signal?.aborted) throw args.signal.reason ?? error;
+                    if (args.method === "state_sync" && isDeadlineFailure(error)) {
+                        const body = isRecord(args.body) ? args.body : {};
+                        throw Object.assign(
+                            new Error(
+                                `state_sync timeout stage=module_ack page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                            ),
+                            {
+                                code: "state_sync_timeout",
+                                stage: "module_ack",
+                                page: body.seed_batch_index ?? 0,
+                                pages: body.seed_batch_total ?? 1,
+                                series: body.seed_id ?? null,
+                                cause: error,
+                            },
+                        );
+                    }
+                    if (
+                        args.attemptClass === "transform_series_execute" &&
+                        isDeadlineFailure(error)
+                    ) {
+                        // A request deadline on the completed page series fails this pass. The
+                        // module may still finish the cold execute, so preserve the live route and
+                        // never turn the timeout into a generation change/re-upload loop.
+                        throw error;
+                    }
                     if (isConnectionFailure(error)) {
                         const previousGeneration =
                             ensuredRoute?.generation ?? this.connectionGeneration;
@@ -518,6 +689,17 @@ export class SubcModuleTransport {
             args.signal?.removeEventListener("abort", onAbort);
             finishWrapupTracking();
             releaseLane();
+            timings.settle = Math.max(
+                0,
+                performance.now() -
+                    callStartedAt -
+                    timings.lane -
+                    timings.route -
+                    timings.encode -
+                    timings.issue -
+                    timings.responseWait,
+            );
+            args.onTimings?.(timings);
         }
     }
 
@@ -537,8 +719,11 @@ export class SubcModuleTransport {
             | "authority.drain_reconcile"
             | "authority.drain_verify"
             | "authority.drain_finish"
-            | "mirror.pull",
+            | "mirror.pull"
+            | "mirror.memory"
+            | "memory.identity.ack",
         body: Record<string, unknown>,
+        timeoutMs?: number,
     ): Promise<Record<string, unknown>> {
         // The transport serializes the body verbatim; the module dispatches on the
         // body's own method field, so it must always be present and canonical here.
@@ -547,6 +732,7 @@ export class SubcModuleTransport {
             projectRoot,
             method,
             body: { ...body, method, v: 1 },
+            timeoutMs,
         })) as unknown;
         if (isRecord(response) && isRecord(response.result)) return response.result;
         if (isRecord(response)) return response;
@@ -565,12 +751,15 @@ export class SubcModuleTransport {
         context_store_uuid: string;
         project: string;
         projectRoot?: string;
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }> {
         this.authorityProjectRoot = args.project;
-        const { projectRoot, ...body } = args;
+        const { projectRoot, sessionId, ...body } = args;
         const response = await this.authorityRequest(
-            args.project,
+            // A tool call already has a real session route. Reusing it avoids asking the
+            // daemon to resolve the project identity as though it were an OpenCode session.
+            sessionId ?? args.project,
             projectRoot ?? this.bindRootForAuthority(),
             "authority.status",
             body,
@@ -652,6 +841,40 @@ export class SubcModuleTransport {
         return { page: response.page as unknown as ChangefeedPage };
     }
 
+    async mirrorMemory(args: {
+        module_row_id: number;
+        projectRoot?: string;
+    }): Promise<{ row: ChangefeedRow | null }> {
+        const { projectRoot, ...body } = args;
+        const response = await this.authorityRequest(
+            `mirror-memory:${args.module_row_id}`,
+            projectRoot ?? this.bindRootForAuthority(),
+            "mirror.memory",
+            body,
+            1_900,
+        );
+        return {
+            row: isRecord(response.row) ? (response.row as unknown as ChangefeedRow) : null,
+        };
+    }
+
+    async memoryIdentityAck(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }> {
+        const { projectRoot, ...body } = args;
+        const response = await this.authorityRequest(
+            `memory-identity:${args.project}`,
+            projectRoot ?? this.bindRootForAuthority(),
+            "memory.identity.ack",
+            body,
+        );
+        return {
+            acknowledged: typeof response.acknowledged === "number" ? response.acknowledged : 0,
+        };
+    }
+
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {
         await this.call({
             sessionId,
@@ -684,6 +907,7 @@ export class SubcModuleTransport {
         sessionId: string,
         rawProjectRoot: string,
         deadlineMs = Date.now() + this.requestTimeoutMs,
+        signal?: AbortSignal,
     ): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
@@ -697,7 +921,7 @@ export class SubcModuleTransport {
         const routeKey = `${sessionId}\0${projectRoot}`;
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
-        const client = await this.ensureConnected();
+        const client = await this.ensureConnected(signal);
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
         if (existing?.generation === generation) {
@@ -717,7 +941,7 @@ export class SubcModuleTransport {
                 session: `${this.routeSessionPrefix}${sessionId}`,
             };
             const route = await this.beforeDeadline(
-                client.routeOpen(target, identity),
+                routeOpenWithoutAmbientConsumerIdentity(client, target, identity),
                 deadlineMs,
                 "opening the module route",
             );
@@ -778,18 +1002,60 @@ export class SubcModuleTransport {
         });
     }
 
-    private async ensureConnected(): Promise<SubcClient> {
+    private backoffActiveError(): Error & { code?: string } {
+        const error = new Error(
+            `subc connection backoff active until ${this.nextProbeMs}`,
+        ) as Error & {
+            code?: string;
+        };
+        error.code = "SUBC_CONNECTION_BACKOFF";
+        return error;
+    }
+
+    /** Sleep that ends early when the caller's pass is aborted. */
+    private sleepAbortable(durationMs: number, signal?: AbortSignal): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) {
+                reject(signal.reason ?? new Error("module transport call aborted"));
+                return;
+            }
+            const onAbort = (): void => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                reject(signal?.reason ?? new Error("module transport call aborted"));
+            };
+            const timer = setTimeout(
+                () => {
+                    signal?.removeEventListener("abort", onAbort);
+                    resolve();
+                },
+                Math.max(0, durationMs),
+            );
+            signal?.addEventListener("abort", onAbort, { once: true });
+        });
+    }
+
+    private async ensureConnected(signal?: AbortSignal): Promise<SubcClient> {
         if (this.client) return this.client;
         if (this.connectionPromise) return await this.connectionPromise;
-        const now = Date.now();
+        let now = Date.now();
         if (now < this.nextProbeMs) {
-            const error = new Error(
-                `subc connection backoff active until ${this.nextProbeMs}`,
-            ) as Error & {
-                code?: string;
-            };
-            error.code = "SUBC_CONNECTION_BACKOFF";
-            throw error;
+            const remainingMs = this.nextProbeMs - now;
+            if (remainingMs > CONNECT_BACKOFF_WAIT_BUDGET_MS) throw this.backoffActiveError();
+            // In-pass wait: sleep out the remainder on THIS pass's own timer and
+            // then make the normal connection attempt (which keeps its per-attempt
+            // deadline and one fresh-connection retry). The sleep is pass-scoped —
+            // it holds only the calling session's serial lane, never a global lock
+            // — so sibling sessions' passes wait or fail on their own schedule.
+            const jitterMs = Math.floor(Math.random() * CONNECT_BACKOFF_WAIT_JITTER_MS);
+            await this.sleepAbortable(remainingMs + jitterMs, signal);
+            // Another pass may have connected (or started connecting) while we slept.
+            if (this.client) return this.client;
+            if (this.connectionPromise) return await this.connectionPromise;
+            now = Date.now();
+            // A concurrent attempt can fail while we sleep and re-arm the latch
+            // past our wake time; fail fast like before instead of waiting again.
+            if (now < this.nextProbeMs) throw this.backoffActiveError();
         }
 
         const generation = this.connectionGeneration;

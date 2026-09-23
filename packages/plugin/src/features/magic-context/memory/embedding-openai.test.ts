@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { EmbeddingConfig } from "../../../config/schema/magic-context";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import { QWEN3_QUERY_INSTRUCTION, resolveEmbeddingTextPrefixes } from "./embedding-model-match";
 import { embeddingModelsMatch, OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
 
 describe("provider modelId matches canonical identity (write/read must agree)", () => {
@@ -33,6 +34,15 @@ describe("provider modelId matches canonical identity (write/read must agree)", 
                 truncate: "END",
             },
         },
+        {
+            name: "with document prefix",
+            config: {
+                provider: "openai-compatible",
+                endpoint: "http://h/v1",
+                model: "nomic-ai/nomic-embed-text-v1.5",
+                document_prefix: "custom-document: ",
+            },
+        },
     ];
     for (const c of cases) {
         test(c.name, () => {
@@ -42,6 +52,14 @@ describe("provider modelId matches canonical identity (write/read must agree)", 
                 apiKey: c.config.provider === "openai-compatible" ? c.config.api_key : undefined,
                 inputType:
                     c.config.provider === "openai-compatible" ? c.config.input_type : undefined,
+                queryInstruction:
+                    c.config.provider === "openai-compatible"
+                        ? c.config.query_instruction
+                        : undefined,
+                documentPrefix:
+                    c.config.provider === "openai-compatible"
+                        ? c.config.document_prefix
+                        : undefined,
                 truncate: c.config.provider === "openai-compatible" ? c.config.truncate : undefined,
             });
             expect(provider.modelId).toBe(getEmbeddingProviderIdentity(c.config));
@@ -65,6 +83,31 @@ describe("embeddingModelsMatch token-boundary semantics", () => {
         expect(
             embeddingModelsMatch("text-embedding-3-small", "openai/text-embedding-3-small"),
         ).toBe(true);
+    });
+    test("matches OpenRouter's canonicalized prefix and variant removal (#306)", () => {
+        expect(
+            embeddingModelsMatch(
+                "private/openrouter/nvidia/llama-nemotron-embed-vl-1b-v2",
+                "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+            ),
+        ).toBe(true);
+    });
+    test("matches a single-sided variant tag", () => {
+        expect(embeddingModelsMatch("X:latest", "X")).toBe(true);
+    });
+    test("matches equal tags", () => {
+        expect(embeddingModelsMatch("X:free", "X:free")).toBe(true);
+    });
+    test("rejects different model-size tags", () => {
+        expect(embeddingModelsMatch("mxbai-embed-large:335m", "mxbai-embed-large:137m")).toBe(
+            false,
+        );
+        expect(embeddingModelsMatch("nomic-embed-text:v1", "nomic-embed-text:v1.5")).toBe(false);
+    });
+    test("still rejects a genuine substitution with a variant tag", () => {
+        expect(
+            embeddingModelsMatch("all-minilm-l6-v2", "nvidia/llama-nemotron-embed-vl-1b-v2:free"),
+        ).toBe(false);
     });
     test("REJECTS a broad configured name contained as an interior token (corruption hole)", () => {
         // The bug: served `…-qwen3-embedding-0.6b` contains configured `qwen3-embedding`
@@ -217,6 +260,96 @@ describe("OpenAICompatibleEmbeddingProvider request body (NVIDIA NIM fields, iss
         const init = fetchSpy.mock.calls[0]?.[1] as RequestInit;
         const body = JSON.parse(init.body as string) as Record<string, unknown>;
         expect("input_type" in body).toBe(false);
+    });
+});
+
+describe("embedding model-family text recipes", () => {
+    test("normalizes vendor prefixes and OpenRouter tags for instruct families", () => {
+        expect(
+            resolveEmbeddingTextPrefixes("private/openrouter/qwen/qwen3-embedding-8b:free"),
+        ).toEqual({ queryPrefix: QWEN3_QUERY_INSTRUCTION, documentPrefix: "" });
+        expect(resolveEmbeddingTextPrefixes("Alibaba-NLP/gte-Qwen2-7B-instruct:latest")).toEqual({
+            queryPrefix: QWEN3_QUERY_INSTRUCTION,
+            documentPrefix: "",
+        });
+        expect(resolveEmbeddingTextPrefixes("intfloat/multilingual-e5-large-instruct")).toEqual({
+            queryPrefix: QWEN3_QUERY_INSTRUCTION,
+            documentPrefix: "",
+        });
+    });
+
+    test("keeps plain encoders bare and gives Nomic its asymmetric recipe", () => {
+        expect(resolveEmbeddingTextPrefixes("openai/text-embedding-3-small")).toEqual({
+            queryPrefix: "",
+            documentPrefix: "",
+        });
+        expect(resolveEmbeddingTextPrefixes("nomic-ai/nomic-embed-text-v1.5:latest")).toEqual({
+            queryPrefix: "search_query: ",
+            documentPrefix: "search_document: ",
+        });
+    });
+});
+
+describe("OpenAICompatibleEmbeddingProvider instruction wire", () => {
+    test("sends the exact family recipe by purpose and honors the disable override", async () => {
+        const inputs: string[][] = [];
+        const server = Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            async fetch(request) {
+                const body = (await request.json()) as { input: string[]; model: string };
+                inputs.push(body.input);
+                return Response.json({
+                    model: body.model,
+                    data: body.input.map(() => ({ embedding: [0.1, 0.2, 0.3] })),
+                });
+            },
+        });
+        const endpoint = `http://127.0.0.1:${server.port}/v1`;
+
+        try {
+            const qwen = new OpenAICompatibleEmbeddingProvider({
+                endpoint,
+                model: "qwen/qwen3-embedding-8b:free",
+            });
+            await qwen.embed("find the answer", undefined, "query");
+            await qwen.embed("stored passage", undefined, "passage");
+
+            const disabled = new OpenAICompatibleEmbeddingProvider({
+                endpoint,
+                model: "qwen/qwen3-embedding-8b:free",
+                queryInstruction: false,
+            });
+            await disabled.embed("find the answer", undefined, "query");
+            await disabled.embed("stored passage", undefined, "passage");
+
+            const plain = new OpenAICompatibleEmbeddingProvider({
+                endpoint,
+                model: "text-embedding-3-small",
+            });
+            await plain.embed("plain query", undefined, "query");
+            await plain.embed("plain document", undefined, "passage");
+
+            const nomic = new OpenAICompatibleEmbeddingProvider({
+                endpoint,
+                model: "nomic-ai/nomic-embed-text-v1.5",
+            });
+            await nomic.embed("nomic query", undefined, "query");
+            await nomic.embed("nomic document", undefined, "passage");
+        } finally {
+            server.stop(true);
+        }
+
+        expect(inputs).toEqual([
+            [`${QWEN3_QUERY_INSTRUCTION}find the answer`],
+            ["stored passage"],
+            ["find the answer"],
+            ["stored passage"],
+            ["plain query"],
+            ["plain document"],
+            ["search_query: nomic query"],
+            ["search_document: nomic document"],
+        ]);
     });
 });
 
@@ -503,5 +636,68 @@ describe("OpenAICompatibleEmbeddingProvider model-substitution guard", () => {
         const result = await provider.embed("text");
         expect(result).not.toBeNull();
         expect(provider._getFailureCount()).toBe(0);
+    });
+});
+
+describe("OpenAICompatibleEmbeddingProvider classified failures", () => {
+    let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>;
+
+    beforeEach(() => {
+        fetchSpy = spyOn(globalThis, "fetch");
+    });
+    afterEach(() => {
+        fetchSpy.mockRestore();
+    });
+
+    test.each([
+        {
+            name: "router namespace rewrite is a substitution rejection",
+            model: "baai/bge-m3-embedding",
+            response: new Response(
+                JSON.stringify({ model: "bge-m3", data: [{ embedding: [0.1, 0.2] }] }),
+                { status: 200 },
+            ),
+            failureClass: "substitution_rejected",
+            reason: "served model 'bge-m3' does not match requested 'baai/bge-m3-embedding' (substitution guard)",
+        },
+        {
+            name: "HTTP failure includes a redacted body excerpt",
+            model: "test-model",
+            response: new Response(
+                '{"error":"quota exhausted","api_key":"sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"}',
+                { status: 402 },
+            ),
+            failureClass: "http_error",
+            reason: 'HTTP 402 from endpoint: {"error":"quota exhausted","api_key":"<REDACTED:api_key>"}',
+        },
+        {
+            name: "empty data is a genuine empty result",
+            model: "test-model",
+            response: new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 }),
+            failureClass: "empty_result",
+            reason: "response data[] was empty",
+        },
+        {
+            name: "wrong envelope reports the available keys",
+            model: "test-model",
+            response: new Response(JSON.stringify({ object: "list", results: [] }), {
+                status: 200,
+            }),
+            failureClass: "invalid_envelope",
+            reason: "response had keys [object, results] but data[] was absent",
+        },
+    ])("$name", async ({ model, response, failureClass, reason }) => {
+        fetchSpy.mockImplementation((async () => response) as FetchLike);
+        const provider = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://127.0.0.1:65535",
+            model,
+        });
+
+        expect(await provider.embed("text")).toBeNull();
+        expect(provider.getLastFailureReason()).toEqual({
+            class: failureClass,
+            reason,
+            retryable: failureClass === "empty_result",
+        });
     });
 });

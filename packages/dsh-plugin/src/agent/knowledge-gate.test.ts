@@ -137,7 +137,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
         projectPath: identity as string,
         category: "PROJECT_RULES",
         content: "unique knowledge content alpha",
-        sourceType: "user",
+        sourceType: "agent",
       });
 
       const deps = fakeDeps(db, dir);
@@ -219,7 +219,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
         projectPath: identity as string,
         category: "PROJECT_RULES",
         content: "stable project fact for generation reuse",
-        sourceType: "user",
+        sourceType: "agent",
       });
       const deps = fakeDeps(db, dir);
       const state = createKnowledgeGateState();
@@ -281,7 +281,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
         projectPath: identity as string,
         category: "PROJECT_RULES",
         content: "duplicate surface id guard content",
-        sourceType: "user",
+        sourceType: "agent",
       });
       const deps = fakeDeps(db, dir);
       const state = createKnowledgeGateState();

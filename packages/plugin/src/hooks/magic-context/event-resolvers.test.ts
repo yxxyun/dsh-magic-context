@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -7,9 +10,11 @@ import { recordDetectedContextLimit } from "../../features/magic-context/storage
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import {
     resolveCacheTtl,
     resolveContextLimit,
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveExecuteThresholdDetail,
     resolveModelKey,
@@ -38,7 +43,7 @@ describe("event-resolvers", () => {
             const limit = resolveContextLimit(undefined, "gpt-4o");
 
             //#then
-            expect(limit).toBe(128_000);
+            expect(limit).toBe(200_000);
         });
 
         it("returns default for unknown provider/model not in models.dev or opencode.json", () => {
@@ -46,7 +51,138 @@ describe("event-resolvers", () => {
             const limit = resolveContextLimit("unknown-provider", "unknown-model-xyz");
 
             //#then
-            expect(limit).toBe(128_000);
+            expect(limit).toBe(200_000);
+        });
+
+        it("keeps a model-scoped successful request as a floor after a catalog regression", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-proven-context-floor";
+            try {
+                clearModelsDevCache();
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "custom",
+                                        models: {
+                                            model: { limit: { context: 30_000 } },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 100,
+                    lastInputTokens: 90_000,
+                    lastUsageContextLimit: 90_000,
+                    lastObservedModelKey: "custom/model",
+                    observedSafeInputTokens: 90_000,
+                });
+
+                const context = { db, sessionID: sessionId };
+                expect(resolveContextLimit("custom", "model", context)).toBe(90_000);
+                expect(resolveTrustedContextLimit("custom", "model", context)).toBe(90_000);
+                expect(resolveContextWindowGeometry("custom", "model", context)?.usableSoft).toBe(
+                    90_000,
+                );
+            } finally {
+                clearModelsDevCache();
+                closeQuietly(db);
+            }
+        });
+
+        it("clears a persisted floor above an overlay-backed absolute wall", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-poisoned-overlay-floor";
+            const dir = mkdtempSync(join(tmpdir(), "mc-floor-overlay-"));
+            const overlayPath = join(dir, "window-overlay.json");
+            try {
+                writeFileSync(
+                    overlayPath,
+                    JSON.stringify({
+                        schema: "fusiform-window-overlay/v1",
+                        generated_at: "2026-09-11T00:00:00Z",
+                        minted_provider_ids: [],
+                        cells: [
+                            {
+                                provider_id: "test-provider",
+                                model_id: "test-model",
+                                facts: {
+                                    "window.enforced": {
+                                        value: { kind: "stated", value: 272_000 },
+                                        grade: "measured",
+                                        units: "provider",
+                                        boundary: "Observed",
+                                        source_ref: "session regression fixture",
+                                        observed_at: "2026-09-11T00:00:00Z",
+                                    },
+                                },
+                            },
+                        ],
+                    }),
+                );
+                setWindowOverlayPath(overlayPath);
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "test-provider",
+                                        models: {
+                                            "test-model": {
+                                                limit: { context: 272_000, output: 128_000 },
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 48.1,
+                    lastInputTokens: 285_310,
+                    lastUsageContextLimit: 593_717,
+                    lastObservedModelKey: "test-provider/test-model",
+                    observedSafeInputTokens: 593_717,
+                    cacheAlertSent: true,
+                });
+
+                const geometry = resolveContextWindowGeometry("test-provider", "test-model", {
+                    db,
+                    sessionID: sessionId,
+                });
+                expect(geometry?.usableSoft).toBe(240_000);
+                expect(geometry?.usableHard).toBe(240_000);
+                expect(geometry?.derivation.absoluteWall).toBe(272_000);
+                const meta = db
+                    .prepare(
+                        "SELECT observed_safe_input_tokens, last_usage_context_limit, last_input_tokens, last_context_percentage, cache_alert_sent FROM session_meta WHERE session_id = ?",
+                    )
+                    .get(sessionId) as Record<string, number>;
+                expect(meta).toMatchObject({
+                    observed_safe_input_tokens: 0,
+                    last_usage_context_limit: 240_000,
+                    last_input_tokens: 0,
+                    last_context_percentage: 0,
+                    cache_alert_sent: 0,
+                });
+            } finally {
+                setWindowOverlayPath(undefined);
+                clearWindowOverlayCacheForTest();
+                clearModelsDevCache();
+                closeQuietly(db);
+                rmSync(dir, { recursive: true, force: true });
+            }
         });
 
         it("does not reserve output twice from a detected prompt-only ceiling", async () => {
@@ -180,6 +316,33 @@ describe("event-resolvers", () => {
                 closeQuietly(db);
             }
         });
+        it("trusts a legacy native-spelling usage key for its canonical model", () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-usage-limit-native-alias";
+            try {
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 10,
+                    lastInputTokens: 100_000,
+                    lastUsageContextLimit: 1_048_576,
+                    lastObservedModelKey: "openai/gpt-alias-test",
+                });
+                // Simulate a legacy session row whose model key uses the old provider prefix.
+                db.prepare(
+                    "UPDATE session_meta SET last_observed_model_key = ? WHERE session_id = ?",
+                ).run("openai-codex/gpt-alias-test", sessionId);
+
+                expect(
+                    resolveTrustedContextLimit("openai", "gpt-alias-test", {
+                        db,
+                        sessionID: sessionId,
+                    }),
+                ).toBe(1_048_576);
+            } finally {
+                closeQuietly(db);
+            }
+        });
     });
 
     describe("resolveCacheTtl", () => {
@@ -189,6 +352,15 @@ describe("event-resolvers", () => {
 
             //#then
             expect(ttl).toBe("5m");
+        });
+
+        it("accepts Pi-native keys when the runtime model key is canonical", () => {
+            expect(
+                resolveCacheTtl(
+                    { default: "5m", "openai-codex/gpt-5.6-sol": "60m" },
+                    "openai/gpt-5.6-sol",
+                ),
+            ).toBe("60m");
         });
 
         it("resolves provider/model and bare-model overrides", () => {
@@ -220,6 +392,27 @@ describe("event-resolvers", () => {
             expect(
                 resolveExecuteThreshold({ default: 95, "openai/gpt-4o": 90 }, "openai/gpt-4o", 65),
             ).toBe(90);
+        });
+
+        it("accepts Pi-native threshold keys and keeps canonical precedence", () => {
+            expect(
+                resolveExecuteThreshold(
+                    { default: 65, "openai-codex/gpt-5.6-sol": 40 },
+                    "openai/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(40);
+            expect(
+                resolveExecuteThreshold(
+                    {
+                        default: 65,
+                        "openai-codex/gpt-5.6-sol": 40,
+                        "openai/gpt-5.6-sol": 30,
+                    },
+                    "openai-codex/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(30);
         });
 
         it("prefers exact provider/model key when present", () => {
@@ -610,8 +803,9 @@ describe("event-resolvers", () => {
     });
 
     describe("resolveModelKey", () => {
-        it("returns provider/model when both parts exist", () => {
+        it("returns the canonical provider/model key when both parts exist", () => {
             expect(resolveModelKey("openai", "gpt-4o")).toBe("openai/gpt-4o");
+            expect(resolveModelKey("openai-codex", "gpt-5.6-sol")).toBe("openai/gpt-5.6-sol");
         });
 
         it("returns undefined when either part is missing", () => {

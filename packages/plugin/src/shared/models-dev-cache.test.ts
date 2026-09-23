@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveKnownHistorianContextLimit } from "../hooks/magic-context/derive-budgets";
 import {
     clearModelsDevCache,
     getModelsDevCacheState,
     getSdkContextLimit,
     getSdkInputLimit,
+    getSdkWindowGeometry,
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
     resetAuthRewarmLatchForTest,
@@ -78,6 +80,23 @@ describe("output-token reservation", () => {
         ).toBe(1_048_576);
     });
 
+    test("output_reserve accepts both harness provider spellings with canonical precedence", () => {
+        const limit = { context: 100_000, output: 20_000 };
+        expect(
+            resolveLimit(limit, "openai-codex", "gpt-5.6-sol", {
+                default: 0,
+                "openai-codex/gpt-5.6-sol": 8_000,
+            }),
+        ).toBe(92_000);
+        expect(
+            resolveLimit(limit, "openai-codex", "gpt-5.6-sol", {
+                default: 0,
+                "openai-codex/gpt-5.6-sol": 8_000,
+                "openai/gpt-5.6-sol": 4_000,
+            }),
+        ).toBe(96_000);
+    });
+
     test("output_reserve overrides shared and separate quota defaults", () => {
         expect(resolveLimit({ context: 100_000, output: 20_000 }, "anthropic", "claude", 0)).toBe(
             100_000,
@@ -129,6 +148,30 @@ describe("models-dev-cache (SDK-only)", () => {
             /* Ignore EBUSY on Windows */
         }
         clearModelsDevCache();
+    });
+
+    test("honors the reporter's default output_reserve on the SDK geometry path", async () => {
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "openai-codex",
+                    models: {
+                        "gpt-5.6-sol": {
+                            limit: { context: 400_000, input: 272_000, output: 128_000 },
+                        },
+                    },
+                },
+            ]),
+        );
+        setOutputReserveConfig({ default: 16_384 });
+
+        const geometry = getSdkWindowGeometry("openai-codex", "gpt-5.6-sol");
+        expect(geometry?.usableSoft).toBe(272_000 - 16_384);
+        expect(geometry?.derivation).toMatchObject({
+            window: 272_000,
+            reserve: 16_384,
+            reserveSource: "output_config",
+        });
     });
 
     test("resolves from the SDK and prefers limit.input over limit.context", async () => {
@@ -186,6 +229,30 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("openai", "gpt-5.4")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-fast")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-mini")).toBe(922000);
+    });
+
+    test("explicit SDK-resolved config limit wins over a larger catalog or detected value", async () => {
+        // OpenCode's config.providers() has already applied opencode.json over its
+        // catalog. The cache must preserve that 120K effective value, and a later
+        // API-detected 262K value may narrow but never enlarge it.
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "regolo",
+                    models: {
+                        "qwen3.5-122b": { limit: { context: 120_000, output: 32_000 } },
+                    },
+                },
+            ]),
+        );
+
+        expect(
+            getSdkContextLimit("regolo", "qwen3.5-122b", 262_144, {
+                reservation: "none",
+                detectedLimitProvenance: "combined",
+            }),
+        ).toBe(120_000);
+        expect(resolveKnownHistorianContextLimit("regolo/qwen3.5-122b")).toBe(120_000);
     });
 
     test("narrows raw context with detected wire truth before reserving output", async () => {

@@ -1,8 +1,18 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
-import { encodeOpenCodeMessagesToCk, resolveOrdinalsForModule } from "./module-wire";
+import {
+    __moduleWireTest,
+    buildPagedModuleTransformPayloads,
+    encodeOpenCodeMessagesToCk,
+    MODULE_PAGE_MAX_BYTES,
+    resolveOrdinalsForModule,
+    SUBC_MAX_FRAME_BODY_BYTES,
+} from "./module-wire";
 import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
 
@@ -32,9 +42,174 @@ describe("encodeOpenCodeMessagesToCk", () => {
             synthetic: true,
         });
     });
+
+    it("carries completed-tool titles only in the non-decision-bearing recovery sidecar", () => {
+        const [encoded] = encodeOpenCodeMessagesToCk([
+            {
+                info: { id: "msg_titled_tool", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "read",
+                        callID: "read:titled",
+                        state: {
+                            status: "completed",
+                            input: { filePath: "src/title.ts" },
+                            output: "contents",
+                            metadata: { title: "Read title-bearing fixture" },
+                        },
+                    },
+                ],
+            },
+        ]);
+
+        expect(encoded.ck.provider_extras).toEqual({
+            opencode: {
+                ctx_expand_tool_titles: {
+                    "read:titled": "Read title-bearing fixture",
+                },
+            },
+        });
+        expect(encoded.ck.content[0]).toEqual({
+            kind: {
+                type: "tool_call",
+                id: "read:titled",
+                name: "read",
+                input: { filePath: "src/title.ts" },
+            },
+        });
+
+        const [pending] = encodeOpenCodeMessagesToCk([
+            {
+                info: { id: "msg_pending_tool", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "read",
+                        callID: "read:pending",
+                        state: { status: "pending", title: "Not recoverable yet" },
+                    },
+                ],
+            },
+        ]);
+        expect(pending.ck.provider_extras).toBeUndefined();
+    });
+
+    it("carries nested OpenCode timestamps from the generated temporal parity fixture", () => {
+        const golden = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/temporal-parity-golden.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            schema: number;
+            generator_version: number;
+            cases: Array<{ raw_messages: unknown[]; encoded_input: unknown[] }>;
+        };
+
+        expect(golden.schema).toBe(1);
+        expect(golden.generator_version).toBe(1);
+        for (const fixture of golden.cases) {
+            const encoded = encodeOpenCodeMessagesToCk(fixture.raw_messages);
+            expect(encoded).toEqual(fixture.encoded_input);
+            expect(encoded[1]?.ck.meta).toMatchObject({
+                created_at_ms: 10_000,
+                completed_at_ms: 70_000,
+            });
+        }
+    });
+
+    it("matches the module golden generated from raw OpenCode reasoning parts", () => {
+        const golden = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/merged-reasoning-adapter-golden.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            generator_version: number;
+            cases: Array<{
+                name: string;
+                raw_messages: unknown[];
+                encoded_input: unknown[];
+            }>;
+        };
+
+        expect(golden.generator_version).toBe(6);
+        expect(golden.cases.map((fixture) => fixture.name)).toEqual([
+            "reasoning",
+            "thinking",
+            "redacted_thinking",
+            "reasoning_cache_control",
+            "live_tool_continuation_request_shell",
+            "incident_astro_signed_reasoning_tool_without_text",
+            "incident_engram_text_after_tool_recurrence",
+            "incident_337_text_before_tool",
+        ]);
+        for (const fixture of golden.cases) {
+            expect(encodeOpenCodeMessagesToCk(fixture.raw_messages)).toEqual(fixture.encoded_input);
+        }
+    });
 });
 
 describe("resolveOrdinalsForModule provisional tails", () => {
+    it("records the exact compaction-summary normalization removed from module input", async () => {
+        const sessionId = "module-wire-summary-normalization";
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages: () => [],
+            readMessageOrdinalPage: () => [],
+            getStoredMessageCount: () => 0,
+        });
+        const summary = {
+            info: {
+                id: "summary-1",
+                role: "assistant",
+                sessionID: sessionId,
+                summary: true,
+                finish: "stop",
+            },
+            parts: [{ type: "text", text: "redacted summary fixture" }],
+        } as MessageLike;
+        const tail = {
+            info: { id: "tail-1", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "continue" }],
+        } as MessageLike;
+
+        try {
+            const resolved = await resolveOrdinalsForModule({
+                sessionId,
+                messages: [summary, tail],
+                generation: 1,
+                memoGeneration: 1,
+                memo: new Map(),
+                memoStoredCount: 0,
+                memoCanonicalCount: 0,
+            });
+
+            expect(resolved.ok).toBe(true);
+            if (!resolved.ok) throw new Error(resolved.reason);
+            expect(resolved.annotatedInput).toEqual([
+                expect.objectContaining({ absolute_ordinal: 1, info: tail.info }),
+            ]);
+            expect(resolved.normalizations).toEqual([
+                {
+                    kind: "summary_message",
+                    message_id: "summary-1",
+                    part_index: -1,
+                    field: "input",
+                    removed: JSON.stringify(summary),
+                },
+            ]);
+        } finally {
+            unregister();
+        }
+    });
+
     async function resolveTail(count: number) {
         const sessionId = `module-wire-provisional-${count}`;
         const persistedTail: Array<{
@@ -160,7 +335,105 @@ describe("resolveOrdinalsForModule provisional tails", () => {
         }
     });
 
-    it("reconciles provisional ordinals when the appended rows persist", async () => {
+    it("serves a warm memo byte-identically without ordinal I/O and re-probes named invalidations", async () => {
+        const sessionId = "module-wire-hot-memo";
+        const rows = [
+            { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+            { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+            { id: "m3", timeCreated: 3, contributesOrdinal: true, hasValidInfo: true },
+        ];
+        let pageReads = 0;
+        let countReads = 0;
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages: () => rows,
+            readMessageOrdinalPage: (after, limit) => {
+                pageReads += 1;
+                return rows
+                    .filter(
+                        (row) =>
+                            !after ||
+                            row.timeCreated > after.timeCreated ||
+                            (row.timeCreated === after.timeCreated && row.id > after.id),
+                    )
+                    .slice(0, limit);
+            },
+            getStoredMessageCount: () => {
+                countReads += 1;
+                return rows.length;
+            },
+        });
+        const wire = (ids: string[]) =>
+            ids.map((id) => ({
+                info: { id, role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: id }],
+            })) as MessageLike[];
+        const digest = (messages: unknown[]) =>
+            createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+        const memo = new Map<string, number>();
+        try {
+            const first = await resolveOrdinalsForModule({
+                sessionId,
+                messages: wire(["m1", "m2", "m3"]),
+                generation: 1,
+                memoGeneration: 1,
+                memo,
+            });
+            expect(first.ok).toBe(true);
+            if (!first.ok) throw new Error(first.reason);
+            const readsAfterPrime = { pageReads, countReads };
+            const second = await resolveOrdinalsForModule({
+                sessionId,
+                messages: wire(["m1", "m2", "m3"]),
+                generation: 1,
+                memoGeneration: first.memoGeneration,
+                memo,
+                memoAnchor: first.memoAnchor,
+                memoStoredCount: first.memoStoredCount,
+                memoCanonicalCount: first.memoCanonicalCount,
+            });
+            expect(second.ok).toBe(true);
+            if (!second.ok) throw new Error(second.reason);
+            expect({ pageReads, countReads }).toEqual(readsAfterPrime);
+            expect(digest(second.annotatedInput)).toBe(digest(first.annotatedInput));
+
+            const unseen = await resolveOrdinalsForModule({
+                sessionId,
+                messages: wire(["m1", "m2", "m3", "m4"]),
+                generation: 1,
+                memoGeneration: second.memoGeneration,
+                memo,
+                memoAnchor: second.memoAnchor,
+                memoStoredCount: second.memoStoredCount,
+                memoCanonicalCount: second.memoCanonicalCount,
+            });
+            expect(unseen.ok).toBe(true);
+            expect(pageReads).toBeGreaterThan(readsAfterPrime.pageReads);
+            expect(countReads).toBeGreaterThan(readsAfterPrime.countReads);
+
+            rows.splice(1, 1);
+            const reset = await resolveOrdinalsForModule({
+                sessionId,
+                messages: wire(["m1", "m3"]),
+                generation: 2,
+                memoGeneration: 1,
+                memo,
+                memoAnchor: second.memoAnchor,
+                memoStoredCount: second.memoStoredCount,
+                memoCanonicalCount: second.memoCanonicalCount,
+            });
+            expect(reset.ok).toBe(true);
+            if (!reset.ok) throw new Error(reset.reason);
+            expect(
+                (reset.annotatedInput as Array<{ absolute_ordinal: number }>).map(
+                    (message) => message.absolute_ordinal,
+                ),
+            ).toEqual([1, 2]);
+        } finally {
+            unregister();
+        }
+    });
+
+    it("reconciles provisional ordinals when an unseen wire id triggers a probe", async () => {
         const result = await resolveTail(2);
         try {
             result.persistedTail.push(
@@ -169,7 +442,17 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             );
             const reconciled = await resolveOrdinalsForModule({
                 sessionId: result.sessionId,
-                messages: result.messages,
+                messages: [
+                    ...result.messages,
+                    {
+                        info: {
+                            id: "m-503",
+                            role: "user",
+                            sessionID: result.sessionId,
+                        },
+                        parts: [{ type: "text", text: "unpersisted 3" }],
+                    } as MessageLike,
+                ],
                 generation: 1,
                 memoGeneration: result.first.memoGeneration,
                 memo: result.memo,
@@ -186,5 +469,153 @@ describe("resolveOrdinalsForModule provisional tails", () => {
         } finally {
             result.unregister();
         }
+    });
+});
+
+const TEST_PAGE_MAX_BYTES = 512 * 1024;
+
+describe("buildPagedModuleTransformPayloads byte reuse", () => {
+    it("pins the application page budget to the shared SUBC frame fixture", async () => {
+        const fixture = (await Bun.file(
+            new URL(
+                "../../../../../crates/mc-module/testdata/subc-frame-limits.json",
+                import.meta.url,
+            ),
+        ).json()) as { max_frame_body_bytes: number; application_body_bytes: number };
+        expect(SUBC_MAX_FRAME_BODY_BYTES).toBe(fixture.max_frame_body_bytes);
+        expect(MODULE_PAGE_MAX_BYTES).toBe(fixture.application_body_bytes);
+    });
+    it("returns the first stringify length on the unpaged path", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-unpaged",
+            input: [{ mid: "m1", ordinal: 1, ck: { text: "hi" } }],
+        };
+        const pages = buildPagedModuleTransformPayloads(body);
+        expect(pages).toHaveLength(1);
+        expect(pages[0]?.page).toBe(body);
+        expect(pages[0]?.bytes).toBe(Buffer.byteLength(JSON.stringify(body)));
+    });
+
+    it("returns paging sizes that match a later stringify of each page", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-paged",
+            input: Array.from({ length: 80 }, (_, index) => ({
+                mid: `m${index}`,
+                ordinal: index + 1,
+                ck: { text: "x".repeat(8_000) },
+            })),
+        };
+        expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(TEST_PAGE_MAX_BYTES);
+        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
+        expect(pages.length).toBeGreaterThan(1);
+        for (const { page, bytes } of pages) {
+            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
+        }
+    });
+
+    it("content-addresses a cold page series so a completed result is adoptable", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-adopt-completed",
+            input: Array.from({ length: 80 }, (_, index) => ({
+                mid: `m${index}`,
+                ordinal: index + 1,
+                ck: { text: "x".repeat(8_000) },
+            })),
+        };
+
+        const first = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
+        const retry = buildPagedModuleTransformPayloads(structuredClone(body), TEST_PAGE_MAX_BYTES);
+        const changed = buildPagedModuleTransformPayloads(
+            {
+                ...body,
+                input: [...body.input, { mid: "changed", ordinal: 81, ck: { text: "changed" } }],
+            },
+            TEST_PAGE_MAX_BYTES,
+        );
+        const id = first[0]?.page.transform_page_id;
+
+        expect(first.length).toBeGreaterThan(1);
+        expect(retry.map(({ page }) => page.transform_page_id)).toEqual(
+            first.map(({ page }) => page.transform_page_id),
+        );
+        expect(changed[0]?.page.transform_page_id).not.toBe(id);
+    });
+
+    it("pages a 30,000-entry tool-input key-order map and bounds the scalar tail", () => {
+        const toolInputKeyOrders = Object.fromEntries(
+            Array.from({ length: 30_000 }, (_, index) => [
+                `msg_${index.toString(16).padStart(24, "0")}#0`,
+                ["filePath", "oldString", "newString"],
+            ]),
+        );
+        const body = {
+            method: "transform",
+            kind: "transform",
+            v: 2,
+            session_id: "ses-key-order-map",
+            input: [],
+            tool_input_key_orders: toolInputKeyOrders,
+            usage: { current_total_input_tokens: 1, context_limit_tokens: 200_000 },
+        };
+
+        expect(Buffer.byteLength(JSON.stringify(toolInputKeyOrders))).toBeGreaterThan(
+            TEST_PAGE_MAX_BYTES,
+        );
+        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES);
+        expect(pages.length).toBeGreaterThan(1);
+        expect(pages.every(({ bytes }) => bytes <= TEST_PAGE_MAX_BYTES)).toBe(true);
+
+        const reassembled = Object.assign(
+            {},
+            ...pages.map(({ page }) => page.tool_input_key_orders as Record<string, string[]>),
+        );
+        expect(reassembled).toEqual(toolInputKeyOrders);
+
+        const complete = { ...pages.at(-1)?.page };
+        for (const field of [
+            "input",
+            "messages",
+            "native_messages",
+            "ts_output",
+            "ts_ck_messages",
+            "normalizations",
+            "tool_input_key_orders",
+        ]) {
+            delete complete[field];
+        }
+        expect(Buffer.byteLength(JSON.stringify(complete))).toBeLessThan(64 * 1024);
+    });
+
+    it("hashes map slices with the Rust canonical page digest", () => {
+        expect(
+            __moduleWireTest.transformPageDigest({
+                messages: [{ mid: "m1", text: "hello" }],
+                tool_input_key_orders: {
+                    "m1#2": ["newString", "filePath"],
+                    "m1#0": ["path", "content"],
+                },
+            }),
+        ).toBe("db28d9596edc518ebe4131403a892c60868ee683f80c248e6c1c1a6f0e9bbf17");
+    });
+
+    it("names the five largest scalar fields when the tail cannot fit", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-scalar-diagnostic",
+            input: [],
+            largest: "a".repeat(180_000),
+            second: "b".repeat(160_000),
+            third: "c".repeat(140_000),
+            fourth: "d".repeat(120_000),
+            fifth: "e".repeat(100_000),
+            sixth: "f".repeat(80_000),
+        };
+
+        expect(() => buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES)).toThrow(
+            "largest scalar fields: largest=180002 bytes, second=160002 bytes, third=140002 bytes, fourth=120002 bytes, fifth=100002 bytes",
+        );
     });
 });

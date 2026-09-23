@@ -1,4 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
+
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
@@ -6,9 +7,11 @@ import {
     conditionCompileReplySuffix,
     conditionCompileStorageFields,
 } from "../../features/magic-context/smart-notes/condition-compiler";
+import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import {
     addNote,
     dismissNote,
+    dismissNotes,
     getNotes,
     getReadySmartNotes,
     getSessionNotes,
@@ -22,7 +25,9 @@ import {
     isRustAuthorityDrainingError,
     toolCallIdFromContext,
 } from "../../plugin/rust-tool-backends";
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
@@ -75,7 +80,7 @@ function formatNoteLine(note: Note): string {
     return `- **#${note.id}**${statusSuffix}: ${note.content}${anchorSuffix(note)}\n  ${conditionLabel}: ${conditionText}`;
 }
 
-const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
+const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])';
 
 /** Default page size for read. Long-running sessions accumulate hundreds of
  *  notes; dumping all of them burns output tokens and buries the recent ones,
@@ -176,13 +181,22 @@ function buildReadSections(args: {
     return sections;
 }
 
-function moduleNoteText(response: unknown): string | null {
+function noteAuthorityRefusal(_args: CtxNoteArgs, action: RustNoteToolRequest["action"]): string {
+    const isMutation = action === "write" || action === "update" || action === "dismiss";
+    return renderCapabilityRefusal(isMutation ? "note_change" : "note_access");
+}
+
+function moduleNoteText(
+    response: unknown,
+    args: CtxNoteArgs,
+    action: RustNoteToolRequest["action"],
+): string | null {
     let value = response;
     if (value !== null && typeof value === "object" && "result" in value) {
         value = (value as { result?: unknown }).result;
     }
     if (isRustAuthorityDrainingError(value)) {
-        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+        return noteAuthorityRefusal(args, action);
     }
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") {
@@ -241,15 +255,48 @@ const ctxNoteArgsShape = {
         .number()
         .optional()
         .describe("Skip this many newest notes for read — page older ones (default: 0)"),
-    note_id: tool.schema
-        .number()
+    note_ids: tool.schema
+        .array(tool.schema.number().int().min(1))
+        .min(1)
+        .max(50)
         .optional()
-        .describe("Note ID (required for 'dismiss' and 'update' actions)."),
+        .describe(
+            "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.",
+        ),
 };
 // The tool definition exposes only the documented argument shape to the model
 // provider, but older callers may still send extra arguments. Parse with
 // passthrough so execute() can receive those fields without advertising them.
 const ctxNoteArgsSchema = tool.schema.object(ctxNoteArgsShape).passthrough();
+
+function formatDismissResults(results: Array<{ noteId: number; outcome: string }>): string {
+    const dismissedCount = results.filter((result) => result.outcome === "dismissed").length;
+    return `Dismissed ${dismissedCount} of ${results.length} notes.\n${results
+        .map((result) => `- Note #${result.noteId}: ${result.outcome}`)
+        .join("\n")}`;
+}
+
+/**
+ * Read `note_ids` for the actions that use it. `write` and `read` never look
+ * at it: tool surfaces that require every declared property make the model
+ * send filler there (issue 460), and filler on an action that does not use
+ * the field must not fail the call. `update` addresses exactly one note;
+ * `dismiss` takes one to fifty.
+ */
+function parseNoteIds(action: string, value: unknown): number[] | string {
+    const max = action === "update" ? 1 : 50;
+    if (
+        !Array.isArray(value) ||
+        value.length < 1 ||
+        value.length > max ||
+        value.some((id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0)
+    ) {
+        return action === "update"
+            ? "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+            : "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.";
+    }
+    return value;
+}
 
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
     return tool({
@@ -268,13 +315,23 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 },
                 limit: "number",
                 offset: "number",
-                note_id: "number",
+                note_ids: { type: "array", items: "number", maxItems: 50 },
             });
             const sessionId = toolContext.sessionID;
             // Infer write only on NON-EMPTY content. GPT-family models fill every
             // optional param (content:"" for a read), so a bare `typeof === "string"`
             // check would mis-infer `write` and then reject the empty content.
             const action = args.action ?? (args.content?.trim() ? "write" : "read");
+            const noteIds =
+                action === "dismiss" || action === "update"
+                    ? parseNoteIds(action, args.note_ids)
+                    : undefined;
+            if (typeof noteIds === "string") return noteIds;
+            const wakePlaneActive =
+                action === "write" &&
+                Boolean(args.surface_condition?.trim()) &&
+                (await wakePlaneStatus()) === "present";
+            const surfaceCondition = wakePlaneActive ? undefined : args.surface_condition?.trim();
 
             // Resolve the session's actual project from `toolContext.directory`
             // each call. OpenCode's top-level `ctx.directory` (the launch dir)
@@ -291,26 +348,27 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     notesAuthority = await deps.rustToolBackends.authorityState({
                         projectPath: projectIdentity,
                         projectRoot: toolContext.directory,
+                        sessionId,
                         domain: "notes",
                     });
                 } catch (error) {
                     if (marker) {
-                        return `Error: Rust notes authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                        sessionLog(sessionId, "ctx_note capability refusal", error);
+                        return noteAuthorityRefusal(args, action);
                     }
                 }
             }
             if (notesAuthority === "MODULE") {
                 const rustNote = deps.rustToolBackends?.note;
                 if (!rustNote || !projectIdentity) {
-                    return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
+                    return noteAuthorityRefusal(args, action);
                 }
-                const surfaceCondition = args.surface_condition?.trim();
                 let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
                 if ((action === "write" || action === "update") && surfaceCondition) {
                     if (
                         deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
                     ) {
-                        return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                        return renderCapabilityRefusal("smart_note_condition");
                     }
                     compilation = await compileSurfaceCondition(surfaceCondition, {
                         projectPath: toolContext.directory,
@@ -330,26 +388,29 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     filter: args.filter,
                     limit: args.limit,
                     offset: args.offset,
-                    noteId: args.note_id,
+                    noteIds: Array.isArray(noteIds) ? noteIds : undefined,
                 };
                 try {
-                    const text = moduleNoteText(await rustNote(request));
+                    const text = moduleNoteText(await rustNote(request), args, action);
                     if (text === null) {
-                        return "Error: Rust module returned an invalid ctx_note response.";
+                        return noteAuthorityRefusal(args, action);
                     }
-                    if (compilation && !text.startsWith("Error:")) {
-                        return text + conditionCompileReplySuffix(compilation);
+                    if (text.startsWith("Error:")) return text;
+                    if (wakePlaneActive) {
+                        return `${text}\nwake plane active — create a scheduled wake instead; stored as a plain note.`;
                     }
+                    if (compilation) return text + conditionCompileReplySuffix(compilation);
                     return text;
                 } catch (error) {
                     if (isRustAuthorityDrainingError(error)) {
-                        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                        return noteAuthorityRefusal(args, action);
                     }
-                    return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
+                    sessionLog(sessionId, "ctx_note capability refusal", error);
+                    return noteAuthorityRefusal(args, action);
                 }
             }
             if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
-                return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                return noteAuthorityRefusal(args, action);
             }
 
             if (action === "write") {
@@ -367,25 +428,33 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
 
                 // Smart note — project-scoped with condition evaluation by dreamer
                 if (args.surface_condition?.trim()) {
+                    if (wakePlaneActive) {
+                        const note = addNote(deps.db, "session", {
+                            sessionId,
+                            content,
+                            anchorOrdinal,
+                        });
+                        return `Saved session note #${note.id}.\nwake plane active — create a scheduled wake instead; stored as a plain note.`;
+                    }
                     if (!deps.dreamerEnabled) {
                         return "Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.";
                     }
                     if (!projectIdentity) {
                         return "Error: Could not resolve project identity for smart note.";
                     }
-                    const surfaceCondition = args.surface_condition.trim();
-                    const compilation = await compileSurfaceCondition(surfaceCondition, {
+                    const smartSurfaceCondition = args.surface_condition.trim();
+                    const compilation = await compileSurfaceCondition(smartSurfaceCondition, {
                         projectPath: toolContext.directory,
                     });
                     const note = addNote(deps.db, "smart", {
                         content,
                         projectPath: projectIdentity,
                         sessionId,
-                        surfaceCondition,
+                        surfaceCondition: smartSurfaceCondition,
                         anchorOrdinal,
                         ...conditionCompileStorageFields(compilation),
                     });
-                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${surfaceCondition}${conditionCompileReplySuffix(compilation)}`;
+                    return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${smartSurfaceCondition}${conditionCompileReplySuffix(compilation)}`;
                 }
 
                 // Simple session note
@@ -394,27 +463,29 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             }
 
             if (action === "dismiss") {
-                const noteId = args.note_id;
-                if (typeof noteId !== "number") {
-                    return "Error: 'note_id' is required when action is 'dismiss'.";
-                }
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for note dismiss.";
                 }
-                const dismissed = dismissNote(deps.db, noteId, {
-                    projectPath: projectIdentity,
-                    sessionId,
-                });
-                return dismissed
-                    ? `Note #${noteId} dismissed.`
-                    : `Error: Note #${noteId} not found in your session/project or already dismissed.`;
+                const ids = noteIds as number[];
+                if (ids.length === 1) {
+                    const dismissed = dismissNote(deps.db, ids[0], {
+                        projectPath: projectIdentity,
+                        sessionId,
+                    });
+                    return dismissed
+                        ? `Note #${ids[0]} dismissed.`
+                        : `Error: Note #${ids[0]} not found in your session/project or already dismissed.`;
+                }
+                return formatDismissResults(
+                    dismissNotes(deps.db, ids, {
+                        projectPath: projectIdentity,
+                        sessionId,
+                    }),
+                );
             }
 
             if (action === "update") {
-                const noteId = args.note_id;
-                if (typeof noteId !== "number") {
-                    return "Error: 'note_id' is required when action is 'update'.";
-                }
+                const noteId = (noteIds as number[])[0];
                 const updates: UpdateNoteOptions = {};
                 if (args.content?.trim()) updates.content = args.content.trim();
                 let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;

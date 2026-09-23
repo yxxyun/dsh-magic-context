@@ -31,6 +31,10 @@ import {
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
+    formatInconclusiveOpenCodeMigrationWarning,
+    formatInconclusivePiMigrationWarning,
+    formatLiveProcessMigrationRefusal,
+    getDatabasePath,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
@@ -39,12 +43,17 @@ import {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
+    openDatabaseAsync,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
+import { SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
+const originalStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR;
+const originalNodeEnv = process.env.NODE_ENV;
+const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 
 function makeTempDir(prefix: string): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -55,6 +64,7 @@ function makeTempDir(prefix: string): string {
 function useTempDataHome(prefix: string): string {
     const dataHome = makeTempDir(prefix);
     process.env.XDG_DATA_HOME = dataHome;
+    process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
     return dataHome;
 }
 
@@ -103,7 +113,14 @@ afterEach(() => {
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalStorageDir === undefined) delete process.env.MAGIC_CONTEXT_STORAGE_DIR;
+    else process.env.MAGIC_CONTEXT_STORAGE_DIR = originalStorageDir;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+    else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
 
     for (const dir of tempDirs) {
         try {
@@ -203,6 +220,102 @@ describe("upstream migration version lane", () => {
             closeQuietly(future);
             closeQuietly(forkOnly);
         }
+    });
+});
+
+describe("explicit shared storage resolution", () => {
+    it("keeps path resolution and database opening in the per-test XDG fixture", () => {
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = makeTempDir("storage-db-test-guard-");
+        const perTestDataHome = makeTempDir("storage-db-preload-xdg-");
+        process.env.XDG_DATA_HOME = perTestDataHome;
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = makeTempDir("storage-db-production-");
+
+        const resolved = resolveDatabasePath();
+        expect(resolved.dbPath).toBe(resolveDbPath(perTestDataHome));
+        const db = openDatabase();
+        expect(db).not.toBeNull();
+        expect(getDatabasePath(db!)).toBe(resolved.dbPath);
+        closeDatabase();
+    });
+
+    it("reports the same finite boot busy timeout installed before the first schema read", async () => {
+        useTempDataHome("storage-db-boot-busy-timeout-");
+        const diagnostics: string[] = [];
+        const db = await openDatabaseAsync({
+            busyTimeoutMs: 0,
+            onBootBusyTimeout: (message) => diagnostics.push(message),
+        });
+
+        expect(db).not.toBeNull();
+        const timeout = db!.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+        expect(timeout.timeout).toBe(0);
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0]).toContain(`timeout=${timeout.timeout}ms`);
+        expect(diagnostics[0]).toContain(`path=${getDatabasePath(db!)}`);
+        closeDatabase();
+    });
+
+    it("bounds the first schema read behind another connection's exclusive lock", async () => {
+        const dir = makeTempDir("storage-db-exclusive-lock-");
+        const dbPath = join(dir, "context.db");
+        expect(openDatabase(dbPath)).not.toBeNull();
+        closeDatabase();
+
+        const holder = new Database(dbPath);
+        holder.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE");
+        const startedAt = performance.now();
+        try {
+            const opened = await openDatabaseAsync({ dbPath, busyTimeoutMs: 35 });
+            const elapsedMs = performance.now() - startedAt;
+            expect(elapsedMs).toBeLessThan(1_000);
+            if (opened) {
+                const timeout = opened.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+                expect(timeout.timeout).toBe(35);
+            }
+        } finally {
+            holder.exec("ROLLBACK");
+            closeQuietly(holder);
+        }
+    });
+
+    it("reports bounded boot phase timings for an async open", async () => {
+        const dataHome = useTempDataHome("storage-db-boot-timing-");
+        let timings: { openMs: number; guardMs: number; migrateMs: number } | undefined;
+
+        const db = await openDatabaseAsync({
+            onBootTimings: (observed) => {
+                timings = observed;
+            },
+        });
+
+        expect(db).not.toBeNull();
+        expect(getDatabasePath(db!)).toBe(resolveDbPath(dataHome));
+        expect(timings).toBeDefined();
+        expect(timings!.openMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.guardMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.migrateMs).toBeGreaterThanOrEqual(0);
+        closeDatabase();
+    });
+
+    it("opens a fresh absolute override and applies private storage permissions", () => {
+        if (process.platform === "win32") return;
+        const override = makeTempDir("storage-db-explicit-");
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "";
+        process.env.NODE_ENV = "development";
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = join(override, "shared");
+        __setRpcDiscoveryFsForTests({
+            readdirSync: (_path, options) => (options?.withFileTypes ? [] : []),
+        });
+        __setRpcIdentityTestHooks({
+            processListExecFileSync: (() => "") as typeof execFileSync,
+        });
+        const db = openDatabase();
+        expect(db).not.toBeNull();
+        const dbPath = join(override, "shared", "context.db");
+        expect(existsSync(dbPath)).toBe(true);
+        expect(statSync(join(override, "shared")).mode & 0o777).toBe(0o700);
+        expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+        closeDatabase();
     });
 });
 
@@ -327,6 +440,48 @@ describe("storage-db", () => {
             );
         });
 
+        it("keeps the shared session table list in lockstep with the live schema", () => {
+            useTempDataHome("storage-db-session-table-list-");
+            const db = openDatabase();
+            const schemaTables = (
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .all() as Array<{ name: string }>
+            )
+                .map((row) => row.name)
+                .filter((table) => {
+                    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                        name: string;
+                    }>;
+                    return columns.some((column) => column.name === "session_id");
+                })
+                .sort();
+
+            // Every exact session_id column denotes session-owned rows. Durable
+            // provenance that must survive session deletion uses explicit names
+            // such as migration_pending.source_session_id instead.
+            expect(SESSION_SCOPED_TABLES.map((definition) => definition.table).sort()).toEqual(
+                schemaTables,
+            );
+
+            // The orphan sweep derives candidates from this harness-provenanced
+            // subset. Tables without harness remain cleanup-only because their
+            // rows cannot safely be attributed to OpenCode instead of Pi.
+            const harnessScopedSchemaTables = schemaTables.filter((table) => {
+                const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                    name: string;
+                }>;
+                return columns.some((column) => column.name === "harness");
+            });
+            expect(
+                SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
+                    .map((definition) => definition.table)
+                    .sort(),
+            ).toEqual(harnessScopedSchemaTables.sort());
+        });
+
         it("#when clearSession runs #then every session-scoped table is emptied", () => {
             // Discover the contract from schema shape instead of maintaining a
             // second table list. Any new table with session_id is seeded here and
@@ -439,6 +594,78 @@ describe("storage-db", () => {
             expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
+        for (const scenario of [
+            {
+                name: "a confirmed live OpenCode server",
+                pid: () => process.pid,
+                configure: () => setLinuxIdentityProbe(),
+                blocksMigration: true,
+            },
+            {
+                name: "a dead OpenCode server PID",
+                pid: () => 2_147_483_647,
+                configure: () => undefined,
+                blocksMigration: false,
+            },
+            {
+                name: "an OpenCode server probe that sandbox policy prevents from running",
+                pid: () => process.pid,
+                configure: () => {
+                    const permissionDenied = new Error(
+                        "sandbox denied process probe",
+                    ) as NodeJS.ErrnoException;
+                    permissionDenied.code = "EPERM";
+                    __setRpcIdentityTestHooks({
+                        platform: "linux",
+                        processKill: (() => {
+                            throw permissionDenied;
+                        }) as typeof process.kill,
+                        readFileSync: (() => {
+                            throw permissionDenied;
+                        }) as typeof readFileSync,
+                    });
+                },
+                blocksMigration: false,
+            },
+        ]) {
+            it(`#when RPC discovery finds ${scenario.name} #then only the confirmed server blocks migration`, () => {
+                const dataHome = useTempDataHome("storage-db-rpc-probe-matrix-");
+                const dbPath = seedPendingMigration(dataHome);
+                const portDir = join(dirname(dbPath), "rpc", "test-project");
+                mkdirSync(portDir, { recursive: true });
+                const pid = scenario.pid();
+                writeFileSync(
+                    join(portDir, `port-${pid}.json`),
+                    JSON.stringify({ port: 43123, pid, started_at: 1_200_000 }),
+                );
+                scenario.configure();
+
+                const opened = openDatabase();
+
+                expect(opened === null).toBe(scenario.blocksMigration);
+                expect(readPersistedVersion(dbPath)).toBe(
+                    scenario.blocksMigration
+                        ? LATEST_SUPPORTED_VERSION - 1
+                        : LATEST_SUPPORTED_VERSION,
+                );
+                if (!scenario.blocksMigration && pid === process.pid) {
+                    expect(inspectRpcServerDiscovery(dirname(dbPath))).toMatchObject({
+                        state: "inconclusive",
+                        serverPids: [],
+                        inconclusivePids: [process.pid],
+                    });
+                    // Sandbox uncertainty must not look like a real multi-instance
+                    // refusal: users need to know that migration continued safely.
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("continuing migration");
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("OS sandbox denied kill(0) or ps");
+                }
+            });
+        }
+
         it("#when an older Pi harness is live #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-pi-migration-");
             const dbPath = seedPendingMigration(dataHome);
@@ -452,11 +679,126 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [41001],
+                blockingProcesses: [{ kind: "Pi", pid: 41001 }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "Pi harness", pid: 41001 },
+                { kind: "Pi", pid: 41001 },
             ]);
+            expect(
+                formatLiveProcessMigrationRefusal(
+                    dbPath,
+                    LATEST_SUPPORTED_VERSION - 1,
+                    LATEST_SUPPORTED_VERSION,
+                    [],
+                    [41001],
+                ),
+            ).toContain("confirmed Pi harness PID 41001");
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a fresh explicit-path database", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-live-pi-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase(dbPath)).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a test-data-dir database", () => {
+            const savedXdg = process.env.XDG_DATA_HOME;
+            const savedTestDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            const isolatedRoot = makeTempDir("storage-db-test-data-dir-live-pi-");
+            const dbPath = join(isolatedRoot, "cortexkit", "magic-context", "context.db");
+            mkdirSync(dirname(dbPath), { recursive: true });
+            closeQuietly(new Database(dbPath));
+            delete process.env.XDG_DATA_HOME;
+            process.env.MAGIC_CONTEXT_TEST_DATA_DIR = isolatedRoot;
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            try {
+                const db = openDatabase();
+                expect(db).not.toBeNull();
+                expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+                expect(getMigrationOnOpenRefusal()).toBeNull();
+            } finally {
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
+                if (savedTestDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+                else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
+            }
+        });
+
+        it("#when an explicit-path database has same-directory live RPC evidence #then refuses migration", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-same-dir-rpc-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                persistedVersion: 0,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [process.pid],
+            });
+            expect(readPersistedVersion(dbPath)).toBe(0);
+        });
+
+        it("#when a Windows omp.exe command line has no Pi arc #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-omp-image-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                platform: "win32",
+                processListExecFileSync: ((file: string | URL) => {
+                    if (String(file) !== "powershell") {
+                        throw new Error(`${String(file)} must not run when CIM succeeds`);
+                    }
+                    return JSON.stringify({
+                        ProcessId: 41001,
+                        ParentProcessId: 8,
+                        CommandLine: "C:\\Users\\qiiks\\.bun\\bin\\omp.exe",
+                        CreationDate: "20260101120000.000000+000",
+                    });
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "continuing migration",
+            );
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "Pi/OMP PID 41001",
+            );
+        });
+
+        it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-pi-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() => {
+                    const error = new Error("sandbox denied ps") as NodeJS.ErrnoException;
+                    error.code = "EPERM";
+                    throw error;
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
         it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {
@@ -490,6 +832,7 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [],
+                blockingProcesses: [],
                 unreadableFile: portFile,
                 unreadableArm: "parse",
             });
@@ -694,6 +1037,37 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when a discovery record provides a process kind #then it takes precedence over command probes", () => {
+            const dataHome = useTempDataHome("storage-db-record-kind-migration-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(dirname(dbPath), { recursive: true });
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
+            `);
+            legacy.close();
+
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({
+                    port: 43123,
+                    pid: process.pid,
+                    started_at: 1_200_000,
+                    kind: "Pi",
+                }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()?.blockingProcesses).toEqual([
+                { kind: "Pi", pid: process.pid },
+            ]);
+        });
+
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-server-migration-");
             const dbPath = resolveDbPath(dataHome);
@@ -742,9 +1116,10 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [process.pid],
+                blockingProcesses: [{ kind: "process", pid: process.pid }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "OpenCode server", pid: process.pid },
+                { kind: "process", pid: process.pid },
             ]);
             const unchanged = new Database(dbPath);
             expect(getPersistedSchemaVersion(unchanged)).toBe(LATEST_SUPPORTED_VERSION - 1);
@@ -914,7 +1289,8 @@ describe("storage-db", () => {
                 expect(dbPath.startsWith(realStorageRoot)).toBe(false);
                 expect(dbPath.includes("mc-test-db-backstop-")).toBe(true);
             } finally {
-                if (savedXdg !== undefined) process.env.XDG_DATA_HOME = savedXdg;
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
                 if (savedTestDir !== undefined)
                     process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
             }

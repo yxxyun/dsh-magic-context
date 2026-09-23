@@ -2,18 +2,31 @@
  * Server-side RPC handlers. Queries the server's own SQLite DB
  * and returns typed responses for TUI consumption.
  */
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
 import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
+import {
+    getAuthorityManagedMarker,
+    getMemoryMirrorStatus,
+} from "../features/magic-context/context-authority";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklogMap,
 } from "../features/magic-context/dreamer/task-registry";
+import { getLocalEmbeddingNativeMemoryStats } from "../features/magic-context/memory/embedding-local";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
+import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
+import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
     openDatabase,
@@ -23,6 +36,7 @@ import {
     getPersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
+import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { getMeasuredToolDefinitionTokens } from "../features/magic-context/tool-definition-tokens";
 import {
     computeOpenCodeWorkMetricsIncremental,
@@ -32,17 +46,22 @@ import {
 import { getEmbedDrainUiStatus } from "../hooks/magic-context/embed-session-state";
 import {
     resolveContextLimit,
+    resolveContextWindowGeometry,
     resolveExecuteThresholdDetail,
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
+import { getLkgSlotHeapStats } from "../hooks/magic-context/lkg-slot";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
+import { RUST_SESSION_UPGRADE_REFUSAL } from "../hooks/magic-context/maintenance-authority";
+import { getCompartmentMirrorHeapStats } from "../hooks/magic-context/module-state-sync";
 import {
     findLastAssistantModelFromOpenCodeDb,
     openCodeDbExists,
     withReadOnlySessionDb,
 } from "../hooks/magic-context/read-session-db";
+import { getTokenizerNativeMemoryStats } from "../hooks/magic-context/read-session-formatting";
 import type { ManagedRecompContext } from "../hooks/magic-context/recomp-orchestrator";
 import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import {
@@ -56,9 +75,25 @@ import {
     markAnnouncementSeen,
     shouldShowAnnouncement,
 } from "../shared/announcement";
-import { log } from "../shared/logger";
+import { resolveCacheTtlDisplay } from "../shared/cache-ttl-display";
+import type { ConfigParseFailure } from "../shared/config-diagnostics";
+import { getMagicContextStorageDir } from "../shared/data-path";
+import { getLoggerDiagnostics, log } from "../shared/logger";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
-import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../shared/rpc-types";
+import type {
+    DebugHeapSnapshotResponse,
+    DebugMemoryHolders,
+    DebugMemoryUsageResponse,
+    EmbedDetail,
+    SidebarSnapshot,
+    StatusDetail,
+} from "../shared/rpc-types";
+import { getSqliteMemoryStats } from "../shared/sqlite";
+import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
+import {
+    resolveTailHygieneStatus,
+    type WireTailHygieneBaseline,
+} from "../shared/tail-hygiene-status";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 
 // Per-process incremental work-metrics state, keyed by session. The RPC server
@@ -67,9 +102,45 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // the next poll cold-starts from the persisted session_meta value's session by
 // re-folding once, which is the acceptable one-time cost design A accepts.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
-const RUST_STATUS_CACHE_TTL_MS = 2_000;
+export async function executeRustRecompRpc(
+    moduleClient: RustModeModuleClient | undefined,
+    sessionId: string,
+    projectRoot: string,
+): Promise<{ ok: boolean; error?: string }> {
+    if (!moduleClient) return { ok: false, error: "Rust module client is unavailable" };
+    try {
+        await moduleClient.call({
+            sessionId,
+            projectRoot,
+            method: "session.recomp",
+            body: {
+                method: "session.recomp",
+                v: 1,
+                session_id: sessionId,
+                command_id: `rpc-recomp:${randomUUID()}`,
+            },
+        });
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
+    memory_mirror?: {
+        feed_head?: number;
+        module_live_rows?: number;
+        host_cursor?: number;
+        host_cursor_updated_at_ms?: number;
+        stalled?: boolean;
+        code?: string | null;
+    };
+    authority?: {
+        memories?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+        notes?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+    };
+    tail_hygiene?: WireTailHygieneBaseline | null;
     boundary_present?: boolean;
     coverage_ordinal?: number | null;
     compartment_count?: number;
@@ -81,7 +152,7 @@ export interface RustSessionStatus {
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
 }
-const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
+const rustStatusInFlight = new Map<string, Promise<RustSessionStatus | undefined>>();
 
 /**
  * Lazily compute work-metrics for the sidebar. Returns the persisted fallback
@@ -123,36 +194,50 @@ function getDb(): Database | null {
     }
 }
 
-async function loadRustSessionStatus(
+/**
+ * Coalesce only overlapping reads. Reusing a completed response would let a burst of module
+ * writes leave status fields behind the durable store while still appearing authoritative.
+ */
+export async function loadRustSessionStatus(
     client: RustModeModuleClient | undefined,
     sessionId: string,
     directory: string,
 ): Promise<RustSessionStatus | undefined> {
     if (!client) return undefined;
-    const cached = rustStatusCache.get(sessionId);
-    if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
-        return cached.status;
-    }
+    const requestKey = `${directory}\0${sessionId}`;
+    const existing = rustStatusInFlight.get(requestKey);
+    if (existing) return existing;
+
+    const request = (async () => {
+        try {
+            const response = await client.call({
+                sessionId,
+                projectRoot: directory,
+                method: "session.status",
+                body: { method: "session.status", v: 1, session_id: sessionId },
+            });
+            const raw =
+                response && typeof response === "object"
+                    ? (response as Record<string, unknown>)
+                    : {};
+            const value =
+                raw.result && typeof raw.result === "object"
+                    ? (raw.result as Record<string, unknown>)
+                    : raw;
+            if (value.error || value.ok === false) return undefined;
+            return value as RustSessionStatus;
+        } catch (error) {
+            log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
+            return undefined;
+        }
+    })();
+    rustStatusInFlight.set(requestKey, request);
     try {
-        const response = await client.call({
-            sessionId,
-            projectRoot: directory,
-            method: "session.status",
-            body: { method: "session.status", v: 1, session_id: sessionId },
-        });
-        const raw =
-            response && typeof response === "object" ? (response as Record<string, unknown>) : {};
-        const value =
-            raw.result && typeof raw.result === "object"
-                ? (raw.result as Record<string, unknown>)
-                : raw;
-        if (value.error || value.ok === false) return undefined;
-        const status = value as RustSessionStatus;
-        rustStatusCache.set(sessionId, { status, cachedAt: Date.now() });
-        return status;
-    } catch (error) {
-        log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
-        return undefined;
+        return await request;
+    } finally {
+        if (rustStatusInFlight.get(requestKey) === request) {
+            rustStatusInFlight.delete(requestKey);
+        }
     }
 }
 
@@ -475,6 +560,11 @@ export function buildSidebarSnapshot(
             nativeContextLimit > 0 ? (effectiveInputTokens / nativeContextLimit) * 100 : undefined;
 
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
+        const tailHygiene = resolveTailHygieneStatus(
+            liveSessionState?.channel1StateBySession.get(sessionId),
+            moduleStatus?.tail_hygiene,
+        );
+
         const calibrated = calibrateBuckets({
             inputTokens: effectiveInputTokens,
             systemLocal: systemPromptTokens,
@@ -522,6 +612,7 @@ export function buildSidebarSnapshot(
             conversationTokens: calibrated.conversationTokens,
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
+            ...(tailHygiene === undefined ? {} : { tailHygiene }),
             executeThreshold,
             executeThresholdClamped,
             boundaryPresent: moduleStatus?.boundary_present,
@@ -603,22 +694,40 @@ export function buildStatusDetail(
         moduleStatus,
         compactionEnabled,
     );
+    const rustMode = config?.transform_mode === "rust";
+    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
+    const moduleMemoryAuthority = moduleStatus?.authority?.memories;
+    const moduleMemoryState = moduleMemoryAuthority?.state;
+    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
     const detail: StatusDetail = {
         ...base,
+        hostBackendsModuleSide: rustMode,
+        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
+        memoryAuthorityMismatch:
+            rustMode &&
+            moduleStatus?.authority !== undefined &&
+            projectIdentity !== null &&
+            getAuthorityManagedMarker(db, projectIdentity) !== null &&
+            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
+        activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,
         droppedTags: 0,
         totalTags: 0,
+        tagCountsAuthoritative: true,
         activeBytes: 0,
         lastResponseTime: 0,
         lastNudgeTokens: 0,
         lastTransformError: null,
+        historianFailureCount: 0,
         isSubagent: false,
         pendingOps: [],
         contextLimit: 0,
         cacheTtlMs: 0,
         cacheRemainingMs: 0,
         cacheExpired: false,
+        cacheTtlSource: "default",
+        configParseFailures: [],
         cacheNeverExpires: false,
         executeThreshold: 65,
         executeThresholdMode: "percentage",
@@ -629,6 +738,7 @@ export function buildStatusDetail(
         compressionUsage: null,
         toastDurationMs: 5000,
         mural: undefined,
+        loggerDiagnostics: getLoggerDiagnostics(),
         // Safe defaults; the live context.db value is filled in the try block below.
         storage_versions: {
             // null = the probe FAILED (read threw); 0 = probe succeeded on a fresh DB
@@ -649,8 +759,7 @@ export function buildStatusDetail(
             context_db_schema_version: getPersistedSchemaVersion(db),
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         };
-        const muralConfig = (config?.experimental as { mural?: { enabled?: boolean } } | undefined)
-            ?.mural;
+        const muralConfig = config?.mural as { enabled?: boolean } | undefined;
         if (muralConfig?.enabled && base.projectIdentity) {
             const row = getMural(db, base.projectIdentity);
             detail.mural = {
@@ -658,6 +767,8 @@ export function buildStatusDetail(
                 ageMs: row ? Math.max(0, Date.now() - row.renderedAt) : null,
             };
         }
+        let persistedCacheTtl = "5m";
+        let persistedModelKey: string | null = null;
         const meta = db
             .prepare<[string], Record<string, unknown>>(
                 "SELECT * FROM session_meta WHERE session_id = ?",
@@ -670,7 +781,17 @@ export function buildStatusDetail(
             detail.lastTransformError = meta.last_transform_error
                 ? String(meta.last_transform_error)
                 : null;
+            detail.historianFailureCount = Number(meta.historian_failure_count ?? 0);
             detail.isSubagent = Boolean(meta.is_subagent);
+            persistedCacheTtl =
+                typeof meta.cache_ttl === "string" && meta.cache_ttl.length > 0
+                    ? meta.cache_ttl
+                    : "5m";
+            persistedModelKey =
+                typeof meta.last_observed_model_key === "string" &&
+                meta.last_observed_model_key.length > 0
+                    ? meta.last_observed_model_key
+                    : null;
         }
 
         // Tags
@@ -689,8 +810,23 @@ export function buildStatusDetail(
                 .get(sessionId);
             detail.droppedTags = droppedRow?.count ?? 0;
             detail.totalTags = detail.activeTags + detail.droppedTags;
+            const observedProtectionFloor = getObservedEpochFloor(db, sessionId);
+            if (observedProtectionFloor !== null) {
+                detail.protectedTagCount = getProtectionWindowForSession(
+                    db,
+                    sessionId,
+                    observedProtectionFloor,
+                ).status.protectedCount;
+            }
         } catch {
             // tags table might have different schema
+        }
+        if (typeof moduleStatus?.tag_count === "number") {
+            // mc-store retains exact minted-tag totals but does not classify its rows with
+            // context.db's active/dropped status vocabulary. Use the module total while
+            // telling the TUI not to present host-mirror breakdowns as Rust authority truth.
+            detail.totalTags = moduleStatus.tag_count;
+            detail.tagCountsAuthoritative = false;
         }
 
         // Pending ops. The dialog only displays pendingOpsCount (computed
@@ -706,6 +842,15 @@ export function buildStatusDetail(
             detail.pendingOps = ops.map((o) => ({ tagId: o.tag_id, operation: o.operation }));
         } catch {
             // pending_ops may not exist
+        }
+
+        const modelSlash = modelKey?.indexOf("/") ?? -1;
+        if (modelKey && modelSlash > 0) {
+            detail.windowGeometry = resolveContextWindowGeometry(
+                modelKey.slice(0, modelSlash),
+                modelKey.slice(modelSlash + 1),
+                { db, sessionID: sessionId },
+            );
         }
 
         // Derived context limit needed for tokens-based threshold resolution.
@@ -740,12 +885,20 @@ export function buildStatusDetail(
                 detail.executeThresholdTokens = thresholdDetail.absoluteTokens;
             }
 
-            const ct = resolveConfigValue<string>(config, "cache_ttl", modelKey, "5m");
-            detail.cacheTtl = ct;
+            const ttlDisplay = resolveCacheTtlDisplay({
+                configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
+                configuredExplicitly: config.cacheTtlConfigured === true,
+                modelKey,
+                sessionValue: persistedCacheTtl,
+                sessionModelKey: persistedModelKey,
+            });
+            detail.cacheTtl = ttlDisplay.value;
+            detail.cacheTtlSource = ttlDisplay.source;
+            detail.cacheTtlModelKey = ttlDisplay.modelKey;
+            detail.configParseFailures = Array.isArray(config.configParseFailures)
+                ? (config.configParseFailures as ConfigParseFailure[])
+                : [];
 
-            if (typeof config.protected_tags === "number") {
-                detail.protectedTagCount = config.protected_tags;
-            }
             if (typeof config.history_budget_percentage === "number") {
                 detail.historyBudgetPercentage = config.history_budget_percentage;
             }
@@ -782,6 +935,30 @@ export function buildStatusDetail(
             } else {
                 detail.cacheRemainingMs = Math.max(0, detail.cacheTtlMs - elapsed);
                 detail.cacheExpired = detail.cacheRemainingMs === 0;
+            }
+        }
+
+        if (base.projectIdentity) {
+            try {
+                const coverage = getEmbeddingCoverageStatus(db, base.projectIdentity, sessionId);
+                const runState = getEmbedDrainUiStatus(
+                    sessionId,
+                    base.recompProgress ?? undefined,
+                ).status;
+                detail.embedding = {
+                    state: !coverage.enabled
+                        ? "off"
+                        : runState !== "idle"
+                          ? runState
+                          : coverage.session.total > 0 &&
+                              coverage.session.embedded >= coverage.session.total
+                            ? "ready"
+                            : "waiting",
+                    indexed: coverage.session.embedded,
+                    total: coverage.session.total,
+                };
+            } catch {
+                detail.embedding = { state: "waiting", indexed: 0, total: 0 };
             }
         }
 
@@ -828,11 +1005,287 @@ function buildEmbedDetail(
         enabled: coverage.enabled,
         model: coverage.model,
         provider: coverage.provider,
+        ...(coverage.synapseDescriptor ? { synapseDescriptor: coverage.synapseDescriptor } : {}),
         session: coverage.session,
         memories: coverage.memories,
         commits: coverage.commits,
         statusText,
     };
+}
+
+export function buildCompartmentCount(
+    db: Database,
+    sessionId: string,
+    moduleStatus?: RustSessionStatus,
+): number {
+    if (typeof moduleStatus?.compartment_count === "number") {
+        return moduleStatus.compartment_count;
+    }
+    try {
+        const row = db
+            .prepare<[string], { count: number }>(
+                "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
+            )
+            .get(sessionId);
+        return row?.count ?? 0;
+    } catch {
+        return 0;
+    }
+}
+
+interface RuntimeDebugMemoryHolders {
+    taggerCache?: {
+        sessionCount: number;
+        assignmentEntries: number;
+        toolAccountingEntries: number;
+        loadSignatureEntries: number;
+        sessions: Array<{
+            sessionId: string;
+            assignments: number;
+            toolAccounting: number;
+        }>;
+    };
+    wireCache?: {
+        snapshots: number;
+        rawContentSnapshots: number;
+        estimatedBytes: number;
+        sessions: Array<{
+            sessionId: string;
+            rawMessages: number;
+            wireMessages: number;
+            rawContentSnapshots: number;
+            estimatedBytes: number;
+        }>;
+    };
+}
+
+const EMPTY_TAGGER_HEAP_STATS = {
+    sessionCount: 0,
+    assignmentEntries: 0,
+    toolAccountingEntries: 0,
+    loadSignatureEntries: 0,
+    sessions: [],
+} satisfies NonNullable<RuntimeDebugMemoryHolders["taggerCache"]>;
+
+const EMPTY_WIRE_HEAP_STATS = {
+    snapshots: 0,
+    rawContentSnapshots: 0,
+    estimatedBytes: 0,
+    sessions: [],
+} satisfies NonNullable<RuntimeDebugMemoryHolders["wireCache"]>;
+
+export function isDebugRpcEnabled(
+    config: Pick<MagicContextConfig, "debug_rpc">,
+    env: NodeJS.ProcessEnv = process.env,
+): boolean {
+    return config.debug_rpc === true || env.MAGIC_CONTEXT_DEBUG_RPC === "1";
+}
+
+export function buildDebugMemoryUsage(
+    runtimeHolders: RuntimeDebugMemoryHolders = {},
+): DebugMemoryUsageResponse {
+    const usage = process.memoryUsage();
+    const lkg = getLkgSlotHeapStats();
+    const tagger = runtimeHolders.taggerCache ?? EMPTY_TAGGER_HEAP_STATS;
+    const wire = runtimeHolders.wireCache ?? EMPTY_WIRE_HEAP_STATS;
+    const mirrors = getCompartmentMirrorHeapStats();
+    const messageIndexQueue = getMessageIndexQueueHeapStats();
+    const sessions = new Map<string, DebugMemoryHolders["sessions"][number]>();
+    const session = (sessionId: string) => {
+        let current = sessions.get(sessionId);
+        if (!current) {
+            current = {
+                sessionId,
+                lkgBytes: 0,
+                taggerAssignments: 0,
+                taggerToolAccounting: 0,
+                wireRawMessages: 0,
+                wireMessages: 0,
+                wireContentSnapshots: 0,
+                wireEstimatedBytes: 0,
+            };
+            sessions.set(sessionId, current);
+        }
+        return current;
+    };
+    for (const slot of lkg.sessions) session(slot.sessionId).lkgBytes += slot.bytes;
+    for (const entry of tagger.sessions) {
+        const target = session(entry.sessionId);
+        target.taggerAssignments += entry.assignments;
+        target.taggerToolAccounting += entry.toolAccounting;
+    }
+    for (const entry of wire.sessions) {
+        const target = session(entry.sessionId);
+        target.wireRawMessages += entry.rawMessages;
+        target.wireMessages += entry.wireMessages;
+        target.wireContentSnapshots += entry.rawContentSnapshots;
+        target.wireEstimatedBytes += entry.estimatedBytes;
+    }
+
+    return {
+        pid: process.pid,
+        bunVersion:
+            typeof Bun !== "undefined" && typeof Bun.version === "string"
+                ? Bun.version
+                : "unavailable",
+        memoryUsage: {
+            rss: usage.rss,
+            heapTotal: usage.heapTotal,
+            heapUsed: usage.heapUsed,
+            external: usage.external,
+            arrayBuffers: usage.arrayBuffers,
+        },
+        native: {
+            sqlite: getSqliteMemoryStats(),
+            tokenizer: getTokenizerNativeMemoryStats(),
+            localEmbedding: getLocalEmbeddingNativeMemoryStats(),
+            quickJs: getQuickJsNativeMemoryStats(),
+        },
+        holders: {
+            lkgSlots: { count: lkg.count, totalBytes: lkg.totalBytes },
+            taggerCache: {
+                sessionCount: tagger.sessionCount,
+                assignmentEntries: tagger.assignmentEntries,
+                toolAccountingEntries: tagger.toolAccountingEntries,
+                loadSignatureEntries: tagger.loadSignatureEntries,
+            },
+            wireCache: {
+                snapshots: wire.snapshots,
+                rawContentSnapshots: wire.rawContentSnapshots,
+                estimatedBytes: wire.estimatedBytes,
+            },
+            compartmentMirrors: { entries: mirrors.entries },
+            messageIndexQueue,
+            sessions: [...sessions.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+        },
+    };
+}
+
+async function writeSnapshotJson(
+    path: string,
+    snapshot: Record<string, unknown>,
+    enforcePrivatePermissions: boolean,
+): Promise<void> {
+    const writer = createWriteStream(path, enforcePrivatePermissions ? { mode: 0o600 } : undefined);
+    const writeChunk = async (chunk: string): Promise<void> => {
+        if (!writer.write(chunk)) await once(writer, "drain");
+    };
+    const writeNumberArray = async (values: number[]): Promise<void> => {
+        await writeChunk("[");
+        const chunkSize = 50_000;
+        for (let offset = 0; offset < values.length; offset += chunkSize) {
+            if (offset > 0) await writeChunk(",");
+            await writeChunk(values.slice(offset, offset + chunkSize).join(","));
+        }
+        await writeChunk("]");
+    };
+
+    try {
+        await writeChunk("{");
+        let first = true;
+        for (const [key, value] of Object.entries(snapshot)) {
+            if (!first) await writeChunk(",");
+            first = false;
+            await writeChunk(`${JSON.stringify(key)}:`);
+            if ((key === "nodes" || key === "edges") && Array.isArray(value)) {
+                await writeNumberArray(value as number[]);
+            } else {
+                await writeChunk(JSON.stringify(value));
+            }
+        }
+        await writeChunk("}");
+        writer.end();
+        await once(writer, "finish");
+    } catch (error) {
+        writer.destroy();
+        try {
+            rmSync(path, { force: true });
+        } catch {
+            // Keep the original write failure when the best-effort partial-file cleanup also fails.
+        }
+        throw error;
+    }
+}
+
+const DEFAULT_HEAP_SNAPSHOT_MAX_RSS_MB = 2048;
+
+function resolveHeapSnapshotMaxRssBytes(): number {
+    const raw = process.env.MAGIC_CONTEXT_DEBUG_HEAP_SNAPSHOT_MAX_RSS_MB;
+    const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+    const megabytes =
+        Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_HEAP_SNAPSHOT_MAX_RSS_MB;
+    return megabytes * 1024 * 1024;
+}
+
+async function generateDebugHeapSnapshot(
+    storageDir: string,
+    memory: DebugMemoryUsageResponse,
+): Promise<DebugHeapSnapshotResponse> {
+    if (typeof Bun === "undefined" || typeof Bun.generateHeapSnapshot !== "function") {
+        throw new Error("Bun.generateHeapSnapshot is unavailable in this runtime");
+    }
+    // Bun walks the whole JSC heap synchronously to build the snapshot. On a
+    // long-running serve (6.5 GB RSS, 2026-09-11) that walk tripped an
+    // EXC_BREAKPOINT inside Bun and took the host down, so the endpoint refuses
+    // above a resident-size ceiling instead of risking the process; the cheap
+    // debug.memoryUsage counters remain available at any size.
+    const rssBytes = memory.memoryUsage.rss;
+    const maxRssBytes = resolveHeapSnapshotMaxRssBytes();
+    if (rssBytes > maxRssBytes) {
+        throw new Error(
+            `heap snapshot refused: process rss ${Math.round(rssBytes / (1024 * 1024))} MiB exceeds the ${Math.round(maxRssBytes / (1024 * 1024))} MiB ceiling (MAGIC_CONTEXT_DEBUG_HEAP_SNAPSHOT_MAX_RSS_MB); use debug.memoryUsage instead`,
+        );
+    }
+
+    const directory = join(storageDir, "heap-snapshots");
+    const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
+    mkdirSync(
+        directory,
+        enforcePrivatePermissions ? { recursive: true, mode: 0o700 } : { recursive: true },
+    );
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const path = join(directory, `${timestamp}-${process.pid}.heapsnapshot`);
+
+    let format: "jsc" | "v8" = "jsc";
+    let snapshotVersion: number | undefined;
+    let snapshot: Bun.HeapSnapshot | string;
+    try {
+        snapshot = Bun.generateHeapSnapshot();
+        snapshotVersion = snapshot.version;
+    } catch (jscError) {
+        try {
+            format = "v8";
+            snapshot = Bun.generateHeapSnapshot("v8");
+        } catch (v8Error) {
+            throw new Error(
+                `Heap snapshot generation failed (jsc=${String(jscError)}; v8=${String(v8Error)})`,
+            );
+        }
+    }
+
+    if (typeof snapshot === "string") {
+        await Bun.write(path, snapshot);
+    } else {
+        await writeSnapshotJson(
+            path,
+            {
+                ...snapshot,
+                magicContext: {
+                    capturedAt: Date.now(),
+                    memory,
+                },
+            },
+            enforcePrivatePermissions,
+        );
+    }
+    if (enforcePrivatePermissions) {
+        try {
+            chmodSync(path, 0o600);
+        } catch {
+            // A tightening failure does not invalidate the completed diagnostic capture.
+        }
+    }
+    return { ...memory, path, format, snapshotVersion };
 }
 
 /**
@@ -846,6 +1299,8 @@ export function registerRpcHandlers(
         client: unknown;
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
+        storageDir?: string;
+        getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
@@ -866,15 +1321,31 @@ export function registerRpcHandlers(
 
     const injectionBudgetTokens = config.memory?.injection_budget_tokens;
 
+    if (isDebugRpcEnabled(config)) {
+        const readMemory = () => buildDebugMemoryUsage(args.getDebugMemoryHolders?.());
+        rpcServer.handle("debug.memoryUsage", async () => ({ ...readMemory() }));
+        rpcServer.handle("debug.heapSnapshot", async () => ({
+            ...(await generateDebugHeapSnapshot(
+                args.storageDir ?? getMagicContextStorageDir(),
+                readMemory(),
+            )),
+        }));
+    }
+
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
-            config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                error: "Rust module status unavailable; canonical session state was not read",
+            };
+        }
         return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
@@ -893,10 +1364,15 @@ export function registerRpcHandlers(
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
-            config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                error: "Rust module status unavailable; canonical session state was not read",
+            };
+        }
         return buildStatusDetail(
             db,
             sessionId,
@@ -928,53 +1404,51 @@ export function registerRpcHandlers(
 
     rpcServer.handle("compartment-count", async (params) => {
         const sessionId = String(params.sessionId ?? "");
+        const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { count: 0 };
-        try {
-            const row = db
-                .prepare<[string], { count: number }>(
-                    "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
-                )
-                .get(sessionId);
-            return { count: row?.count ?? 0 };
-        } catch {
-            return { count: 0 };
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                count: 0,
+                error: "Rust module status unavailable; canonical compartment count was not read",
+            };
         }
+        return { count: buildCompartmentCount(db, sessionId, moduleStatus) };
     });
 
-    // ── Recomp / session-upgrade: delegate to the shared orchestrator ───────
-    // The RPC dialog paths ("/ctx-recomp" + "Run upgrade now") run through the
-    // SAME runManagedRecomp/runManagedUpgrade as the /ctx-* command paths, so
-    // they get identical model fallback, live progress, terminal state, and
-    // clean messaging. Dogfood 2026-05-30: the old RPC upgrade handler lacked
-    // model fallback (failed when the primary historian model returned empty,
-    // while /ctx-session-upgrade succeeded via fallback) and the command path
-    // lacked progress (left the sidebar stuck on a stale "failed"). One runner
-    // closes both gaps permanently.
+    // Under TypeScript authority, the RPC dialogs share the same recomp/upgrade
+    // orchestrators as /ctx-* commands. Rust authority branches below: recomp goes
+    // to session.recomp, while session upgrade refuses because the module owns state.
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
         const { deriveHistorianChunkTokens, resolveHistorianContextLimit } = await import(
             "../hooks/magic-context/derive-budgets"
         );
-        const { resolveFallbackChain } = await import("../shared/resolve-fallbacks");
+        const { resolveHistorianModel } = await import("../shared/model-resolution");
         const { userMemoryCollectionEnabled } = await import(
             "../features/magic-context/dreamer/task-config"
         );
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
+        const historianModel = resolveHistorianModel(config, "opencode");
         return {
             client: args.client as ManagedRecompContext["client"],
             db,
             liveSessionState,
             directory,
             historianChunkTokens: deriveHistorianChunkTokens(
-                resolveHistorianContextLimit(config.historian?.model),
+                resolveHistorianContextLimit(historianModel.primary?.model),
             ),
             historianTimeoutMs: config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
             memoryEnabled: config.memory?.enabled ?? true,
             autoPromote: config.memory?.auto_promote ?? true,
-            fallbackModels: resolveFallbackChain(config.historian?.fallback_models),
-            runMigration: config.memory?.enabled !== false && !!config.historian?.model,
+            historianModel: historianModel.primary,
+            fallbackModels: historianModel.fallbacks,
+            runMigration: config.memory?.enabled !== false && !!historianModel.primary?.model,
             userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
             historianTwoPass: config.historian?.two_pass === true,
             getNotificationParams,
@@ -984,6 +1458,10 @@ export function registerRpcHandlers(
     rpcServer.handle("recomp", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        const dir = String(params.directory ?? directory);
+        if (config.transform_mode === "rust") {
+            return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
+        }
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
 
@@ -1014,6 +1492,9 @@ export function registerRpcHandlers(
     rpcServer.handle("upgrade", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        if (config.transform_mode === "rust") {
+            return { ok: false, error: RUST_SESSION_UPGRADE_REFUSAL };
+        }
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
 

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
     type AuthorityDrainResponse,
@@ -7,47 +7,82 @@ import {
     checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
+    observeAuthorityRouting,
     prepareAuthority,
     pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
-import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    resolveProjectIdentityForSession,
+} from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
+import {
+    modelKeyAcceptsImages,
+    resolveMuralWire,
+} from "../../features/magic-context/mural/render-trigger";
+import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
     clearPersistedTodoSyntheticAnchor,
+    clearThinkingBindingRecoveryIf,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
+    getPersistedCompactionMarkerState,
+    getPersistedTodoPermissionDenied,
     isEmergencyRecoveryArmed,
+    isProviderOverflowFailClosedProven,
     isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
+    resolveEpochFloorForPass,
+    setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
+import { getPendingOps } from "../../features/magic-context/storage-ops";
+import {
+    GLOBAL_USER_PROFILE_PROJECT_PATH,
+    getProjectState,
+} from "../../features/magic-context/storage-project-state";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { canonicalModelIdentity } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
+import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
+import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
+    cachedToolPermissionDenied,
     resolveCtxReduceAvailability,
     resolveTodowriteAvailability,
     resolveTodowriteAvailabilityFromMessages,
+    type ToolAvailabilityVerdict,
+    todowritePermissionDenied,
 } from "./ctx-reduce-availability";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { isEditTool } from "./edit-marker";
 import {
+    EmergencyFailClosedError,
+    ENGINE_RECONNECTING_USER_MESSAGE,
+} from "./emergency-fail-closed";
+import {
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { saveLkgSlotToDb } from "./lkg-persist";
 import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
 import {
     captureSlot,
     dropSlot,
+    exactReusablePrefix,
     getSlot,
+    incrementalLkgContentDigests,
     LKG_SNAPSHOT_ARRAY,
     LKG_SNAPSHOT_BOOLEAN,
     LKG_SNAPSHOT_KEY,
@@ -56,12 +91,18 @@ import {
     LKG_SNAPSHOT_OBJECT,
     LKG_SNAPSHOT_STRING,
     LKG_SNAPSHOT_UNDEFINED,
-    type LkgContentField,
     type LkgEntryNote,
-    lkgContentDigestFromFields,
+    type LkgInputSnapshot,
+    type LkgSlot,
+    type MessageContentSnapshot,
+    messageContentFields,
+    messageContentSnapshot,
     noteEntry,
+    signatureForFields,
+    visitMessageContentFields,
 } from "./lkg-slot";
 import {
+    clearCompartmentMirrorCursor,
     type ModuleCompartmentMirrorResponse,
     type ModuleCompartmentReader,
     type ModuleStateSyncClient,
@@ -70,20 +111,30 @@ import {
     syncModuleState,
 } from "./module-state-sync";
 import {
+    isModuleTransportGenerationChangedResult,
+    TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS,
+    transformColdStartExecuteTimeoutMs,
+} from "./module-transport";
+import {
     buildPagedModuleTransformPayloads,
+    cloneModuleNativeOutput,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
-import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
+import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
-import { runRustModePostprocess } from "./transform-postprocess-phase";
+import {
+    replayRustModeBindingMismatchStrips,
+    runRustModePostprocess,
+} from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 export class MemoryAuthorityUnavailableError extends Error {
@@ -97,29 +148,120 @@ export class MemoryAuthorityUnavailableError extends Error {
     }
 }
 
+class RustTransformProtocolError extends Error {
+    readonly code = "rust_transform_protocol_error";
+
+    constructor(message: string) {
+        super(message);
+        this.name = "RustTransformProtocolError";
+    }
+}
+
 export const RUST_FAILURE_PARK_THRESHOLD = 3;
 export const RUST_PARK_RETRY_INTERVAL = 5;
 export const RUST_EMERGENCY_WALL_PCT = 95;
 export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
+export const RUST_SILENT_RESEND_AFTER_MS = 10_000;
+export const RUST_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+// A frozen defer prevents an immediate LKG/module/LKG double bust. After eight healthy module
+// passes or sixteen new raw messages, continued replay adds more stale-snapshot risk than value.
+const RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT = 8;
+const RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT = 16;
+
+function activeAgentFromMessages(messages: readonly MessageLike[]): string | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const info = messages[index]?.info as { role?: unknown; agent?: unknown } | undefined;
+        if (info?.role !== "user") continue;
+        return typeof info.agent === "string" && info.agent.length > 0 ? info.agent : undefined;
+    }
+    return undefined;
+}
+
+async function resolveCombinedTodowriteVerdict(
+    deps: TransformDeps,
+    sessionId: string,
+    messages: readonly MessageLike[],
+    availability: ToolAvailabilityVerdict,
+    timings: RustPassTimings,
+    probeFresh = true,
+): Promise<boolean> {
+    if (!availability.frozen || !availability.callable || deps.compactionOff === true) return false;
+
+    const persistedDenied = getPersistedTodoPermissionDenied(deps.db, sessionId);
+    if (!probeFresh && persistedDenied !== null) return !persistedDenied;
+    let permissionDenied =
+        cachedToolPermissionDenied(sessionId, "todowrite") ?? persistedDenied ?? false;
+    if (deps.client) {
+        try {
+            const probeStartedAt = performance.now();
+            permissionDenied = await todowritePermissionDenied(
+                deps.client,
+                sessionId,
+                activeAgentFromMessages(messages),
+            );
+            timings.todoProbe += performance.now() - probeStartedAt;
+            const persistStartedAt = performance.now();
+            // Permission is still revalidated with the host each pass. Avoid a redundant
+            // SQLite write only when the durable verdict already matches that fresh read.
+            if (persistedDenied !== permissionDenied) {
+                setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
+            }
+            timings.todoPersist += performance.now() - persistStartedAt;
+        } catch (error) {
+            // A failed SDK read cannot turn a prior denial into an allow. Keep the last
+            // in-memory or durable verdict until a later pass obtains authoritative data.
+            sessionLog(
+                sessionId,
+                "todowrite permission read failed; retaining the last successful verdict:",
+                error,
+            );
+        }
+    }
+    return !permissionDenied;
+}
 const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
 
-function rawFallbackSerializedBytes(messages: readonly MessageLike[]): number | null {
+/**
+ * Serialize the raw array message-by-message with a running byte sum, aborting
+ * as soon as the sum proves the prompt is over the context limit. A refusal
+ * then costs a fraction of the full serialization and never runs the
+ * tokenizer; when the sum stays under the budget the total matches a
+ * whole-array serialization up to array punctuation.
+ */
+function rawFallbackSerializedBytes(
+    messages: readonly MessageLike[],
+    abortAboveBytes: number,
+): { bytes: number; aborted: boolean } | null {
+    let bytes = 0;
     try {
-        const serialized = JSON.stringify(messages);
-        return typeof serialized === "string" ? Buffer.byteLength(serialized) : null;
+        for (const message of messages) {
+            const serialized = JSON.stringify(message);
+            if (typeof serialized !== "string") return null;
+            // +1 accounts for the separator between array entries.
+            bytes += Buffer.byteLength(serialized) + 1;
+            if (bytes > abortAboveBytes) return { bytes, aborted: true };
+        }
     } catch {
         // Serialization is itself required before these messages can reach a provider.
         return null;
     }
+    return { bytes: bytes + 1, aborted: false };
 }
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
+    call(
+        args: Parameters<ModuleStateSyncClient["call"]>[0] & {
+            onTimings?: (timings: import("./module-transport").ModuleCallTimings) => void;
+        },
+    ): Promise<unknown>;
     authorityStatus?(args: {
         context_store_uuid: string;
         project: string;
         /** Bound route root for this authority query. */
         projectRoot?: string;
+        /** Existing OpenCode session route used by host tools. */
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
@@ -134,6 +276,14 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
+    mirrorMemory?(args: { module_row_id: number; projectRoot?: string }): Promise<{
+        row: import("../../features/magic-context/context-authority").ChangefeedRow | null;
+    }>;
+    memoryIdentityAck?(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }>;
     deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
@@ -142,15 +292,10 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
-interface MessageContentSnapshot {
-    signature: string;
-    fields: LkgContentField[];
-}
-
 interface RustLkgCapturePlan {
     sessionId: string;
     inputIds: string[];
-    inputSnapshots: readonly MessageContentSnapshot[];
+    inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[];
     jsonPrefix: string;
     modelKey: string | null;
     providerKey: string | null;
@@ -167,16 +312,69 @@ interface RustWireCache {
     rawLastVisible: boolean;
     /** Content-sensitive per-message snapshots for the whole raw array. Delta passes
      * re-verify every reused message so in-place edits cannot ride a stale prefix. */
-    rawContentSnapshots: MessageContentSnapshot[];
+    rawContentSnapshots: Pick<MessageContentSnapshot, "fields">[];
     ckFingerprint: string;
     ckPrefixFingerprintBeforeLast: string;
     nativeFingerprint: string;
     nativePrefixFingerprintBeforeLast: string;
     fingerprint: string;
+    /** Previous acknowledged module output. The array is reused by reference and supplies the
+     * prefix for a validated native-output delta; eviction falls back to a full response. */
+    nativeOutput?: unknown[];
+}
+
+class MagicContextRustHeapHolder {
+    readonly wireCaches = new Map<string, RustWireCache>();
+}
+
+export interface RustWireCacheHeapStats {
+    snapshots: number;
+    rawContentSnapshots: number;
+    estimatedBytes: number;
+    sessions: Array<{
+        sessionId: string;
+        rawMessages: number;
+        wireMessages: number;
+        rawContentSnapshots: number;
+        estimatedBytes: number;
+    }>;
+}
+
+function rustWireCacheEstimatedBytes(cache: RustWireCache): number {
+    let bytes = 0;
+    for (const value of [
+        cache.rawLastId,
+        cache.rawLastSignature,
+        cache.ckFingerprint,
+        cache.ckPrefixFingerprintBeforeLast,
+        cache.nativeFingerprint,
+        cache.nativePrefixFingerprintBeforeLast,
+        cache.fingerprint,
+    ]) {
+        if (value) bytes += value.length * 2;
+    }
+    for (const snapshot of cache.rawContentSnapshots) {
+        for (const field of snapshot.fields) {
+            if (typeof field === "string") bytes += field.length * 2;
+            else if (typeof field === "number" || typeof field === "boolean") bytes += 8;
+            else bytes += String(field).length * 2;
+        }
+    }
+    if (cache.nativeOutput) {
+        try {
+            bytes += Buffer.byteLength(JSON.stringify(cache.nativeOutput));
+        } catch {
+            // Cyclic host extensions are excluded from the serialized estimate.
+        }
+    }
+    return bytes;
 }
 
 interface RustSessionState extends ModuleStateSyncState {
     initialized: boolean;
+    todoProbeIdentity?: string;
+    todoProbeNextPass?: boolean;
+    lastAppliedAtMs?: number;
     consecutiveFailures: number;
     passCount: number;
     parked: boolean;
@@ -200,10 +398,31 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityProject: string | null;
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
+    recordedSessionProjectIdentity: string | null;
+    recordedSessionDirectory: string | null;
+    resolvedMemoryProjectDirectory: string | null;
+    resolvedMemoryProjectPath: string | null;
+    stateSyncInputSignature: string | null;
+    memoryMirrorProjectionKey: string | null;
+    compartmentMirrorProjectionKey: string | null;
+    mirrorProjectionInFlight: boolean;
+    muralCuePoolVersion: number;
+    muralGeneration: number;
+    muralCache: { key: string; value: MuralWireOptions } | null;
     authorityMemorySyncSkipLogged?: boolean;
     lkgCaptureSequence: number;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
+    lkgAcceptedCapture?: {
+        inputs: readonly LkgInputSnapshot[];
+        captureSequence: number;
+        rowVersion: number;
+    };
+    /** A fallback replay is provider-visible output. Keep that exact representation through
+     * deferred recovery; healthy-pass and raw-tail limits prevent indefinite stale replay. */
+    lkgRepresentationFrozen: boolean;
+    lkgFrozenHealthyPasses: number;
+    lkgFrozenAtInputCount: number | null;
 }
 
 export interface RustModeTransformOptions {
@@ -212,6 +431,8 @@ export interface RustModeTransformOptions {
     projectRoot?: string;
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
+    /** Test-only page-size override for exercising multi-page control flow with small fixtures. */
+    modulePageMaxBytes?: number;
     memorySyncRequestedSessions?: Set<string>;
     /**
      * Invoked with each project that reaches rust-mode authority preparation, so the
@@ -223,12 +444,59 @@ export interface RustModeTransformOptions {
     allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
+    /** Override only to exercise a failure at the native-output installation boundary. */
+    installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
+    /** Override only to observe mural generation caching in tests. */
+    muralResolverForTests?: typeof resolveMuralWire;
+    /** Override only to observe session-identity caching in tests. */
+    sessionProjectIdentityResolverForTests?: typeof resolveProjectIdentityForSession;
+    /** Override only to observe memory-project identity caching in tests. */
+    memoryProjectIdentityResolverForTests?: typeof resolveProjectIdentity;
+    /** Arm host-side turn recovery after an engine-reconnecting refusal. */
+    onEngineReconnectRefusal?: (args: {
+        sessionId: string;
+        projectRoot: string;
+        refusedUserMessageId: string;
+        providerProvenEmergency: boolean;
+        compactionOff: boolean;
+    }) => void;
+    /** Disable hot-path I/O caches to establish an uncached differential-timing baseline. */
+    disableHotPathIoCachesForTests?: boolean;
+    /** Test-only callback after a capture is accepted, reporting the reused digest prefix length. */
+    onLkgCaptureForTests?: (reusedPrefix: number) => void;
+    /** Test-only override for the silent-request resend threshold. */
+    silentResendAfterMsForTests?: number;
+    /** Test-only override for the health-probe deadline. */
+    healthProbeTimeoutMsForTests?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object";
+}
+
+function moduleFailureCode(error: unknown): string | null {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (typeof current.code === "string" && current.code.length > 0) return current.code;
+        if (typeof current.message === "string") {
+            try {
+                const detail: unknown = JSON.parse(current.message);
+                if (isRecord(detail) && typeof detail.code === "string") return detail.code;
+            } catch {
+                // Human-readable transport errors need no typed classification.
+            }
+        }
+        current = current.cause;
+    }
+    return null;
+}
+
+function isNonRetryableStateSyncFailure(error: unknown): boolean {
+    return moduleFailureCode(error) === "state_sync_non_retryable";
 }
 
 /**
@@ -252,117 +520,45 @@ function messageIdOf(message: MessageLike): string | null {
     return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-const FNV1A_32_OFFSET = 0x811c9dc5;
-const FNV1A_32_PRIME = 0x01000193;
-
-function updateFnv1a32(hash: number, value: string): number {
-    let next = hash;
-    for (let index = 0; index < value.length; index += 1) {
-        next ^= value.charCodeAt(index);
-        next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
-    }
-    return next;
+function contentSnapshotsFor(
+    messages: readonly MessageLike[],
+): Pick<MessageContentSnapshot, "fields">[] {
+    // Copy primitive field tokens before the RPC so later host mutations cannot alter
+    // this snapshot. Wire-prefix validation compares the fields directly, without a hash.
+    return messages.map((message) => ({ fields: messageContentFields(message) }));
 }
 
-interface MessageContentFieldVisitor {
-    field(value: LkgContentField): boolean;
-    beginObject(): number | undefined;
-    endObject(token: number, entryCount: number): boolean;
-}
-
-function isSnapshotObjectChild(value: unknown): boolean {
-    return value !== undefined && typeof value !== "function" && typeof value !== "symbol";
-}
-
-function visitMessageContentFields(value: unknown, visitor: MessageContentFieldVisitor): boolean {
-    if (value === null) return visitor.field(LKG_SNAPSHOT_NULL);
-    if (typeof value === "string") {
-        return visitor.field(LKG_SNAPSHOT_STRING) && visitor.field(value);
-    }
-    if (typeof value === "number") {
-        return visitor.field(LKG_SNAPSHOT_NUMBER) && visitor.field(value);
-    }
-    if (typeof value === "boolean") {
-        return visitor.field(LKG_SNAPSHOT_BOOLEAN) && visitor.field(value);
-    }
-    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-        return visitor.field(LKG_SNAPSHOT_UNDEFINED);
-    }
-    if (Array.isArray(value)) {
-        if (!visitor.field(LKG_SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
-        for (const item of value) {
-            if (!visitMessageContentFields(item, visitor)) return false;
-        }
-        return true;
-    }
-    if (typeof value === "object") {
-        if (!visitor.field(LKG_SNAPSHOT_OBJECT)) return false;
-        const objectToken = visitor.beginObject();
-        if (objectToken === undefined) return false;
-        let entryCount = 0;
-        for (const key in value) {
-            if (!Object.hasOwn(value, key)) continue;
-            const child = (value as Record<string, unknown>)[key];
-            if (!isSnapshotObjectChild(child)) continue;
-            entryCount += 1;
-            if (
-                !visitor.field(LKG_SNAPSHOT_KEY) ||
-                !visitor.field(key) ||
-                !visitMessageContentFields(child, visitor)
-            ) {
-                return false;
-            }
-        }
-        return visitor.endObject(objectToken, entryCount);
-    }
-    return visitor.field(LKG_SNAPSHOT_UNDEFINED);
-}
-
-function messageContentFields(message: MessageLike): LkgContentField[] {
-    const fields: LkgContentField[] = [];
-    const complete = visitMessageContentFields(message, {
-        field(value) {
-            fields.push(value);
-            return true;
-        },
-        beginObject() {
-            const countIndex = fields.length;
-            fields.push(0);
-            return countIndex;
-        },
-        endObject(countIndex, entryCount) {
-            fields[countIndex] = entryCount;
-            return true;
-        },
-    });
-    if (!complete) throw new Error("message content snapshot traversal stopped unexpectedly");
-    return fields;
-}
-
-function signatureForFields(fields: readonly LkgContentField[]): string {
-    let hash = FNV1A_32_OFFSET;
-    for (const field of fields) {
-        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
-        hash = updateFnv1a32(hash, `${typeof field}:${value.length}:`);
-        hash = updateFnv1a32(hash, value);
-        hash = updateFnv1a32(hash, "\0");
-    }
-    return hash.toString(16).padStart(8, "0");
-}
-
-/** Capture an exact field snapshot plus its compact content-sensitive rolling hash. */
-function messageContentSnapshot(message: MessageLike): MessageContentSnapshot {
-    const fields = messageContentFields(message);
-    return { signature: signatureForFields(fields), fields };
-}
-
-function contentSnapshotsFor(messages: readonly MessageLike[]): MessageContentSnapshot[] {
-    return messages.map(messageContentSnapshot);
+function rustCaptureDigests(
+    inputs: readonly LkgInputSnapshot[],
+    prior: LkgSlot | undefined,
+    acceptedInputs: readonly LkgInputSnapshot[] | null,
+) {
+    const reusablePrefix = prior?.inputContentSignatures
+        ? exactReusablePrefix(inputs, acceptedInputs)
+        : 0;
+    const inputContentSignatures = [
+        ...(prior?.inputContentSignatures?.slice(0, reusablePrefix) ?? []),
+        ...inputs.slice(reusablePrefix).map((input) => signatureForFields(input.fields)),
+    ];
+    const incremental = incrementalLkgContentDigests(
+        inputs.map((input, index) => ({
+            ...input,
+            signature: inputContentSignatures[index] ?? "",
+        })),
+        prior?.inputContentSignatures
+            ? {
+                  ids: prior.inputIdSeq.slice(0, reusablePrefix),
+                  signatures: prior.inputContentSignatures.slice(0, reusablePrefix),
+                  digests: prior.inputContentDigests.slice(0, reusablePrefix),
+              }
+            : undefined,
+    );
+    return { ...incremental, inputContentSignatures };
 }
 
 function messageMatchesContentSnapshot(
     message: MessageLike,
-    snapshot: MessageContentSnapshot,
+    snapshot: Pick<MessageContentSnapshot, "fields">,
 ): boolean {
     let fieldIndex = 0;
     const matched = visitMessageContentFields(message, {
@@ -434,6 +630,9 @@ function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
 }
 
 interface RustPassTimings {
+    identityResolve: number;
+    promptSurface: number;
+    muralResolve: number;
     prefixGuard: number;
     ordinalResolve: number;
     stateSync: number;
@@ -441,14 +640,32 @@ interface RustPassTimings {
     wireBuild: number;
     wireMessages: number;
     transport: number;
+    transportDetail: import("./module-transport").ModuleCallTimings;
+    preflight: number;
+    todoVerdict: number;
+    todoProbe: number;
+    todoPersist: number;
+    todoProbeRequired: number;
+    todoProbeReason: string;
+    todoUnprobedBust: number;
+    sessionDirectory: number;
+    paging: number;
+    outputClone: number;
+    delivery: number;
+    bookkeeping: number;
     transportPages: number;
     transportBytes: number;
     apply: number;
     lkgSnapshot: number;
+    mirrorPull: number;
+    compartmentMirror: number;
 }
 
 function emptyRustPassTimings(): RustPassTimings {
     return {
+        identityResolve: 0,
+        promptSurface: 0,
+        muralResolve: 0,
         prefixGuard: 0,
         ordinalResolve: 0,
         stateSync: 0,
@@ -456,16 +673,76 @@ function emptyRustPassTimings(): RustPassTimings {
         wireBuild: 0,
         wireMessages: 0,
         transport: 0,
+        transportDetail: { lane: 0, route: 0, encode: 0, issue: 0, responseWait: 0, settle: 0 },
+        preflight: 0,
+        todoVerdict: 0,
+        todoProbe: 0,
+        todoPersist: 0,
+        todoProbeRequired: 0,
+        todoProbeReason: "none",
+        todoUnprobedBust: 0,
+        sessionDirectory: 0,
+        paging: 0,
+        outputClone: 0,
+        delivery: 0,
+        bookkeeping: 0,
         transportPages: 0,
         transportBytes: 0,
         apply: 0,
         lkgSnapshot: 0,
+        mirrorPull: 0,
+        compartmentMirror: 0,
+    };
+}
+
+export function formatRustInputCoverageLog(args: {
+    ocInput: number;
+    markerAt: string | null;
+    covered: number;
+}): string {
+    return `rust input coverage: oc_input=${args.ocInput} marker_at=${args.markerAt ?? "none"} covered=${args.covered}`;
+}
+
+function materializedCompactionBoundary(
+    response: Record<string, unknown>,
+): import("./transform-postprocess-phase").RustMaterializedCompactionBoundary | undefined {
+    if (response.committed !== true) return undefined;
+    if (
+        typeof response.scheduler_decision !== "string" ||
+        response.scheduler_decision.toLowerCase() !== "execute"
+    ) {
+        return undefined;
+    }
+    const ordinal = response.coverage_ordinal;
+    const rowVersion = response.row_version;
+    const boundaryId = response.boundary_id;
+    if (
+        typeof ordinal !== "number" ||
+        !Number.isSafeInteger(ordinal) ||
+        ordinal < 0 ||
+        typeof rowVersion !== "number" ||
+        !Number.isSafeInteger(rowVersion) ||
+        rowVersion <= 0 ||
+        typeof boundaryId !== "string"
+    ) {
+        return undefined;
+    }
+    const separator = boundaryId.lastIndexOf("#");
+    if (separator < 1 || !/^\d+$/.test(boundaryId.slice(separator + 1))) return undefined;
+    return {
+        rowVersion,
+        ordinal,
+        endMessageId: boundaryId.slice(0, separator),
     };
 }
 
 function formatRustPassLog(args: {
     decision: string;
     reason: string;
+    schedulerDecision?: string;
+    schedulerDeferReason?: string;
+    historianNoFire?: string;
+    historianCanonicalCause?: string;
     servedFrom: string;
     inputCount: number;
     outputCount: number;
@@ -477,6 +754,9 @@ function formatRustPassLog(args: {
 }): string {
     const timings = args.timings ?? emptyRustPassTimings();
     const measured =
+        timings.identityResolve +
+        timings.promptSurface +
+        timings.muralResolve +
         timings.prefixGuard +
         timings.ordinalResolve +
         timings.stateSync +
@@ -484,10 +764,24 @@ function formatRustPassLog(args: {
         timings.wireBuild +
         timings.transport +
         timings.apply +
-        timings.lkgSnapshot;
+        timings.lkgSnapshot +
+        timings.preflight +
+        timings.todoVerdict +
+        timings.sessionDirectory +
+        timings.paging +
+        timings.delivery +
+        timings.bookkeeping;
+    // Mirror stages run after appliedAt and are excluded from elapsed, so they
+    // must not be subtracted into `other` or they would hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
     const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    const schedulerFields = args.schedulerDecision
+        ? ` scheduler=${args.schedulerDecision}${args.schedulerDeferReason ? ` defer_reason=${args.schedulerDeferReason}` : ""}`
+        : "";
+    const historianFields = args.historianCanonicalCause
+        ? ` historian_no_fire=${args.historianNoFire ?? "unknown"} canonical_cause=${args.historianCanonicalCause}`
+        : "";
+    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=identity_resolve:${timings.identityResolve.toFixed(1)} prompt_surface:${timings.promptSurface.toFixed(1)} mural_resolve:${timings.muralResolve.toFixed(1)} prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)} transport_lane:${timings.transportDetail.lane.toFixed(1)} transport_route:${timings.transportDetail.route.toFixed(1)} transport_encode:${timings.transportDetail.encode.toFixed(1)} transport_issue:${timings.transportDetail.issue.toFixed(1)} transport_response_wait_decode:${timings.transportDetail.responseWait.toFixed(1)} transport_settle:${timings.transportDetail.settle.toFixed(1)} transport_wrapper:${Math.max(0, timings.transport - Object.values(timings.transportDetail).reduce((sum, ms) => sum + ms, 0)).toFixed(1)} preflight:${timings.preflight.toFixed(1)} todo_verdict:${timings.todoVerdict.toFixed(1)} todo_probe:${timings.todoProbe.toFixed(1)} todo_persist:${timings.todoPersist.toFixed(1)} todo_probe_required:${timings.todoProbeRequired} todo_probe_reason:${timings.todoProbeReason} todo_unprobed_bust:${timings.todoUnprobedBust} session_directory:${timings.sessionDirectory.toFixed(1)} paging:${timings.paging.toFixed(1)} output_clone:${timings.outputClone.toFixed(1)} delivery:${timings.delivery.toFixed(1)} bookkeeping:${timings.bookkeeping.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -526,8 +820,21 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
     const synthetic =
         parts.length > 0 && parts.every((part) => isRecord(part) && part.synthetic === true);
     if (info.role === "user" && info.sessionID === sessionId && synthetic) return;
+    // Include the observed head in the error so logs reveal whether the response violated the
+    // expected role, session ID, or synthetic-part shape without requiring a payload dump.
+    const headSummary = output.slice(0, 3).map((message) => {
+        const mi = messageInfo(message);
+        const mParts = isRecord(message) && Array.isArray(message.parts) ? message.parts : [];
+        const partDesc = mParts
+            .slice(0, 5)
+            .map((part) =>
+                isRecord(part) ? `${String(part.type)}${part.synthetic === true ? "" : "!"}` : "?",
+            )
+            .join(",");
+        return `role=${String(mi.role)} sid=${mi.sessionID === sessionId ? "ok" : String(mi.sessionID ?? "absent")} id=${String(mi.id ?? "-").slice(0, 24)} parts=[${partDesc}]`;
+    });
     throw new Error(
-        `rust transform wire invariant failed: boundary=${boundaryId} expected a synthetic m0 user message scoped to session ${sessionId}`,
+        `rust transform wire invariant failed: boundary=${boundaryId} expected a synthetic m0 user message scoped to session ${sessionId}; head: ${headSummary.join(" | ")}`,
     );
 }
 
@@ -535,6 +842,74 @@ function responseValue(response: unknown): Record<string, unknown> {
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
     throw new Error("module transform returned a non-object response");
+}
+
+function mirrorProjectionKey(response: Record<string, unknown>): string | null {
+    const memoryMirrorHead = response.memory_mirror_head;
+    if (
+        typeof memoryMirrorHead === "number" &&
+        Number.isSafeInteger(memoryMirrorHead) &&
+        memoryMirrorHead >= 0
+    ) {
+        return JSON.stringify(["memory-feed", memoryMirrorHead]);
+    }
+    const rowVersion = response.row_version;
+    if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
+        return null;
+    }
+    const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
+        ? response.rendered_memory_ids
+        : [];
+    // Older modules do not publish the feed frontier. Keep their legacy projection trigger
+    // rather than polling on every pass; current modules use the exact feed sequence above.
+    return JSON.stringify([
+        rowVersion,
+        response.boundary_id ?? null,
+        response.coverage_ordinal ?? null,
+        renderedMemoryIds,
+    ]);
+}
+
+function stateSyncInputSignature(args: {
+    projectPath: string | undefined;
+    sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
+    todoAvailability: ToolAvailabilityVerdict;
+    historyRefresh: boolean;
+    deferredHistoryRefresh: boolean;
+    pendingMaterialization: boolean;
+    deferredMaterialization: boolean;
+}): string {
+    return JSON.stringify([
+        args.projectPath ?? null,
+        args.sessionMeta.lastTodoState ?? "",
+        args.sessionMeta.clearedReasoningThroughTag ?? 0,
+        args.sessionMeta.toolReclaimWatermark ?? 0,
+        args.todoAvailability.frozen,
+        args.todoAvailability.callable,
+        args.historyRefresh,
+        args.deferredHistoryRefresh,
+        args.pendingMaterialization,
+        args.deferredMaterialization,
+    ]);
+}
+
+function isTransformPageAttemptMismatch(error: unknown): boolean {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        const code = typeof current.code === "string" ? current.code : "";
+        const message = typeof current.message === "string" ? current.message : "";
+        if (
+            code === "attempt_mismatch" ||
+            code === "authority_transform_page_attempt_mismatch" ||
+            /\b(?:authority_transform_page_)?attempt_mismatch\b/.test(message)
+        ) {
+            return true;
+        }
+        current = current.cause;
+    }
+    return false;
 }
 
 function mirrorRustRenderedMemoryIds(args: {
@@ -623,10 +998,24 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityProject: null,
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
+            recordedSessionProjectIdentity: null,
+            recordedSessionDirectory: null,
+            resolvedMemoryProjectDirectory: null,
+            resolvedMemoryProjectPath: null,
+            stateSyncInputSignature: null,
+            memoryMirrorProjectionKey: null,
+            compartmentMirrorProjectionKey: null,
+            mirrorProjectionInFlight: false,
+            muralCuePoolVersion: 0,
+            muralGeneration: 0,
+            muralCache: null,
             authorityMemorySyncSkipLogged: false,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
+            lkgRepresentationFrozen: false,
+            lkgFrozenHealthyPasses: 0,
+            lkgFrozenAtInputCount: null,
         };
         states.set(sessionId, state);
     }
@@ -676,6 +1065,45 @@ function passUsage(usage: ContextUsage, limit: number): Record<string, number> {
         current_total_input_tokens: usage.inputTokens,
         context_limit_tokens: limit,
     };
+}
+
+interface TransformGeometryWire {
+    usable_soft: number;
+    usable_hard: number;
+    absolute_wall: number;
+    derivation: string;
+}
+
+function transformGeometryForWire(
+    geometry: WindowGeometryResult | undefined,
+): TransformGeometryWire | undefined {
+    if (!geometry) return undefined;
+    const { window, reserve } = geometry.derivation;
+    let derivation: string;
+    if (geometry.geometry === "separate" && geometry.usableSoft < geometry.usableHard) {
+        derivation = `s1-pre-carve/input=${geometry.usableSoft}`;
+    } else if (geometry.geometry === "separate") {
+        derivation = `s1-separate/context=${window}`;
+    } else {
+        derivation =
+            `s1-shared/context-output/context=${window}/output=${reserve}` +
+            `/mode=${geometry.geometry}/usable-hard=${geometry.usableHard}`;
+    }
+    return {
+        usable_soft: geometry.usableSoft,
+        usable_hard: geometry.usableHard,
+        absolute_wall: geometry.derivation.absoluteWall,
+        derivation,
+    };
+}
+
+function hardWallUsagePercentage(
+    usage: ContextUsage,
+    geometry: TransformGeometryWire | undefined,
+): number {
+    return geometry && geometry.usable_hard > 0 && usage.inputTokens > 0
+        ? (usage.inputTokens / geometry.usable_hard) * 100
+        : usage.percentage;
 }
 
 function shouldDisarmRustEmergencyRecovery(input: {
@@ -759,22 +1187,41 @@ function authoritySeedRows(
                   )
                   .all(projectPath, projectPath);
     const memoryRows = snapshots.filter(isRecord);
+    // A `superseded_by_memory_id` pointing outside this seed set can never resolve
+    // module-side: the store records it as a pending memory reference, and the
+    // resolution sweep only clears pendings whose target later appears in
+    // mc_memories. A target that is absent here is absent for good (its row was
+    // hard-deleted after an archive), so the pending would survive to
+    // authority_finish_prepare and permanently reject the memories-domain handoff.
+    // Dropping the dead link here keeps the gate meaningful for the case it exists
+    // to catch: a target the host DID send that the module failed to ingest.
+    const seededIds = new Set(memoryRows.map((row) => Number(row.id)));
     const mappings =
         domain === "memories"
             ? getMemoryVerifications(
                   db,
                   memoryRows.map((row) => Number(row.id)),
               )
-            : new Map<number, { files: string[]; hasSentinel: boolean }>();
+            : new Map<number, { files: string[]; hasSentinel: boolean; mappingOrigin: "mapper" }>();
     return memoryRows.map((snapshot) => {
         const id = Number(snapshot.id);
         const mapping = mappings.get(id);
+        const resolvedSnapshot =
+            domain === "memories" &&
+            snapshot.superseded_by_memory_id != null &&
+            !seededIds.has(Number(snapshot.superseded_by_memory_id))
+                ? { ...snapshot, superseded_by_memory_id: null }
+                : snapshot;
         const seededSnapshot =
             domain === "memories" && mapping
-                ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
+                ? {
+                      ...resolvedSnapshot,
+                      mapping: mapping.hasSentinel ? null : mapping.files,
+                      mapping_origin: mapping.mappingOrigin,
+                  }
                 : domain === "notes" && snapshot.project_path == null
-                  ? { ...snapshot, project_path: projectPath }
-                  : snapshot;
+                  ? { ...resolvedSnapshot, project_path: projectPath }
+                  : resolvedSnapshot;
         return { source_row_id: snapshot.id, snapshot: seededSnapshot };
     });
 }
@@ -921,7 +1368,7 @@ async function prepareRustMemoryAuthority(args: {
             }
         }
         if (preparing.length > 0) {
-            await prepareAuthority({
+            const prepared = await prepareAuthority({
                 db,
                 projectPath,
                 domains: preparing,
@@ -929,10 +1376,15 @@ async function prepareRustMemoryAuthority(args: {
                 seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
                 checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
             });
+            for (const authority of prepared) statuses.set(authority.domain, authority);
         }
     }
 
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
+    observeAuthorityRouting(
+        projectPath,
+        domains.every((domain) => statuses.get(domain)?.state === "MODULE") ? "MODULE" : "TS",
+    );
     state.memoryAuthorityReady = true;
     args.onProjectPrepared?.(projectPath);
 }
@@ -989,9 +1441,18 @@ function mirrorRustSyntheticTodoAnchor(args: {
 }
 
 /** Single response-field seam for the parallel module encode-back contract. */
+function hasNativeResponseContent(response: Record<string, unknown>): boolean {
+    if (typeof response.native_messages === "string" || Array.isArray(response.native_messages)) {
+        return true;
+    }
+    const delta = response.native_messages_delta;
+    return isRecord(delta) && Array.isArray(delta.messages);
+}
+
 export function applyNativeMessagesVerbatim(
     output: { messages: unknown[] },
     response: Record<string, unknown>,
+    previous?: { messages: readonly unknown[]; fingerprint: string },
 ): unknown[] {
     const nativeMessages = response.native_messages;
     if (typeof nativeMessages === "string") {
@@ -1000,25 +1461,106 @@ export function applyNativeMessagesVerbatim(
             throw new Error("rust transform native_messages string was not an array");
         return replaceMessagesInPlace(output, parsed);
     }
-    if (!Array.isArray(nativeMessages)) {
+    if (Array.isArray(nativeMessages)) {
+        // The module owns healing, ordering, and codec fidelity. Do not clone,
+        // normalize, or otherwise inspect the returned native message array.
+        return replaceMessagesInPlace(output, nativeMessages);
+    }
+    const delta = response.native_messages_delta;
+    if (!isRecord(delta) || !Array.isArray(delta.messages)) {
         throw new Error("rust transform response omitted native_messages");
     }
-    // The module owns healing, ordering, and codec fidelity. Do not clone,
-    // normalize, or otherwise inspect the returned native message array.
-    return replaceMessagesInPlace(output, nativeMessages);
+    const replaceFrom = delta.replace_from;
+    if (
+        !previous ||
+        delta.after !== previous.fingerprint ||
+        typeof replaceFrom !== "number" ||
+        !Number.isSafeInteger(replaceFrom) ||
+        replaceFrom < 0 ||
+        replaceFrom > previous.messages.length
+    ) {
+        throw new Error(
+            "rust transform native_messages_delta did not match the acknowledged output",
+        );
+    }
+    return replaceMessagesInPlace(output, [
+        ...previous.messages.slice(0, replaceFrom),
+        ...delta.messages,
+    ]);
+}
+
+function resolvedHistorianModelChain(
+    deps: Pick<TransformDeps, "historianModel" | "fallbackModels">,
+): string[] {
+    const models = [deps.historianModel, ...(deps.fallbackModels ?? [])]
+        .map((entry) => (typeof entry === "string" ? entry : entry?.model))
+        .filter((model): model is string => typeof model === "string" && model.length > 0);
+    return [...new Set(models)];
+}
+
+function muralInputForWire(
+    mural: ReturnType<typeof resolveMuralWire> | undefined,
+): Record<string, unknown> | undefined {
+    if (
+        !mural?.enabled ||
+        !mural.supportsVision ||
+        typeof mural.dataUrl !== "string" ||
+        mural.dataUrl.length === 0
+    ) {
+        return undefined;
+    }
+    return {
+        enabled: true,
+        supports_vision: true,
+        data_url: mural.dataUrl,
+        content_hash: mural.contentHash,
+    };
+}
+
+function toolInputKeyOrders(input: unknown[]): Record<string, string[]> {
+    const orders: Record<string, string[]> = {};
+    for (const entry of input) {
+        if (!entry || typeof entry !== "object") continue;
+        const record = entry as Record<string, unknown>;
+        const mid = typeof record.mid === "string" ? record.mid : null;
+        const ck = record.ck;
+        if (!mid || !ck || typeof ck !== "object") continue;
+        const content = (ck as Record<string, unknown>).content;
+        if (!Array.isArray(content)) continue;
+        for (let index = 0; index < content.length; index += 1) {
+            const block = content[index];
+            if (!block || typeof block !== "object") continue;
+            const kind = (block as Record<string, unknown>).kind;
+            if (!kind || typeof kind !== "object") continue;
+            const kindRecord = kind as Record<string, unknown>;
+            const toolInput = kindRecord.input;
+            if (
+                kindRecord.type === "tool_call" &&
+                isEditTool(typeof kindRecord.name === "string" ? kindRecord.name : undefined) &&
+                toolInput !== null &&
+                typeof toolInput === "object" &&
+                !Array.isArray(toolInput)
+            ) {
+                orders[`${mid}#${index}`] = Object.keys(toolInput as Record<string, unknown>);
+            }
+        }
+    }
+    return orders;
 }
 
 function buildTransformBody(args: {
     sessionId: string;
     input: unknown[];
     nativeMessages: unknown[];
+    toolInputKeyOrders?: Record<string, string[]>;
     passInputs: Record<string, unknown>;
     usage: Record<string, number | boolean>;
+    geometry?: TransformGeometryWire;
     modelKey: string | null;
     providerId: string | null;
+    variant?: string;
     systemPromptHash: string;
     upgradeState: string;
-    midTurn: boolean;
     prevResponseCompletedAtMs?: number;
     requestObservedAtMs?: number;
     channel2NudgeState: string;
@@ -1038,12 +1580,13 @@ function buildTransformBody(args: {
         serializer_profile: "opencode-aisdk",
         serve_native: true,
         session_id: args.sessionId,
-        // Model/provider and system-prompt changes are provider-cache eviction signals;
-        // send the same identity inputs used by the TypeScript materializer instead of
-        // leaving the native identity blank.
+        // Send the same model/provider/system identity used by the TypeScript materializer.
+        // The module retains effort only for models where a change naturally busts the
+        // provider cache; cache-preserving models keep it out of the render identity.
         render_config: [
             args.providerId ? `provider:${args.providerId}` : "",
             args.modelKey ? `model:${args.modelKey}` : "",
+            args.variant ? `variant:${args.variant}` : "",
             args.systemPromptHash ? `system:${args.systemPromptHash}` : "",
         ]
             .filter(Boolean)
@@ -1051,9 +1594,9 @@ function buildTransformBody(args: {
         system_prompt_hash: args.systemPromptHash,
         upgrade_state: args.upgradeState,
         is_subagent: args.passInputs.is_subagent === true,
-        protected_tags: args.passInputs.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         messages: args.input,
         native_messages: args.nativeMessages,
+        tool_input_key_orders: args.toolInputKeyOrders ?? toolInputKeyOrders(args.input),
         ...(args.fullArrayFingerprint ? { full_array_fingerprint: args.fullArrayFingerprint } : {}),
         ...(args.tailDelta
             ? {
@@ -1065,8 +1608,8 @@ function buildTransformBody(args: {
               }
             : {}),
         usage: args.usage,
+        ...(args.geometry ? { geometry: args.geometry } : {}),
         provider_error: args.passInputs.provider_error,
-        mid_turn: args.midTurn,
         prev_response_completed_at_ms: args.prevResponseCompletedAtMs,
         request_observed_at_ms: args.requestObservedAtMs,
         channel2_nudge_state: args.channel2NudgeState,
@@ -1081,12 +1624,24 @@ function buildTransformBody(args: {
         ...(typeof args.passInputs.todo_tool_present === "boolean"
             ? { todo_tool_present: args.passInputs.todo_tool_present }
             : {}),
+        ...(typeof args.passInputs.todo_verdict_probed === "boolean"
+            ? { todo_verdict_probed: args.passInputs.todo_verdict_probed, verdict_stale_ok: false }
+            : {}),
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
         prompt_surface_config_identity: args.passInputs.prompt_surface_config_identity,
         prompt_surface_tool_descriptions: args.passInputs.prompt_surface_tool_descriptions ?? {},
+        prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
+        mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
+        ...(typeof args.passInputs.protected_tokens_effective === "number"
+            ? { protected_tokens_effective: args.passInputs.protected_tokens_effective }
+            : {}),
+        auto_search_enabled: args.passInputs.auto_search_enabled === true,
+        auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
+        auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
         history_budget_tokens: args.passInputs.history_budget_tokens,
+        historian_model_chain: args.passInputs.historian_model_chain,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
         caveman_enabled: args.passInputs.caveman_enabled === true,
         caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
@@ -1115,21 +1670,58 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ) => Promise<void>;
-    clearSession: (sessionId: string) => void;
+    clearSession: (sessionId: string) => Promise<void>;
     invalidateWireState: (sessionId: string) => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
+    getHeapStats: () => RustWireCacheHeapStats;
 } {
     const states = new Map<string, RustSessionState>();
-    const wireCaches = new Map<string, RustWireCache>();
+    const heapHolder = new MagicContextRustHeapHolder();
+    const promptSurfaceGuidanceEpochs = deps.promptSurfaceRuntime
+        ? createPromptSurfaceGuidanceEpochCache(deps.promptSurfaceRuntime)
+        : undefined;
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
 
+    const resolveMuralForPass = (
+        state: RustSessionState,
+        projectIdentity: string | undefined,
+        modelKey: string | undefined,
+        budgetTokens: number | undefined,
+    ): MuralWireOptions => {
+        // SDK refreshes can correct image support without changing the model key.
+        // Cache the candidate mural for the next permitted HARD (prefix rebuild);
+        // the Rust module keeps already-served m0 prefix bytes frozen on passes
+        // without cache-bust permission.
+        const key = JSON.stringify([
+            state.muralGeneration,
+            state.muralCuePoolVersion,
+            projectIdentity ?? null,
+            modelKey ?? null,
+            budgetTokens ?? null,
+            modelKeyAcceptsImages(modelKey),
+        ]);
+        if (options.disableHotPathIoCachesForTests !== true && state.muralCache?.key === key) {
+            return state.muralCache.value;
+        }
+        const value = (options.muralResolverForTests ?? resolveMuralWire)(
+            deps.db,
+            projectIdentity,
+            modelKey,
+            true,
+            budgetTokens,
+        );
+        state.muralCache = { key, value };
+        return value;
+    };
+
     const logStage = (
         sessionId: string,
-        stage: keyof RustPassTimings,
+        stage: Exclude<keyof RustPassTimings, "transportDetail" | "todoProbeReason">,
         startedAt: number,
         timings: RustPassTimings,
         extra?: string,
@@ -1146,21 +1738,121 @@ export function createRustModeTransform(
 
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
+        attemptTimeoutMs = args.timeoutMs ?? timeoutMs,
     ): Promise<unknown> => {
         const controller = new AbortController();
-        const timer = setTimeout(
-            () => controller.abort(new Error("rust module request timed out")),
-            timeoutMs,
-        );
+        const body = isRecord(args.body) ? args.body : {};
+        const timeoutError =
+            args.method === "state_sync"
+                ? Object.assign(
+                      new Error(
+                          `state_sync timeout stage=module_ack page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                      ),
+                      {
+                          code: "state_sync_timeout",
+                          stage: "module_ack",
+                          page: body.seed_batch_index ?? 0,
+                          pages: body.seed_batch_total ?? 1,
+                          series: body.seed_id ?? null,
+                      },
+                  )
+                : new Error("rust module request timed out");
+        const timer = setTimeout(() => controller.abort(timeoutError), attemptTimeoutMs);
         try {
-            return await options.moduleClient.call({ ...args, signal: controller.signal });
+            return await options.moduleClient.call({
+                ...args,
+                signal: controller.signal,
+                timeoutMs: attemptTimeoutMs,
+            });
+        } catch (error) {
+            if (controller.signal.aborted) throw timeoutError;
+            throw error;
         } finally {
             clearTimeout(timer);
         }
     };
 
+    const callTransformWithSilentResend = async (
+        args: Parameters<RustModeModuleClient["call"]>[0],
+        attemptTimeoutMs: number,
+    ): Promise<unknown> => {
+        const startedAtMs = Date.now();
+        const deadlineMs = startedAtMs + attemptTimeoutMs;
+        const silentAfterMs = options.silentResendAfterMsForTests ?? RUST_SILENT_RESEND_AFTER_MS;
+        const probeTimeoutMs = options.healthProbeTimeoutMsForTests ?? RUST_HEALTH_PROBE_TIMEOUT_MS;
+        const originalAttemptId = randomUUID();
+        const originalBody = isRecord(args.body)
+            ? { ...args.body, attempt_id: originalAttemptId }
+            : args.body;
+        const original = callModule({ ...args, body: originalBody }, attemptTimeoutMs);
+        if (attemptTimeoutMs <= silentAfterMs) return original;
+
+        let silentTimer: ReturnType<typeof setTimeout> | undefined;
+        const first = await Promise.race([
+            original.then(
+                (response) => ({ kind: "response" as const, response }),
+                (error) => ({ kind: "error" as const, error }),
+            ),
+            new Promise<{ kind: "silent" }>((resolve) => {
+                silentTimer = setTimeout(() => resolve({ kind: "silent" }), silentAfterMs);
+            }),
+        ]);
+        if (first.kind !== "silent") clearTimeout(silentTimer);
+        if (first.kind === "response") return first.response;
+        if (first.kind === "error") throw first.error;
+
+        const probeBudgetMs = Math.min(probeTimeoutMs, Math.max(0, deadlineMs - Date.now()));
+        if (probeBudgetMs <= 0) return original;
+        try {
+            await callModule(
+                {
+                    sessionId: args.sessionId,
+                    projectRoot: args.projectRoot,
+                    method: "session.status",
+                    body: {
+                        method: "session.status",
+                        v: 1,
+                        session_id: args.sessionId,
+                    },
+                    bypassSessionLane: true,
+                },
+                probeBudgetMs,
+            );
+        } catch {
+            // A failed probe indicates that the module may be unavailable. Keep waiting on
+            // the original request so normal timeout handling chooses refusal or fallback.
+            return original;
+        }
+
+        const remainingMs = Math.max(0, deadlineMs - Date.now());
+        if (remainingMs <= 0) return original;
+        const resendAttemptId = randomUUID();
+        sessionLog(
+            args.sessionId,
+            `rust silent resend original_attempt=${originalAttemptId} resend_attempt=${resendAttemptId} silent_gap_ms=${Date.now() - startedAtMs}`,
+        );
+        const resendBody = isRecord(args.body)
+            ? {
+                  ...args.body,
+                  attempt_id: resendAttemptId,
+                  original_attempt_id: originalAttemptId,
+                  resend: true,
+              }
+            : args.body;
+        return callModule(
+            {
+                ...args,
+                body: resendBody,
+                bypassSessionLane: true,
+            },
+            remainingMs,
+        );
+    };
+
     const markFailure = (sessionId: string, state: RustSessionState, error: unknown): void => {
-        state.consecutiveFailures += 1;
+        state.consecutiveFailures = isNonRetryableStateSyncFailure(error)
+            ? Math.max(RUST_FAILURE_PARK_THRESHOLD, state.consecutiveFailures + 1)
+            : state.consecutiveFailures + 1;
         state.failureCount += 1;
         sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);
         if (state.consecutiveFailures < RUST_FAILURE_PARK_THRESHOLD || state.parked) return;
@@ -1168,8 +1860,7 @@ export function createRustModeTransform(
         state.parkCount += 1;
         state.passesSincePark = 0;
         state.warningSent = true;
-        const warning =
-            "Rust Magic Context is unavailable for this session; retry after the module recovers.";
+        const warning = ENGINE_RECONNECTING_USER_MESSAGE;
         sessionLog(
             sessionId,
             `mc_rust_park_transition failure_passes=${state.consecutiveFailures} pass_count=${state.passCount} park_count=${state.parkCount}`,
@@ -1185,10 +1876,11 @@ export function createRustModeTransform(
     };
 
     const invalidateWireState = (sessionId: string): void => {
-        wireCaches.delete(sessionId);
+        heapHolder.wireCaches.delete(sessionId);
         const state = states.get(sessionId);
         if (!state) return;
         resetOrdinalMemo(state);
+        state.stateSyncInputSignature = null;
         state.forceFullWire = true;
     };
 
@@ -1200,6 +1892,8 @@ export function createRustModeTransform(
     ): boolean => {
         const slot = getSlot(sessionId);
         if (!slot) {
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, "lkg_miss");
             return false;
         }
@@ -1224,6 +1918,8 @@ export function createRustModeTransform(
         }
         if (!entry) {
             dropSlot(sessionId, "lkg_invalidated_reshape");
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, "lkg_invalidated_reshape");
             return false;
         }
@@ -1236,11 +1932,19 @@ export function createRustModeTransform(
             entry,
         });
         if (!replay.ok) {
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, replay.reason);
             return false;
         }
         const replayModel =
             modelFromMessages(currentMessages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
+        replayRustModeBindingMismatchStrips({
+            db: deps.db,
+            sessionId,
+            messages: replay.messages as MessageLike[],
+            resolvedProviderID: replayModel?.providerID,
+        });
         const trustedReplayLimit = replayModel
             ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
                   db: deps.db,
@@ -1288,13 +1992,13 @@ export function createRustModeTransform(
     const prepareRustCapture = (
         state: RustSessionState,
         sessionId: string,
-        input: MessageLike[],
-        inputSnapshots: readonly MessageContentSnapshot[],
-        response: Record<string, unknown>,
+        inputIds: readonly unknown[],
+        inputKeys: ReturnType<typeof resolveLkgModelKeys>,
+        inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[],
+        nativeMessages: readonly unknown[],
         responseRowVersion: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
-        const inputIds = input.map((message) => message.info.id);
         if (
             inputIds.some((id) => typeof id !== "string") ||
             new Set(inputIds).size !== inputIds.length ||
@@ -1303,17 +2007,15 @@ export function createRustModeTransform(
         ) {
             return null;
         }
-        const native = response.native_messages;
-        const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
+        const jsonPrefix = JSON.stringify(nativeMessages);
         if (typeof jsonPrefix !== "string") return null;
-        const keys = resolveLkgModelKeys(input);
         return {
             sessionId,
             inputIds: inputIds as string[],
             inputSnapshots,
             jsonPrefix,
-            modelKey: keys.modelKey,
-            providerKey: keys.providerKey,
+            modelKey: inputKeys.modelKey,
+            providerKey: inputKeys.providerKey,
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
@@ -1323,6 +2025,7 @@ export function createRustModeTransform(
     const commitRustCapture = (
         state: RustSessionState,
         plan: RustLkgCapturePlan,
+        requireDurable = false,
     ): "captured" | "superseded" => {
         if (
             states.get(plan.sessionId) !== state ||
@@ -1331,21 +2034,59 @@ export function createRustModeTransform(
         ) {
             return "superseded";
         }
-        const inputContentDigests = plan.inputSnapshots.map((snapshot) =>
-            lkgContentDigestFromFields(snapshot.fields),
+        // Reuse requires the exact inputs from a previously accepted capture in this
+        // process; a restarted adapter has no such proof. Compute FNV signatures at
+        // commit, not before the RPC, retaining Pi's input_content_signatures format.
+        // Cache-busting/recovery captures still commit synchronously for durability.
+        const prior = getSlot(plan.sessionId);
+        const inputs = plan.inputIds.map((id, index) => ({
+            id,
+            fields: plan.inputSnapshots[index]?.fields ?? [],
+        }));
+        // A failed durable refresh followed by eviction can hydrate an older slot.
+        // Its digests must not borrow the newer in-memory capture's equality proof.
+        const accepted = state.lkgAcceptedCapture;
+        const {
+            digests: inputContentDigests,
+            inputContentSignatures,
+            reusedPrefix,
+        } = rustCaptureDigests(
+            inputs,
+            prior?.modelKey === plan.modelKey &&
+                prior?.providerKey === plan.providerKey &&
+                prior?.captureSequence === accepted?.captureSequence &&
+                prior?.rowVersion === accepted?.rowVersion
+                ? prior
+                : undefined,
+            accepted?.inputs ?? null,
         );
-        const captured = captureSlot(plan.sessionId, {
+        const slot = {
             jsonPrefix: plan.jsonPrefix,
             inputIdSeq: plan.inputIds,
             inputContentDigests,
+            inputContentSignatures,
             lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
             modelKey: plan.modelKey,
             providerKey: plan.providerKey,
             capturedAt: plan.capturedAt,
             rowVersion: plan.rowVersion,
             captureSequence: plan.captureSequence,
-        });
+        };
+        const captured = captureSlot(plan.sessionId, slot);
         if (!captured) throw new Error("LKG slot rejected the prepared snapshot");
+        state.lkgAcceptedCapture = {
+            inputs,
+            captureSequence: plan.captureSequence,
+            rowVersion: plan.rowVersion,
+        };
+        options.onLkgCaptureForTests?.(reusedPrefix);
+        // Durability across restarts: store the exact accepted snapshot (the
+        // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
+        // a write failure leaves the in-memory slot serving this process.
+        const persisted = saveLkgSlotToDb(deps.db, plan.sessionId, slot);
+        if (requireDurable && !persisted) {
+            throw new Error("priced LKG snapshot did not reach durable storage");
+        }
         state.lkgLastCapturedRowVersion = plan.rowVersion;
         state.lkgSyncCaptureRequired = false;
         return "captured";
@@ -1360,6 +2101,10 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
+        const trailingBlankNewestAssistantId = [...messages]
+            .reverse()
+            .find((message) => message.info.role === "assistant")?.info.id;
         const timings = emptyRustPassTimings();
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
@@ -1375,11 +2120,25 @@ export function createRustModeTransform(
         let requestInputTokens = 0;
         let decision = "error";
         let materializeReason = "none";
+        let schedulerDecision: string | undefined;
+        let schedulerDeferReason: string | undefined;
+        let historianNoFire: string | undefined;
+        let historianCanonicalCause: string | undefined;
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let rowVersion = 0;
+        let coveredOrdinal = 0;
+        let markerAt: string | null = null;
+        try {
+            const marker = getPersistedCompactionMarkerState(deps.db, sessionId);
+            markerAt = marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null;
+        } catch {
+            // Diagnostics remain available even when the local state database is unavailable.
+        }
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
+        let providerProvenEmergency = false;
+        let recoveryProjectRoot = options.projectRoot ?? deps.directory ?? "";
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
         // and is the same value copied onto the module request when this pass runs.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
@@ -1393,14 +2152,22 @@ export function createRustModeTransform(
                 preflightError = error;
             }
         }
-        const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
+        const modelKey = model
+            ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
+            : null;
         let resolvedContextLimit: number | undefined;
+        let resolvedWindowGeometry: WindowGeometryResult | undefined;
         if (model) {
             try {
                 resolvedContextLimit = resolveTrustedContextLimit(model.providerID, model.modelID, {
                     db: deps.db,
                     sessionID: sessionId,
                 });
+                resolvedWindowGeometry = resolveContextWindowGeometry(
+                    model.providerID,
+                    model.modelID,
+                    { db: deps.db, sessionID: sessionId },
+                );
             } catch (error) {
                 preflightError ??= error;
             }
@@ -1411,57 +2178,77 @@ export function createRustModeTransform(
         } catch (error) {
             preflightError ??= error;
         }
+        const transformGeometry = transformGeometryForWire(resolvedWindowGeometry);
+        const hasTrustedEmergencyWall = transformGeometry
+            ? transformGeometry.usable_hard > 0
+            : resolvedContextLimit !== undefined && resolvedContextLimit > 0;
+        const hardWallPercentage = hardWallUsagePercentage(passUsageSnapshot, transformGeometry);
+        const providerOverflowProven = isProviderOverflowFailClosedProven(sessionId);
         emergencyFailClosed =
-            passUsageSnapshot.percentage >= RUST_EMERGENCY_WALL_PCT &&
-            resolvedContextLimit !== undefined &&
-            resolvedContextLimit > 0;
+            providerOverflowProven ||
+            (hardWallPercentage >= RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall);
         if (overflowState) {
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
-                overflowState.detectedContextLimitModelKey === modelKey;
+                canonicalModelIdentity(overflowState.detectedContextLimitModelKey) ===
+                    canonicalModelIdentity(modelKey ?? "");
             const hasProviderProof =
                 (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
                 // An unknown persisted arm alone is not proof. A second provider rejection
                 // while that arm is durable records the process-local reconfirmation.
                 isProviderOverflowReconfirmed(sessionId);
-            emergencyFailClosed ||=
+            const persistedProviderEmergency =
                 overflowState.needsEmergencyRecovery &&
                 overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
                 hasProviderProof;
+            emergencyFailClosed ||= persistedProviderEmergency;
+            providerProvenEmergency =
+                hardWallPercentage >= RUST_EMERGENCY_WALL_PCT &&
+                (providerOverflowProven || persistedProviderEmergency);
         }
         const serveRawFallback = (cause?: unknown): void => {
             const contextLimit =
+                transformGeometry?.usable_hard ??
                 resolvedContextLimit ??
                 (overflowState && overflowState.detectedContextLimit > 0
                     ? overflowState.detectedContextLimit
                     : undefined);
             if (contextLimit !== undefined) {
-                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
-                try {
-                    estimate = rawFallbackEstimator({
-                        messages,
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                    });
-                } catch {
-                    // The byte proxy below remains available when tokenization does not.
-                }
-                const rawBytes = rawFallbackSerializedBytes(messages);
                 // The local tokenizer is telemetry-grade and can materially undercount a new
                 // provider tokenizer. Four serialized bytes per context token is an independent,
                 // conservative risk budget for a raw full-history fallback.
+                const proxyBudgetBytes = contextLimit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN;
+                // Byte proxy first: once the running serialized sum crosses the budget,
+                // the refusal is proven and the tokenizer pass — seconds on giant
+                // histories — is skipped entirely on the failure path.
+                const proxy = rawFallbackSerializedBytes(messages, proxyBudgetBytes);
                 const proxyTokens =
-                    rawBytes === null
+                    proxy === null
                         ? contextLimit + 1
-                        : Math.ceil(rawBytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+                        : Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
+                let estimatorRan = false;
+                if (proxy !== null && !proxy.aborted) {
+                    try {
+                        estimate = rawFallbackEstimator({
+                            messages,
+                            systemPromptTokens: sessionMeta.systemPromptTokens,
+                            providerID: model?.providerID,
+                            modelID: model?.modelID,
+                            agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                        });
+                        estimatorRan = true;
+                    } catch {
+                        // The byte proxy above remains available when tokenization does not.
+                    }
+                }
                 const refusalTokens = Math.max(estimate?.tokens ?? 0, proxyTokens);
                 if (refusalTokens > contextLimit) {
                     sessionLog(
                         sessionId,
-                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? "unavailable"} ` +
-                            `proxy_bytes=${rawBytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}`,
+                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? (estimatorRan ? "unavailable" : "skipped")} ` +
+                            `proxy_bytes=${proxy?.bytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}` +
+                            (proxy?.aborted === true ? " early_abort=true" : ""),
                     );
                     throw new RawFallbackContextLimitError(refusalTokens, contextLimit, { cause });
                 }
@@ -1473,9 +2260,21 @@ export function createRustModeTransform(
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
             sessionLog(
                 sessionId,
+                formatRustInputCoverageLog({
+                    ocInput: inputCount,
+                    markerAt,
+                    covered: coveredOrdinal,
+                }),
+            );
+            sessionLog(
+                sessionId,
                 formatRustPassLog({
                     decision,
                     reason: materializeReason,
+                    schedulerDecision,
+                    schedulerDeferReason,
+                    historianNoFire,
+                    historianCanonicalCause,
                     servedFrom,
                     inputCount,
                     outputCount: output.messages.length,
@@ -1507,6 +2306,21 @@ export function createRustModeTransform(
                         : "unknown";
             servedFrom =
                 typeof response.served_from === "string" ? response.served_from : "unknown";
+            schedulerDecision =
+                typeof response.scheduler_decision === "string"
+                    ? response.scheduler_decision
+                    : undefined;
+            schedulerDeferReason =
+                typeof response.scheduler_defer_reason === "string"
+                    ? response.scheduler_defer_reason
+                    : undefined;
+            const historian = isRecord(response.historian) ? response.historian : undefined;
+            historianNoFire =
+                typeof historian?.no_fire === "string" ? historian.no_fire : undefined;
+            historianCanonicalCause =
+                typeof historian?.canonical_cause === "string"
+                    ? historian.canonical_cause
+                    : undefined;
             materializeReason =
                 typeof response.materialize_reason === "string" &&
                 response.materialize_reason.length > 0
@@ -1526,6 +2340,12 @@ export function createRustModeTransform(
                 Number.isSafeInteger(response.row_version)
                     ? response.row_version
                     : 0;
+            coveredOrdinal =
+                typeof response.coverage_ordinal === "number" &&
+                Number.isSafeInteger(response.coverage_ordinal) &&
+                response.coverage_ordinal >= 0
+                    ? response.coverage_ordinal
+                    : 0;
             if (
                 timings &&
                 (typeof timings.handler_total === "number" ||
@@ -1541,10 +2361,15 @@ export function createRustModeTransform(
                 sessionLog(
                     sessionId,
                     `rust module stages: handler=${stage("handler_total")} apply_once=${stage("total")} ` +
-                        `request_to_handler=${stage("request_observed_to_handler")} ` +
-                        `projection=${stage("projection")} selection=${stage("selection")} ` +
-                        `build_output=${stage("build_output")} store_commit=${stage("store_commit")} ` +
+                        `request_to_handler=${stage("request_observed_to_handler")} delta_expand=${stage("delta_expand")} ` +
+                        `projection_cache_lookup=${stage("projection_cache_lookup")} projection=${stage("projection")} ` +
+                        `selection=${stage("selection")} build_output=${stage("build_output")} ` +
+                        `store_commit=${stage("store_commit")} trigger=${stage("trigger_ms")} ` +
+                        `trigger_boundary=${stage("trigger_boundary_build")} trigger_eval=${stage("trigger_eval")} ` +
+                        `projection_cache_store=${stage("projection_cache_store")} native_attach=${stage("native_attach")} ` +
+                        `retained_size=${stage("retained_size")} snapshot_store=${stage("snapshot_store")} ` +
                         `post_attach=${stage("post_attach")} response_encode=${stage("response_encode")} ` +
+                        `response_meta_encode=${stage("response_meta_encode")} response_splice=${stage("response_splice")} ` +
                         `native_cache_reused=${stage("native_cache_reused_messages")} ` +
                         `native_cache_encoded=${stage("native_cache_encoded_messages")}`,
                 );
@@ -1593,19 +2418,62 @@ export function createRustModeTransform(
                 return;
             }
         }
+        timings.preflight = performance.now() - passStartedAt;
+
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
-        // Freeze the native todo-tool verdict before state sync reads it. Rust owns
-        // synthetic-todo bytes, but the host still observes OpenCode's per-session map.
+        // Freeze the native todo-tool map verdict before state sync reads it, then combine it
+        // with OpenCode's live permission decision. The module receives one authoritative bool;
+        // provisional or missing host evidence fails closed for synthesis.
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         const todoAvailability = resolveTodowriteAvailability(sessionId);
-        // A provisional fail-open verdict must not activate ctx_reduce provider bytes. The
-        // first persisted user message freezes each verdict for all later transform passes.
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
-        const todoToolPresent = todoAvailability.frozen ? todoAvailability.callable : undefined;
+        let todoProbeIdentity = "";
+        let todoProbeRequired = true;
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
-            const { directory } = await getSessionDirectory(deps, sessionId);
+            const directoryStartedAt = performance.now();
+            const { directory, resolvedFromHost } = await getSessionDirectory(deps, sessionId);
+            timings.sessionDirectory += performance.now() - directoryStartedAt;
+            const identityResolveStartedAt = performance.now();
+            if (
+                resolvedFromHost &&
+                (options.disableHotPathIoCachesForTests === true ||
+                    state.recordedSessionDirectory !== directory)
+            ) {
+                const sessionProjectIdentity = (
+                    options.sessionProjectIdentityResolverForTests ??
+                    resolveProjectIdentityForSession
+                )(directory, deps.allowHomeProject);
+                if (sessionProjectIdentity) {
+                    if (state.recordedSessionProjectIdentity !== sessionProjectIdentity) {
+                        // Missing chunk embeddings are restored through the session's
+                        // host-owned project binding, not through Rust module state.
+                        recordSessionProjectIdentity(deps.db, sessionId, sessionProjectIdentity);
+                    }
+                    state.recordedSessionProjectIdentity = sessionProjectIdentity;
+                    state.recordedSessionDirectory = directory;
+                }
+            }
+            let memoryProjectPath = deps.projectPath;
+            if (deps.memoryConfig?.enabled && directory.length > 0) {
+                if (
+                    options.disableHotPathIoCachesForTests !== true &&
+                    state.resolvedMemoryProjectDirectory === directory
+                ) {
+                    memoryProjectPath = state.resolvedMemoryProjectPath ?? undefined;
+                } else {
+                    const resolvedProject = (
+                        options.memoryProjectIdentityResolverForTests ?? resolveProjectIdentity
+                    )(directory);
+                    if (resolvedProject) {
+                        state.resolvedMemoryProjectDirectory = directory;
+                        state.resolvedMemoryProjectPath = resolvedProject;
+                    }
+                    memoryProjectPath = resolvedProject;
+                }
+            }
+            logStage(sessionId, "identityResolve", identityResolveStartedAt, timings);
             if (model) deps.liveModelBySession?.set(sessionId, model);
             const usage = passUsageSnapshot;
             requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));
@@ -1629,36 +2497,93 @@ export function createRustModeTransform(
                 deps.executeThresholdTokens,
                 resolvedContextLimit,
             );
-            const midTurn = isMidTurn(deps, sessionId);
             const requestObservedAtMs = Date.now();
             const recoveryNoHeadEscape =
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
-            const promptSurface = resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
+            const promptSurfaceStartedAt = performance.now();
+            const promptSurfaceGuidance =
+                options.disableHotPathIoCachesForTests === true
+                    ? deps.promptSurfaceRuntime?.resolveGuidance(
+                          deps.promptSurface,
+                          modelKey ?? undefined,
+                      )
+                    : promptSurfaceGuidanceEpochs?.resolve(
+                          sessionId,
+                          deps.promptSurface,
+                          modelKey ?? undefined,
+                      );
+            const promptSurface =
+                promptSurfaceGuidance ??
+                resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
+            logStage(sessionId, "promptSurface", promptSurfaceStartedAt, timings);
+            const muralResolveStartedAt = performance.now();
+            const resolvedMural =
+                !sessionMeta.isSubagent && deps.muralEnabled === true
+                    ? resolveMuralForPass(
+                          state,
+                          deps.projectPath,
+                          modelKey ?? undefined,
+                          deps.memoryConfig?.injectionBudgetTokens,
+                      )
+                    : undefined;
+            const mural = muralInputForWire(resolvedMural);
+            logStage(sessionId, "muralResolve", muralResolveStartedAt, timings);
+            const protectionFloorCacheBustingPass =
+                schedulerDecision === "execute" ||
+                deps.historyRefreshSessions.has(sessionId) ||
+                deps.pendingMaterializationSessions.has(sessionId) ||
+                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
+                deps.deferredMaterializationSessions?.has(sessionId) === true;
+            const protectionFloorResolution = resolveEpochFloorForPass(deps.db, sessionId, {
+                configuredOverride: deps.protectedTokens,
+                tierOverrides: deps.protectedTokenTierOverrides,
+                usableSoft: transformGeometry?.usable_soft ?? 128_000,
+                isCacheBustingPass: protectionFloorCacheBustingPass,
+                onRejectedProjectOverride: (warning) => sessionLog(sessionId, warning),
+            });
+            if (protectionFloorResolution.snapshotChanged) {
+                sessionLog(
+                    sessionId,
+                    `protected token floor snapshot: floor=${protectionFloorResolution.floor} provenance=${protectionFloorResolution.provenance === "override" ? "absolute" : "derived"} usableSoft=${transformGeometry?.usable_soft ?? 128_000}`,
+                );
+            } else if (protectionFloorResolution.preSnapshotInputChanged) {
+                sessionLog(
+                    sessionId,
+                    `protected token floor remains frozen until next priced pass: floor=${protectionFloorResolution.floor} reason=${protectionFloorResolution.preSnapshotBustReason}`,
+                );
+            }
+            const effectiveFloor = protectionFloorResolution.floor;
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
                 provider_id: model?.providerID ?? null,
                 usage: passUsage(usage, contextLimit),
+                geometry: transformGeometry,
                 effective_execute_threshold: threshold,
+                auto_search_enabled: deps.autoSearch?.enabled ?? true,
+                auto_search_score_threshold: deps.autoSearch?.scoreThreshold ?? 0.6,
+                auto_search_min_prompt_chars: deps.autoSearch?.minPromptChars ?? 20,
                 history_budget_tokens: historyBudgetTokens,
+                historian_model_chain: resolvedHistorianModelChain(deps),
                 clear_reasoning_age: deps.clearReasoningAge,
                 caveman_enabled:
                     !sessionMeta.isSubagent && deps.cavemanTextCompression?.enabled === true,
                 caveman_min_chars: deps.cavemanTextCompression?.minChars ?? 500,
                 cache_ttl: sessionMeta.cacheTtl,
-                mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
                 system_prompt_hash: sessionMeta.systemPromptHash ?? "",
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
-                todo_tool_present: todoToolPresent,
+                todo_tool_present: false,
                 prompt_surface_preset: promptSurface.preset,
                 prompt_surface_model_key: modelKey,
                 prompt_surface_config_identity: promptSurfaceConfigIdentity(deps.promptSurface),
                 prompt_surface_tool_descriptions: deps.promptSurface?.tool_descriptions ?? {},
-                protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
+                prompt_surface_guidance_override: promptSurfaceGuidance?.primaryOverride,
+                mural,
+                protected_tokens_effective: effectiveFloor,
                 temporal_awareness: deps.experimentalTemporalAwareness === true,
                 channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),
                 emergency_recovery_armed:
@@ -1667,7 +2592,7 @@ export function createRustModeTransform(
                 detected_context_limit: overflowState.detectedContextLimit,
                 detected_context_limit_model_key: overflowState.detectedContextLimitModelKey,
             };
-            const previousWireCache = wireCaches.get(sessionId);
+            const previousWireCache = heapHolder.wireCaches.get(sessionId);
             let wireDelta:
                 | {
                       rawStart: number;
@@ -1768,6 +2693,7 @@ export function createRustModeTransform(
                 memoStoredCount: state.ordinalMemoStoredCount,
                 memoCanonicalCount: state.ordinalMemoCanonicalCount,
                 provisionalBase,
+                forceProbeForTests: options.disableHotPathIoCachesForTests,
             });
             logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
             if (!resolved.ok) {
@@ -1786,6 +2712,7 @@ export function createRustModeTransform(
                     memoStoredCount: state.ordinalMemoStoredCount,
                     memoCanonicalCount: state.ordinalMemoCanonicalCount,
                     provisionalBase: state.ordinalContinuationBase ?? undefined,
+                    forceProbeForTests: options.disableHotPathIoCachesForTests,
                 });
                 logStage(
                     sessionId,
@@ -1809,20 +2736,91 @@ export function createRustModeTransform(
             const syncPass = {
                 db: deps.db,
                 sessionId,
-                projectPath:
-                    deps.memoryConfig?.enabled && directory.length > 0
-                        ? resolveProjectIdentity(directory)
-                        : deps.projectPath,
+                projectPath: memoryProjectPath,
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
-            const memoryProjectPath =
-                deps.memoryConfig?.enabled && directory.length > 0
-                    ? resolveProjectIdentity(directory)
-                    : deps.projectPath;
-            const stateSyncStartedAt = performance.now();
+            recoveryProjectRoot = projectRoot;
             const authoritySeqAdoption = { used: false };
+            const memorySyncRequested =
+                options.memorySyncRequestedSessions?.delete(sessionId) === true;
+            // The acknowledged watermark snapshot is invalidated only by inputs already observed
+            // on this pass: memory-tool mutation requests; compartment/m0 publication signals;
+            // project/config refresh signals; or the already-loaded session_meta todo/reasoning
+            // epoch. A new transform instance is the config-reload/workspace epoch boundary.
+            const currentStateSyncInputSignature = stateSyncInputSignature({
+                projectPath: syncPass.projectPath,
+                sessionMeta,
+                todoAvailability,
+                historyRefresh: deps.historyRefreshSessions.has(sessionId),
+                deferredHistoryRefresh:
+                    deps.deferredHistoryRefreshSessions?.has(sessionId) === true,
+                pendingMaterialization: deps.pendingMaterializationSessions.has(sessionId),
+                deferredMaterialization:
+                    deps.deferredMaterializationSessions?.has(sessionId) === true,
+            });
+            const todoVerdictStartedAt = performance.now();
+            todoProbeIdentity = JSON.stringify([
+                modelKey,
+                sessionMeta.systemPromptHash,
+                activeAgentFromMessages(messages),
+                currentStateSyncInputSignature,
+                markerAt,
+                getProjectState(deps.db, memoryProjectPath ?? projectRoot),
+                getProjectState(deps.db, GLOBAL_USER_PROFILE_PROJECT_PATH),
+                passInputs.upgrade_state,
+                promptSurfaceConfigIdentity(deps.promptSurface),
+                state.muralCuePoolVersion,
+                state.muralGeneration,
+                mural,
+                effectiveFloor,
+                deps.clearReasoningAge,
+                deps.cavemanTextCompression,
+            ]);
+            const idleBudgetMs = sessionMeta.cacheTtl === "1h" ? 3_600_000 : 300_000;
+            // Synthetic todo bytes are re-decided only on a bust. Observe every
+            // adapter-visible bust signal rather than polling host permissions on
+            // an unchanged defer pass; unexpected module busts remain observable.
+            const todoProbeSignals = {
+                cold: !state.initialized,
+                missing_verdict: getPersistedTodoPermissionDenied(deps.db, sessionId) === null,
+                full_wire: state.forceFullWire || !wireDelta,
+                identity: state.todoProbeIdentity !== todoProbeIdentity,
+                module_hint: state.todoProbeNextPass === true,
+                pressure: usage.percentage >= threshold,
+                memory_sync: memorySyncRequested,
+                refresh: protectionFloorCacheBustingPass,
+                emergency: overflowState.needsEmergencyRecovery,
+                frozen: state.lkgRepresentationFrozen,
+                agent_drop: getPendingOps(deps.db, sessionId).length > 0,
+                ttl:
+                    state.lastAppliedAtMs !== undefined &&
+                    requestObservedAtMs - state.lastAppliedAtMs >= idleBudgetMs,
+            };
+            const probeReasons = Object.entries(todoProbeSignals)
+                .filter(([, due]) => due)
+                .map(([reason]) => reason);
+            todoProbeRequired = probeReasons.length > 0;
+            timings.todoProbeReason = probeReasons.join(",") || "none";
+            timings.todoProbeRequired = Number(todoProbeRequired);
+            passInputs.todo_tool_present = await resolveCombinedTodowriteVerdict(
+                deps,
+                sessionId,
+                messages,
+                todoAvailability,
+                timings,
+                todoProbeRequired,
+            );
+            passInputs.todo_verdict_probed = timings.todoProbe > 0;
+            passInputs.verdict_stale_ok = false;
+            timings.todoVerdict += performance.now() - todoVerdictStartedAt;
+            const knownWatermarksUnchanged =
+                options.disableHotPathIoCachesForTests !== true &&
+                !memorySyncRequested &&
+                !state.lkgRepresentationFrozen &&
+                state.stateSyncInputSignature === currentStateSyncInputSignature;
             let stateSyncRetryBusy = false;
+            const stateSyncStartedAt = performance.now();
             try {
                 await prepareRustMemoryAuthority({
                     db: deps.db,
@@ -1833,7 +2831,7 @@ export function createRustModeTransform(
                     allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
                     onProjectPrepared: options.onProjectPrepared,
                 });
-                if (options.memorySyncRequestedSessions?.delete(sessionId)) {
+                if (memorySyncRequested) {
                     // A memory tool call can complete after the prior authority pass has
                     // acknowledged its watermarks. Rewind only memory watermarks so the
                     // next pass ships the mutation delta without reseeding compartments.
@@ -1868,9 +2866,13 @@ export function createRustModeTransform(
                         authority: true,
                         authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
                         authoritySeqAdoption,
+                        knownWatermarksUnchanged,
                     },
                 });
                 stateSyncRetryBusy = stateSyncResult.status === "retry_busy";
+                if (!stateSyncRetryBusy) {
+                    state.stateSyncInputSignature = currentStateSyncInputSignature;
+                }
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
@@ -1958,6 +2960,7 @@ export function createRustModeTransform(
                 sessionId,
                 input: encodedInput,
                 nativeMessages: wireDelta ? messages.slice(wireDelta.rawStart) : messages,
+                toolInputKeyOrders: toolInputKeyOrders(encodedInput),
                 fullArrayFingerprint: pendingWireCache.fingerprint,
                 tailDelta: wireDelta
                     ? {
@@ -1972,18 +2975,18 @@ export function createRustModeTransform(
                     final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
                     final_wire_trusted: finalWireEstimate?.trusted === true,
                 },
+                geometry: transformGeometry,
                 modelKey: modelKey ?? null,
                 providerId: model?.providerID ?? null,
+                variant: deps.variantBySession?.get(sessionId),
                 systemPromptHash: sessionMeta.systemPromptHash ?? "",
                 upgradeState: String(passInputs.upgrade_state ?? ""),
-                midTurn,
                 prevResponseCompletedAtMs:
                     sessionMeta.lastResponseTime > 0 ? sessionMeta.lastResponseTime : undefined,
                 requestObservedAtMs,
                 channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
-            const pages = buildPagedModuleTransformPayloads(body);
             logStage(
                 sessionId,
                 "wireBuild",
@@ -1991,44 +2994,237 @@ export function createRustModeTransform(
                 timings,
                 wireDelta ? `mode=tail_delta input=${encodedInput.length}` : "mode=full",
             );
-            let response: Record<string, unknown> | undefined;
+            type TransformSeriesRestart = {
+                reason: "attempt_mismatch" | "reconnect";
+                pages: number;
+                atPage: number;
+            };
+            type TransformSeriesResult =
+                | { response: Record<string, unknown> }
+                | { restart: TransformSeriesRestart };
+            const sendTransformSeries = async (
+                payload: Record<string, unknown>,
+                detail = "",
+            ): Promise<TransformSeriesResult> => {
+                const pagingStartedAt = performance.now();
+                // A one-page content-addressed envelope lets the module replay a completed
+                // request when only its response was lost, without executing the transform twice.
+                const pages = buildPagedModuleTransformPayloads(
+                    payload,
+                    options.modulePageMaxBytes,
+                    true,
+                );
+                timings.paging += performance.now() - pagingStartedAt;
+                const seedMessageCount = Array.isArray(payload.input)
+                    ? payload.input.length
+                    : Array.isArray(payload.messages)
+                      ? payload.messages.length
+                      : 0;
+                const paged = pages.some(
+                    (entry) => typeof entry.page.transform_page_id === "string",
+                );
+                let response: Record<string, unknown> | undefined;
+                for (const [index, { page, bytes }] of pages.entries()) {
+                    const transportStartedAt = performance.now();
+                    let moduleResponse: unknown;
+                    try {
+                        const attemptClass:
+                            | "transform_page_upload"
+                            | "transform_series_execute"
+                            | undefined = paged
+                            ? index === pages.length - 1
+                                ? "transform_series_execute"
+                                : "transform_page_upload"
+                            : undefined;
+                        const attemptTimeoutMs =
+                            options.moduleTimeoutMs ??
+                            (attemptClass === "transform_series_execute"
+                                ? transformColdStartExecuteTimeoutMs(seedMessageCount)
+                                : attemptClass === "transform_page_upload"
+                                  ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
+                                  : timeoutMs);
+                        const callArgs = {
+                            sessionId,
+                            projectRoot,
+                            method: "transform" as const,
+                            body: page,
+                            onTimings: (detail: import("./module-transport").ModuleCallTimings) => {
+                                for (const key of Object.keys(detail) as (keyof typeof detail)[])
+                                    timings.transportDetail[key] += detail[key];
+                            },
+                            // A reconnect discards a collecting page series. Page zero can be
+                            // retried safely, but later pages must make the caller restart it.
+                            generationSensitive: paged && index > 0,
+                            attemptClass,
+                        };
+                        moduleResponse = page.transform_page_complete
+                            ? await callTransformWithSilentResend(callArgs, attemptTimeoutMs)
+                            : await callModule(callArgs, attemptTimeoutMs);
+                    } catch (error) {
+                        if (paged && isTransformPageAttemptMismatch(error)) {
+                            return {
+                                restart: {
+                                    reason: "attempt_mismatch",
+                                    pages: pages.length,
+                                    atPage: index,
+                                },
+                            };
+                        }
+                        throw error;
+                    }
+                    if (paged && isModuleTransportGenerationChangedResult(moduleResponse)) {
+                        return {
+                            restart: { reason: "reconnect", pages: pages.length, atPage: index },
+                        };
+                    }
+                    if (paged && isTransformPageAttemptMismatch(moduleResponse)) {
+                        return {
+                            restart: {
+                                reason: "attempt_mismatch",
+                                pages: pages.length,
+                                atPage: index,
+                            },
+                        };
+                    }
+                    response = responseValue(moduleResponse);
+                    timings.transportBytes += bytes;
+                    timings.transportPages += 1;
+                    logStage(
+                        sessionId,
+                        "transport",
+                        transportStartedAt,
+                        timings,
+                        `page=${index + 1}/${pages.length}${detail}`,
+                    );
+                }
+                if (!response) throw new Error("rust module returned no transform response");
+                return { response };
+            };
+            let transformSeriesRestarted = false;
+            const sendTransformSeriesWithSingleRestart = async (
+                payload: Record<string, unknown>,
+                detail = "",
+            ): Promise<Record<string, unknown>> => {
+                let result = await sendTransformSeries(payload, detail);
+                if (!("restart" in result)) return result.response;
+                if (transformSeriesRestarted) {
+                    throw new Error(
+                        `rust transform page series restart exhausted: reason=${result.restart.reason}`,
+                    );
+                }
+                transformSeriesRestarted = true;
+                sessionLog(
+                    sessionId,
+                    `transform_series_restart reason=${result.restart.reason} pages=${result.restart.pages} at_page=${result.restart.atPage}`,
+                );
+                result = await sendTransformSeries(payload, `${detail} restart=series`);
+                if ("restart" in result) {
+                    throw new Error(
+                        `rust transform page series restart exhausted: reason=${result.restart.reason}`,
+                    );
+                }
+                return result.response;
+            };
+            let response = await sendTransformSeriesWithSingleRestart(body);
             let servedFinalWireEstimate:
                 | ReturnType<typeof estimateFinalWireInputTokens>
                 | undefined;
-            for (const [index, page] of pages.entries()) {
-                timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
-                const transportStartedAt = performance.now();
-                response = responseValue(
-                    await callModule({
-                        sessionId,
-                        projectRoot,
-                        method: "transform",
-                        body: page,
-                    }),
-                );
-                timings.transportPages += 1;
-                logStage(
-                    sessionId,
-                    "transport",
-                    transportStartedAt,
-                    timings,
-                    `page=${index + 1}/${pages.length}`,
-                );
-            }
-            if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
-            if (isNeedFullSync(response)) {
-                // A module restart can retain durable state while changing the accepted
-                // state-sync shape, so the next sync must re-probe its capabilities.
-                options.moduleClient.invalidateStateSyncCapabilities?.();
-                // need_full_sync is a WIRE-layer miss: the module (often freshly
-                // restarted, with its process-local Ready snapshot gone) cannot
-                // reconstruct the array from a tail delta. It says nothing about
-                // context.db state — the module's durable store survives restarts —
-                // so this arm must NOT re-seed state. A full state re-seed here
-                // cost 19-74s per pass on a live session (the SUBC loop) and
-                // hammered the module hard enough to crash-loop it.
+            const needFullSync = isNeedFullSync(response);
+            const nativeContentOmitted = !hasNativeResponseContent(response);
+            if (needFullSync || nativeContentOmitted) {
+                if (needFullSync) {
+                    resetOrdinalMemo(state);
+                    state.stateSyncInputSignature = null;
+                    state.memoryMirrorProjectionKey = null;
+                    state.compartmentMirrorProjectionKey = null;
+                    state.muralGeneration += 1;
+                    state.muralCache = null;
+                    clearCompartmentMirrorCursor(sessionId);
+                    // The module restarted and rejected the generation used by the state sync
+                    // above. Synchronize the new process before requesting the full response;
+                    // otherwise this pass may use incomplete restored state while the next pass
+                    // uses the complete state, producing inconsistent output.
+                    options.moduleClient.invalidateStateSyncCapabilities?.();
+                    const recoveryCachedCapabilities =
+                        options.moduleClient.getCachedStateSyncCapabilities;
+                    const recoveryStateSyncCapabilities =
+                        options.moduleClient.stateSyncCapabilities;
+                    const recoverySyncStartedAt = performance.now();
+                    try {
+                        const recoverySync = await syncModuleState({
+                            client: {
+                                call: callModule,
+                                getCachedStateSyncCapabilities: recoveryCachedCapabilities
+                                    ? () => recoveryCachedCapabilities.call(options.moduleClient)
+                                    : undefined,
+                                stateSyncCapabilities: recoveryStateSyncCapabilities
+                                    ? (capabilityArgs) =>
+                                          recoveryStateSyncCapabilities.call(
+                                              options.moduleClient,
+                                              capabilityArgs,
+                                          )
+                                    : undefined,
+                            },
+                            state,
+                            pass: syncPass,
+                            projectRoot,
+                            force: true,
+                            options: {
+                                authority: true,
+                                authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
+                                authoritySeqAdoption,
+                            },
+                        });
+                        stateSyncRetryBusy = recoverySync.status === "retry_busy";
+                    } catch (error) {
+                        // If a compatibility seed cannot be built, including when an older
+                        // module provides a seed that is too large, retain the recovery path that
+                        // sends the complete arrays. Retry state synchronization on a later pass.
+                        sessionLog(
+                            sessionId,
+                            "restart state reconciliation failed; continuing with full transform retry:",
+                            error,
+                        );
+                    } finally {
+                        logStage(
+                            sessionId,
+                            "stateSync",
+                            recoverySyncStartedAt,
+                            timings,
+                            "retry=full reason=need_full_sync",
+                        );
+                    }
+                } else {
+                    sessionLog(
+                        sessionId,
+                        "native_delta_fallback_reason=adapter_response_omitted_native_content retry=full",
+                    );
+                }
+                // Retry the transform with complete arrays. A restart-triggered miss was
+                // reconciled with durable state above, so reseeding is appropriate there. A
+                // malformed native response does not prove that the module restarted; retry it
+                // without reseeding state.
                 state.forceFullWire = true;
+                if (!todoProbeRequired) {
+                    const todoRetryStartedAt = performance.now();
+                    todoProbeRequired = true;
+                    timings.todoProbeRequired = 1;
+                    timings.todoProbeReason = "full_retry";
+                    passInputs.todo_tool_present = await resolveCombinedTodowriteVerdict(
+                        deps,
+                        sessionId,
+                        messages,
+                        todoAvailability,
+                        timings,
+                    );
+                    passInputs.todo_verdict_probed = timings.todoProbe > 0;
+                    timings.todoVerdict += performance.now() - todoRetryStartedAt;
+                    Object.assign(body, {
+                        todo_tool_present: passInputs.todo_tool_present,
+                        todo_verdict_probed: passInputs.todo_verdict_probed,
+                    });
+                }
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
                     let retryResolved = await resolveOrdinalsForModule({
@@ -2041,6 +3237,7 @@ export function createRustModeTransform(
                         memoStoredCount: state.ordinalMemoStoredCount,
                         memoCanonicalCount: state.ordinalMemoCanonicalCount,
                         provisionalBase: state.ordinalContinuationBase ?? undefined,
+                        forceProbeForTests: options.disableHotPathIoCachesForTests,
                     });
                     logStage(
                         sessionId,
@@ -2060,6 +3257,7 @@ export function createRustModeTransform(
                             memoAnchor: state.ordinalMemoAnchor,
                             memoStoredCount: state.ordinalMemoStoredCount,
                             memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                            forceProbeForTests: options.disableHotPathIoCachesForTests,
                         });
                     }
                     if (!retryResolved.ok) {
@@ -2100,6 +3298,7 @@ export function createRustModeTransform(
                         sessionId,
                         input: retryEncodedInput,
                         nativeMessages: messages,
+                        toolInputKeyOrders: toolInputKeyOrders(retryEncodedInput),
                         fullArrayFingerprint: pendingWireCache.fingerprint,
                         passInputs,
                         usage: {
@@ -2107,11 +3306,11 @@ export function createRustModeTransform(
                             final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
                             final_wire_trusted: finalWireEstimate?.trusted === true,
                         },
+                        geometry: transformGeometry,
                         modelKey: modelKey ?? null,
                         providerId: model?.providerID ?? null,
                         systemPromptHash: sessionMeta.systemPromptHash ?? "",
                         upgradeState: String(passInputs.upgrade_state ?? ""),
-                        midTurn,
                         prevResponseCompletedAtMs:
                             sessionMeta.lastResponseTime > 0
                                 ? sessionMeta.lastResponseTime
@@ -2128,31 +3327,7 @@ export function createRustModeTransform(
                         "retry=full",
                     );
                 }
-                response = undefined;
-                const retryWireBuildStartedAt = performance.now();
-                const retryPages = buildPagedModuleTransformPayloads(body);
-                logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
-                for (const [index, page] of retryPages.entries()) {
-                    timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
-                    const transportStartedAt = performance.now();
-                    response = responseValue(
-                        await callModule({
-                            sessionId,
-                            projectRoot,
-                            method: "transform",
-                            body: page,
-                        }),
-                    );
-                    timings.transportPages += 1;
-                    logStage(
-                        sessionId,
-                        "transport",
-                        transportStartedAt,
-                        timings,
-                        `page=${index + 1}/${retryPages.length} retry=full`,
-                    );
-                }
-                if (!response) throw new Error("rust module returned no retry transform response");
+                response = await sendTransformSeriesWithSingleRestart(body, " retry=full");
                 captureResponseTelemetry(response);
                 if (isNeedFullSync(response)) {
                     // The retry was a genuine full send; a second need_full_sync means
@@ -2160,6 +3335,9 @@ export function createRustModeTransform(
                     // failure ladder (LKG replay now, park after three) instead of
                     // letting an empty-output response masquerade as a served pass.
                     throw new Error("rust module still requires full sync after a full-array send");
+                }
+                if (!hasNativeResponseContent(response)) {
+                    throw new Error("rust module omitted native content after a full-array retry");
                 }
             }
             const deliveryPassIds = noteDeliveryPassIds(response);
@@ -2181,33 +3359,143 @@ export function createRustModeTransform(
                 }
             };
             const explicitDecision =
-                typeof response.decision === "string" ||
-                typeof response.action === "string" ||
-                typeof response.cache_bust === "boolean";
-            const decisionUpper = decision.toUpperCase();
-            const cacheBustingPass =
-                response.cache_bust === true ||
+                typeof response.decision === "string" && response.decision.length > 0
+                    ? response.decision
+                    : typeof response.action === "string" && response.action.length > 0
+                      ? response.action
+                      : undefined;
+            if (!explicitDecision) {
+                throw new RustTransformProtocolError(
+                    "rust transform wire invariant failed: response omitted decision and action",
+                );
+            }
+            const decisionUpper = explicitDecision.toUpperCase();
+            // `let`: a frozen LKG replay that can no longer validate (or hits its bound) releases
+            // the freeze on this pass, which then behaves as priced below.
+            let cacheBustingPass =
                 decisionUpper === "HARD" ||
                 decisionUpper === "MIGRATE_HARD" ||
                 decisionUpper === "EXECUTE" ||
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
                 // so the previous last-known-good (LKG) snapshot is already stale.
-                decisionUpper === "SOFT" ||
-                !explicitDecision;
-            let appliedMessages: unknown[];
+                decisionUpper === "SOFT";
+            if (!todoProbeRequired && cacheBustingPass) {
+                timings.todoUnprobedBust += 1;
+                sessionLog(
+                    sessionId,
+                    `todo_permission_probe_miss decision=${decisionUpper} reason=${response.materialize_reason ?? "unknown"} verdict_stale_ok=false`,
+                );
+            }
+            const deferredFirstDivergence = isRecord(response.first_divergence)
+                ? response.first_divergence
+                : undefined;
+            const deferredFrozenPrefixDivergence =
+                !cacheBustingPass &&
+                [deferredFirstDivergence?.block_id_old, deferredFirstDivergence?.block_id_new].some(
+                    (blockId) => blockId === "mc_m0#0" || blockId === "mc_m1#0",
+                );
+            if (deferredFrozenPrefixDivergence) {
+                // The module keeps the fingerprint from its last served response until an
+                // explicit cache invalidation. Freeze the host representation as well, so losing
+                // the process-local cache cannot change m0/m1 during either the first or a later
+                // deferred pass after restart.
+                state.lkgRepresentationFrozen = true;
+                state.forceFullWire = true;
+                sessionLog(sessionId, "deferred frozen-prefix divergence; replaying LKG");
+            }
+            const materializedBoundary = materializedCompactionBoundary(response);
+            let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
+            let frozenHealthyPassesAfterApply: number | null = null;
+            let frozenReleaseReason: string | null = null;
             const applyStartedAt = performance.now();
             try {
                 // Validate and postprocess the module result before touching the caller-owned
                 // array. This keeps failure recovery O(1) on the steady path: no defensive
                 // full-array clone is needed just in case boundary validation rejects it.
-                appliedMessages = applyNativeMessagesVerbatim({ messages: [] }, response);
-                runRustModePostprocess({
-                    db: deps.db,
-                    sessionId,
-                    messages: appliedMessages as MessageLike[],
-                    projectPath: memoryProjectPath,
-                    fullFeatureMode: !sessionMeta.isSubagent,
-                });
+                const moduleMessages = applyNativeMessagesVerbatim(
+                    { messages: [] },
+                    response,
+                    previousWireCache?.nativeOutput
+                        ? {
+                              messages: previousWireCache.nativeOutput,
+                              fingerprint: previousWireCache.fingerprint,
+                          }
+                        : undefined,
+                );
+                let appliedMessages = moduleMessages;
+                let replayedFrozenRepresentation = false;
+                if (state.lkgRepresentationFrozen && !cacheBustingPass) {
+                    if (state.lkgFrozenAtInputCount === null) {
+                        state.lkgFrozenAtInputCount = inputCount;
+                    }
+                    const keys = resolveLkgModelKeys(messages);
+                    const frozen = replayLkg({
+                        sessionId,
+                        messages,
+                        modelKey: keys.modelKey,
+                        providerKey: keys.providerKey,
+                    });
+                    if (!frozen.ok) {
+                        cacheBustingPass = true;
+                        frozenReleaseReason = frozen.reason;
+                    } else {
+                        frozenHealthyPassesAfterApply = state.lkgFrozenHealthyPasses + 1;
+                        const rawTailGrowth = Math.max(0, inputCount - state.lkgFrozenAtInputCount);
+                        const releaseReason =
+                            rawTailGrowth >= RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT
+                                ? "raw_tail_growth_limit"
+                                : frozenHealthyPassesAfterApply >=
+                                    RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT
+                                  ? "healthy_pass_limit"
+                                  : null;
+                        if (releaseReason) {
+                            cacheBustingPass = true;
+                            frozenReleaseReason = releaseReason;
+                        } else {
+                            appliedMessages = frozen.messages;
+                            replayedFrozenRepresentation = true;
+                            servedFrom = "lkg_frozen";
+                            sessionLog(sessionId, "lkg_frozen_replay_served");
+                        }
+                    }
+                }
+                if (!replayedFrozenRepresentation) {
+                    const outputCloneStartedAt = performance.now();
+                    appliedMessages = cloneModuleNativeOutput(moduleMessages);
+                    timings.outputClone += performance.now() - outputCloneStartedAt;
+                }
+                // Delta offsets count the module's array, before host marker insertion or
+                // reasoning recovery. Keep that basis unmodified, including nested parts;
+                // a postprocessed prefix can silently discard a message at the next splice.
+                pendingWireCache.nativeOutput = moduleMessages;
+                // LKG captures postprocessed output, so running postprocess again would stop the
+                // fallback artifact from being an exact replay.
+                if (!replayedFrozenRepresentation) {
+                    const postprocess = runRustModePostprocess({
+                        db: deps.db,
+                        sessionId,
+                        messages: appliedMessages as MessageLike[],
+                        projectPath: memoryProjectPath,
+                        sessionDirectory: directory,
+                        materializedBoundary,
+                        fullFeatureMode: !sessionMeta.isSubagent,
+                        compactionOff: deps.compactionOff,
+                        resolvedProviderID: model?.providerID,
+                        thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                            model?.providerID,
+                            model?.modelID,
+                        ),
+                        trailingBlankSourceDecisions,
+                        trailingBlankNewestAssistantId:
+                            typeof trailingBlankNewestAssistantId === "string"
+                                ? trailingBlankNewestAssistantId
+                                : undefined,
+                        tagger: deps.tagger,
+                        ctxReduceAvailability: reduceAvailability,
+                    });
+                    thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
+                    markerAt = postprocess.markerAt;
+                }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
@@ -2230,21 +3518,43 @@ export function createRustModeTransform(
                     });
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
+                // output.messages commonly aliases the raw input array, so preserve the entry ids
+                // before installation replaces that array with native output.
+                const lkgInputIds = messages.map((message) => message.info.id);
+                const lkgInputKeys = resolveLkgModelKeys(messages);
+                const applyReplaceStartedAt = performance.now();
+                installNativeMessages(output, appliedMessages);
+                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
+                if (thinkingBindingRecovery) {
+                    const cleared = clearThinkingBindingRecoveryIf(
+                        deps.db,
+                        sessionId,
+                        thinkingBindingRecovery.flagTarget,
+                    );
+                    sessionLog(
+                        sessionId,
+                        `rust thinking binding recovery: stripped bound reasoning from assistant ${thinkingBindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+                    );
+                }
+
                 const lkgSnapshotStartedAt = performance.now();
-                // When the response changes the served bytes, discard the previous last-known-good
-                // snapshot before scheduling the new capture. Otherwise, a transport failure on the
-                // next turn could replay obsolete output.
+                // A cache-busting replacement invalidates the previous snapshot only after the
+                // replacement is installed. If installation fails, the prior LKG remains available
+                // and its replay still applies durable binding-mismatch strips.
                 if (cacheBustingPass) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
+                    state.lkgAcceptedCapture = undefined;
                 }
-                // Reuse the wire-cache field snapshots for this input. Serialize the served
-                // response here, but defer hashing so LKG work does not block installing the result.
+                // Build the capture from the installed array. A priced replacement commits its
+                // snapshot before this transform can return, so a process death cannot leave the
+                // previous priced representation durable. Defer-only refreshes remain asynchronous.
                 const capturePlan = prepareRustCapture(
                     state,
                     sessionId,
-                    messages,
+                    lkgInputIds,
+                    lkgInputKeys,
                     pendingWireCache.rawContentSnapshots,
-                    response,
+                    output.messages,
                     rowVersion,
                 );
                 let captureMode = "async";
@@ -2256,6 +3566,7 @@ export function createRustModeTransform(
                         return;
                     }
                     dropSlot(sessionId, `lkg_${mode}_capture_failed`);
+                    state.lkgAcceptedCapture = undefined;
                     state.lkgSyncCaptureRequired = true;
                     sessionLog(
                         sessionId,
@@ -2265,13 +3576,16 @@ export function createRustModeTransform(
                 };
                 if (!capturePlan) {
                     captureMode = "declined";
-                    captureFailed("async", new Error("LKG snapshot preparation was rejected"));
-                } else if (state.lkgSyncCaptureRequired) {
-                    captureMode = "sync_recovery";
+                    const error = new Error("LKG snapshot preparation was rejected");
+                    captureFailed("async", error);
+                    if (cacheBustingPass) throw error;
+                } else if (cacheBustingPass || state.lkgSyncCaptureRequired) {
+                    captureMode = cacheBustingPass ? "sync_priced" : "sync_recovery";
                     try {
-                        commitRustCapture(state, capturePlan);
+                        commitRustCapture(state, capturePlan, cacheBustingPass);
                     } catch (error) {
                         captureFailed("sync", error);
+                        if (cacheBustingPass) throw error;
                     }
                 } else {
                     try {
@@ -2301,9 +3615,6 @@ export function createRustModeTransform(
                     timings,
                     `mode=${captureMode} row_version=${rowVersion}`,
                 );
-                const applyReplaceStartedAt = performance.now();
-                replaceMessagesInPlace(output, appliedMessages);
-                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
             } catch (error) {
                 logStage(sessionId, "apply", applyStartedAt, timings, "failed=true");
                 try {
@@ -2313,11 +3624,26 @@ export function createRustModeTransform(
                 }
                 throw error;
             }
+            const bookkeepingStartedAt = performance.now();
+            if (cacheBustingPass) {
+                if (frozenReleaseReason) {
+                    sessionLog(
+                        sessionId,
+                        `lkg_frozen_replay_released reason=${frozenReleaseReason}`,
+                    );
+                }
+                state.lkgRepresentationFrozen = false;
+                state.lkgFrozenHealthyPasses = 0;
+                state.lkgFrozenAtInputCount = null;
+            } else if (frozenHealthyPassesAfterApply !== null) {
+                state.lkgFrozenHealthyPasses = frozenHealthyPassesAfterApply;
+            }
             try {
                 mirrorRustRenderedMemoryIds({ db: deps.db, sessionId, response });
             } catch (error) {
                 sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }
+            const deliveryStartedAt = performance.now();
             if (deliveryPassIds.length > 0) {
                 try {
                     await sendNoteDeliveryDisposition("transform.ack");
@@ -2327,6 +3653,7 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
             }
+            timings.delivery += performance.now() - deliveryStartedAt;
             const ordinalContinuationBase = response.ordinal_continuation_base;
             if (
                 typeof ordinalContinuationBase === "number" &&
@@ -2349,9 +3676,10 @@ export function createRustModeTransform(
             state.parked = false;
             state.passesSincePark = 0;
             state.warningSent = false;
-            // An applied pass proves the module reconstructed the wire; delta
-            // transport may resume on the next pass.
-            state.forceFullWire = false;
+            // A frozen LKG representation is not the module's acknowledged native prefix, so
+            // output deltas cannot safely splice against it. Full transport resumes deltas only
+            // after a cache-busting pass adopts the module representation.
+            state.forceFullWire = state.lkgRepresentationFrozen;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {
@@ -2376,35 +3704,6 @@ export function createRustModeTransform(
                         "rust channel2 pending-intent CAS failed (ignored):",
                         error,
                     );
-                }
-            }
-            if (options.moduleClient.mirrorPull) {
-                try {
-                    await pullMemoryMirrorOnce({
-                        db: deps.db,
-                        module: options.moduleClient as AuthorityModuleClient,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
-                }
-            }
-            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (getCompartmentsAfter) {
-                try {
-                    await mirrorModuleCompartments({
-                        db: deps.db,
-                        sessionId,
-                        reader: {
-                            getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                getCompartmentsAfter.call(
-                                    options.moduleClient,
-                                    mirroredSessionId,
-                                    afterSequence,
-                                ),
-                        } satisfies ModuleCompartmentReader,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
                 }
             }
             // Provider overflow proves the prior wire failed, so successful local
@@ -2434,8 +3733,97 @@ export function createRustModeTransform(
                     // Best-effort: a later pass with current recovery evidence retries the clear.
                 }
             }
-            wireCaches.set(sessionId, pendingWireCache);
+            if (timings.todoProbe > 0) state.todoProbeIdentity = todoProbeIdentity;
+            state.todoProbeNextPass =
+                response.reconcile_pending === true ||
+                (isRecord(response.historian) && response.historian.fired === true);
+            state.lastAppliedAtMs = requestObservedAtMs;
+            heapHolder.wireCaches.set(sessionId, pendingWireCache);
+            timings.bookkeeping += performance.now() - bookkeepingStartedAt - timings.delivery;
             appliedAt = performance.now();
+            // Stable transform projections cannot have new module-owned mirror rows. A changed
+            // row/boundary/manifest marker schedules one ordered background pull; old modules that
+            // omit row_version keep the compatibility behavior of polling after every pass.
+            const projectionKey =
+                options.disableHotPathIoCachesForTests === true
+                    ? null
+                    : mirrorProjectionKey(response);
+            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
+            const memoryMirrorDue =
+                options.moduleClient.mirrorPull !== undefined &&
+                (memorySyncRequested ||
+                    projectionKey === null ||
+                    state.memoryMirrorProjectionKey !== projectionKey);
+            const compartmentMirrorDue =
+                getCompartmentsAfter !== undefined &&
+                (projectionKey === null || state.compartmentMirrorProjectionKey !== projectionKey);
+            if ((memoryMirrorDue || compartmentMirrorDue) && !state.mirrorProjectionInFlight) {
+                state.mirrorProjectionInFlight = true;
+                void (async () => {
+                    if (memoryMirrorDue) {
+                        const mirrorPullStartedAt = performance.now();
+                        try {
+                            const mirrorDrain = await pullMemoryMirrorOnce({
+                                db: deps.db,
+                                module: options.moduleClient,
+                            });
+                            if (mirrorDrain.cuePoolVersion !== state.muralCuePoolVersion) {
+                                state.muralCuePoolVersion = mirrorDrain.cuePoolVersion;
+                                state.muralCache = null;
+                            }
+                            if (mirrorDrain.complete) {
+                                state.memoryMirrorProjectionKey = projectionKey;
+                            } else if (mirrorDrain.budgetExhausted) {
+                                sessionLog(
+                                    sessionId,
+                                    `rust memory mirror backlog deferred: rows_applied=${mirrorDrain.rowsApplied} backlog_remaining=true pages=${mirrorDrain.pagesPulled}`,
+                                );
+                            }
+                        } catch (error) {
+                            sessionLog(
+                                sessionId,
+                                "rust memory mirror-back failed (ignored):",
+                                error,
+                            );
+                        } finally {
+                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
+                        }
+                    }
+                    if (compartmentMirrorDue && getCompartmentsAfter) {
+                        const compartmentMirrorStartedAt = performance.now();
+                        try {
+                            await mirrorModuleCompartments({
+                                db: deps.db,
+                                sessionId,
+                                reader: {
+                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                        getCompartmentsAfter.call(
+                                            options.moduleClient,
+                                            mirroredSessionId,
+                                            afterSequence,
+                                        ),
+                                } satisfies ModuleCompartmentReader,
+                            });
+                            state.compartmentMirrorProjectionKey = projectionKey;
+                        } catch (error) {
+                            sessionLog(
+                                sessionId,
+                                "rust compartment mirror-back failed (ignored):",
+                                error,
+                            );
+                        } finally {
+                            logStage(
+                                sessionId,
+                                "compartmentMirror",
+                                compartmentMirrorStartedAt,
+                                timings,
+                            );
+                        }
+                    }
+                })().finally(() => {
+                    state.mirrorProjectionInFlight = false;
+                });
+            }
             finishPass(true);
         } catch (error) {
             if (
@@ -2454,10 +3842,28 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
-                throw new EmergencyFailClosedError(
-                    "Rust Magic Context was unavailable at a provider-proven context limit",
-                    { cause: error },
-                );
+                const refusedUser = newestUserMessage(messages);
+                const refusedUserMessageId = refusedUser ? messageIdOf(refusedUser) : null;
+                if (refusedUserMessageId) {
+                    try {
+                        options.onEngineReconnectRefusal?.({
+                            sessionId,
+                            projectRoot: recoveryProjectRoot,
+                            refusedUserMessageId,
+                            providerProvenEmergency,
+                            compactionOff: deps.compactionOff === true,
+                        });
+                    } catch (recoveryError) {
+                        sessionLog(
+                            sessionId,
+                            "rust refusal recovery failed to arm:",
+                            recoveryError,
+                        );
+                    }
+                }
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, {
+                    cause: error,
+                });
             }
             // Validation happens before the caller-owned array is replaced, so the
             // original live array is still available for fail-open replay.
@@ -2467,9 +3873,21 @@ export function createRustModeTransform(
                 output,
                 sessionMeta.systemPromptTokens,
             );
+            if (replayed) {
+                if (!state.lkgRepresentationFrozen) {
+                    state.lkgFrozenAtInputCount = inputCount;
+                }
+                state.lkgRepresentationFrozen = true;
+                state.lkgFrozenHealthyPasses = 0;
+                state.forceFullWire = true;
+            } else {
+                state.lkgRepresentationFrozen = false;
+                state.lkgFrozenHealthyPasses = 0;
+                state.lkgFrozenAtInputCount = null;
+            }
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
-            materializeReason = "none";
+            materializeReason = moduleFailureCode(error) ?? "none";
             markFailure(sessionId, state, error);
             if (!replayed) {
                 try {
@@ -2486,20 +3904,29 @@ export function createRustModeTransform(
 
     return {
         run,
-        clearSession(sessionId: string): void {
+        async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
                 states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
-            dropSlot(sessionId, "session-deleted");
-            states.delete(sessionId);
-            wireCaches.delete(sessionId);
-            if (projectRoot && options.moduleClient.deleteSession) {
-                void options.moduleClient
-                    .deleteSession(sessionId, projectRoot)
-                    .catch((error) => {
-                        sessionLog(sessionId, "rust module session deletion failed:", error);
-                    })
-                    .finally(() => options.moduleClient.closeSession?.(sessionId));
-            } else {
+            const clearLocalState = () => {
+                dropSlot(sessionId, "session-deleted");
+                states.delete(sessionId);
+                heapHolder.wireCaches.delete(sessionId);
+                promptSurfaceGuidanceEpochs?.clear(sessionId);
+                clearCompartmentMirrorCursor(sessionId);
+            };
+            clearLocalState();
+            try {
+                if (projectRoot && options.moduleClient.deleteSession) {
+                    await options.moduleClient.deleteSession(sessionId, projectRoot);
+                }
+            } catch (error) {
+                sessionLog(sessionId, "rust module session deletion failed:", error);
+                throw error;
+            } finally {
+                // A transform that was already running may finish while session.delete waits.
+                // Clear the state again so its completion cannot repopulate this route's
+                // wire or last-known-good state after deletion has begun.
+                clearLocalState();
                 options.moduleClient.closeSession?.(sessionId);
             }
         },
@@ -2508,6 +3935,24 @@ export function createRustModeTransform(
             return {
                 ...ensureState(states, sessionId),
                 idOrdinalMemo: new Map(ensureState(states, sessionId).idOrdinalMemo),
+            };
+        },
+        getHeapStats(): RustWireCacheHeapStats {
+            const sessions = [...heapHolder.wireCaches].map(([sessionId, cache]) => ({
+                sessionId,
+                rawMessages: cache.rawCount,
+                wireMessages: cache.wireCount,
+                rawContentSnapshots: cache.rawContentSnapshots.length,
+                estimatedBytes: rustWireCacheEstimatedBytes(cache),
+            }));
+            return {
+                snapshots: heapHolder.wireCaches.size,
+                rawContentSnapshots: sessions.reduce(
+                    (sum, session) => sum + session.rawContentSnapshots,
+                    0,
+                ),
+                estimatedBytes: sessions.reduce((sum, session) => sum + session.estimatedBytes, 0),
+                sessions,
             };
         },
     };
@@ -2525,7 +3970,9 @@ export async function runRustModeTransform(
 
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
+    authoritySeedRows,
     contentSnapshotsFor,
+    rustCaptureDigests,
     snapshotTags: {
         array: LKG_SNAPSHOT_ARRAY,
         object: LKG_SNAPSHOT_OBJECT,
@@ -2539,7 +3986,13 @@ export const __rustModeTransformTest = {
     messageContentSnapshot,
     messageMatchesContentSnapshot,
     buildTransformBody,
+    transformGeometryForWire,
+    hardWallUsagePercentage,
+    muralInputForWire,
+    resolvedHistorianModelChain,
     formatRustPassLog,
+    formatRustInputCoverageLog,
+    materializedCompactionBoundary,
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,
     directiveTextOf,

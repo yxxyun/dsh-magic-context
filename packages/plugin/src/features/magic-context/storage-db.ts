@@ -10,7 +10,7 @@ import {
     statSync,
     unlinkSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
@@ -19,16 +19,25 @@ import {
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
-    discoverLivePiProcessIds,
+    classifyProcessKind,
+    inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
+    readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import { Database, detectSqliteRuntime, registerSlowWriteReporter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+
 import { ensureContextStoreUuid } from "./context-authority";
-import type { FailClosedBlockingProcess } from "./fail-closed-block";
+import {
+    attachFailClosedBlockingProcessEvidence,
+    type FailClosedBlockingProcess,
+    type FailClosedProcessKind,
+} from "./fail-closed-block";
+import { startMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -36,6 +45,11 @@ import {
     setDatabase as setToolDefinitionDatabase,
 } from "./tool-definition-tokens";
 import { runToolOwnerBackfill } from "./tool-owner-backfill";
+
+// The SQLite chokepoint cannot import the logging chain itself (it is executed
+// directly by Node in the backend smoke); every storage open path runs through
+// this module, so registering here covers privileged writes on both runtimes.
+registerSlowWriteReporter(logSlowWriteTransaction);
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -65,6 +79,8 @@ export interface MigrationOnOpenRefusal {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
+    /** Process kinds may be omitted when older test fixtures provide only serverPids. */
+    blockingProcesses?: FailClosedBlockingProcess[];
     unreadableFile?: string;
     unreadableArm?: "parse" | "io";
 }
@@ -89,6 +105,13 @@ export function __resetSchemaFenceStateForTests(): void {
 }
 
 export const LATEST_SUPPORTED_VERSION = 85;
+
+/**
+ * Every runtime backend receives the same finite wait before the first schema
+ * read. Five seconds preserves the established contention tolerance while
+ * remaining well inside the server-wide 15 second boot budget.
+ */
+export const BOOT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -150,9 +173,39 @@ function restrictDatabaseFilePermissions(dbPath: string): void {
     }
 }
 
+export interface DatabaseBootTimings {
+    openMs: number;
+    guardMs: number;
+    migrateMs: number;
+}
+
 export interface OpenDatabaseOptions {
     dbPath?: string;
     latestSupportedVersion?: number;
+    /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
+    busyTimeoutMs?: number;
+    /** Boot-only timing sink; omitted by ordinary storage callers. */
+    onBootTimings?: (timings: DatabaseBootTimings) => void;
+    /** Receives the exact busy-timeout diagnostic emitted during a fresh database open. */
+    onBootBusyTimeout?: (message: string) => void;
+}
+
+function resolveBootBusyTimeoutMs(value: number | undefined): number {
+    if (value === undefined) return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+    if (!Number.isFinite(value)) return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+    return Math.max(0, Math.min(BOOT_SQLITE_BUSY_TIMEOUT_MS, Math.floor(value)));
+}
+
+function installBootBusyTimeout(
+    db: Database,
+    dbPath: string,
+    timeoutMs: number,
+    report: (message: string) => void = log,
+): void {
+    db.exec(`PRAGMA busy_timeout=${timeoutMs}`);
+    report(
+        `[magic-context] SQLite boot busy timeout: backend=${detectSqliteRuntime()} timeout=${timeoutMs}ms path=${dbPath}`,
+    );
 }
 
 // Exported for the test-isolation guard test. Returns a PATH only — opens no DB —
@@ -314,9 +367,16 @@ export function enforceSchemaFence(
 export type RpcDiscoveryUnreadableArm = "parse" | "io";
 
 export interface RpcServerDiscovery {
-    state: "absent" | "stale" | "live" | "unreadable";
+    state: "absent" | "stale" | "live" | "unreadable" | "inconclusive";
     serverPids: number[];
+    /** Per-PID labels captured while the discovery record was validated. */
+    serverProcesses?: FailClosedBlockingProcess[];
     staleFiles: string[];
+    /**
+     * PIDs for which the process-existence or process-identity check could not
+     * run. That failure does not prove that the process is actively using RPC.
+     */
+    inconclusivePids?: number[];
     unreadableFile?: string;
     unreadableArm?: RpcDiscoveryUnreadableArm;
 }
@@ -378,6 +438,56 @@ function invalidDiscoveryReason(raw: string): RpcDiscoveryJunkReason {
     // A legacy file containing only a port, with no server PID, is invalid and
     // cannot be accepted while deciding whether migration is safe.
     return "parse-invalid";
+}
+
+function classifyDiscoveryRecordKind(record: {
+    kind?: string;
+    harness?: string;
+}): FailClosedProcessKind | null {
+    for (const value of [record.kind, record.harness]) {
+        const normalized = value?.trim().toLowerCase();
+        if (!normalized) continue;
+        if (normalized === "process") return "process";
+        if (normalized === "opencode server" || normalized === "server") {
+            return "OpenCode server";
+        }
+        if (
+            normalized === "opencode instance" ||
+            normalized === "opencode instance (tui/cli)" ||
+            normalized === "opencode" ||
+            normalized === "tui" ||
+            normalized === "cli"
+        ) {
+            return "OpenCode instance (TUI/CLI)";
+        }
+        if (
+            normalized === "pi" ||
+            normalized === "pi harness" ||
+            normalized === "omp" ||
+            normalized === "oh-my-pi"
+        ) {
+            return "Pi";
+        }
+    }
+    return null;
+}
+
+function classifyRpcProcess(
+    record: {
+        pid: number;
+        kind?: string;
+        harness?: string;
+    },
+    commandLine?: string | null,
+): FailClosedProcessKind {
+    return (
+        classifyDiscoveryRecordKind(record) ??
+        classifyProcessKind(
+            commandLine === undefined
+                ? readProcessProbeEvidence(record.pid).commandLine
+                : commandLine,
+        )
+    );
 }
 
 function classifyJunkDiscovery(
@@ -446,7 +556,9 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     }
 
     const pids = new Set<number>();
+    const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
+    const inconclusivePids = new Set<number>();
     for (const portFile of portFiles) {
         let raw: string;
         try {
@@ -464,8 +576,31 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
-        if (isPidAlive(record.pid) && isPidIdentityPlausible(record)) pids.add(record.pid);
-        else staleFiles.push(portFile);
+        const liveness = isPidAlive(record.pid);
+        if (liveness === "dead") {
+            staleFiles.push(portFile);
+            continue;
+        }
+        const evidence = readProcessProbeEvidence(record.pid);
+        const identity = isPidIdentityPlausible(record, evidence);
+        if (identity === "plausible") {
+            pids.add(record.pid);
+            const detected = attachFailClosedBlockingProcessEvidence(
+                {
+                    kind: classifyRpcProcess(record, evidence.commandLine),
+                    pid: record.pid,
+                } satisfies FailClosedBlockingProcess,
+                evidence,
+            );
+            const previous = processByPid.get(record.pid);
+            if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
+                processByPid.set(record.pid, detected);
+            }
+        } else if (identity === "implausible") {
+            staleFiles.push(portFile);
+        } else {
+            inconclusivePids.add(record.pid);
+        }
     }
 
     // Remove stale evidence even when another record still proves that a server
@@ -481,19 +616,40 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
 
     const serverPids = [...pids].sort((a, b) => a - b);
     if (serverPids.length > 0) {
-        return { state: "live", serverPids, staleFiles };
+        return {
+            state: "live",
+            serverPids,
+            serverProcesses: serverPids.map(
+                (pid) => processByPid.get(pid) ?? { kind: "process" as const, pid },
+            ),
+            staleFiles,
+        };
+    }
+    const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
+    if (uncertainPids.length > 0) {
+        return {
+            state: "inconclusive",
+            serverPids: [],
+            staleFiles,
+            inconclusivePids: uncertainPids,
+        };
     }
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live harnesses that would block an on-open migration. */
+function createPiBlockingProcess(pid: number): FailClosedBlockingProcess {
+    return attachFailClosedBlockingProcessEvidence(
+        { kind: "Pi", pid },
+        readProcessProbeEvidence(pid),
+    );
+}
+
+/** Return the live processes that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
-    const openCode =
-        discovery.state === "live"
-            ? discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }))
-            : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ harness: "Pi harness", pid }));
+    const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
+    const piDiscovery = inspectLivePiProcesses();
+    const pi = piDiscovery.processIds.map(createPiBlockingProcess);
     return [...openCode, ...pi];
 }
 
@@ -502,6 +658,81 @@ export function getLiveMigrationBlockingProcesses(storageDir: string): FailClose
  * older build. OpenCode servers keep their plugin loaded, and a live Pi process
  * can spawn a child with its loaded extension after another process migrates.
  */
+export function formatInconclusiveOpenCodeMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
+}
+
+export function formatInconclusivePiMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; Pi/OMP PID ${pids.join(", ")} was not confirmed as a live harness because the process image or command line was ambiguous. No live Pi harness was confirmed.`;
+}
+
+function logInconclusiveMigrationProbes(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    piDiscovery: {
+        state: "known" | "unreadable" | "inconclusive";
+        inconclusivePids?: readonly number[];
+    },
+): void {
+    const uncertainPids = discovery.inconclusivePids ?? [];
+    if (uncertainPids.length > 0) {
+        log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
+    }
+    if (piDiscovery.state === "unreadable") {
+        log(
+            `[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`,
+        );
+    } else if ((piDiscovery.inconclusivePids?.length ?? 0) > 0) {
+        log(formatInconclusivePiMigrationWarning(dbPath, piDiscovery.inconclusivePids ?? []));
+    }
+}
+
+function isDefaultSharedDatabasePath(dbPath: string): boolean {
+    // Test-only storage overrides are isolated by construction and must not
+    // inherit a real user's global Pi-process fence.
+    if (
+        !process.env.XDG_DATA_HOME &&
+        (process.env.MAGIC_CONTEXT_TEST_DATA_DIR || process.env.NODE_ENV === "test")
+    ) {
+        return false;
+    }
+    return resolve(dbPath) === resolve(join(getMagicContextStorageDir(), "context.db"));
+}
+
+function migrationBlockingPiPids(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    discoveredPiPids: readonly number[],
+): number[] {
+    if (isDefaultSharedDatabasePath(dbPath)) return [...discoveredPiPids];
+
+    // RPC discovery is rooted inside dbDir, so a matching PID is evidence that
+    // this process is attached to the target data directory rather than merely
+    // running elsewhere on the machine.
+    const sameDataDirPids = new Set(discovery.serverPids);
+    return discoveredPiPids.filter((pid) => sameDataDirPids.has(pid));
+}
+
+export function formatLiveProcessMigrationRefusal(
+    dbPath: string,
+    persistedVersion: number,
+    latestSupportedVersion: number,
+    serverPids: readonly number[],
+    piPids: readonly number[],
+): string {
+    const blockers = [
+        ...serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
+        ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`),
+    ];
+    return `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`;
+}
+
 function enforceMigrationOnOpenGuard(
     db: Database,
     dbPath: string,
@@ -514,9 +745,22 @@ function enforceMigrationOnOpenGuard(
         return true;
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
-    const piPids = discoverLivePiProcessIds();
-    if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
+    const piDiscovery = inspectLivePiProcesses();
+    const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
+    const serverProcesses =
+        discovery.serverProcesses ??
+        (discovery.state === "live"
+            ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
+            : []);
+    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
+    if (
+        (discovery.state === "absent" ||
+            discovery.state === "stale" ||
+            discovery.state === "inconclusive") &&
+        piPids.length === 0
+    ) {
         lastMigrationOnOpenRefusal = null;
+        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery);
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
@@ -526,6 +770,7 @@ function enforceMigrationOnOpenGuard(
         persistedVersion,
         supportedVersion: latestSupportedVersion,
         serverPids: blockingPids,
+        blockingProcesses,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
         ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
@@ -540,12 +785,14 @@ function enforceMigrationOnOpenGuard(
             `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
-        const blockers = [
-            ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
-            ...piPids.map((pid) => `Pi harness PID ${pid}`),
-        ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`,
+            formatLiveProcessMigrationRefusal(
+                dbPath,
+                persistedVersion,
+                latestSupportedVersion,
+                discovery.serverPids,
+                piPids,
+            ),
         );
     }
     return false;
@@ -618,7 +865,7 @@ function finishDatabaseOpen(
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
     if (!explicitDbPath) {
-        const runBackfill = () => {
+        const runBackfills = () => {
             try {
                 runToolOwnerBackfill(db);
             } catch (error) {
@@ -626,9 +873,14 @@ function finishDatabaseOpen(
                     `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
                 );
             }
+            void startMessageFtsRowidMapBackfill(db).catch((error) => {
+                log(
+                    `[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`,
+                );
+            });
         };
-        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfill);
-        else runBackfill();
+        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
+        else runBackfills();
     }
     // Wire the persistence-backed tool-definition measurement store and
     // rehydrate the in-memory map from any prior writes. Doing this here
@@ -650,12 +902,14 @@ function finishDatabaseOpen(
     return db;
 }
 
-export function initializeDatabase(db: Database): void {
-    // Install the busy timeout BEFORE any file-level PRAGMAs like WAL. Two
-    // processes can cold-open the same DB at once (real OpenCode/Pi startup, or
-    // the subprocess lease tests); without the timeout this connection can throw
-    // SQLITE_BUSY immediately while the sibling is switching journal mode.
-    db.exec("PRAGMA busy_timeout=5000");
+export function initializeDatabase(
+    db: Database,
+    busyTimeoutMs = BOOT_SQLITE_BUSY_TIMEOUT_MS,
+): void {
+    // Keep the same finite timeout through schema creation and migrations. The
+    // open paths install it before their first read; direct initializer callers
+    // receive it here before any file-level PRAGMA such as WAL.
+    db.exec(`PRAGMA busy_timeout=${resolveBootBusyTimeoutMs(busyTimeoutMs)}`);
     // SQLite per-connection PRAGMAs. foreign_keys MUST run before any reads
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
@@ -692,7 +946,7 @@ export function initializeDatabase(db: Database): void {
       tag_id INTEGER,
       session_id TEXT,
       content TEXT,
-      created_at INTEGER,
+      created_at INTEGER, -- epoch ms; Date.now() on source writes, preserved on session clones
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, tag_id)
     );
@@ -716,7 +970,7 @@ export function initializeDatabase(db: Database): void {
       p1_embedding BLOB,
       p1_embedding_model_id TEXT,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -735,7 +989,7 @@ export function initializeDatabase(db: Database): void {
       model_id TEXT NOT NULL,
       dims INTEGER NOT NULL,
       vector BLOB NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(compartment_id, model_id, window_index)
     );
     CREATE INDEX IF NOT EXISTS idx_cce_session ON compartment_chunk_embeddings(session_id);
@@ -758,7 +1012,7 @@ export function initializeDatabase(db: Database): void {
       kind TEXT NOT NULL,
       at_compartment INTEGER,
       fields_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
     CREATE INDEX IF NOT EXISTS idx_compartment_events_session
@@ -787,7 +1041,7 @@ export function initializeDatabase(db: Database): void {
       session_id TEXT NOT NULL,
       category TEXT NOT NULL,
       content TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -806,7 +1060,7 @@ export function initializeDatabase(db: Database): void {
       source_message_time INTEGER NOT NULL,
       question_embedding BLOB,
       question_embedding_model_id TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(project_path, harness, session_id, source_start_message_id, source_end_message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_primer_candidates_project_time
@@ -828,7 +1082,8 @@ export function initializeDatabase(db: Database): void {
       last_observed_at INTEGER,
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL,
+      source_candidate_provenance TEXT,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_primers_project_status_observed
@@ -941,7 +1196,7 @@ export function initializeDatabase(db: Database): void {
       job_id TEXT,
       cursor TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL DEFAULT 0,
       UNIQUE(session_id, request_key)
     );
@@ -982,7 +1237,7 @@ export function initializeDatabase(db: Database): void {
       shadow_epoch INTEGER NOT NULL DEFAULT 0,
       corpus_hash TEXT NOT NULL DEFAULT '',
       coverage_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       UNIQUE(dedup_key, cohort_key)
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
@@ -994,8 +1249,10 @@ export function initializeDatabase(db: Database): void {
       -- verified_at=0 means "mapped (files known) but not yet content-verified".
       -- map-memories sets mapped_at + verified_at=0; verify sets verified_at=now.
       verified_at  INTEGER NOT NULL,
-      mapped_at    INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (memory_id, file_path)
+       mapped_at    INTEGER NOT NULL DEFAULT 0,
+       -- Distinguishes mapper-authored independence from a host rejection fallback.
+       mapping_origin TEXT NOT NULL DEFAULT 'mapper',
+       PRIMARY KEY (memory_id, file_path)
     );
     CREATE INDEX IF NOT EXISTS idx_memory_verifications_memory ON memory_verifications(memory_id);
 
@@ -1180,6 +1437,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       tokenize='porter unicode61'
     );
 
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+      session_id TEXT NOT NULL,
+      message_ordinal INTEGER NOT NULL,
+      fts_rowid INTEGER NOT NULL,
+      PRIMARY KEY(session_id, message_ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      watermark_rowid INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+      (id, watermark_rowid, completed, updated_at)
+    VALUES (1, 0, 0, 0);
+
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
@@ -1187,8 +1461,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
-    CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
-      ON message_history_index(harness, session_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS message_history_source (
       session_id TEXT NOT NULL,
@@ -1291,10 +1563,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       pending_pi_compaction_marker_state TEXT,
       new_work_tokens INTEGER NOT NULL DEFAULT 0,
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
-      -- deferred_execute_state: intentionally NULLABLE without a default.
-      -- Absence is SQL NULL; presence is a JSON blob written via
-      -- setDeferredExecutePendingIfAbsent. Excluded from the
-      -- healAllNullColumns fallback list.
+      -- Retired columns remain in place so existing databases keep the same schema:
+      -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
       cached_m0_project_memory_epoch INTEGER,
@@ -1309,6 +1579,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
+      protected_tokens_effective INTEGER,
+      protected_tokens_pre_snapshot TEXT,
       protected_tail_policy_version INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_window_started_at INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1325,8 +1597,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
-      cached_m0_project_identity TEXT,
-      cached_m0_last_baseline_end_message_id TEXT,
+       cached_m0_project_identity TEXT,
+       cached_m0_last_baseline_end_message_id TEXT,
+       thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
     );
@@ -1387,7 +1660,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance_avg REAL,
       discarded_last INTEGER NOT NULL DEFAULT 0,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL -- epoch ms (Date.now())
     );
     CREATE INDEX IF NOT EXISTS idx_historian_runs_session
       ON historian_runs(session_id, created_at DESC);
@@ -1402,6 +1675,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       decision           TEXT    NOT NULL,
       materialized       INTEGER NOT NULL DEFAULT 0,
       materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
       emergency          INTEGER NOT NULL DEFAULT 0,
       dropped_tokens     INTEGER NOT NULL DEFAULT 0,
       dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -1434,7 +1713,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance INTEGER NOT NULL DEFAULT 50,
       episode_type TEXT,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -1445,7 +1724,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       category TEXT NOT NULL,
       content TEXT NOT NULL,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
 
@@ -1464,6 +1743,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "primer_candidates", "question_embedding", "BLOB");
     ensureColumn(db, "primer_candidates", "question_embedding_model_id", "TEXT");
     ensureColumn(db, "primers", "question_embedding_model_id", "TEXT");
+    ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
+    const hasUserMemoriesTable = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_memories'")
+        .get();
+    if (hasUserMemoriesTable) {
+        ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
+    }
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_primer_candidates_occurrence
         ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
@@ -1546,6 +1832,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // strip newly-aged calls mid-prefix on a defer pass (Anthropic cache bust).
     ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
@@ -1705,6 +1994,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+    ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
     ensureColumn(db, "session_meta", "protected_tail_policy_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(
         db,
@@ -1846,6 +2137,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         decision           TEXT    NOT NULL,
         materialized       INTEGER NOT NULL DEFAULT 0,
         materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
         emergency          INTEGER NOT NULL DEFAULT 0,
         dropped_tokens     INTEGER NOT NULL DEFAULT 0,
         dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -1855,6 +2152,15 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
         ON transform_decisions(session_id, harness);
     `);
+
+    // transform_decisions existed before comparison telemetry was introduced.
+    // Keep the boot-time backfill alongside the fresh CREATE definition so
+    // databases opened by a newer runtime before migration replay still accept
+    // the telemetry writer. NULL means no comparison ran on that pass.
+    ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
 
     // NULL-column healing runs in migration v5 and again in v51 to repair
     // databases where the old v5 healer swallowed a transient write error.
@@ -1884,6 +2190,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "recomp_compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "recomp_facts", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "message_history_index", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+    // This index needs the harness column, which older persisted message-history
+    // tables lack. Create it only after the startup heal so legacy opens reach
+    // the migration runner instead of failing before it can repair the store.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+        ON message_history_index(harness, session_id, updated_at);
+    `);
     ensureColumn(db, "workspaces", "share_categories", `TEXT NOT NULL DEFAULT '["CONSTRAINTS"]'`);
     // notes table is created by migration v1 (not initializeDatabase). It
     // exists by the time runMigrations() returns, but ensureColumn's PRAGMA
@@ -1894,23 +2207,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // cannot go here because the table doesn't exist yet on a fresh DB.
 }
 
-const CHANNEL2_CLAIM_TTL_MS = 120_000;
+const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 
 /**
  * Boot heal for a wedged Channel-2 ceiling-nudge lease.
  *
  * The delivery path CAS-claims `pending → claimed` before sending the synthetic
- * user message. A crash can strand that claim and burn the one-shot cap, but a
+ * user message. A crash can strand that claim and consume the cycle, but a
  * sibling process can also be legitimately mid-send against the shared DB. The
  * claimed_at lease timestamp is the liveness boundary: only old/legacy claims are
- * rewound to `pending`; fresh claims are left alone so boot recovery never steals
- * an in-flight delivery.
+ * reaped to the empty, re-armable state; fresh claims are left alone so boot
+ * recovery never steals an in-flight delivery.
  */
 function healWedgedChannel2Claims(db: Database): void {
     try {
         const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
         db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
+            "UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
         ).run(staleBefore);
     } catch {
         // Columns may be missing on a very fresh DB before ensureColumn/migration
@@ -1957,6 +2270,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    const busyTimeoutMs = resolveBootBusyTimeoutMs(options?.busyTimeoutMs);
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
@@ -1982,6 +2296,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         ensureSecureStorageDir(dbDir);
 
         const db = new Database(dbPath);
+        installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
@@ -1990,7 +2305,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             closeQuietly(db);
             return null;
         }
-        initializeDatabase(db);
+        initializeDatabase(db, busyTimeoutMs);
         runMigrations(db);
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
@@ -2018,14 +2333,23 @@ export async function openDatabaseAsync(
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    const busyTimeoutMs = resolveBootBusyTimeoutMs(options?.busyTimeoutMs);
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
-        if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) return null;
-        if (!persistenceByDatabase.has(existing)) persistenceByDatabase.set(existing, true);
-        healWedgedChannel2Claims(existing);
-        return existing;
+        const startedAt = performance.now();
+        const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
+        if (accepted) {
+            if (!persistenceByDatabase.has(existing)) persistenceByDatabase.set(existing, true);
+            healWedgedChannel2Claims(existing);
+        }
+        options?.onBootTimings?.({
+            openMs: performance.now() - startedAt,
+            guardMs: 0,
+            migrateMs: 0,
+        });
+        return accepted ? existing : null;
     }
 
     const pending = pendingAsyncOpens.get(dbPath);
@@ -2033,23 +2357,38 @@ export async function openDatabaseAsync(
 
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
+        const openStartedAt = performance.now();
+        let openMs = 0;
+        let guardMs = 0;
+        let migrateMs = 0;
+        let guardStartedAt: number | null = null;
+        let migrateStartedAt: number | null = null;
         try {
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
 
             db = new Database(dbPath);
+            installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
+            openMs = performance.now() - openStartedAt;
+            guardStartedAt = performance.now();
             if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+                guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;
             }
             if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+                guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;
             }
-            initializeDatabase(db);
+            guardMs = performance.now() - guardStartedAt;
+            migrateStartedAt = performance.now();
+            initializeDatabase(db, busyTimeoutMs);
             await runMigrationsWithRetry(db);
             ensureContextStoreUuid(db);
-            return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+            const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+            migrateMs = performance.now() - migrateStartedAt;
+            return opened;
         } catch (error) {
             if (db) closeQuietly(db);
             const detail = getErrorMessage(error);
@@ -2057,6 +2396,15 @@ export async function openDatabaseAsync(
             throw new Error(
                 `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
             );
+        } finally {
+            if (openMs === 0) openMs = performance.now() - openStartedAt;
+            if (guardStartedAt !== null && guardMs === 0) {
+                guardMs = performance.now() - guardStartedAt;
+            }
+            if (migrateStartedAt !== null && migrateMs === 0) {
+                migrateMs = performance.now() - migrateStartedAt;
+            }
+            options?.onBootTimings?.({ openMs, guardMs, migrateMs });
         }
     })();
     pendingAsyncOpens.set(dbPath, opening);

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
+import { CONFIG_WARNING_CLASS, type ConfigParseFailure } from "../../shared/config-diagnostics";
+import {
+    formatOpenCodeDbMissingStatusLine,
+    resetOpenCodeDbPathStateForTesting,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { executeStatus } from "./execute-status";
 import { estimateTokens } from "./read-session-formatting";
@@ -16,7 +22,7 @@ describe("executeStatus", () => {
             "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
         ).run(SESSION_ID, 1, 12, 34, "m12", "m34", "Status arc", "status body", Date.now());
 
-        const status = executeStatus(db, SESSION_ID, 20);
+        const status = executeStatus(db, SESSION_ID);
         const expected = estimateTokens("## 12-34 · Status arc\nstatus body\n");
 
         expect(status).toContain(`- History block: ~${expected.toLocaleString()} tokens`);
@@ -34,7 +40,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             65,
             "some/model",
             undefined,
@@ -56,7 +61,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             65,
             "some/model",
             undefined,
@@ -70,6 +74,39 @@ describe("executeStatus", () => {
         db.close();
     });
 
+    test("shows the exact nudge hygiene ratio and keeps zero values", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+
+        const status = executeStatus(
+            db,
+            SESSION_ID,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            {
+                u: 0,
+                t: 0,
+                severity: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 0,
+                computedAt: 0,
+            },
+        );
+
+        expect(status).toContain("### Tail Hygiene");
+        expect(status).toContain("0.0% · 0 / 0 tok");
+        expect(status).toContain("Reasoning is excluded from both terms");
+        db.close();
+    });
+
     test("renders 'never expires' for cacheTtl 'never'", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);
@@ -78,12 +115,97 @@ describe("executeStatus", () => {
             SESSION_ID,
         );
 
-        const status = executeStatus(db, SESSION_ID, 20);
+        const status = executeStatus(db, SESSION_ID);
 
-        expect(status).toContain("- Configured: never");
-        expect(status).toContain("- Remaining: never expires (always-warm lane)");
-        expect(status).toContain("never expires");
+        expect(status).toContain("- Cache TTL: never (session)");
+        expect(status).toContain(
+            "- Remaining: never (MC never assumes expiry — external cache-keep)",
+        );
+        expect(status).toContain("never (MC never assumes expiry");
         expect(status).not.toContain("Infinity");
+        db.close();
+    });
+
+    test("puts the missing OpenCode store before parse failures and keeps configured TTL read-only", () => {
+        const originalOpenCodeDb = process.env.OPENCODE_DB;
+        process.env.OPENCODE_DB = ":memory:";
+        resetOpenCodeDbPathStateForTesting();
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+        const failure: ConfigParseFailure = {
+            warningClass: CONFIG_WARNING_CLASS.FILE_PARSE,
+            source: "user",
+            path: "/tmp/magic-context.jsonc",
+            line: 1,
+            column: 1,
+            message: "invalid symbol",
+            recovered: true,
+            warning: "/tmp/magic-context.jsonc:1:1: invalid symbol",
+        };
+
+        const status = executeStatus(
+            db,
+            SESSION_ID,
+            undefined,
+            "anthropic/claude-opus-5",
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            false,
+            {
+                cacheTtlConfig: { default: "5m", "anthropic/claude-opus-5": "1h" },
+                cacheTtlConfigured: true,
+                configParseFailures: [failure],
+            },
+        );
+
+        expect(status.split("\n")[0]).toBe(
+            formatOpenCodeDbMissingStatusLine(resolveOpenCodeDbPath()),
+        );
+        expect(status).toContain(
+            "Config: PARSE FAILED (/tmp/magic-context.jsonc:1:1) — recovered values applied; fix the file",
+        );
+        expect(status).toContain("Cache TTL: 1h (config for anthropic/claude-opus-5)");
+        expect(getOrCreateSessionMeta(db, SESSION_ID).cacheTtl).toBe("5m");
+        db.close();
+        if (originalOpenCodeDb === undefined) delete process.env.OPENCODE_DB;
+        else process.env.OPENCODE_DB = originalOpenCodeDb;
+        resetOpenCodeDbPathStateForTesting();
+    });
+
+    test("shows module-routed host paths only in Rust mode", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+
+        const tsStatus = executeStatus(db, SESSION_ID);
+        const rustStatus = executeStatus(
+            db,
+            SESSION_ID,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            true,
+        );
+
+        expect(rustStatus).toContain("### Rust Mode");
+        expect(rustStatus).toContain(
+            "Host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
+        );
+        expect(tsStatus).not.toContain("Host backends → MODULE");
         db.close();
     });
 });

@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { join } from "node:path";
 
 import {
+    casChannel2NudgeState,
+    claimChannel2NudgeState,
     closeDatabase,
+    getChannel2NudgeClaim,
     getChannel2NudgeClaimedAt,
     getChannel2NudgeState,
     openDatabase,
@@ -10,6 +13,10 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { Database } from "../../shared/sqlite";
+import {
+    rearmChannel2AfterCoverageAdvancingHardFold,
+    rearmChannel2AfterMeasuredCollapse,
+} from "./channel2-cycle";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { closeReadOnlySessionDb } from "./read-session-db";
 
@@ -59,6 +66,29 @@ function fakeClient(
     return { session: { promptAsync, messages } };
 }
 
+function channel2Baseline(
+    baselineU: number,
+    baselineT: number,
+    overrides: Partial<{
+        turnDeltaU: number;
+        turnDeltaT: number;
+        usableWindow: number;
+        evaluable: boolean;
+        generationInvalidated: boolean;
+    }> = {},
+) {
+    return {
+        baselineU,
+        baselineT,
+        turnDeltaU: 0,
+        turnDeltaT: 0,
+        usableWindow: 128_000,
+        evaluable: true,
+        generationInvalidated: false,
+        ...overrides,
+    };
+}
+
 describe("maybeDeliverChannel2", () => {
     it("no-ops when no pending intent exists", async () => {
         useTempDataHome("ch2-noop-");
@@ -78,8 +108,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-noclient", {
             db,
             // No client (e.g. a context with no client available).
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
         expect(delivered).toBe(false);
         // Intent stays pending: delivery is simply unavailable, not consumed.
@@ -93,10 +122,10 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-unknown", {
             db,
             client: fakeClient(async () => ({})),
-            // No reclaimable/usable measurement at this event.
+            // No rendered-tail U/T measurement at this event.
         });
-        // Unknown pressure must never burn the one-shot cap NOR cancel the
-        // intent — a later final-stop with a real measurement decides.
+        // An unknown baseline must neither consume the cycle cap nor cancel the
+        // intent; a later final-stop with a real measurement decides.
         expect(delivered).toBe(false);
         expect(getChannel2NudgeState(db, "ses-unknown")).toBe("pending");
     });
@@ -105,36 +134,64 @@ describe("maybeDeliverChannel2", () => {
         useTempDataHome("ch2-stale-");
         const db = openDatabase()!;
         setChannel2NudgeState(db, "ses-stale", "pending");
-        // 11k reclaimable >= 10k floor but < usable/3 (44k/3 ≈ 14.7k): the
-        // audit repro — floor-only validation delivered this stale nudge and
-        // permanently burned the one-per-session cap.
+        // The absolute floor still holds, but severity is only 0.50. Revalidation
+        // must apply the same fourth-band predicate that armed the intent.
         const delivered = await maybeDeliverChannel2("ses-stale", {
             db,
             client: fakeClient(async () => ({})),
-            reclaimableTokens: 11_000,
-            usableTokens: 44_000,
+            baseline: channel2Baseline(50_000, 100_000),
         });
         expect(delivered).toBe(false);
         // Cancelled to '' (re-armable), NOT 'delivered' — cap preserved.
         expect(getChannel2NudgeState(db, "ses-stale")).toBe("");
     });
 
-    it("boot-heals only stale claimed leases, not fresh live claims", () => {
+    it("holds pending when the persisted baseline generation was invalidated", async () => {
+        useTempDataHome("ch2-invalidated-");
+        const db = openDatabase()!;
+        const sessionId = "ses-invalidated";
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(70_000, 100_000, {
+                evaluable: false,
+                generationInvalidated: true,
+            }),
+        });
+
+        expect(delivered).toBe(false);
+        expect(promptAsync).not.toHaveBeenCalled();
+        expect(getChannel2NudgeState(db, sessionId)).toBe("pending");
+    });
+
+    it("boot-reaps only ten-minute claimed leases, not fresh live claims", () => {
         useTempDataHome("ch2-ttl-heal-");
         let db = openDatabase()!;
-        setChannel2NudgeState(db, "ses-fresh-claim", "claimed");
-        setChannel2NudgeState(db, "ses-stale-claim", "claimed");
-        db.prepare(
+        setChannel2NudgeState(db, "ses-fresh-claim", "pending");
+        setChannel2NudgeState(db, "ses-stale-claim", "pending");
+        expect(claimChannel2NudgeState(db, "ses-fresh-claim", "fresh-token")).toBe(true);
+        expect(claimChannel2NudgeState(db, "ses-stale-claim", "stale-token")).toBe(true);
+        const ageClaim = db.prepare(
             "UPDATE session_meta SET channel2_nudge_claimed_at = ? WHERE session_id = ?",
-        ).run(Date.now() - 180_000, "ses-stale-claim");
+        );
+        ageClaim.run(Date.now() - 9 * 60_000, "ses-fresh-claim");
+        ageClaim.run(Date.now() - 11 * 60_000, "ses-stale-claim");
 
         closeDatabase();
         db = openDatabase()!;
 
-        expect(getChannel2NudgeState(db, "ses-fresh-claim")).toBe("claimed");
-        expect(getChannel2NudgeClaimedAt(db, "ses-fresh-claim")).toBeGreaterThan(0);
-        expect(getChannel2NudgeState(db, "ses-stale-claim")).toBe("pending");
-        expect(getChannel2NudgeClaimedAt(db, "ses-stale-claim")).toBe(0);
+        const freshClaim = getChannel2NudgeClaim(db, "ses-fresh-claim");
+        expect(freshClaim.state).toBe("claimed");
+        expect(freshClaim.claimedAt).toBeGreaterThan(0);
+        expect(freshClaim.claimToken).toBe("fresh-token");
+        expect(getChannel2NudgeClaim(db, "ses-stale-claim")).toEqual({
+            state: "",
+            claimedAt: 0,
+            claimToken: "",
+        });
     });
 
     it("cache-hit openDatabase heals stale claimed leases for long-lived processes", () => {
@@ -143,12 +200,12 @@ describe("maybeDeliverChannel2", () => {
         setChannel2NudgeState(db, "ses-cache-heal", "claimed");
         db.prepare(
             "UPDATE session_meta SET channel2_nudge_claimed_at = ? WHERE session_id = ?",
-        ).run(Date.now() - 180_000, "ses-cache-heal");
+        ).run(Date.now() - 11 * 60_000, "ses-cache-heal");
 
         const cached = openDatabase()!;
 
         expect(cached).toBe(db);
-        expect(getChannel2NudgeState(db, "ses-cache-heal")).toBe("pending");
+        expect(getChannel2NudgeState(db, "ses-cache-heal")).toBe("");
         expect(getChannel2NudgeClaimedAt(db, "ses-cache-heal")).toBe(0);
     });
 
@@ -164,8 +221,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(true);
@@ -188,8 +244,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -219,8 +274,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client,
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -228,17 +282,24 @@ describe("maybeDeliverChannel2", () => {
         expect(getChannel2NudgeState(db, sessionId)).toBe("");
     });
 
-    it("delivers via the in-process client and consumes the one-shot cap", async () => {
+    it("delivers via the in-process client and consumes the current cycle", async () => {
         useTempDataHome("ch2-deliver-");
         const db = openDatabase()!;
-        setChannel2NudgeState(db, "ses-go", "pending");
+        const sessionId = "ses-go";
+        setChannel2NudgeState(db, sessionId, "pending");
+        const claimStartedAt = Date.now();
 
-        const promptAsync = mock(async () => ({}));
-        const delivered = await maybeDeliverChannel2("ses-go", {
+        const promptAsync = mock(async () => {
+            const claim = getChannel2NudgeClaim(db, sessionId);
+            expect(claim.state).toBe("claimed");
+            expect(claim.claimedAt).toBeGreaterThanOrEqual(claimStartedAt);
+            expect(claim.claimToken.length).toBeGreaterThan(0);
+            return {};
+        });
+        const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(true);
@@ -247,7 +308,7 @@ describe("maybeDeliverChannel2", () => {
             path: { id: string };
             body: { noReply: boolean; parts: Array<{ text: string; synthetic?: boolean }> };
         };
-        expect(callArg.path.id).toBe("ses-go");
+        expect(callArg.path.id).toBe(sessionId);
         expect(callArg.body.noReply).toBe(false);
         expect(callArg.body.parts[0]!.text).toContain("<system-reminder>");
         expect(callArg.body.parts[0]!.text).toContain("ctx_reduce");
@@ -256,8 +317,38 @@ describe("maybeDeliverChannel2", () => {
         // NOT be ignored (that would strip it from the model).
         expect(callArg.body.parts[0]!.synthetic).toBe(true);
         expect((callArg.body.parts[0] as { ignored?: boolean }).ignored).not.toBe(true);
-        // One-shot cap consumed.
-        expect(getChannel2NudgeState(db, "ses-go")).toBe("delivered");
+        // The nudge was delivered once, so clear claim ownership while recording
+        // that this tail-reset cycle has already consumed its single delivery.
+        expect(getChannel2NudgeClaim(db, sessionId)).toEqual({
+            state: "delivered",
+            claimedAt: 0,
+            claimToken: "",
+        });
+    });
+
+    it("keeps the nudge row byte-identical when the same intent is served again", async () => {
+        useTempDataHome("ch2-byte-freeze-");
+        const db = openDatabase()!;
+        const sessionId = "ses-byte-freeze";
+        const payloads: string[] = [];
+        const promptAsync = mock(async (input: unknown) => {
+            const body = (input as { body: unknown }).body;
+            payloads.push(JSON.stringify(body));
+            return {};
+        });
+        const options = {
+            db,
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(75_000, 100_000),
+        };
+
+        setChannel2NudgeState(db, sessionId, "pending");
+        expect(await maybeDeliverChannel2(sessionId, options)).toBe(true);
+        setChannel2NudgeState(db, sessionId, "pending");
+        expect(await maybeDeliverChannel2(sessionId, options)).toBe(true);
+
+        expect(payloads).toHaveLength(2);
+        expect(payloads[1]).toBe(payloads[0]);
     });
 
     it("treats a lost post-send confirm CAS as unconfirmed without reverting to pending", async () => {
@@ -273,13 +364,37 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-confirm-lost", {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
         expect(delivered).toBe(false);
         expect(getChannel2NudgeState(db, "ses-confirm-lost")).toBe("");
+    });
+
+    it("does not confirm when only the in-flight claim token changes", async () => {
+        useTempDataHome("ch2-confirm-token-");
+        const db = openDatabase()!;
+        const sessionId = "ses-confirm-token";
+        setChannel2NudgeState(db, sessionId, "pending");
+
+        const promptAsync = mock(async () => {
+            db.prepare(
+                "UPDATE session_meta SET channel2_nudge_claim_token = ? WHERE session_id = ? AND channel2_nudge_state = 'claimed'",
+            ).run("foreign-token", sessionId);
+        });
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(75_000, 100_000),
+        });
+
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(delivered).toBe(false);
+        const survivingClaim = getChannel2NudgeClaim(db, sessionId);
+        expect(survivingClaim.state).toBe("claimed");
+        expect(survivingClaim.claimedAt).toBeGreaterThan(0);
+        expect(survivingClaim.claimToken).toBe("foreign-token");
     });
 
     it("preserves a sibling's delivered claim when token confirmation is no longer ours", async () => {
@@ -300,8 +415,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -333,8 +447,7 @@ describe("maybeDeliverChannel2", () => {
             const secondDelivered = await maybeDeliverChannel2(sessionId, {
                 db,
                 client: fakeClient(secondPromptAsync),
-                reclaimableTokens: 30_000,
-                usableTokens: 60_000,
+                baseline: channel2Baseline(75_000, 100_000),
             });
             expect(secondDelivered).toBe(true);
         });
@@ -342,8 +455,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(firstPromptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(firstPromptAsync).toHaveBeenCalledTimes(1);
@@ -392,8 +504,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -402,11 +513,11 @@ describe("maybeDeliverChannel2", () => {
 
         db.prepare(
             "UPDATE session_meta SET channel2_nudge_claimed_at = ? WHERE session_id = ?",
-        ).run(Date.now() - 180_000, sessionId);
+        ).run(Date.now() - 11 * 60_000, sessionId);
 
         const cached = openDatabase()!;
         expect(cached).toBe(db);
-        expect(getChannel2NudgeState(db, sessionId)).toBe("pending");
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
         expect(getChannel2NudgeClaimedAt(db, sessionId)).toBe(0);
     });
 
@@ -421,24 +532,163 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-fail", {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
         // Reverted to pending so a later event retries — the single nudge isn't lost.
-        expect(getChannel2NudgeState(db, "ses-fail")).toBe("pending");
+        expect(getChannel2NudgeClaim(db, "ses-fail")).toEqual({
+            state: "pending",
+            claimedAt: 0,
+            claimToken: "",
+        });
     });
 
-    it("a second delivery attempt after success is a no-op (one nudge per lifetime)", async () => {
-        useTempDataHome("ch2-twice-");
+    it("re-arms only when a HARD fold advances m0 coverage", () => {
+        useTempDataHome("ch2-fold-cycle-");
         const db = openDatabase()!;
-        setChannel2NudgeState(db, "ses-twice", "delivered");
-        const delivered = await maybeDeliverChannel2("ses-twice", {
+        const sessionId = "ses-fold-cycle";
+        setChannel2NudgeState(db, sessionId, "delivered");
+
+        // A marker-only/SOFT coverage advance does not reset the delivered cap.
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: false,
+                compactionOff: false,
+                previousCoverage: 1,
+                currentCoverage: 2,
+            }),
+        ).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        // A HARD pass with no new m0 coverage also leaves the cycle consumed.
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: true,
+                compactionOff: false,
+                previousCoverage: 2,
+                currentCoverage: 2,
+            }),
+        ).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: true,
+                compactionOff: false,
+                previousCoverage: 2,
+                currentCoverage: 3,
+            }),
+        ).toBe(true);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+
+        setChannel2NudgeState(db, sessionId, "claimed");
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: true,
+                compactionOff: false,
+                previousCoverage: 3,
+                currentCoverage: 4,
+            }),
+        ).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("claimed");
+    });
+
+    it("threshold crossings without a fold and SOFT passes do not re-arm", () => {
+        useTempDataHome("ch2-no-fold-cycle-");
+        const db = openDatabase()!;
+        const sessionId = "ses-no-fold-cycle";
+        setChannel2NudgeState(db, sessionId, "delivered");
+
+        expect(casChannel2NudgeState(db, sessionId, "", "pending")).toBe(false);
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: false,
+                compactionOff: false,
+                previousCoverage: 3,
+                currentCoverage: 3,
+            }),
+        ).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+    });
+
+    it("a hover fixture delivers exactly once", async () => {
+        useTempDataHome("ch2-hover-");
+        const db = openDatabase()!;
+        const sessionId = "ses-hover";
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+        const deps = {
             db,
-            client: fakeClient(async () => ({})),
-        });
-        expect(delivered).toBe(false);
-        expect(getChannel2NudgeState(db, "ses-twice")).toBe("delivered");
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(75_000, 100_000),
+        };
+
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
+        expect(casChannel2NudgeState(db, sessionId, "", "pending")).toBe(false);
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(false);
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(false);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+    });
+
+    it("a two-cycle fixture delivers twice", async () => {
+        useTempDataHome("ch2-two-cycle-");
+        const db = openDatabase()!;
+        const sessionId = "ses-two-cycle";
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+        const deps = {
+            db,
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(75_000, 100_000),
+        };
+
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
+        expect(
+            rearmChannel2AfterCoverageAdvancingHardFold({
+                db,
+                sessionId,
+                foldExecuted: true,
+                compactionOff: false,
+                previousCoverage: 3,
+                currentCoverage: 4,
+            }),
+        ).toBe(true);
+        expect(casChannel2NudgeState(db, sessionId, "", "pending")).toBe(true);
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
+        expect(promptAsync).toHaveBeenCalledTimes(2);
+    });
+
+    it("a reduce-then-relapse fixture delivers twice", async () => {
+        useTempDataHome("ch2-reduce-relapse-");
+        const db = openDatabase()!;
+        const sessionId = "ses-reduce-relapse";
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+        const deps = {
+            db,
+            client: fakeClient(promptAsync),
+            baseline: channel2Baseline(75_000, 100_000),
+        };
+
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
+        expect(
+            rearmChannel2AfterMeasuredCollapse({
+                db,
+                sessionId,
+                baseline: channel2Baseline(24_999, 80_000),
+            }),
+        ).toBe(true);
+        expect(casChannel2NudgeState(db, sessionId, "", "pending")).toBe(true);
+        expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
+        expect(promptAsync).toHaveBeenCalledTimes(2);
     });
 });

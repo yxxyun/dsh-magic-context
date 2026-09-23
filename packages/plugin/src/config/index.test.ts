@@ -1,9 +1,23 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { resolveEpochFloorForPass } from "../features/magic-context/storage-meta-persisted";
+import { buildOpenCodeConfigWarningBanner } from "../shared/config-warning-surface";
+import { resolveHistorianModel } from "../shared/model-resolution";
+import { Database } from "../shared/sqlite";
+import { createTestTempDir } from "../shared/test-temp-dir";
+import {
+    getWindowOverlay,
+    reloadWindowOverlay,
+    setWindowOverlayPath,
+} from "../shared/window-geometry";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
+import { resolveConfigProfile } from "./profiles";
+import { getProtectedTokensTierOverrides } from "./project-security";
+import { REMOVED_AGENT_CONFIG_WARNING } from "./removed-agent-config";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
 import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
@@ -108,6 +122,123 @@ function loadWithUserAndProjectConfig(
         }
     }
 }
+
+describe("loadPluginConfig — Fusiform overlay reload", () => {
+    it("does not invalidate a same-path overlay during routine config reads", () => {
+        const overlayDir = mkdtempSync(join(tmpdir(), "mc-config-overlay-"));
+        const overlayPath = join(overlayDir, "window-overlay.json");
+        const configText = JSON.stringify({ models: { window_overlay_path: overlayPath } });
+        const writeOverlay = (modelId: string) =>
+            writeFileSync(
+                overlayPath,
+                JSON.stringify({
+                    schema: "fusiform-window-overlay/v1",
+                    generated_at: "2026-09-01T00:00:00Z",
+                    minted_provider_ids: [],
+                    cells: [{ provider_id: "hunt-provider", model_id: modelId, facts: {} }],
+                }),
+            );
+
+        try {
+            writeOverlay("before-rewrite");
+            loadWithUserConfig(configText);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            writeOverlay("after-rewrite");
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            loadWithUserConfig(configText);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            reloadWindowOverlay(overlayPath);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
+        } finally {
+            setWindowOverlayPath(undefined);
+            rmSync(overlayDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("loadPluginConfig — preload user-config isolation", () => {
+    it("resolves schema-default embedding config for a fixture with no config (#388)", () => {
+        const projectDir = mkdtempSync(join(tmpdir(), "mc-config-preload-fixture-"));
+        try {
+            // The test preload owns this default. A per-test XDG_CONFIG_HOME assignment
+            // still overrides it through loadWithUserConfig below.
+            expect(process.env.XDG_CONFIG_HOME).toContain("mc-plugin-test-xdg-pid-");
+            expect(loadPluginConfig(projectDir).embedding).toEqual({
+                provider: "local",
+                model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                local_runtime: "auto",
+            });
+        } finally {
+            rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+
+    it("allows a test-scoped XDG_CONFIG_HOME to override the preload default", () => {
+        const preloadConfigHome = process.env.XDG_CONFIG_HOME;
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://fixture.example/v1",
+                    model: "fixture-model",
+                },
+            }),
+        );
+
+        expect(result.embedding).toMatchObject({
+            provider: "openai-compatible",
+            endpoint: "https://fixture.example/v1",
+            model: "fixture-model",
+        });
+        expect(process.env.XDG_CONFIG_HOME).toBe(preloadConfigHome);
+    });
+});
+
+describe("loadPluginConfig — parse failure diagnostics", () => {
+    it("recovers the reporter's stray leading character and keeps a loud location warning", () => {
+        const result = loadWithUserConfig('\\{\n  "cache_ttl": "1h"\n}');
+
+        expect(result.cache_ttl).toBe("1h");
+        expect(result.configParseFailures).toHaveLength(1);
+        expect(result.configParseFailures?.[0]).toMatchObject({
+            warningClass: "file-parse",
+            line: 1,
+            column: 1,
+            recovered: true,
+            message: "invalid symbol",
+        });
+        expect(result.configWarnings?.[0]).toContain(":1:1: invalid symbol");
+    });
+
+    it("keeps file parse and invalid-leaf warning classes distinct", () => {
+        const parseResult = loadWithUserConfig('\\{\n  "cache_ttl": "1h"\n}');
+        const leafResult = loadWithUserConfig('{"protected_tokens":"bogus"}');
+
+        expect(parseResult.configWarningDetails?.[0]?.warningClass).toBe("file-parse");
+        expect(
+            leafResult.configWarningDetails?.some(
+                (detail) => detail.warningClass === "invalid-leaf",
+            ),
+        ).toBe(true);
+    });
+
+    it("puts a recovered parse failure first in the OpenCode warning banner", () => {
+        const result = loadWithUserConfig('\\{\n  "cache_ttl": "1h"\n}');
+        const failures = result.configParseFailures ?? [];
+        const banner = buildOpenCodeConfigWarningBanner(
+            result.configWarnings ?? [],
+            failures,
+            failures,
+        );
+
+        expect(banner).toStartWith("## ⚠️ Magic Context Config Warning");
+        expect(banner.indexOf("PARSE FAILED")).toBeLessThan(banner.indexOf("Fix the reported"));
+        expect(banner).toContain(":1:1");
+    });
+});
 
 describe("loadPluginConfig — graduated mural config", () => {
     it("adopts legacy experimental.mural at the top-level and warns once", () => {
@@ -340,6 +471,40 @@ describe("loadPluginConfig — secret redaction", () => {
             (x) => x.includes("memory") && x.includes("injection_budget_tokens"),
         );
         expect(w).toBeDefined();
+    });
+
+    it("prunes only cross-harness qualifier leaves and names their full paths", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                historian: {
+                    two_pass: true,
+                    opencode: {
+                        model: "anthropic/claude-sonnet",
+                        variant: "high",
+                        thinking_level: "minimal",
+                    },
+                    pi: {
+                        model: "github-copilot/gpt-5",
+                        thinking_level: "medium",
+                        variant: "fast",
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.two_pass).toBe(true);
+        expect(result.historian?.opencode).toEqual({
+            model: "anthropic/claude-sonnet",
+            variant: "high",
+        });
+        expect(result.historian?.pi).toEqual({
+            model: "github-copilot/gpt-5",
+            thinking_level: "medium",
+        });
+        const warnings = result.configWarnings?.join("\n") ?? "";
+        expect(warnings).toContain("historian.opencode.thinking_level");
+        expect(warnings).toContain("historian.pi.variant");
+        expect(warnings).not.toContain("invalid agent configuration, ignoring");
     });
 
     it("still shows numeric and boolean invalid values (not secrets by nature)", () => {
@@ -586,18 +751,26 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
         expect(warnings).not.toContain("dreamer.enabled");
     });
 
-    it("migrates sidekick.enabled=false (loud) and removes sidekick.enabled=true (silent)", () => {
-        const disabled = loadWithUserConfig(JSON.stringify({ sidekick: { enabled: false } }));
-        expect(disabled.sidekick?.disable).toBe(true);
-        expect(disabled.configWarnings?.join("\n")).toContain(
-            'Migrated "sidekick.enabled=false" → "sidekick.disable=true" in-memory (run doctor to persist).',
+    it("ignores the removed agent block with one warning", () => {
+        const removedKey = ["side", "kick"].join("");
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "work",
+                [removedKey]: { enabled: false, model: "example/model" },
+                profiles: {
+                    work: {
+                        [removedKey]: { model: "example/profile-model" },
+                        historian: { opencode: { model: "example/historian" } },
+                    },
+                },
+            }),
         );
 
-        const enabled = loadWithUserConfig(JSON.stringify({ sidekick: { enabled: true } }));
-        expect(enabled.sidekick?.disable).toBeUndefined();
-        expect("enabled" in (enabled.sidekick as Record<string, unknown>)).toBe(false);
-        const enabledWarnings = enabled.configWarnings?.join("\n") ?? "";
-        expect(enabledWarnings).not.toContain("sidekick.enabled");
+        expect(removedKey in result).toBe(false);
+        expect(result.historian?.opencode?.model).toBe("example/historian");
+        expect(result.configWarnings?.filter((warning) => warning.includes(removedKey))).toEqual([
+            `[config] ${REMOVED_AGENT_CONFIG_WARNING}`,
+        ]);
     });
 
     it("removes invalid historian.enabled and applies conflict rules", () => {
@@ -605,13 +778,11 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
             JSON.stringify({
                 historian: { enabled: false },
                 dreamer: { enabled: false, disable: false },
-                sidekick: { enabled: true, disable: true },
             }),
         );
 
         expect(result.historian).toEqual({ two_pass: false, disallowed_tools: [] });
         expect(result.dreamer?.disable).toBe(true);
-        expect(result.sidekick?.disable).toBe(true);
         expect(result.configWarnings?.join("\n")).toContain(
             'Removed invalid "historian.enabled" in-memory (run doctor to persist).',
         );
@@ -620,7 +791,8 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
 
 describe("loadPluginConfig — variable expansion scope", () => {
     it("keeps {env:} and {file:} expansion enabled for user config", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "file-secret", "utf-8");
 
         try {
@@ -642,12 +814,13 @@ describe("loadPluginConfig — variable expansion scope", () => {
             }
             expect(result.configWarnings).toBeUndefined();
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 
     it("leaves {env:} and {file:} tokens literal in project config and warns", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "project-file-secret", "utf-8");
 
         try {
@@ -670,7 +843,7 @@ describe("loadPluginConfig — variable expansion scope", () => {
             expect(warnings).toContain("security reasons");
             expect(warnings).toContain("embedding.endpoint/provider");
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 
@@ -740,29 +913,150 @@ describe("loadPluginConfig — user-only settings", () => {
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({
                 historian: {
-                    model: "anthropic/user-historian",
-                    fallback_models: ["anthropic/user-fallback"],
+                    opencode: {
+                        model: "anthropic/user-historian",
+                        fallback_models: ["anthropic/user-fallback"],
+                    },
+                    pi: {
+                        model: "github-copilot/user-historian",
+                        fallback_models: ["github-copilot/user-fallback"],
+                    },
                 },
             }),
             JSON.stringify({
                 historian: {
-                    model: "anthropic/project-historian",
-                    fallback_models: ["anthropic/project-fallback"],
+                    opencode: {
+                        model: "anthropic/project-historian",
+                        fallback_models: ["anthropic/project-fallback"],
+                    },
+                    pi: {
+                        model: "github-copilot/project-historian",
+                        fallback_models: ["github-copilot/project-fallback"],
+                    },
                     temperature: 0.2,
                 },
             }),
         );
 
-        expect(result.historian?.model).toBe("anthropic/user-historian");
-        expect(result.historian?.fallback_models).toEqual(["anthropic/user-fallback"]);
+        expect(result.historian?.opencode).toEqual({
+            model: "anthropic/user-historian",
+            fallback_models: ["anthropic/user-fallback"],
+        });
+        expect(result.historian?.pi).toEqual({
+            model: "github-copilot/user-historian",
+            fallback_models: ["github-copilot/user-fallback"],
+        });
         expect(result.historian?.temperature).toBe(0.2);
-        expect(result.configWarnings?.join("\n")).toContain(
-            "Ignoring historian.model/fallback_models",
-        );
+        const warnings = result.configWarnings?.join("\n") ?? "";
+        expect(warnings).toContain("historian.opencode.model");
+        expect(warnings).toContain("historian.pi.model");
     });
 });
 
 describe("loadPluginConfig — project compaction trust boundary", () => {
+    it("keeps protected_tokens scalar-only at both tiers and preserves the user scalar on an invalid project leaf", () => {
+        const vectors = [
+            {
+                name: "user scalar",
+                user: { protected_tokens: 20_000 },
+                project: {},
+                expected: 20_000,
+                warns: false,
+            },
+            {
+                name: "user object",
+                user: { protected_tokens: { default: 20_000 } },
+                project: {},
+                expected: undefined,
+                warns: true,
+            },
+            {
+                name: "project scalar",
+                user: {},
+                project: { protected_tokens: 20_000 },
+                expected: 20_000,
+                warns: false,
+            },
+            {
+                name: "project object",
+                user: {},
+                project: { protected_tokens: { default: 20_000 } },
+                expected: undefined,
+                warns: true,
+            },
+            {
+                name: "invalid project object over user scalar",
+                user: { protected_tokens: 25_000 },
+                project: { protected_tokens: { default: 30_000 } },
+                expected: 25_000,
+                warns: true,
+            },
+        ] as const;
+
+        for (const vector of vectors) {
+            const result = loadWithUserAndProjectConfig(
+                JSON.stringify(vector.user),
+                JSON.stringify(vector.project),
+            );
+            expect(result.protected_tokens, vector.name).toBe(vector.expected);
+            const warned = (result.configWarnings ?? []).some((warning) =>
+                warning.includes("protected_tokens"),
+            );
+            expect(warned, vector.name).toBe(vector.warns);
+        }
+    });
+
+    it("rejects a project protected_tokens floor below the derived floor once geometry is known", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({}),
+            JSON.stringify({ protected_tokens: 4_000 }),
+        );
+        const db = new Database(":memory:");
+        db.exec(`
+            CREATE TABLE session_meta (
+                session_id TEXT PRIMARY KEY,
+                harness TEXT NOT NULL DEFAULT 'opencode',
+                last_response_time INTEGER NOT NULL DEFAULT 0,
+                cache_ttl TEXT NOT NULL DEFAULT '5m',
+                counter INTEGER NOT NULL DEFAULT 0,
+                last_nudge_tokens INTEGER NOT NULL DEFAULT 0,
+                last_nudge_band TEXT NOT NULL DEFAULT '',
+                last_transform_error TEXT NOT NULL DEFAULT '',
+                is_subagent INTEGER NOT NULL DEFAULT 0,
+                last_context_percentage REAL NOT NULL DEFAULT 0,
+                last_input_tokens INTEGER NOT NULL DEFAULT 0,
+                observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_alert_sent INTEGER NOT NULL DEFAULT 0,
+                times_execute_threshold_reached INTEGER NOT NULL DEFAULT 0,
+                compartment_in_progress INTEGER NOT NULL DEFAULT 0,
+                system_prompt_hash TEXT NOT NULL DEFAULT '',
+                cleared_reasoning_through_tag INTEGER NOT NULL DEFAULT 0,
+                protected_tokens_effective INTEGER,
+                protected_tokens_pre_snapshot TEXT
+            )
+        `);
+        const warnings: string[] = [];
+        const tierOverrides = getProtectedTokensTierOverrides(result);
+
+        const resolved = resolveEpochFloorForPass(db, "loader-derived-floor", {
+            tierOverrides,
+            usableSoft: 200_000,
+            isCacheBustingPass: true,
+            onRejectedProjectOverride: (warning) => warnings.push(warning),
+        });
+        resolveEpochFloorForPass(db, "loader-derived-floor-next", {
+            tierOverrides,
+            usableSoft: 200_000,
+            isCacheBustingPass: true,
+            onRejectedProjectOverride: (warning) => warnings.push(warning),
+        });
+
+        expect(resolved.floor).toBe(16_000);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("protected_tokens=4000");
+        db.close();
+    });
+
     it("ignores a lower project execute_threshold_percentage with a warning", () => {
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ execute_threshold_percentage: 60 }),
@@ -877,21 +1171,25 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
             JSON.stringify({ language: "tr" }),
             JSON.stringify({
                 dreamer: {
-                    model: "anthropic/project-dreamer",
-                    tasks: {
-                        verify: {
-                            schedule: "0 3 * * *",
-                            model: "anthropic/project-verify",
-                        },
+                    tasks: { verify: { schedule: "0 3 * * *" } },
+                    opencode: {
+                        model: "anthropic/project-dreamer",
+                        tasks: { verify: { model: "anthropic/project-verify" } },
+                    },
+                    pi: {
+                        model: "github-copilot/project-dreamer",
+                        tasks: { verify: { model: "github-copilot/project-verify" } },
                     },
                 },
             }),
         );
 
         expect(result.language).toBe("tr");
-        expect(result.dreamer?.model).toBe("anthropic/project-dreamer");
+        expect(result.dreamer?.opencode?.model).toBe("anthropic/project-dreamer");
+        expect(result.dreamer?.pi?.model).toBe("github-copilot/project-dreamer");
         expect(result.dreamer?.tasks.verify.schedule).toBe("0 3 * * *");
-        expect(result.dreamer?.tasks.verify.model).toBe("anthropic/project-verify");
+        expect(result.dreamer?.opencode?.tasks?.verify?.model).toBe("anthropic/project-verify");
+        expect(result.dreamer?.pi?.tasks?.verify?.model).toBe("github-copilot/project-verify");
     });
 
     it("project boolean override beats user default", () => {
@@ -958,6 +1256,362 @@ describe("transform_mode resolution", () => {
     });
 });
 
+describe("loadPluginConfig — user-owned model profiles", () => {
+    it("merges user base, selected profile, then project config without losing profile fallback qualifiers", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({
+                profile: "personal",
+                historian: {
+                    two_pass: true,
+                    opencode: {
+                        model: "anthropic/base-historian",
+                        fallback_models: ["anthropic/base-fallback"],
+                    },
+                },
+                dreamer: {
+                    opencode: { model: "anthropic/base-dreamer" },
+                },
+                profiles: {
+                    work: {
+                        historian: {
+                            opencode: {
+                                model: { model: "anthropic/work-historian", variant: "high" },
+                                fallback_models: [
+                                    { model: "openai/work-fallback", variant: "low" },
+                                ],
+                            },
+                        },
+                        dreamer: {
+                            opencode: {
+                                model: "anthropic/work-dreamer",
+                                fallback_models: [
+                                    { model: "openai/work-dreamer-fallback", variant: "medium" },
+                                ],
+                            },
+                        },
+                    },
+                    personal: {
+                        historian: { opencode: { model: "anthropic/personal-historian" } },
+                    },
+                },
+            }),
+            JSON.stringify({
+                profile: "work",
+                memory: { enabled: false },
+            }),
+        );
+
+        expect(result.profile).toBe("work");
+        expect(result.memory.enabled).toBe(false);
+        expect(result.historian?.two_pass).toBe(true);
+        expect(result.historian?.opencode).toEqual({
+            model: { model: "anthropic/work-historian", variant: "high" },
+            fallback_models: [{ model: "openai/work-fallback", variant: "low" }],
+        });
+        expect(result.dreamer?.opencode?.model).toBe("anthropic/work-dreamer");
+        expect(result.dreamer?.opencode?.fallback_models).toEqual([
+            { model: "openai/work-dreamer-fallback", variant: "medium" },
+        ]);
+    });
+
+    it("uses project selection over user selection and falls back to the base on an unknown name", () => {
+        const userConfig = JSON.stringify({
+            profile: "personal",
+            historian: { opencode: { model: "anthropic/base" } },
+            profiles: {
+                personal: { historian: { opencode: { model: "anthropic/personal" } } },
+                work: { historian: { opencode: { model: "anthropic/work" } } },
+            },
+        });
+
+        const userDefault = loadWithUserAndProjectConfig(userConfig, "{}");
+        const projectOverride = loadWithUserAndProjectConfig(userConfig, '{"profile":"work"}');
+        const unknownProject = loadWithUserAndProjectConfig(userConfig, '{"profile":"missing"}');
+
+        expect(userDefault.profile).toBe("personal");
+        expect(userDefault.historian?.opencode?.model).toBe("anthropic/personal");
+        expect(projectOverride.profile).toBe("work");
+        expect(projectOverride.historian?.opencode?.model).toBe("anthropic/work");
+        expect(unknownProject.profile).toBeUndefined();
+        expect(unknownProject.enabled).toBe(true);
+        expect(unknownProject.historian?.opencode?.model).toBe("anthropic/base");
+        expect(unknownProject.configWarnings?.join("\n")).toContain(
+            'Unknown profile "missing" selected by project config',
+        );
+    });
+
+    it("rejects invalid profile definitions with a warning instead of applying their fields", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "unsafe",
+                historian: { opencode: { model: "anthropic/base" } },
+                profiles: {
+                    unsafe: {
+                        embedding: { provider: "off" },
+                    },
+                },
+            }),
+        );
+
+        expect(result.profile).toBeUndefined();
+        expect(result.embedding.provider).toBe("local");
+        expect(result.historian?.opencode?.model).toBe("anthropic/base");
+        expect(result.configWarnings?.join("\n")).toContain("Ignoring profiles from user config");
+    });
+
+    it("strips hostile project profile definitions while allowing only user-owned definitions", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({
+                historian: { opencode: { model: "anthropic/user-base" } },
+            }),
+            JSON.stringify({
+                profile: "work",
+                profiles: {
+                    work: {
+                        historian: { opencode: { model: "attacker/project-profile" } },
+                    },
+                },
+            }),
+        );
+
+        expect(result.profile).toBeUndefined();
+        expect(result.historian?.opencode?.model).toBe("anthropic/user-base");
+        expect(result.configWarnings?.join("\n")).toContain(
+            "Ignoring profiles from project config",
+        );
+    });
+
+    it("falls back loudly for inherited profile names without changing the resolved base config", () => {
+        const userConfig = JSON.stringify({
+            historian: { opencode: { model: "anthropic/base", fallback_models: ["openai/base"] } },
+            profiles: { known: { historian: { opencode: { model: "anthropic/known" } } } },
+        });
+        const base = loadWithUserConfig(userConfig);
+        const { configWarnings: _baseWarnings, ...baseWithoutWarnings } = base;
+        const hostileNames = [
+            "__proto__",
+            "constructor",
+            "prototype",
+            "toString",
+            "hasOwnProperty",
+            "valueOf",
+        ];
+
+        for (const name of hostileNames) {
+            const resolved = loadWithUserAndProjectConfig(
+                userConfig,
+                JSON.stringify({ profile: name }),
+            );
+            const { configWarnings: _warnings, ...resolvedWithoutWarnings } = resolved;
+
+            expect(resolved.profile).toBeUndefined();
+            expect(resolved.configWarnings?.join("\n")).toContain(
+                `Unknown profile "${name}" selected by project config`,
+            );
+            expect(resolvedWithoutWarnings).toEqual(baseWithoutWarnings);
+        }
+    });
+
+    it("ignores a profile inherited from a polluted Object prototype", () => {
+        const profileName = "profile_overlay_pollution_canary";
+        const previousDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, profileName);
+        const userBase = { historian: { opencode: { model: "anthropic/base" } } };
+        // Null-prototype input isolates lookup behavior from strict schema validation of inherited data.
+        const profileOpenCode = Object.assign(Object.create(null), {
+            model: "anthropic/known",
+        });
+        const profileHistorian = Object.assign(Object.create(null), {
+            opencode: profileOpenCode,
+        });
+        const knownProfile = Object.assign(Object.create(null), {
+            historian: profileHistorian,
+        });
+        const profiles = Object.assign(Object.create(null), {
+            known: knownProfile,
+        }) as Record<string, unknown>;
+        Object.defineProperty(Object.prototype, profileName, {
+            value: { historian: { opencode: { model: "attacker/inherited-overlay" } } },
+            enumerable: true,
+            configurable: true,
+        });
+
+        try {
+            const resolution = resolveConfigProfile({
+                userRaw: {
+                    ...userBase,
+                    profiles,
+                },
+                projectRaw: { profile: profileName },
+            });
+
+            expect(resolution.activeProfile).toBeUndefined();
+            expect(resolution.overlay).toEqual({});
+            expect(resolution.userBase).toEqual(userBase);
+            expect(resolution.projectBase).toEqual({});
+            expect(resolution.warnings).toEqual([
+                `Unknown profile "${profileName}" selected by project config; using base config without a profile.`,
+            ]);
+        } finally {
+            if (previousDescriptor) {
+                Object.defineProperty(Object.prototype, profileName, previousDescriptor);
+            } else {
+                delete (Object.prototype as Record<string, unknown>)[profileName];
+            }
+        }
+    });
+
+    it("treats empty, null, and non-string project selectors as no selection", () => {
+        const userConfig = JSON.stringify({
+            profile: "personal",
+            historian: { opencode: { model: "anthropic/base" } },
+            profiles: {
+                personal: { historian: { opencode: { model: "anthropic/personal" } } },
+            },
+        });
+        const invalidProjectSelectors = ["", null, { name: "work" }];
+
+        for (const profile of invalidProjectSelectors) {
+            const result = loadWithUserAndProjectConfig(userConfig, JSON.stringify({ profile }));
+
+            expect(result.profile).toBe("personal");
+            expect(result.historian?.opencode?.model).toBe("anthropic/personal");
+            expect(result.configWarnings?.join("\n")).toContain(
+                "Ignoring invalid profile selection from project config",
+            );
+        }
+    });
+
+    it("preserves an untouched historian Pi block when a profile overlays OpenCode", () => {
+        const piBase = {
+            model: { model: "github-copilot/base", thinking_level: "high" },
+            fallback_models: [
+                { model: "openai/base-fallback", thinking_level: "minimal" },
+                { model: "github-copilot/second-base-fallback", thinking_level: "medium" },
+            ],
+            thinking_level: "high",
+        };
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "work",
+                historian: {
+                    opencode: { model: "anthropic/base-opencode" },
+                    pi: piBase,
+                },
+                profiles: {
+                    work: {
+                        historian: { opencode: { model: "anthropic/work-opencode" } },
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.opencode).toEqual({ model: "anthropic/work-opencode" });
+        expect(result.historian?.pi).toEqual(piBase);
+    });
+
+    it("replaces a base fallback_models array wholesale when a profile provides one", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "work",
+                historian: {
+                    opencode: {
+                        model: "anthropic/base",
+                        fallback_models: [
+                            { model: "openai/base-first", variant: "low" },
+                            { model: "anthropic/base-second", variant: "high" },
+                        ],
+                    },
+                },
+                profiles: {
+                    work: {
+                        historian: {
+                            opencode: {
+                                fallback_models: [{ model: "google/work-only", variant: "medium" }],
+                            },
+                        },
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.opencode?.fallback_models).toEqual([
+            { model: "google/work-only", variant: "medium" },
+        ]);
+    });
+
+    it("resolves profiles independently for two projects in one process", () => {
+        const xdg = mkdtempSync(join(tmpdir(), "mc-profile-isolation-user-"));
+        const projectA = mkdtempSync(join(tmpdir(), "mc-profile-isolation-a-"));
+        const projectB = mkdtempSync(join(tmpdir(), "mc-profile-isolation-b-"));
+        const previousXdg = process.env.XDG_CONFIG_HOME;
+        mkdirSync(join(xdg, "cortexkit"), { recursive: true });
+        mkdirSync(join(projectA, ".cortexkit"), { recursive: true });
+        mkdirSync(join(projectB, ".cortexkit"), { recursive: true });
+        writeFileSync(
+            join(xdg, "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                profiles: {
+                    work: { historian: { opencode: { model: "anthropic/work" } } },
+                    personal: {
+                        historian: { opencode: { model: "anthropic/personal" } },
+                    },
+                },
+            }),
+        );
+        writeFileSync(join(projectA, ".cortexkit", "magic-context.jsonc"), '{"profile":"work"}');
+        writeFileSync(
+            join(projectB, ".cortexkit", "magic-context.jsonc"),
+            '{"profile":"personal"}',
+        );
+        process.env.XDG_CONFIG_HOME = xdg;
+        try {
+            const work = loadPluginConfig(projectA);
+            const personal = loadPluginConfig(projectB);
+            const workAgain = loadPluginConfig(projectA);
+            expect(work.profile).toBe("work");
+            expect(personal.profile).toBe("personal");
+            expect(workAgain.profile).toBe("work");
+            expect(work.historian?.opencode?.model).toBe("anthropic/work");
+            expect(personal.historian?.opencode?.model).toBe("anthropic/personal");
+            expect(workAgain.historian?.opencode?.model).toBe("anthropic/work");
+        } finally {
+            if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousXdg;
+            rmSync(xdg, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            rmSync(projectA, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            rmSync(projectB, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+
+    it("feeds the selected profile through the existing historian model resolver", () => {
+        const config = loadWithUserAndProjectConfig(
+            JSON.stringify({
+                profiles: {
+                    work: {
+                        historian: {
+                            opencode: {
+                                model: { model: "anthropic/work", variant: "high" },
+                                fallback_models: [
+                                    { model: "openai/work-fallback", variant: "low" },
+                                ],
+                            },
+                        },
+                    },
+                },
+            }),
+            '{"profile":"work"}',
+        );
+
+        // Profile selection changes only the normal resolved model input. The
+        // existing model-switch identity path still sees canonical model IDs and
+        // qualifier-distinct fallback attempts; profiles add no separate cache-bust class.
+        expect(resolveHistorianModel(config, "opencode")).toEqual({
+            primary: { model: "anthropic/work", qualifier: "high" },
+            fallbacks: [{ model: "openai/work-fallback", qualifier: "low" }],
+        });
+    });
+});
+
 describe("loadPluginConfigDetailed — prompt-surface registration owner", () => {
     it("captures the user default before project guidance routing is merged", () => {
         const xdg = mkdtempSync(join(tmpdir(), "mc-config-prompt-surface-"));
@@ -1008,5 +1662,33 @@ describe("loadPluginConfigDetailed — prompt-surface registration owner", () =>
             rmSync(xdg, { recursive: true, force: true });
             rmSync(projectDir, { recursive: true, force: true });
         }
+    });
+});
+
+describe("shared per-harness config loading", () => {
+    it("lets OpenCode load Pi and OMP agent blocks without schema recovery warnings", () => {
+        const config = loadWithUserConfig(
+            JSON.stringify({
+                historian: {
+                    opencode: { model: "anthropic/opencode-historian" },
+                    pi: { model: "anthropic/pi-historian", thinking_level: "high" },
+                    omp: { model: "anthropic/omp-historian", thinking_level: "auto" },
+                },
+                dreamer: {
+                    opencode: { model: "anthropic/opencode-dreamer" },
+                    pi: { model: "anthropic/pi-dreamer", thinking_level: "medium" },
+                    omp: { model: "anthropic/omp-dreamer", thinking_level: "inherit" },
+                },
+            }),
+        );
+
+        expect(config.configWarnings).toBeUndefined();
+        expect(config.historian?.omp).toEqual({
+            model: "anthropic/omp-historian",
+            thinking_level: "auto",
+        });
+        expect(resolveHistorianModel(config, "opencode").primary?.model).toBe(
+            "anthropic/opencode-historian",
+        );
     });
 });

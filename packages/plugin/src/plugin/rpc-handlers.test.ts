@@ -1,24 +1,39 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+
+import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
+import { upsertMural } from "../features/magic-context/mural/storage-mural";
 import {
     getPersistedSchemaVersion,
     initializeDatabase,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
+import {
+    resetEpochFloorRegistryForTest,
+    resolveEpochFloorForPass,
+} from "../features/magic-context/storage-meta-persisted";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
+import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
+import type { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
+    buildCompartmentCount,
+    buildDebugMemoryUsage,
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
+    executeRustRecompRpc,
+    isDebugRpcEnabled,
+    loadRustSessionStatus,
+    registerRpcHandlers,
 } from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
 
@@ -29,9 +44,138 @@ function createTestDb(): Database {
     return db;
 }
 
+type TestRpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
+    const handlers = new Map<string, TestRpcHandler>();
+    const rpcServer = {
+        handle(method: string, handler: TestRpcHandler) {
+            handlers.set(method, handler);
+        },
+    } as unknown as MagicContextRpcServer;
+    registerRpcHandlers(rpcServer, {
+        directory: process.cwd(),
+        config: MagicContextConfigSchema.parse({ debug_rpc: debugRpc }),
+        client: {},
+        liveSessionState: createLiveSessionState(),
+    });
+    return handlers;
+}
+
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+});
+
+describe("debug RPC guard", () => {
+    test("reports process and readable native allocation counters", () => {
+        const memory = buildDebugMemoryUsage();
+        expect(memory.memoryUsage).toMatchObject({
+            rss: expect.any(Number),
+            external: expect.any(Number),
+            arrayBuffers: expect.any(Number),
+        });
+        expect(memory.native.sqlite).toMatchObject({
+            connectionCount: expect.any(Number),
+            cacheUpperBoundBytes: expect.any(Number),
+            sqliteStatusApi: "unavailable",
+        });
+        expect(memory.native.tokenizer.loaded).toBeTypeOf("boolean");
+        expect(memory.native.localEmbedding.loaded).toBeTypeOf("boolean");
+        expect(memory.native.quickJs.loaded).toBeTypeOf("boolean");
+        expect(memory.holders.lkgSlots.totalBytes).toBeTypeOf("number");
+        expect(memory.holders.messageIndexQueue.activeBufferBytes).toBeTypeOf("number");
+    });
+
+    test("does not register heap diagnostics when the flag is off by default", () => {
+        const previous = process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        try {
+            const handlers = registeredRpcMethods(false);
+            expect(handlers.has("debug.memoryUsage")).toBe(false);
+            expect(handlers.has("debug.heapSnapshot")).toBe(false);
+        } finally {
+            if (previous === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+            else process.env.MAGIC_CONTEXT_DEBUG_RPC = previous;
+        }
+    });
+
+    test("registers diagnostics only for an explicit config or environment opt-in", () => {
+        const previous = process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        try {
+            expect(isDebugRpcEnabled({ debug_rpc: true }, {})).toBe(true);
+            expect(isDebugRpcEnabled({ debug_rpc: false }, { MAGIC_CONTEXT_DEBUG_RPC: "1" })).toBe(
+                true,
+            );
+            expect(isDebugRpcEnabled({ debug_rpc: false }, {})).toBe(false);
+            expect(registeredRpcMethods(true).has("debug.heapSnapshot")).toBe(true);
+        } finally {
+            if (previous === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+            else process.env.MAGIC_CONTEXT_DEBUG_RPC = previous;
+        }
+    });
+});
+
+describe("Rust maintenance RPC routing", () => {
+    test("routes recomp to the module with a replay-safe command id", async () => {
+        const call = mock(async () => ({ ok: true, disposition: "started" }));
+
+        expect(
+            await executeRustRecompRpc(
+                { call } as unknown as RustModeModuleClient,
+                "ses-rust-recomp-rpc",
+                "/fixture/project",
+            ),
+        ).toEqual({ ok: true });
+        expect(call).toHaveBeenCalledTimes(1);
+        expect(call.mock.calls[0]?.[0]).toMatchObject({
+            sessionId: "ses-rust-recomp-rpc",
+            projectRoot: "/fixture/project",
+            method: "session.recomp",
+            body: {
+                method: "session.recomp",
+                v: 1,
+                session_id: "ses-rust-recomp-rpc",
+                command_id: expect.stringMatching(/^rpc-recomp:/),
+            },
+        });
+    });
+
+    test("fails closed when the module transport is unavailable", async () => {
+        expect(
+            await executeRustRecompRpc(undefined, "ses-rust-recomp-rpc", "/fixture/project"),
+        ).toEqual({ ok: false, error: "Rust module client is unavailable" });
+    });
+});
+
+describe("Rust session status reads", () => {
+    test("coalesces overlapping reads without reusing a completed store snapshot", async () => {
+        let callCount = 0;
+        let releaseFirst!: (value: Record<string, unknown>) => void;
+        const firstResponse = new Promise<Record<string, unknown>>((resolve) => {
+            releaseFirst = resolve;
+        });
+        const client = {
+            call: () => {
+                callCount += 1;
+                return callCount === 1
+                    ? firstResponse
+                    : Promise.resolve({ ok: true, tag_count: 8_842 });
+            },
+        } as unknown as RustModeModuleClient;
+
+        const first = loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        const overlapping = loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        expect(callCount).toBe(1);
+        releaseFirst({ ok: true, tag_count: 1_666 });
+        expect((await first)?.tag_count).toBe(1_666);
+        expect((await overlapping)?.tag_count).toBe(1_666);
+
+        const refreshed = await loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        expect(callCount).toBe(2);
+        expect(refreshed?.tag_count).toBe(8_842);
+    });
 });
 
 describe("sidebar snapshot RPC failures", () => {
@@ -47,6 +191,55 @@ describe("sidebar snapshot RPC failures", () => {
         expect(buildSidebarSnapshotRpcResponse(busyDb, "ses_busy", process.cwd())).toEqual({
             error: "sidebar snapshot unavailable",
         });
+    });
+});
+
+describe("buildStatusDetail — active profile", () => {
+    test("includes the resolved profile name in the RPC status payload", () => {
+        const db = createTestDb();
+        try {
+            expect(
+                buildStatusDetail(db, "ses-profile-status", process.cwd(), undefined, {
+                    profile: "work",
+                }).activeProfile,
+            ).toBe("work");
+            expect(
+                buildStatusDetail(db, "ses-base-status", process.cwd()).activeProfile,
+            ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — protected-token floor", () => {
+    test("uses the durable first-observed floor for pre-snapshot sessions after restart", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-status-pre-snapshot-floor";
+            const insertTag = db.prepare(
+                `INSERT INTO tags (
+                    session_id, message_id, type, status, byte_size, tag_number,
+                    token_count, input_token_count, reasoning_token_count
+                ) VALUES (?, ?, 'tool', 'active', 1, ?, 2000, 0, 0)`,
+            );
+            for (let tagNumber = 1; tagNumber <= 10; tagNumber += 1) {
+                insertTag.run(sessionId, `message-${tagNumber}`, tagNumber);
+            }
+
+            const defer = resolveEpochFloorForPass(db, sessionId, {
+                usableSoft: 100_000,
+                isCacheBustingPass: false,
+            });
+            expect(defer.floor).toBe(8_000);
+            resetEpochFloorRegistryForTest();
+
+            const detail = buildStatusDetail(db, sessionId, process.cwd());
+            expect(detail.protectedTagCount).toBe(4);
+        } finally {
+            closeQuietly(db);
+            resetEpochFloorRegistryForTest();
+        }
     });
 });
 
@@ -71,6 +264,11 @@ describe("buildStatusDetail — storage version probe", () => {
                 context_db_schema_version: LATEST_SUPPORTED_VERSION,
                 plugin_supported_version: LATEST_SUPPORTED_VERSION,
             });
+            expect(detail.loggerDiagnostics).toEqual({
+                swallowedWriteCount: 0,
+                lastErrorMessage: null,
+                lastErrorTime: null,
+            });
         } finally {
             closeQuietly(db);
         }
@@ -94,6 +292,85 @@ describe("buildSidebarSnapshot — stale build error state", () => {
             expect(snapshot.lastTransformError).toBe(
                 "Magic Context: plugin build is older than its database — restart OpenCode",
             );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildSidebarSnapshot — persisted tail hygiene", () => {
+    test("preserves zero-valued TypeScript baseline fields in the RPC payload", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-hygiene-zero";
+            const live = createLiveSessionState();
+            live.channel1StateBySession.set(sessionId, {
+                baselineU: 0,
+                baselineT: 0,
+                turnDeltaU: 0,
+                turnDeltaT: 0,
+                usableWindow: 128_000,
+                realUserTurnCount: 0,
+                baselineGeneration: 0,
+                computedAt: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineParts: [],
+                contentSignature: "empty",
+                reducedSinceRefresh: false,
+                oldestReclaimableToolTags: [],
+            });
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live);
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 0,
+                t: 0,
+                severity: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 0,
+                computedAt: 0,
+                reclaimableToolOutputCount: 0,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("prefers the durable Rust baseline when module authority is active", () => {
+        const db = createTestDb();
+        try {
+            const snapshot = buildSidebarSnapshot(
+                db,
+                "ses-hygiene-rust",
+                process.cwd(),
+                createLiveSessionState(),
+                undefined,
+                undefined,
+                {
+                    tail_hygiene: {
+                        u: 65_100,
+                        t: 100_000,
+                        severity: 0.651,
+                        evaluable: true,
+                        generation_invalidated: false,
+                        baseline_generation: 7,
+                        computed_at_ms: 123,
+                    },
+                },
+            );
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 65_100,
+                t: 100_000,
+                severity: 0.651,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 7,
+                computedAt: 123,
+                reclaimableToolOutputCount: 0,
+            });
         } finally {
             closeQuietly(db);
         }
@@ -332,6 +609,18 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                 ) VALUES (?, 1, 1, 5000, '', 0)`,
             ).run(sessionId);
 
+            const moduleStatus = {
+                usage: {
+                    current_total_input_tokens: 42_000,
+                    context_limit_tokens: 100_000,
+                },
+                boundary_present: true,
+                coverage_ordinal: 17,
+                compartment_count: 4,
+                compartment_tokens: 23,
+                pending_drop_count: 2,
+                tag_count: 9,
+            };
             const snapshot = buildSidebarSnapshot(
                 db,
                 sessionId,
@@ -339,17 +628,17 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                 undefined,
                 4000,
                 undefined,
-                {
-                    usage: {
-                        current_total_input_tokens: 42_000,
-                        context_limit_tokens: 100_000,
-                    },
-                    boundary_present: true,
-                    coverage_ordinal: 17,
-                    compartment_count: 4,
-                    compartment_tokens: 23,
-                    pending_drop_count: 2,
-                },
+                moduleStatus,
+            );
+            const detail = buildStatusDetail(
+                db,
+                sessionId,
+                process.cwd(),
+                undefined,
+                undefined,
+                undefined,
+                4000,
+                moduleStatus,
             );
 
             expect(snapshot.inputTokens).toBe(42_000);
@@ -360,6 +649,11 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
             expect(snapshot.pendingOpsCount).toBe(2);
             expect(snapshot.boundaryPresent).toBe(true);
             expect(snapshot.coverageOrdinal).toBe(17);
+            expect(buildCompartmentCount(db, sessionId, moduleStatus)).toBe(4);
+            expect(detail.totalTags).toBe(9);
+            expect(detail.activeTags).toBe(0);
+            expect(detail.droppedTags).toBe(0);
+            expect(detail.tagCountsAuthoritative).toBe(false);
         } finally {
             closeQuietly(db);
         }
@@ -538,6 +832,35 @@ describe("buildStatusDetail — storage versions probe", () => {
     });
 });
 
+describe("buildStatusDetail — mural read surface", () => {
+    test("reads the graduated top-level mural config", () => {
+        const db = createTestDb();
+        try {
+            const directory = process.cwd();
+            const projectIdentity = resolveProjectIdentity(directory);
+            upsertMural(db, {
+                projectPath: projectIdentity,
+                image: Buffer.from("png"),
+                contentHash: "mural-content-hash",
+                renderedAt: Date.now() - 1000,
+                model: "deterministic",
+                memoryIds: [1],
+                width: 16,
+                height: 8,
+            });
+
+            const detail = buildStatusDetail(db, "ses-mural-status", directory, undefined, {
+                mural: { enabled: true },
+            });
+
+            expect(detail.mural?.present).toBe(true);
+            expect(detail.mural?.ageMs).toBeGreaterThanOrEqual(1000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
     test("sets cacheNeverExpires: true when cache_ttl is 'never'", () => {
         const db = createTestDb();
@@ -568,6 +891,90 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
             const roundTripped = JSON.parse(JSON.stringify(detail));
             expect(roundTripped.cacheRemainingMs).toBe(-1);
             expect(roundTripped.cacheRemainingMs).not.toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — Rust host paths", () => {
+    test("surfaces a frozen non-frontier memory mirror from module and host evidence", () => {
+        const db = createTestDb();
+        try {
+            db.prepare(
+                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 3726, ?)",
+            ).run(Date.now() - 40_001);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:status', 1, 'ARCHITECTURE', 'hash')",
+            ).run();
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-mirror-stall",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { memory_mirror: { feed_head: 4850 } },
+            );
+
+            expect(detail.memoryMirror).toMatchObject({
+                cursor: 3726,
+                feedHead: 4850,
+                liveRows: 1,
+                pendingRows: 1124,
+                stalled: true,
+                code: "MC-M01",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("surfaces a host marker that disagrees with module authority status", () => {
+        const db = createTestDb();
+        try {
+            const directory = process.cwd();
+            const projectIdentity = resolveProjectIdentity(directory);
+            expect(projectIdentity).not.toBeNull();
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'store', 1)",
+            ).run(projectIdentity);
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-authority-mismatch",
+                directory,
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { authority: { memories: { project: projectIdentity ?? "", state: "TS" } } },
+            );
+
+            expect(detail.memoryAuthorityMismatch).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("marks host paths module-side only for Rust mode", () => {
+        const db = createTestDb();
+        try {
+            const rustDetail = buildStatusDetail(
+                db,
+                "ses-rust-host-paths",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+            );
+            const tsDetail = buildStatusDetail(db, "ses-ts-host-paths", process.cwd(), undefined, {
+                transform_mode: "ts",
+            });
+
+            expect(rustDetail.hostBackendsModuleSide).toBe(true);
+            expect(tsDetail.hostBackendsModuleSide).toBe(false);
         } finally {
             closeQuietly(db);
         }

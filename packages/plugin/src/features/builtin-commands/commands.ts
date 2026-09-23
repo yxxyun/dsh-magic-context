@@ -2,7 +2,7 @@ import type { BuiltinCommandConfig } from "./types";
 
 const COMPACTION_ENABLED_PATH = `compaction${".enabled"}`;
 
-export function getMagicContextBuiltinCommands(compactionEnabled = true): BuiltinCommandConfig {
+export function getMagicContextBuiltinCommands(compactionEnabled = true) {
     const unavailableInCompactionOff = (command: string) =>
         `Unavailable when ${COMPACTION_ENABLED_PATH} is false: /${command} manages compacted history.`;
 
@@ -14,7 +14,7 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true): Builti
         "ctx-recomp": {
             template: "ctx-recomp",
             description: compactionEnabled
-                ? "Rebuild compartments and facts from raw history (full or <start>-<end> range)"
+                ? "Rebuild compressed history from raw history (full or <start>-<end> range); memories are not changed"
                 : unavailableInCompactionOff("ctx-recomp"),
         },
         "ctx-wrapup": {
@@ -34,10 +34,6 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true): Builti
                 ? "Force-process all pending magic context operations immediately"
                 : unavailableInCompactionOff("ctx-flush"),
         },
-        "ctx-aug": {
-            template: "ctx-aug",
-            description: "Augment your prompt with project memory context via sidekick agent",
-        },
         "ctx-dream": {
             template: "ctx-dream",
             description: "Run the hidden dreamer maintenance pass for this project now",
@@ -47,5 +43,9 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true): Builti
             description:
                 "Embedding status, or start/pause history compartment embedding (start | pause)",
         },
-    };
+    } satisfies BuiltinCommandConfig;
 }
+
+export type MagicContextBuiltinCommandName = keyof ReturnType<
+    typeof getMagicContextBuiltinCommands
+>;

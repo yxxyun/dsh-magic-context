@@ -3,9 +3,9 @@
 // to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
 process.env.OPENCODE_CLIENT = "desktop";
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -42,6 +42,10 @@ import { autoEmbedAttemptedBySession, clearEmbedSessionState } from "./embed-ses
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
 import { createLiveSessionState } from "./live-session-state";
 import { closeReadOnlySessionDb } from "./read-session-db";
+import { __ignoredNotificationTest } from "./send-session-notification";
+
+// Command-routing units model an already idle host; lifecycle ordering has its own timeline regression.
+beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
 
 type PromptMocks = {
     prompt?: ReturnType<typeof mock>;
@@ -88,6 +92,7 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
     autoEmbedAttemptedBySession.clear();
     _resetProjectEmbeddingRegistryForTests();
     _setTestProviderFactoryForProject(null);
@@ -95,7 +100,8 @@ afterEach(() => {
     __resetMessageIndexAsyncForTests();
     closeReadOnlySessionDb();
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
         try {
@@ -162,7 +168,7 @@ function createMockDeps(promptMocks: PromptMocks = createPromptMocks()): MagicCo
         scheduler,
         compactionHandler,
         directory: "/tmp",
-        config: { protected_tags: 3, cache_ttl: "5m" },
+        config: { protected_tokens: 4_000, cache_ttl: "5m" },
     };
 }
 
@@ -245,6 +251,48 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
+    it("review: refusing ordinary mirror must not extend the 1.9s tool reply budget", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-review-memory-budget-");
+        const deps = createMockDeps();
+        deps.config = { ...deps.config, transform_mode: "rust" } as never;
+        let targeted = false;
+        let drained = false;
+        deps.rustModeModuleClient = {
+            async call() {
+                return {
+                    memory_operation: { action: "write", module_id: 9101, category: "CONSTRAINTS" },
+                };
+            },
+            async mirrorMemory() {
+                targeted = true;
+                return { row: null };
+            },
+            async mirrorPull() {
+                drained = true;
+                await new Promise((resolve) => setTimeout(resolve, 2_200));
+                throw new Error("refusing slow mirror");
+            },
+        } as never;
+        const hook = requireHook(createMagicContextHook(deps));
+        const started = performance.now();
+        const reply = await hook.rustToolBackends!.memory!({
+            sessionId: "review-budget",
+            projectRoot: "/tmp",
+            projectPath: "/tmp",
+            memoryProject: "/tmp",
+            action: "write",
+            category: "CONSTRAINTS",
+            content: "budget probe",
+        });
+        const elapsed = performance.now() - started;
+        expect(targeted).toBe(true);
+        expect(drained).toBe(false);
+        expect(reply).toBe(
+            "Saved memory in CONSTRAINTS. Its id will appear in <project-memory> on the next pass.",
+        );
+        expect(reply).not.toContain("9101");
+        expect(elapsed).toBeLessThan(2_000);
+    });
     it("constructs with directory fallback when load-time identity resolution throws", () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
         const projectDir = makeTempDir("hook-identity-fallback-project-");
@@ -260,6 +308,34 @@ describe("magic-context hook", () => {
         deps.directory = projectDir;
 
         expect(createMagicContextHook(deps)).not.toBeNull();
+    });
+
+    it("constructs and resolves a project when sandbox policy denies realpath for the home directory", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-realpath-sandbox-data-");
+        const projectDir = makeTempDir("hook-realpath-sandbox-project-");
+        const deniedHome = makeTempDir("hook-realpath-sandbox-home-");
+        const originalNative = realpathSync.native;
+        const permissionDenied = new Error("sandbox denied realpath") as NodeJS.ErrnoException;
+        permissionDenied.code = "EPERM";
+        __setProjectIdentityTestHooks({ homeDirectory: () => deniedHome });
+        Object.defineProperty(realpathSync, "native", {
+            configurable: true,
+            value: (() => {
+                throw permissionDenied;
+            }) as typeof realpathSync.native,
+        });
+        const deps = createMockDeps();
+        deps.directory = projectDir;
+
+        try {
+            expect(createMagicContextHook(deps)).not.toBeNull();
+            expect(resolveProjectIdentity(projectDir)).toMatch(/^dir:[0-9a-f]{12}$/);
+        } finally {
+            Object.defineProperty(realpathSync, "native", {
+                configurable: true,
+                value: originalNative,
+            });
+        }
     });
 
     it("rehydrates pending marker sessions into both deferred signal sets", () => {
@@ -351,7 +427,68 @@ describe("magic-context hook", () => {
         expect(typeof hook["tool.execute.after"]).toBe("function");
     });
 
-    it("re-arms auto-embed when the first transform precedes compartment work", async () => {
+    it("intercepts a Desktop slashless status command before an LLM completion", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-stripped-status-");
+        const promptMocks = createPromptMocks();
+        const hook = requireHook(createMagicContextHook(createMockDeps(promptMocks)));
+        let persistedCommandRows = 0;
+        let llmCompletions = 0;
+
+        const promptPipeline = async () => {
+            await hook["chat.message"]!(
+                {
+                    sessionID: "ses-stripped-status",
+                    agent: "build",
+                    model: { providerID: "anthropic", modelID: "claude" },
+                    variant: "high",
+                },
+                {
+                    message: {} as never,
+                    parts: [{ type: "text", text: "ctx-status" } as never],
+                },
+            );
+            persistedCommandRows += 1;
+            llmCompletions += 1;
+        };
+
+        await expectSentinel(promptPipeline(), "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__");
+
+        expect(persistedCommandRows).toBe(0);
+        expect(llmCompletions).toBe(0);
+        expect(promptMocks.prompt).toHaveBeenCalledTimes(1);
+        const notification = promptMocks.prompt?.mock.calls[0]?.[0] as {
+            body?: {
+                noReply?: boolean;
+                parts?: Array<{ text?: string; ignored?: boolean }>;
+            };
+        };
+        expect(notification.body?.noReply).toBe(true);
+        expect(notification.body?.parts?.[0]?.ignored).toBe(true);
+        expect(notification.body?.parts?.[0]?.text).toContain("## Magic Context Status");
+    });
+
+    it("keeps the native slash-command path unchanged", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-native-status-");
+        const promptMocks = createPromptMocks();
+        const hook = requireHook(createMagicContextHook(createMockDeps(promptMocks)));
+
+        await expectSentinel(
+            hook["command.execute.before"]!(
+                { command: "ctx-status", sessionID: "ses-native-status", arguments: "" },
+                { parts: [] },
+            ),
+            "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+        );
+
+        expect(promptMocks.prompt).toHaveBeenCalledTimes(1);
+        const notification = promptMocks.prompt?.mock.calls[0]?.[0] as {
+            body?: { noReply?: boolean; parts?: Array<{ ignored?: boolean }> };
+        };
+        expect(notification.body?.noReply).toBe(true);
+        expect(notification.body?.parts?.[0]?.ignored).toBe(true);
+    });
+
+    it("silently embeds seven compartments on idle and latches subsequent drains", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-auto-embed-data-");
         const projectDir = makeTempDir("hook-auto-embed-project-");
         mkdirSync(join(projectDir, ".cortexkit"));
@@ -362,8 +499,22 @@ describe("magic-context hook", () => {
                 memory: { enabled: true },
             }),
         );
-        _setTestProviderFactoryForProject(() => new HookFakeEmbeddingProvider());
-        const deps = createMockDeps();
+        const provider = new HookFakeEmbeddingProvider();
+        const embedBatch = mock(provider.embedBatch.bind(provider));
+        provider.embedBatch = embedBatch;
+        _setTestProviderFactoryForProject(() => provider);
+        const prompts = createPromptMocks();
+        const hostDb = new Database(":memory:");
+        hostDb.exec("CREATE TABLE message (role TEXT, data TEXT)");
+        const appendUserRow = (input: unknown) => {
+            hostDb
+                .prepare("INSERT INTO message (role, data) VALUES ('user', ?)")
+                .run(JSON.stringify(input));
+        };
+        prompts.prompt = mock(appendUserRow);
+        prompts.promptAsync = mock(async (input: unknown) => appendUserRow(input));
+        const userRows = () => hostDb.prepare("SELECT * FROM message WHERE role = 'user'").all();
+        const deps = createMockDeps(prompts);
         deps.directory = projectDir;
         const hook = requireHook(createMagicContextHook(deps));
         const db = openDatabase();
@@ -391,33 +542,66 @@ describe("magic-context hook", () => {
             await runTransform();
             await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
 
-            appendCompartments(db, sessionId, [
-                {
-                    sequence: 0,
-                    startMessage: 1,
-                    endMessage: 1,
-                    startMessageId: "u1",
-                    endMessageId: "u1",
-                    title: "Late compartment",
-                    content: "Late compartment content",
-                    p1: "Late compartment content",
-                },
-            ]);
-            db.prepare(
-                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-            ).run(sessionId, 1, "u1", "user", "Late compartment source text");
+            for (let i = 1; i <= 7; i++) {
+                appendCompartments(db, sessionId, [
+                    {
+                        sequence: i - 1,
+                        startMessage: i,
+                        endMessage: i,
+                        startMessageId: `u${i}`,
+                        endMessageId: `u${i}`,
+                        title: `Compartment ${i}`,
+                        content: `Content ${i}`,
+                        p1: `Content ${i}`,
+                    },
+                ]);
+                db.prepare(
+                    "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+                ).run(sessionId, i, `u${i}`, "user", `Source text ${i}`);
+            }
 
             await runTransform();
             await waitUntil(() => {
                 const coverage = getEmbeddingCoverageStatus(db, projectIdentity, sessionId);
                 return (
-                    coverage.session.total === 1 &&
-                    coverage.session.embedded === 1 &&
+                    coverage.session.total === 7 &&
+                    coverage.session.embedded === 7 &&
                     autoEmbedAttemptedBySession.has(sessionId)
                 );
             });
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            expect(userRows()).toEqual([]);
+            expect(prompts.prompt).not.toHaveBeenCalled();
+            expect(prompts.promptAsync).not.toHaveBeenCalled();
+            const calls = embedBatch.mock.calls.length;
+            expect(calls).toBeGreaterThan(0);
+            // Leave new work eligible: without the latch a second transform would drain it.
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 7,
+                    startMessage: 8,
+                    endMessage: 8,
+                    startMessageId: "u8",
+                    endMessageId: "u8",
+                    title: "Later",
+                    content: "Later",
+                    p1: "Later",
+                },
+            ]);
+            db.prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+            ).run(sessionId, 8, "u8", "user", "Later source text");
+            await runTransform();
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            expect(embedBatch.mock.calls.length).toBe(calls);
+            expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
+                total: 8,
+                embedded: 7,
+            });
+            expect(userRows()).toEqual([]);
         } finally {
             clearEmbedSessionState(sessionId);
+            hostDb.close();
         }
     });
 
@@ -480,7 +664,7 @@ describe("magic-context hook", () => {
                     parts: [
                         {
                             type: "text",
-                            text: expect.stringContaining("## Magic Status"),
+                            text: expect.stringContaining("## Magic Context Status"),
                             ignored: true,
                         },
                     ],
@@ -653,7 +837,7 @@ describe("magic-context hook", () => {
 
         expect(promptMocks.prompt).toHaveBeenCalledTimes(3);
         expect(promptMocks.createSession).toHaveBeenCalledTimes(1);
-        expect(promptMocks.deleteSession).toHaveBeenCalledTimes(1);
+        expect(promptMocks.deleteSession).toHaveBeenCalledTimes(1); // resolved prompt is safe to retire inline
         const firstCallArg = promptMocks.prompt?.mock.calls[0]?.[0] as Record<string, unknown>;
         const secondCallArg = promptMocks.prompt?.mock.calls[1]?.[0] as Record<string, unknown>;
         const thirdCallArg = promptMocks.prompt?.mock.calls[2]?.[0] as Record<string, unknown>;
@@ -790,90 +974,6 @@ describe("magic-context hook", () => {
         expect(promptMocks.createSession).not.toHaveBeenCalled();
     });
 
-    it("runs sidekick for ctx-aug and sends the augmented user prompt", async () => {
-        process.env.XDG_DATA_HOME = makeTempDir("hook-sidekick-aug-");
-        const promptMocks = createPromptMocks();
-        promptMocks.listMessages = mock(async () => ({
-            data: [
-                {
-                    info: { role: "assistant", time: { created: Date.now() } },
-                    parts: [{ type: "text", text: "Relevant memory briefing" }],
-                },
-            ],
-        }));
-        const deps = createMockDeps(promptMocks);
-        deps.config = {
-            ...deps.config,
-            sidekick: {
-                timeout_ms: 5_000,
-            },
-        };
-        const hook = requireHook(createMagicContextHook(deps));
-
-        await expectSentinel(
-            hook["command.execute.before"]!(
-                {
-                    command: "ctx-aug",
-                    sessionID: "ses-sidekick",
-                    arguments: "Implement sidekick migration",
-                },
-                { parts: [{ type: "text", text: "" }] },
-            ),
-            "__CONTEXT_MANAGEMENT_CTX-AUG_HANDLED__",
-        );
-
-        expect(promptMocks.createSession).toHaveBeenCalledTimes(1);
-        expect(promptMocks.prompt).toBeDefined();
-        expect(promptMocks.prompt!).toHaveBeenCalledTimes(2);
-        expect(promptMocks.prompt!.mock.calls[0]?.[0]).toEqual(
-            expect.objectContaining({
-                path: { id: "ses-sidekick" },
-                body: expect.objectContaining({
-                    parts: [
-                        expect.objectContaining({
-                            text: "🔍 Preparing augmentation… this may take 2-10s depending on your sidekick provider.",
-                        }),
-                    ],
-                }),
-            }),
-        );
-        expect(promptMocks.prompt!.mock.calls[1]?.[0]).toEqual(
-            expect.objectContaining({
-                path: { id: "dream-child" },
-                query: { directory: "/tmp" },
-                body: expect.objectContaining({
-                    agent: "sidekick",
-                    system: expect.stringContaining('ctx_search(query="'),
-                    parts: [
-                        {
-                            type: "text",
-                            text: "Implement sidekick migration",
-                            // synthetic:true hides the prompt from the TUI
-                            // subagent pane while still feeding it to the LLM.
-                            synthetic: true,
-                        },
-                    ],
-                }),
-            }),
-        );
-        expect(promptMocks.promptAsync).toHaveBeenCalledWith(
-            expect.objectContaining({
-                path: { id: "ses-sidekick" },
-                body: {
-                    parts: [
-                        {
-                            type: "text",
-                            text: "Implement sidekick migration\n\n<sidekick-augmentation>\nRelevant memory briefing\n</sidekick-augmentation>",
-                        },
-                    ],
-                },
-            }),
-        );
-        expect(promptMocks.deleteSession).toHaveBeenCalledWith({
-            path: { id: "dream-child" },
-        });
-    });
-
     it("checks the dream schedule in the background after message updates", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-dream-schedule-");
         const promptMocks = createPromptMocks();
@@ -965,7 +1065,7 @@ describe("magic-context hook", () => {
             await new Promise((resolve) => setTimeout(resolve, 0));
 
             expect(promptMocks.createSession).toHaveBeenCalledTimes(1);
-            expect(promptMocks.deleteSession).toHaveBeenCalledTimes(1);
+            expect(promptMocks.deleteSession).toHaveBeenCalledTimes(1); // resolved prompt is safe to retire inline
         } finally {
             Date.now = originalDateNow;
         }
@@ -1026,4 +1126,39 @@ describe("magic-context hook", () => {
         expect(meta.observedSafeInputTokens).toBe(0);
         expect(meta.cacheAlertSent).toBe(false);
     });
+});
+
+it("the event hook flushes notices on session.idle, never on a terminal assistant update", async () => {
+    __ignoredNotificationTest.reset();
+    process.env.XDG_DATA_HOME = makeTempDir("hook-notice-idle-");
+    const promptMocks = createPromptMocks();
+    const deps = createMockDeps(promptMocks);
+    const hook = requireHook(createMagicContextHook(deps));
+    const sessionID = "ses-hook-notice-idle";
+    await hook.event!({
+        event: {
+            type: "message.updated",
+            properties: {
+                info: {
+                    id: "done",
+                    sessionID,
+                    role: "assistant",
+                    finish: "stop",
+                    time: { created: 1, completed: 2 },
+                },
+            },
+        },
+    } as never);
+    const { sendIgnoredMessage } = await import("./send-session-notification");
+    expect(
+        await sendIgnoredMessage(deps.client, sessionID, "⏳ Context at 95%", {
+            agent: "build",
+            variant: "high",
+            providerId: "local",
+            modelId: "27B",
+        }),
+    ).toBe("queued");
+    expect(promptMocks.prompt).not.toHaveBeenCalled();
+    await hook.event!({ event: { type: "session.idle", properties: { sessionID } } } as never);
+    expect(promptMocks.prompt).toHaveBeenCalledTimes(1);
 });

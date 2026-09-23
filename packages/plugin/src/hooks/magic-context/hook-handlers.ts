@@ -1,3 +1,4 @@
+import type { MagicContextConfig } from "../../config/schema/magic-context";
 import {
     clearSessionTracking,
     scheduleIncrementalIndex,
@@ -13,16 +14,18 @@ import {
     clearEmergencyDropSample,
     clearEmergencyRecovery,
     clearHistorianFailureState,
-    getLastNudgeLevel,
+    getChannel1NudgeState,
     getLastNudgeUndropped,
-    resetLastNudgeCycle,
-    setLastNudgeLevel,
+    markChannel1PostReduceGracePending,
+    setChannel1NudgeState,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
+import { seedSessionCacheTtlIfUnsynced } from "../../shared/cache-ttl-seed";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
+import type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
 import {
     cachedToolPermissionDenied,
     resolveTodowriteAvailability,
@@ -32,10 +35,12 @@ import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
     type Channel1State,
-    computePressure,
     decideChannel1,
+    formatChannel1Evaluation,
+    reclaimableToolOutputCount,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
+import { annotateEmptyTaskOutput } from "./empty-task-output";
 import {
     getMessageUpdatedAssistantInfo,
     getMessageUpdatedInfo,
@@ -49,11 +54,17 @@ import {
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
-import { clearIgnoredMessages, flushIgnoredMessages } from "./send-session-notification";
+import {
+    clearIgnoredMessages,
+    flushIgnoredMessages,
+    observeIgnoredNotificationEvent,
+} from "./send-session-notification";
 import { variantChangeBustsProviderCache } from "./sentinel";
+import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
+export type LatestAssistantMessageIdBySession = Map<string, string>;
 export type VariantBySession = Map<string, string | undefined>;
 export type AgentBySession = Map<string, string>;
 
@@ -133,6 +144,21 @@ export type FlushedSessions = Set<string>;
 
 export type LastHeuristicsTurnId = Map<string, string>;
 
+type CommandNotificationParams = {
+    agent?: string;
+    variant?: string;
+    providerId?: string;
+    modelId?: string;
+};
+
+export interface MagicContextCommandHandler {
+    "command.execute.before": (
+        input: CommandExecuteInput,
+        output: CommandExecuteOutput,
+        params: CommandNotificationParams,
+    ) => Promise<unknown>;
+}
+
 export function getLiveNotificationParams(
     sessionId: string,
     liveModelBySession: LiveModelBySession,
@@ -172,15 +198,49 @@ export function createChatMessageHook(args: {
     /** E5 — one-time session upgrade reminder. Optional: only wired when the
      *  historian can run (so an upgrade is actually possible). Self-gates. */
     upgradeReminder?: (sessionId: string) => Promise<void>;
+    /** The native slash-command handler, reused when Desktop removes the slash. */
+    commandHandler?: MagicContextCommandHandler;
+    cacheTtlConfig?: MagicContextConfig["cache_ttl"];
 }) {
-    return async (input: {
-        sessionID?: string;
-        variant?: string;
-        agent?: string;
-        model?: { providerID?: string; modelID?: string };
-    }) => {
+    return async (
+        input: {
+            sessionID?: string;
+            variant?: string;
+            agent?: string;
+            model?: { providerID?: string; modelID?: string };
+        },
+        output?: {
+            parts?: Array<{
+                type: string;
+                text?: string;
+                ignored?: boolean;
+                synthetic?: boolean;
+            }>;
+        },
+    ) => {
         const sessionId = input.sessionID;
         if (!sessionId) return;
+
+        const strippedCommand =
+            args.commandHandler && output?.parts
+                ? matchStrippedMagicContextCommand(output.parts)
+                : null;
+        if (strippedCommand && args.commandHandler && output?.parts) {
+            await args.commandHandler["command.execute.before"](
+                {
+                    command: strippedCommand.command,
+                    sessionID: sessionId,
+                    arguments: strippedCommand.arguments,
+                },
+                { parts: output.parts },
+                {
+                    agent: input.agent,
+                    variant: input.variant,
+                    providerId: input.model?.providerID,
+                    modelId: input.model?.modelID,
+                },
+            );
+        }
 
         // E5: fire-and-forget one-time upgrade reminder for legacy sessions.
         // Self-gating + model-invisible, so it never affects the prompt prefix.
@@ -193,6 +253,14 @@ export function createChatMessageHook(args: {
                 providerID: input.model.providerID,
                 modelID: input.model.modelID,
             });
+            if (args.cacheTtlConfig) {
+                seedSessionCacheTtlIfUnsynced({
+                    db: args.db,
+                    sessionId,
+                    configured: args.cacheTtlConfig,
+                    modelKey: `${input.model.providerID}/${input.model.modelID}`,
+                });
+            }
         }
 
         // The tool-heavy "sticky turn reminder" was replaced by the in-turn
@@ -209,27 +277,14 @@ export function createChatMessageHook(args: {
             input.variant !== undefined &&
             previousVariant !== input.variant
         ) {
-            // A reasoning-variant change maps to a thinking-config change
-            // (effort / budget_tokens / toggle — see OpenCode's
-            // `reasoningVariants`). Whether that busts the provider's prompt
-            // cache on its own depends on the provider's cache model: the
-            // Anthropic family renders the thinking config into the prompt
-            // (so the provider itself invalidates message blocks on a change
-            // and our queued ops drain on that natural bust), while
-            // OpenAI-compatible providers carry reasoning_effort / budget as
-            // a request parameter outside the cache key, so a variant flip
-            // is a full cache HIT and our flush would be the ONLY bust — a
-            // gratuitous one. See `variantChangeBustsProviderCache` for the
-            // full rationale and the safety asymmetry.
-            //
-            // providerID comes from the hook input (the live request's
-            // model) with `liveModelBySession` as a fallback for sessions
-            // whose first chat.message predates a model-bearing event. When
-            // no provider is known yet we take the conservative TRUE arm
-            // (today's behavior) so we never silently drop a needed drain.
-            const providerID =
-                input.model?.providerID ?? args.liveModelBySession.get(sessionId)?.providerID;
-            if (variantChangeBustsProviderCache(providerID)) {
+            // Variant changes alter cached thinking blocks on some models. Fable
+            // 5.1 and GPT-6 Astra carry effort outside the cached prefix, leaving
+            // existing prompt bytes unchanged. Use both live IDs to decide; if either
+            // is unknown, leave the cache unchanged rather than flushing speculatively.
+            const liveModel = args.liveModelBySession.get(sessionId);
+            const providerID = input.model?.providerID ?? liveModel?.providerID;
+            const modelID = input.model?.modelID ?? liveModel?.modelID;
+            if (variantChangeBustsProviderCache(providerID, modelID)) {
                 sessionLog(
                     sessionId,
                     `variant changed (${previousVariant} -> ${input.variant}), triggering flush`,
@@ -248,7 +303,7 @@ export function createChatMessageHook(args: {
                 // but the flush was deferred, not triggered.
                 sessionLog(
                     sessionId,
-                    `variant changed (${previousVariant} -> ${input.variant}) on provider ${providerID} whose cache ignores request params; deferring flush to next natural bust`,
+                    `variant changed (${previousVariant} -> ${input.variant}) on ${providerID ?? "unknown"}/${modelID ?? "unknown"} without a proven natural cache bust; deferring flush to next natural bust`,
                 );
             }
         }
@@ -263,6 +318,8 @@ export function createEventHook(args: {
     >;
     db: Parameters<typeof getOrCreateSessionMeta>[0];
     liveModelBySession: LiveModelBySession;
+    /** The lexicographically newest assistant row observed for each session. */
+    latestAssistantMessageIdBySession?: LatestAssistantMessageIdBySession;
     variantBySession: VariantBySession;
     agentBySession: AgentBySession;
     /**
@@ -279,10 +336,15 @@ export function createEventHook(args: {
     deferredMaterializationSessions: DeferredMaterializationSessions;
     lastHeuristicsTurnId: LastHeuristicsTurnId;
     commitSeenLastPass?: Map<string, boolean>;
+    /** Optional source override for the settled raw-message read. */
+    readIncrementalMessage?: typeof readRawSessionMessageById;
     client: PluginContext["client"];
-    protectedTags: number;
 }) {
+    const latestAssistantMessageIdBySession =
+        args.latestAssistantMessageIdBySession ?? new Map<string, string>();
+
     return async (input: { event: { type: string; properties?: unknown } }) => {
+        observeIgnoredNotificationEvent(input.event);
         await args.eventHandler(input);
 
         if (input.event.type === "message.updated") {
@@ -298,70 +360,89 @@ export function createEventHook(args: {
                         args.db,
                         messageInfo.sessionID,
                         messageInfo.messageID,
-                        readRawSessionMessageById,
+                        args.readIncrementalMessage ?? readRawSessionMessageById,
                     );
                 }
             }
 
             const assistantInfo = getMessageUpdatedAssistantInfo(input.event.properties);
             if (assistantInfo?.providerID && assistantInfo?.modelID) {
-                const previous = args.liveModelBySession.get(assistantInfo.sessionID);
-                args.liveModelBySession.set(assistantInfo.sessionID, {
-                    providerID: assistantInfo.providerID,
-                    modelID: assistantInfo.modelID,
-                });
-                // When the model changes (e.g., switching from 128k to 1M context model),
-                // clear stale context percentage and historian failure state so the transform
-                // doesn't keep using the old model's usage metrics or emergency state.
-                if (
-                    previous &&
-                    (previous.providerID !== assistantInfo.providerID ||
-                        previous.modelID !== assistantInfo.modelID)
-                ) {
-                    // The reasoning watermark is only valid for the model that
-                    // produced it. On a switch TO an interleaved-reasoning
-                    // provider (e.g. Moonshot/Kimi), replaying the old
-                    // watermark would re-clear typed reasoning that OpenCode
-                    // must preserve so it can emit `reasoning_content` on the
-                    // wire. On a switch BACK to a normal model, keeping the old
-                    // watermark would make reasoning cleanup resume from the
-                    // previous model's cutoff instead of starting fresh. Clear
-                    // it for both forward and backward transitions.
-                    dropSlot(assistantInfo.sessionID, "model-change");
-                    sessionLog(
-                        assistantInfo.sessionID,
-                        `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
-                    );
-                    // Don't clear lastContextPercentage/lastInputTokens here — the event handler
-                    // already computed the correct percentage using the NEW model's context limit
-                    // (via resolveContextLimit with the new providerID/modelID). Clearing would
-                    // erase the first valid usage sample from the new model.
-                    clearHistorianFailureState(args.db, assistantInfo.sessionID);
-                    clearPersistedReasoningWatermark(args.db, assistantInfo.sessionID);
-                    // Clear the prior model's detected-overflow limit and the
-                    // emergency-recovery flag. The transform has its OWN model-change
-                    // branch that clears these, but it never fires on a mid-session
-                    // switch: this handler updates liveModelBySession first, so by the
-                    // time the transform runs, its knownModel already equals the new
-                    // model. transform.ts explicitly delegates mid-session switches to
-                    // "the first message.updated to trigger hook-handler clearing" —
-                    // so the detected-limit + recovery clears must live HERE too, else
-                    // the old model's limit leaks into the new model's pressure math
-                    // (e.g. a 120K detected limit kept after switching to a 1M model).
-                    clearDetectedContextLimit(args.db, assistantInfo.sessionID);
-                    clearEmergencyRecovery(args.db, assistantInfo.sessionID);
-                    // The emergency idempotence latch is keyed to the prior model's
-                    // ceiling (contextLimit × executeThreshold). A switch to a
-                    // smaller model lowers the ceiling, so the latch must reset to
-                    // re-evaluate the full tail. For the same delegation reason as
-                    // above, the transform-side reset is dead on a live switch —
-                    // clear it HERE.
-                    clearEmergencyDropSample(args.db, assistantInfo.sessionID);
-                    updateSessionMeta(args.db, assistantInfo.sessionID, {
-                        clearedReasoningThroughTag: 0,
-                        observedSafeInputTokens: 0,
-                        cacheAlertSent: false,
+                const latestMessageID = latestAssistantMessageIdBySession.get(
+                    assistantInfo.sessionID,
+                );
+                // OpenCode MessageID.ascending orders assistant ids lexicographically.
+                // Once an ordered event has been observed, an id-less event cannot
+                // prove it belongs to the newest assistant and must not overwrite
+                // the model used to pin synthetic user messages.
+                const acceptsModelUpdate =
+                    latestMessageID === undefined ||
+                    (assistantInfo.messageID !== undefined &&
+                        assistantInfo.messageID >= latestMessageID);
+                if (acceptsModelUpdate) {
+                    if (assistantInfo.messageID !== undefined) {
+                        latestAssistantMessageIdBySession.set(
+                            assistantInfo.sessionID,
+                            assistantInfo.messageID,
+                        );
+                    }
+                    const previous = args.liveModelBySession.get(assistantInfo.sessionID);
+                    args.liveModelBySession.set(assistantInfo.sessionID, {
+                        providerID: assistantInfo.providerID,
+                        modelID: assistantInfo.modelID,
                     });
+                    // When the model changes (e.g., switching from 128k to 1M context model),
+                    // clear stale context percentage and historian failure state so the transform
+                    // doesn't keep using the old model's usage metrics or emergency state.
+                    if (
+                        previous &&
+                        (previous.providerID !== assistantInfo.providerID ||
+                            previous.modelID !== assistantInfo.modelID)
+                    ) {
+                        // The reasoning watermark is only valid for the model that
+                        // produced it. On a switch TO an interleaved-reasoning
+                        // provider (e.g. Moonshot/Kimi), replaying the old
+                        // watermark would re-clear typed reasoning that OpenCode
+                        // must preserve so it can emit `reasoning_content` on the
+                        // wire. On a switch BACK to a normal model, keeping the old
+                        // watermark would make reasoning cleanup resume from the
+                        // previous model's cutoff instead of starting fresh. Clear
+                        // it for both forward and backward transitions.
+                        dropSlot(assistantInfo.sessionID, "model-change");
+                        sessionLog(
+                            assistantInfo.sessionID,
+                            `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
+                        );
+                        // Don't clear lastContextPercentage/lastInputTokens here — the event handler
+                        // already computed the correct percentage using the NEW model's context limit
+                        // (via resolveContextLimit with the new providerID/modelID). Clearing would
+                        // erase the first valid usage sample from the new model.
+                        clearHistorianFailureState(args.db, assistantInfo.sessionID);
+                        clearPersistedReasoningWatermark(args.db, assistantInfo.sessionID);
+                        // Clear the prior model's detected-overflow limit and the
+                        // emergency-recovery flag. The transform has its OWN model-change
+                        // branch that clears these, but it never fires on a mid-session
+                        // switch: this handler updates liveModelBySession first, so by the
+                        // time the transform runs, its knownModel already equals the new
+                        // model. transform.ts explicitly delegates mid-session switches to
+                        // "the first message.updated to trigger hook-handler clearing" —
+                        // so the detected-limit + recovery clears must live HERE too, else
+                        // the old model's limit leaks into the new model's pressure math
+                        // (e.g. a 120K detected limit kept after switching to a 1M model).
+                        clearDetectedContextLimit(args.db, assistantInfo.sessionID);
+                        clearEmergencyRecovery(args.db, assistantInfo.sessionID);
+                        // The emergency idempotence latch is keyed to the prior model's
+                        // ceiling (contextLimit × executeThreshold). A switch to a
+                        // smaller model lowers the ceiling, so the latch must reset to
+                        // re-evaluate the full tail. For the same delegation reason as
+                        // above, the transform-side reset is dead on a live switch —
+                        // clear it HERE.
+                        clearEmergencyDropSample(args.db, assistantInfo.sessionID);
+                        updateSessionMeta(args.db, assistantInfo.sessionID, {
+                            clearedReasoningThroughTag: 0,
+                            observedSafeInputTokens: 0,
+                            cacheAlertSent: false,
+                        });
+                    }
                 }
             }
         }
@@ -378,6 +459,7 @@ export function createEventHook(args: {
             // createEventHandler has already persisted pending_session_cleanup before
             // this process-local indexing latch is discarded.
             args.liveModelBySession.delete(sessionId);
+            latestAssistantMessageIdBySession.delete(sessionId);
             args.variantBySession.delete(sessionId);
             args.agentBySession.delete(sessionId);
             args.sessionDirectoryBySession.delete(sessionId);
@@ -395,9 +477,8 @@ export function createEventHook(args: {
             clearSessionTracking(sessionId);
         }
 
-        // Terminal message.updated/session events are the other existing idle
-        // boundary. `flushIgnoredMessages` checks the same DB signal again, so
-        // streaming deltas cannot accidentally release the queue mid-turn.
+        // The harness idle signal, not finish=stop, authorizes notice delivery.
+        // Other events may safely attempt a flush but cannot release the queue.
         if (input.event.type !== "session.deleted") {
             await flushIgnoredMessages(sessionId);
         }
@@ -416,15 +497,9 @@ export function createEventHook(args: {
     };
 }
 
-export function createCommandExecuteBeforeHook(commandHandler: {
-    "command.execute.before": (
-        input: import("./command-handler").CommandExecuteInput,
-        output: import("./command-handler").CommandExecuteOutput,
-        params: { agent?: string; variant?: string; providerId?: string; modelId?: string },
-    ) => Promise<unknown>;
-}) {
+export function createCommandExecuteBeforeHook(commandHandler: MagicContextCommandHandler) {
     return async (input: unknown, output: unknown) => {
-        const typedInput = input as import("./command-handler").CommandExecuteInput & {
+        const typedInput = input as CommandExecuteInput & {
             agent?: string;
             variant?: string;
             providerID?: string;
@@ -437,8 +512,8 @@ export function createCommandExecuteBeforeHook(commandHandler: {
             modelId: typedInput.modelID,
         };
         return commandHandler["command.execute.before"](
-            typedInput as import("./command-handler").CommandExecuteInput,
-            output as import("./command-handler").CommandExecuteOutput,
+            typedInput as CommandExecuteInput,
+            output as CommandExecuteOutput,
             params,
         );
     };
@@ -474,44 +549,61 @@ function maybeInjectChannel1Nudge(
     // Content-based idempotency (robust to callID reuse on retries).
     if (out.output.includes(CHANNEL1_SENTINEL)) return;
 
-    // Accumulate this tool's tokens into the per-turn accumulator (prospective:
-    // this output is not yet tagged/counted in the baseline).
-    const thisTurnTokens = toolOutputTokens(out.output);
-    state.turnToolTokens += thisTurnTokens;
+    // The just-completed output is prospective input for the next pass and is
+    // inside the recency reserve, so it grows T but not U.
+    state.turnDeltaT += toolOutputTokens(out.output);
 
-    if (state.reducedSinceRefresh) return; // suppress nagging right after a reduce
-
-    const undroppedTokens = state.tailToolTokens + state.turnToolTokens;
-    const pressure = computePressure({
-        lastInputTokens: state.lastInputTokens,
-        turnToolTokens: state.turnToolTokens,
-        contextLimit: state.contextLimit,
-        executeThresholdPercentage: state.executeThresholdPercentage,
-    });
-
-    const workingWindowTokens = Math.round(
-        (state.contextLimit * state.executeThresholdPercentage) / 100,
-    );
+    const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({
-        undroppedTokens,
-        pressure,
-        estimatedInputTokens: state.lastInputTokens + state.turnToolTokens,
-        workingWindowTokens,
+        baselineU: state.baselineU,
+        baselineT: state.baselineT,
+        turnDeltaU: state.turnDeltaU,
+        turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
-        lastNudgeLevel: getLastNudgeLevel(args.db, sessionId),
-        hasRecentReduce: false, // handled by reducedSinceRefresh above
+        lastNudgeLevel: nudgeState.level,
+        lastFireOrdinal: nudgeState.ordinal,
+        currentRealUserTurnCount: state.realUserTurnCount,
+        hasRecentReduce: state.reducedSinceRefresh,
+        agentDropsAppliedThisPass: state.agentDropsAppliedThisPass,
+        postReduceGracePending: nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: nudgeState.postReduceGracePreLevel,
+        evaluable: state.evaluable,
+        generationInvalidated: state.generationInvalidated,
     });
+    sessionLog(sessionId, formatChannel1Evaluation(decision));
 
-    // Always persist the cadence + band state so a reduce-driven drop re-arms it.
+    // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);
-    setLastNudgeLevel(args.db, sessionId, decision.nextLastNudgeLevel);
-    if (!decision.fire) return;
+    const nextNudgeState = {
+        ...nudgeState,
+        level: decision.nextLastNudgeLevel,
+        postReduceGracePending: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePreLevel,
+    };
+    if (!decision.fire) {
+        setChannel1NudgeState(args.db, sessionId, nextNudgeState);
+        return;
+    }
 
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
+        reclaimableToolOutputCount(state.baselineParts),
         state.oldestReclaimableToolTags,
+        decision.sticky,
     );
+    setChannel1NudgeState(args.db, sessionId, {
+        ...nextNudgeState,
+        ordinal: state.realUserTurnCount,
+    });
     sessionLog(
         sessionId,
         `channel1 nudge fired: level=${decision.level} undropped~${Math.round(decision.undroppedTokens / 1000)}k tool=${tool}`,
@@ -545,19 +637,37 @@ export function createToolExecuteAfterHook(args: {
         // so this is a no-op until the assistant is actually idle.
         await flushIgnoredMessages(typedInput.sessionID);
 
+        // Surface a completed native task that returned no final text so the
+        // caller can distinguish an empty result from a genuinely-empty tool.
+        annotateEmptyTaskOutput(typedInput.tool, output);
+
         if (typedInput.tool === "ctx_reduce") {
             // Mark the Channel 1 baseline dirty so the next nudge re-measures the
             // (now smaller) reclaimable tail instead of replaying a stale band.
             const state = args.channel1StateBySession.get(typedInput.sessionID);
-            if (state) state.reducedSinceRefresh = true;
+            if (state) {
+                state.reducedSinceRefresh = true;
+                state.evaluable = false;
+                state.generationInvalidated = true;
+            }
             try {
-                resetLastNudgeCycle(args.db, typedInput.sessionID);
+                const grace = markChannel1PostReduceGracePending(args.db, typedInput.sessionID);
+                if (state) {
+                    state.channel1PostReduceGrace = {
+                        pending: true,
+                        preReduceLevel: grace.postReduceGracePreLevel ?? grace.level,
+                    };
+                }
             } catch (error) {
-                sessionLog(typedInput.sessionID, "channel1 reduce reset failed (ignored):", error);
+                sessionLog(
+                    typedInput.sessionID,
+                    "channel1 reduce grace arm failed (ignored):",
+                    error,
+                );
             }
         } else {
-            // Channel 1: append an in-turn ctx_reduce nudge to this tool's output
-            // when reclaimable space + pressure warrant it. Auto-sticky via
+            // Channel 1: append an in-turn ctx_reduce nudge when the rendered-tail
+            // hygiene ratio and minimum-mass guards warrant it. Auto-sticky via
             // OpenCode's DB (the mutated output.output persists + replays). Fully
             // guarded so an injection failure can never block the tool result.
             try {

@@ -1,6 +1,7 @@
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -50,6 +51,166 @@ function tableExists(db: Database, name: string): boolean {
     return Boolean(
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
+}
+
+function tableHasHarnessColumn(db: Database, name: string): boolean {
+    if (!tableExists(db, name)) return false;
+    return (db.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name: string }>).some(
+        (column) => column.name === "harness",
+    );
+}
+
+/**
+ * Session-scoped (and singleton cursor) tables whose `harness` column v85
+ * rewrites from the OpenCode 1.x mislabel `opencode2` to `opencode`.
+ * Named so a structural test can prove every DDL-declared harness table is
+ * covered: a table added later without being listed goes red.
+ */
+export const V85_OPENCODE2_RELABEL_TABLES = [
+    "tags",
+    "pending_ops",
+    "source_contents",
+    "compartments",
+    "compartment_chunk_embeddings",
+    "session_projects",
+    "compartment_events",
+    "compression_depth",
+    "session_facts",
+    "primer_candidates",
+    "notes",
+    "message_history_index",
+    "message_history_source",
+    "pending_session_cleanup",
+    "message_history_orphan_sweep",
+    "session_meta",
+    "subagent_invocations",
+    "historian_runs",
+    "transform_decisions",
+    "recomp_compartments",
+    "recomp_facts",
+] as const;
+
+/**
+ * Runtime-created singleton (not part of initializeDatabase). Relabel when
+ * the table exists so a live upgrade does not leave an `opencode2` cursor.
+ */
+export const V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"] as const;
+
+function deleteLosingOpenCode2Twin(
+    db: Database,
+    table: string,
+    joinColumns: readonly string[],
+    newerPredicate: string,
+): void {
+    if (!tableHasHarnessColumn(db, table)) return;
+    const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
+    const o2On = naturalJoin
+        ? `${naturalJoin} AND oc.harness = 'opencode'`
+        : `oc.harness = 'opencode'`;
+    const ocOn = naturalJoin
+        ? `${naturalJoin} AND o2.harness = 'opencode2'`
+        : `o2.harness = 'opencode2'`;
+    db.exec(`
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT o2.rowid
+            FROM ${table} AS o2
+            JOIN ${table} AS oc
+              ON ${o2On}
+            WHERE o2.harness = 'opencode2'
+              AND NOT (${newerPredicate})
+        );
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT oc.rowid
+            FROM ${table} AS oc
+            JOIN ${table} AS o2
+              ON ${ocOn}
+            WHERE oc.harness = 'opencode'
+              AND (${newerPredicate})
+        );
+    `);
+}
+
+function relabelOpenCode2HarnessRows(db: Database): void {
+    // session_projects PK(session_id, harness): keep the newer updated_at.
+    // On a tie, keep the already-correct `opencode` row.
+    deleteLosingOpenCode2Twin(
+        db,
+        "session_projects",
+        ["session_id"],
+        "o2.updated_at > oc.updated_at",
+    );
+    // primer_candidates unique includes harness: keep the newer created_at.
+    deleteLosingOpenCode2Twin(
+        db,
+        "primer_candidates",
+        ["project_path", "session_id", "source_start_message_id", "source_end_message_id"],
+        "o2.created_at > oc.created_at",
+    );
+    // transform_decisions PK(session_id, harness, message_id): keep the newer ts_ms.
+    deleteLosingOpenCode2Twin(
+        db,
+        "transform_decisions",
+        ["session_id", "message_id"],
+        "o2.ts_ms > oc.ts_ms",
+    );
+    // message_history_orphan_sweep PK(harness): keep the larger last_swept_at.
+    // NULL sorts as older than any timestamp.
+    deleteLosingOpenCode2Twin(
+        db,
+        "message_history_orphan_sweep",
+        [],
+        "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)",
+    );
+    // session_project_backfill_state PK(harness): prefer a completed cursor
+    // over a mislabelled running lease, then the larger started_at.
+    if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
+        db.exec(`
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode2'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
+              )
+              AND NOT (
+                  (status = 'completed'
+                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                        != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                      AND COALESCE(started_at, -1) > COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
+                          -1
+                      )
+                  )
+              );
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
+              )
+              AND (
+                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
+                    AND status != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
+                      AND COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
+                          -1
+                      ) > COALESCE(started_at, -1)
+                  )
+              );
+        `);
+    }
+
+    const tables = new Set<string>([
+        ...V85_OPENCODE2_RELABEL_TABLES,
+        ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES,
+    ]);
+    for (const table of tables) {
+        if (!tableHasHarnessColumn(db, table)) continue;
+        db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
+    }
 }
 
 /**
@@ -350,6 +511,7 @@ export const MIGRATIONS: Migration[] = [
                     status TEXT NOT NULL DEFAULT 'active',
                     promoted_at INTEGER NOT NULL,
                     source_candidate_ids TEXT DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -742,7 +904,7 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 15,
-        description: "Add deferred_execute_state column for boundary execution drain",
+        description: "Add the now-retired deferred_execute_state column",
         up: (db: Database) => {
             const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
                 name?: string;
@@ -1849,6 +2011,7 @@ export const MIGRATIONS: Migration[] = [
                     last_observed_at INTEGER,
                     answer_refreshed_at INTEGER,
                     source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -2785,7 +2948,6 @@ export const MIGRATIONS: Migration[] = [
             }
         },
     },
-
     {
         version: 78,
         description: "add migration_pending journal for crash-safe cross-harness session migration",
@@ -2817,7 +2979,6 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
-
     {
         version: 79,
         description: "record m[0] system-hash and model-key comparison telemetry",
@@ -2833,7 +2994,6 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
         },
     },
-
     {
         version: 80,
         description: "record observed m[0] tool-set hash comparisons",
@@ -2847,7 +3007,6 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
         },
     },
-
     {
         version: 81,
         description: "persist last-known-good transform snapshots across restarts",
@@ -2874,7 +3033,6 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
-
     {
         version: 82,
         description: "record the origin of memory file-independent mappings",
@@ -2892,7 +3050,6 @@ export const MIGRATIONS: Migration[] = [
             );
         },
     },
-
     {
         version: 83,
         description: "add indexed rowid access for message FTS content",
@@ -2919,7 +3076,6 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
-
     {
         version: 84,
         description: "persist protected-token floor state per session",
@@ -2929,7 +3085,6 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
         },
     },
-
     {
         version: 85,
         description: "relabel OpenCode 1.x mis-tagged opencode2 session rows",
@@ -2951,7 +3106,7 @@ export const MIGRATIONS: Migration[] = [
             // so twins cannot exist and a plain UPDATE is enough.
             relabelOpenCode2HarnessRows(db);
         },
-    }
+    },
 ];
 
 /**
@@ -2964,160 +3119,6 @@ export const LATEST_MIGRATION_VERSION: number = MIGRATIONS.reduce(
     (max, m) => Math.max(max, m.version),
     0,
 );
-
-/**
- * Upstream helper closure for migrations v77..v85 — ported
- * verbatim from v0.42.6.
- *
- * Generated by tools/port-upstream-migrations.mjs. These live next to the
- * migrations that call them (rather than in a separate module) so this port
- * stays a single-file diff against upstream.
- */
-function tableHasHarnessColumn(db: Database, name: string): boolean {
-    if (!tableExists(db, name)) return false;
-    return (db.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name: string }>).some(
-        (column) => column.name === "harness",
-    );
-}
-export const V85_OPENCODE2_RELABEL_TABLES = [
-    "tags",
-    "pending_ops",
-    "source_contents",
-    "compartments",
-    "compartment_chunk_embeddings",
-    "session_projects",
-    "compartment_events",
-    "compression_depth",
-    "session_facts",
-    "primer_candidates",
-    "notes",
-    "message_history_index",
-    "message_history_source",
-    "pending_session_cleanup",
-    "message_history_orphan_sweep",
-    "session_meta",
-    "subagent_invocations",
-    "historian_runs",
-    "transform_decisions",
-    "recomp_compartments",
-    "recomp_facts",
-] as const;
-export const V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"] as const;
-function deleteLosingOpenCode2Twin(
-    db: Database,
-    table: string,
-    joinColumns: readonly string[],
-    newerPredicate: string,
-): void {
-    if (!tableHasHarnessColumn(db, table)) return;
-    const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
-    const o2On = naturalJoin
-        ? `${naturalJoin} AND oc.harness = 'opencode'`
-        : `oc.harness = 'opencode'`;
-    const ocOn = naturalJoin
-        ? `${naturalJoin} AND o2.harness = 'opencode2'`
-        : `o2.harness = 'opencode2'`;
-    db.exec(`
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT o2.rowid
-            FROM ${table} AS o2
-            JOIN ${table} AS oc
-              ON ${o2On}
-            WHERE o2.harness = 'opencode2'
-              AND NOT (${newerPredicate})
-        );
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT oc.rowid
-            FROM ${table} AS oc
-            JOIN ${table} AS o2
-              ON ${ocOn}
-            WHERE oc.harness = 'opencode'
-              AND (${newerPredicate})
-        );
-    `);
-}
-function relabelOpenCode2HarnessRows(db: Database): void {
-    // session_projects PK(session_id, harness): keep the newer updated_at.
-    // On a tie, keep the already-correct `opencode` row.
-    deleteLosingOpenCode2Twin(
-        db,
-        "session_projects",
-        ["session_id"],
-        "o2.updated_at > oc.updated_at",
-    );
-    // primer_candidates unique includes harness: keep the newer created_at.
-    deleteLosingOpenCode2Twin(
-        db,
-        "primer_candidates",
-        ["project_path", "session_id", "source_start_message_id", "source_end_message_id"],
-        "o2.created_at > oc.created_at",
-    );
-    // transform_decisions PK(session_id, harness, message_id): keep the newer ts_ms.
-    deleteLosingOpenCode2Twin(
-        db,
-        "transform_decisions",
-        ["session_id", "message_id"],
-        "o2.ts_ms > oc.ts_ms",
-    );
-    // message_history_orphan_sweep PK(harness): keep the larger last_swept_at.
-    // NULL sorts as older than any timestamp.
-    deleteLosingOpenCode2Twin(
-        db,
-        "message_history_orphan_sweep",
-        [],
-        "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)",
-    );
-    // session_project_backfill_state PK(harness): prefer a completed cursor
-    // over a mislabelled running lease, then the larger started_at.
-    if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
-        db.exec(`
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode2'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
-              )
-              AND NOT (
-                  (status = 'completed'
-                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                        != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                      AND COALESCE(started_at, -1) > COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
-                          -1
-                      )
-                  )
-              );
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
-              )
-              AND (
-                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
-                    AND status != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
-                      AND COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
-                          -1
-                      ) > COALESCE(started_at, -1)
-                  )
-              );
-        `);
-    }
-
-    const tables = new Set<string>([
-        ...V85_OPENCODE2_RELABEL_TABLES,
-        ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES,
-    ]);
-    for (const table of tables) {
-        if (!tableHasHarnessColumn(db, table)) continue;
-        db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
-    }
-}
 
 function ensureMigrationsTable(db: Database): void {
     db.exec(`
@@ -3202,8 +3203,27 @@ export function runMigrations(db: Database): void {
     let touchedLegacyAuthorityBatch = false;
     while (true) {
         let migration: Migration | undefined;
+        const migrationState: { value?: Migration } = {};
         let currentVersion = 0;
         try {
+            // A current database needs no write lock. This read-only fast path is
+            // important during parallel startup: a sibling's ordinary IMMEDIATE
+            // transaction must not make a fresh opener wait merely to discover
+            // that there is no migration to apply. Pending databases still re-read
+            // under BEGIN IMMEDIATE below before selecting the migration.
+            currentVersion = getCurrentVersion(db);
+            const pendingMigration = MIGRATIONS.find(
+                (candidate) =>
+                    candidate.version > currentVersion &&
+                    !isMigrationApplied(db, candidate.version),
+            );
+            if (!pendingMigration) break;
+            // The transaction callback owns `migration`. Keep it undefined until
+            // BEGIN IMMEDIATE succeeds so lock-acquisition failures retain the
+            // retryable MigrationLockBusyError classification below.
+            migration = undefined;
+
+            const transactionStartedAt = performance.now();
             const applied = db
                 .transaction(() => {
                     currentVersion = getCurrentVersion(db);
@@ -3217,6 +3237,7 @@ export function runMigrations(db: Database): void {
                             candidate.version > currentVersion &&
                             !isMigrationApplied(db, candidate.version),
                     );
+                    migrationState.value = migration;
                     if (!migration) return false;
 
                     if (!loggedPlan) {
@@ -3238,6 +3259,8 @@ export function runMigrations(db: Database): void {
                     return true;
                 })
                 .immediate();
+            logSlowWriteTransaction("migration-runner", transactionStartedAt);
+            migration = migrationState.value;
 
             if (!applied || !migration) break;
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;
@@ -3274,7 +3297,9 @@ export function runMigrations(db: Database): void {
 
     if (touchedLegacyAuthorityBatch) {
         try {
+            const transactionStartedAt = performance.now();
             db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+            logSlowWriteTransaction("migration-runner", transactionStartedAt);
         } catch (error) {
             throw new Error(
                 `Migration authority-trigger postcondition failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,

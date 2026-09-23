@@ -1,6 +1,6 @@
 {
   "name": "@magic-context/core",
-  "version": "0.36.1",
+  "version": "0.42.6",
   "private": true,
   "type": "module",
   "description": "Alias shim: maps the @magic-context/core/* specifier (used by packages/dsh-plugin and packages/adapter-api) onto the vendored upstream Magic Context feature tree at packages/plugin/src. Not a published package upstream — npm returns 404 for @magic-context/core.",

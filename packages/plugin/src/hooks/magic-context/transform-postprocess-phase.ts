@@ -1,36 +1,56 @@
+import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     applyStrippedPlaceholderDelta,
     type ContextDatabase,
-    clearDeferredExecutePendingIfMatches,
+    captureChannel1PostReduceGraceBaseline,
     clearPendingCompactionMarkerStateIf,
     clearPersistedTodoSyntheticAnchor,
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
+    getChannel1NudgeState,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
     getPendingOps,
+    getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
-    getProcessedImageStrippedIds,
-    getStaleReduceStrippedIds,
-    getStrippedPlaceholderIds,
+    getTagsBySession,
     type PendingCompactionMarker,
-    peekDeferredExecutePending,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
+    setPendingCompactionMarkerState,
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    addMergedReasoningStrippedIds,
+    addTrailingBlankDecisions,
+    clearEmergencyDropSample,
+    demoteTrailingBlankKeepDecisions,
+    getDeferredClearedCompactionMarkerState,
+    getEmergencyInputSample,
+    getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getThinkingBindingRecoveryTarget,
+    getTrailingBlankDecisions,
+    loadPostprocessReplaySnapshot,
+    NEWEST_REASONING_BEARING_ASSISTANT,
     type PersistedCompactionMarkerState,
+    type PostprocessReplaySnapshot,
+    retireDeferredClearedCompactionMarkerState,
+    setEmergencyDropSample,
+    THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+    thinkingBindingRecoveryFrozenId,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
+    getOldestActiveUnprotectedToolTags,
     getTagNumberByMessageId,
+    getTailHygieneTags,
+    markTagsCompactedByMessageIds,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -41,6 +61,11 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
+import { hasReclaimRide } from "./cache-busting-signals";
+import {
+    rearmChannel2AfterCoverageAdvancingHardFold,
+    rearmChannel2AfterMeasuredCollapse,
+} from "./channel2-cycle";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
@@ -54,16 +79,26 @@ import {
     resolveToolPermissionDenied,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
+import type { Channel1State } from "./ctx-reduce-nudge";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
+import {
+    type DroppedTokenReduction,
+    estimateDroppedTokensFromTagReductions,
+} from "./dropped-token-estimate";
+import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
     clearInjectionCache,
     getVisibleMemoryIds,
+    hasCompleteCachedM0M1,
+    type InjectM0M1Result,
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
+    type MaterializeDecision,
     mustMaterialize,
     type PreparedCompartmentInjection,
+    prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
 import { markNoteNudgeDelivered, peekNoteNudgeText } from "./note-nudger";
@@ -72,15 +107,38 @@ import type { PassOutcome } from "./pass-outcome";
 import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
+    applyFrozenTrailingBlankDecisions,
+    assistantHasReasoningPart,
     clearOldReasoning,
+    findLatestAssistantReasoningMutationExemptMessage,
+    findMergedReasoningStripDecisions,
+    findNewestReasoningBearingAssistantId,
+    findTrailingBlankDecisionCandidates,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
+    stripReasoningFromAssistantIds,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
+    type TrailingBlankDecision,
+    type TrailingBlankSourceDecisions,
 } from "./strip-content";
-import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
+import {
+    buildEditSupersessionReclaim,
+    buildSupersessionReclaimOps,
+    recentSupersessionOwnerMessageIds,
+} from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
+import {
+    assertTailHygieneContentUnchanged,
+    countRealUserMessages,
+    effectiveTailHygiene,
+    refreshTailHygieneBaseline,
+    sameTailHygieneStructuralSignature,
+    type TailHygieneStructuralSignature,
+    tailHygieneStructuralSignature,
+} from "./tail-hygiene-walk";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -101,12 +159,19 @@ import {
 import { logTransformTiming } from "./transform-stage-logger";
 
 const DEGRADE_CACHE_WARNING_THRESHOLD = 10;
+/**
+ * Keep the newest host-message tail intact when retiring system-only notifications.
+ * This is an actionable-message heuristic, not the persisted tag protection window.
+ */
+const SYSTEM_INJECTION_ACTIONABLE_TAIL_MESSAGES = 40;
 // Bounded (LRU, max 100) so a crashed/never-reset session can't leak an entry
 // forever in a long-running process — matches the other per-session caches.
 const degradedCacheCountBySession = new BoundedSessionMap<number>(100);
+const routinePressureAppliedBySession = new BoundedSessionMap<boolean>(100);
 
 export function resetDegradedCacheCount(sessionId: string): void {
     degradedCacheCountBySession.delete(sessionId);
+    routinePressureAppliedBySession.delete(sessionId);
 }
 
 export type DeferredCompactionMarkerClearOutcome =
@@ -115,13 +180,15 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-already-cleared";
 
 function isSyntheticHeadMessage(message: MessageLike): boolean {
-    // The flag alone is input-controlled metadata: a persisted or foreign row
-    // could carry it and absorb a real message into the injected head, shifting
-    // the summary's canonical position. Require the exact shape only
-    // prependM0M1Messages produces: an ID-less user message whose every part is
-    // marked synthetic. Persisted OpenCode rows always carry an id, so they can
-    // never satisfy this regardless of their metadata.
-    if (message.info.syntheticHead !== true) return false;
+    // Structural shape only — an ID-less user message whose every part is
+    // marked synthetic. Persisted OpenCode rows always carry an id, so no
+    // persisted or foreign row can satisfy this regardless of its metadata;
+    // the shape is exactly what the TS lane's prependM0M1Messages and the
+    // Rust module's m0/m1 encode both produce. The TS lane additionally sets
+    // info.syntheticHead, but the Rust encode does not — requiring the flag
+    // here made the head walk stop at index 0 on rust-mode output and splice
+    // the compaction summary AHEAD of m0, failing the m0 wire invariant on
+    // every pass for sessions with persisted marker state.
     if (message.info.id !== undefined) return false;
     if (message.info.role !== "user") return false;
     const parts = message.parts;
@@ -214,13 +281,22 @@ export async function applyTodoSynthesis(args: {
     todowriteAvailability: ToolAvailabilityVerdict;
     client?: PluginContext["client"];
     activeAgent?: string;
+    replaySnapshot?: Pick<
+        PostprocessReplaySnapshot,
+        "todoPermissionDenied" | "todoSyntheticAnchor"
+    >;
 }): Promise<number> {
     if (!args.fullFeatureMode || args.compactionOff) return 0;
 
-    const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+    const persistedAnchor = args.replaySnapshot
+        ? args.replaySnapshot.todoSyntheticAnchor
+        : getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+    const persistedPermissionDenied = args.replaySnapshot
+        ? args.replaySnapshot.todoPermissionDenied
+        : getPersistedTodoPermissionDenied(args.db, args.sessionId);
     let permissionDenied =
         cachedToolPermissionDenied(args.sessionId, "todowrite") ??
-        getPersistedTodoPermissionDenied(args.db, args.sessionId) ??
+        persistedPermissionDenied ??
         false;
     const toolsMapUnavailable =
         args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
@@ -324,19 +400,141 @@ export async function applyTodoSynthesis(args: {
     return 0;
 }
 
+/** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
+export function replayRustModeBindingMismatchStrips(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    resolvedProviderID?: string;
+}): void {
+    if (!modelAcceptsEmptyContent(args.resolvedProviderID)) return;
+    const recoveryMessageIds = new Set<string>();
+    for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+        if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+        const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+        if (messageId.length > 0) recoveryMessageIds.add(messageId);
+    }
+    stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
+}
+
 /**
- * Apply the host-resident note and recall overlays after native Rust serving.
- * These anchors are deliberately appended after the module response lands: they
- * are TypeScript cache decisions, not module-owned CK bytes.
+ * Rebuild host-owned canonical representation after native Rust serving.
+ * The persisted compaction summary is restored with the same canonicalizer as the
+ * TypeScript lane, then note and recall anchors are replayed onto the native result.
  */
+export interface RustMaterializedCompactionBoundary {
+    /** Durable module row returned by the same transform response as this boundary. */
+    rowVersion: number;
+    /** Last raw block ordinal included in the module's materialized baseline. */
+    ordinal: number;
+    /** OpenCode message id owning the last covered flat block. */
+    endMessageId: string;
+}
+
+/**
+ * Use the boundary carried in the module response as OpenCode's compaction target;
+ * do not replace it with a target read later from status. Store that target in the
+ * local pending blob, advance it only forward in session metadata, and clear it only
+ * when compare-and-swap confirms that the pending value has not changed.
+ */
+export function applyRustModeDeferredCompactionMarker(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    boundary: RustMaterializedCompactionBoundary;
+    sessionDirectory?: string;
+}): void {
+    const { boundary } = args;
+    if (
+        !Number.isSafeInteger(boundary.rowVersion) ||
+        boundary.rowVersion <= 0 ||
+        !Number.isSafeInteger(boundary.ordinal) ||
+        boundary.ordinal < 0 ||
+        boundary.endMessageId.length === 0
+    ) {
+        sessionLog(args.sessionId, "rust compaction-marker: invalid materialized boundary ignored");
+        return;
+    }
+
+    let target: PendingCompactionMarker = {
+        ordinal: boundary.ordinal,
+        endMessageId: boundary.endMessageId,
+        publishedAt: Date.now(),
+    };
+    args.db.transaction(() => {
+        const persisted = getPersistedCompactionMarkerState(args.db, args.sessionId);
+        const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+        if (pending && pending.ordinal > target.ordinal) {
+            target = pending;
+            return;
+        }
+        if (
+            pending &&
+            pending.ordinal === target.ordinal &&
+            pending.endMessageId === target.endMessageId
+        ) {
+            target = pending;
+            return;
+        }
+        if (persisted && persisted.boundaryOrdinal >= target.ordinal && pending === null) return;
+        setPendingCompactionMarkerState(args.db, args.sessionId, target);
+    })();
+
+    const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+    if (!pending || pending.ordinal > boundary.ordinal) return;
+    const outcome = applyDeferredCompactionMarker(
+        args.db,
+        args.sessionId,
+        pending,
+        args.sessionDirectory,
+        {
+            rowVersion: boundary.rowVersion,
+            ordinal: boundary.ordinal,
+            endMessageId: boundary.endMessageId,
+        },
+    );
+    switch (outcome.kind) {
+        case "applied":
+        case "already-current":
+        case "stale-skip":
+            if (!clearPendingCompactionMarkerStateIf(args.db, args.sessionId, pending)) {
+                sessionLog(
+                    args.sessionId,
+                    `rust compaction-marker drain: CAS lost after module row ${boundary.rowVersion}; newer pending target retained`,
+                );
+            }
+            break;
+        case "retryable-failure":
+            sessionLog(
+                args.sessionId,
+                `rust compaction-marker drain: retryable failure after module row ${boundary.rowVersion}; pending target retained`,
+                outcome.error,
+            );
+            break;
+    }
+}
+
 export function runRustModePostprocess(args: {
     db: ContextDatabase;
     sessionId: string;
     messages: MessageLike[];
     projectPath?: string;
+    sessionDirectory?: string;
+    materializedBoundary?: RustMaterializedCompactionBoundary;
     fullFeatureMode: boolean;
-}): void {
-    if (!args.fullFeatureMode) return;
+    compactionOff?: boolean;
+    resolvedProviderID?: string;
+    thinkingBindingRecoveryEnabledForModel?: boolean;
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
+    trailingBlankNewestAssistantId?: string;
+    tagger: Tagger;
+    ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+}): {
+    thinkingBindingRecovery: { flagTarget: string; messageId: string } | null;
+    markerAt: string | null;
+} {
+    if (!args.fullFeatureMode || args.compactionOff) {
+        return { thinkingBindingRecovery: null, markerAt: null };
+    }
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
     // those responses untouched instead of treating a missing `info` object as a failure.
@@ -348,8 +546,27 @@ export function runRustModePostprocess(args: {
                 !isRecord((message as { info?: unknown }).info),
         )
     ) {
-        return;
+        return { thinkingBindingRecovery: null, markerAt: null };
     }
+    if (args.materializedBoundary) {
+        applyRustModeDeferredCompactionMarker({
+            db: args.db,
+            sessionId: args.sessionId,
+            boundary: args.materializedBoundary,
+            sessionDirectory: args.sessionDirectory,
+        });
+    }
+    reconcileMarkerRepresentation(
+        args.messages,
+        getPersistedCompactionMarkerState(args.db, args.sessionId),
+        {
+            db: args.db,
+            sessionId: args.sessionId,
+            tagger: args.tagger,
+            ctxReduceAvailability: args.ctxReduceAvailability,
+            isCacheBustingPass: args.materializedBoundary != null,
+        },
+    );
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
@@ -358,6 +575,45 @@ export function runRustModePostprocess(args: {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const [id, decision] of getTrailingBlankDecisions(args.db, args.sessionId)) {
+                trailingBlankDecisions.set(id, decision);
+            }
+            const candidates = findTrailingBlankDecisionCandidates(
+                args.messages,
+                trailingBlankDecisions,
+                { sourceDecisions: args.trailingBlankSourceDecisions },
+            ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
+            if (candidates.length > 0) {
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: args.trailingBlankNewestAssistantId,
+                });
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (decision) trailingBlankDecisions.set(id, decision);
+                    }
+                } else {
+                    sessionLog(
+                        args.sessionId,
+                        "rust trailing blank decision: persistence failed; serving only frozen decisions",
+                    );
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust trailing blank decision failed:", error);
+        }
+    }
+    // The Rust module's core.frozen_units store owns keep shape and canonical blank counts.
+    // The host may only enforce the absorbing strip direction: replaying keep here could
+    // manufacture a suffix the module intentionally omitted or normalize bytes it already chose.
+    const absorbingStripDecisions = new Map(
+        [...trailingBlankDecisions].filter(([, decision]) => decision === "strip"),
+    );
+    applyFrozenTrailingBlankDecisions(args.messages, absorbingStripDecisions);
 
     const currentUserMessageId = findLastUserMessageId(args.messages);
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
@@ -368,15 +624,69 @@ export function runRustModePostprocess(args: {
         args.projectPath,
         noteReadStillVisible,
     );
-    if (!deferredNoteText) return;
-    const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
-    const anchoredMessageId = findLastUserMessageId(args.messages);
-    const outcome = markNoteNudgeDelivered(args.db, args.sessionId, instruction, anchoredMessageId);
-    if (anchoredMessageId && outcome.ok) {
-        appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
-    } else if (anchoredMessageId && !outcome.ok) {
-        sessionLog(args.sessionId, `rust note-nudge delivery skipped wire append: ${outcome.kind}`);
+    if (deferredNoteText) {
+        const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
+        const anchoredMessageId = findLastUserMessageId(args.messages);
+        const outcome = markNoteNudgeDelivered(
+            args.db,
+            args.sessionId,
+            instruction,
+            anchoredMessageId,
+        );
+        if (anchoredMessageId && outcome.ok) {
+            appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
+        } else if (anchoredMessageId && !outcome.ok) {
+            sessionLog(
+                args.sessionId,
+                `rust note-nudge delivery skipped wire append: ${outcome.kind}`,
+            );
+        }
     }
+
+    const recoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+                const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                if (messageId.length > 0) recoveryMessageIds.add(messageId);
+            }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        recoveryMessageIds.has(messageId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        recoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                    } else {
+                        sessionLog(
+                            args.sessionId,
+                            "rust thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
+        }
+        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
+    }
+    const marker = getPersistedCompactionMarkerState(args.db, args.sessionId);
+    return {
+        thinkingBindingRecovery,
+        markerAt: marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null,
+    };
 }
 
 function dropMarkerSummaryTag(
@@ -405,8 +715,19 @@ export function reconcileMarkerRepresentation(
         sessionId: string;
         tagger: Tagger;
         ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+        isCacheBustingPass?: boolean;
     },
 ): boolean {
+    if (persistedMarkerState === null) {
+        if (options.isCacheBustingPass === true) {
+            retireDeferredClearedCompactionMarkerState(options.db, options.sessionId);
+        } else {
+            persistedMarkerState = getDeferredClearedCompactionMarkerState(
+                options.db,
+                options.sessionId,
+            );
+        }
+    }
     const retainedMessages: MessageLike[] = [];
     const staleSummaryIds = new Set<string>();
     for (const message of messages) {
@@ -509,7 +830,18 @@ export function clearPendingCompactionMarkerAfterSuccessfulDrain(args: {
     return "cas-lost-already-cleared";
 }
 
+export interface CompactionMarkerStrategy {
+    applyDeferred: typeof applyDeferredCompactionMarker;
+    reconcile: typeof reconcileMarkerRepresentation;
+}
+
+export const defaultCompactionMarkerStrategy: CompactionMarkerStrategy = {
+    applyDeferred: applyDeferredCompactionMarker,
+    reconcile: reconcileMarkerRepresentation,
+};
+
 interface RunPostTransformPhaseArgs {
+    compactionMarkerStrategy?: CompactionMarkerStrategy;
     sessionId: string;
     db: ContextDatabase;
     messages: MessageLike[];
@@ -519,6 +851,8 @@ interface RunPostTransformPhaseArgs {
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+    /** Final-array counts of reclaimable tagged mass (U) and total eligible mass (T). */
+    channel1StateBySession?: Map<string, Channel1State>;
     /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
      *  synthetic todo-pair injection below: a session whose tools map filters
      *  todowrite out must not get a synthetic pair for a tool it cannot call. */
@@ -529,7 +863,11 @@ interface RunPostTransformPhaseArgs {
     activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
+    /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
+    usableWindow: number;
     schedulerDecision: "execute" | "defer";
+    /** Use the defer reason resolved with the scheduler decision at the boundary; do not recompute it from this phase's inputs, which may no longer reflect that decision. */
+    schedulerDeferReason?: "scheduler_defer" | null;
     fullFeatureMode: boolean;
     /**
      * Compaction-off mode (issue #266), boot-resolved. Every mutating gate in
@@ -563,7 +901,14 @@ interface RunPostTransformPhaseArgs {
     deferredMaterializationSessions: Set<string>;
     lastHeuristicsTurnId: Map<string, string>;
     clearReasoningAge: number;
-    protectedTags: number;
+    /** Canonical token-window membership consumed by pending-operation application. */
+    protectedTagIds: ReadonlySet<number>;
+    /** Canonical token-window membership in tag-number space. */
+    protectedTagNumbers: ReadonlySet<number>;
+    /** Canonical token-window cutoff in tag-number space. */
+    protectedCutoff: number | null;
+    /** Number of persisted tool rows in the canonical token window. */
+    protectedCount: number;
     /**
      * Ceiling for the tiered emergency drop = contextLimit × executeThreshold%.
      * Undefined when the context limit isn't resolved (cold start) — the
@@ -571,6 +916,15 @@ interface RunPostTransformPhaseArgs {
      */
     emergencyCeilingTokens?: number;
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
+    /**
+     * Messages trimmed while this transform rebuilds history. OpenCode rebuilds
+     * the next request from the boundary written later in this pass, so some rows
+     * can be absent now and return next time. Keep their objects long enough to
+     * persist empty sentinels for placeholder-only assistant messages before then.
+     */
+    hiddenMessagesAtCompactionSeam?: MessageLike[];
+    /** All source rows removed by the in-memory trim; their fresh tags are never served. */
+    trimmedMessagesAtCompactionBoundary?: MessageLike[];
     didMutateFromFlushedStatuses: boolean;
     watermark: number;
     forceMaterializationPercentage: number;
@@ -609,12 +963,18 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    /** True only when the live request is canonical Anthropic Fable 5.1. */
+    thinkingBindingRecoveryEnabledForModel?: boolean;
+    /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
         projectPath?: string;
         projectDirectory?: string;
         injectDocs?: boolean;
+        /** False suppresses every memory-derived m[0]/m[1] surface. */
+        memoryEnabled?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
@@ -632,11 +992,20 @@ export interface PostTransformPhaseResult {
     /** True only when this pass consumed newly folded historian history. */
     historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
+    systemHashPrev: string | null;
+    systemHashNew: string | null;
+    m0ModelKeyPrev: string | null;
+    m0ModelKeyNew: string | null;
+    m0ToolSetHashPrev: string | null;
+    m0ToolSetHashNew: string | null;
+    /** Estimated nonnegative tokens removed by tag reductions first applied this pass. */
     droppedTokens: number;
     emergencyReclaimedTokens: number;
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+    /** Pending flag applied to the live output; the caller clears it only after the live lane succeeds. */
+    thinkingBindingRecovery: { flagTarget: string; messageId: string } | null;
 }
 
 export interface ConfirmedAbortClient {
@@ -725,6 +1094,11 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
+        mergedReasoningStrippedIds?: ReadonlySet<string>;
+        thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
+        trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
+        skipMergedReasoningStrip?: boolean;
+        skipTrailingWhitespaceStrip?: boolean;
     },
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
@@ -747,9 +1121,24 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
-        mutationExemptMessage: options?.reasoningMutationExemptMessage,
-    });
+    const bindingRecoveryParts = options?.skipMergedReasoningStrip
+        ? 0
+        : stripReasoningFromAssistantIds(
+              messages,
+              resolvedProviderID,
+              options?.thinkingBindingRecoveryMessageIds ?? new Set(),
+          );
+    const mergedReasoningParts =
+        bindingRecoveryParts +
+        (options?.skipMergedReasoningStrip
+            ? 0
+            : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+                  mutationExemptMessage: options?.reasoningMutationExemptMessage,
+                  frozenMessageIds: options?.mergedReasoningStrippedIds,
+              }));
+    if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
+        applyFrozenTrailingBlankDecisions(messages, options?.trailingBlankDecisions ?? new Map());
+    }
     return { clearedParts, mergedReasoningParts };
 }
 
@@ -757,16 +1146,21 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
-    // Capture before todo/history synthesis can add assistant messages. Anthropic
-    // requires the signed reasoning blocks from the newest assistant to be replayed
-    // unchanged, and OpenCode serializes these same in-memory message objects.
-    let reasoningMutationExemptMessage: MessageLike | undefined;
+    const trailingBlankSourceDecisions =
+        args.trailingBlankSourceDecisions ?? snapshotTrailingBlankSourceDecisions(args.messages);
+    // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
+    // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
+    // host message because its shape can change before the next pass.
+    let trailingBlankNewestAssistant: MessageLike | undefined;
     for (let index = args.messages.length - 1; index >= 0; index -= 1) {
         const message = args.messages[index];
         if (message.info.role !== "assistant") continue;
-        reasoningMutationExemptMessage = message;
+        trailingBlankNewestAssistant = message;
         break;
     }
+    const reasoningMutationExemptMessage = findLatestAssistantReasoningMutationExemptMessage(
+        args.messages,
+    );
     // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
     // "user wants pending ops + heuristics to run" signal. Survives across
     // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
@@ -795,6 +1189,27 @@ export async function runPostTransformPhase(
     // ≥ the force-materialize threshold.
     const emergencyDropEligible =
         !compactionOff && args.contextUsage.percentage >= args.forceMaterializationPercentage;
+    const executePressureEligible = args.schedulerDecision === "execute" || emergencyDropEligible;
+    if (!executePressureEligible) {
+        routinePressureAppliedBySession.delete(args.sessionId);
+    } else if (args.fullFeatureMode && alreadyRanThisTurn) {
+        // The shared once-per-turn map proves an earlier pass in this pressure
+        // episode already ran even when this process-local episode map is cold.
+        routinePressureAppliedBySession.set(args.sessionId, true);
+    }
+    const routinePressureAlreadyApplied =
+        args.fullFeatureMode &&
+        executePressureEligible &&
+        routinePressureAppliedBySession.get(args.sessionId) === true;
+    // Require five points below the force band so a batch-induced dip cannot
+    // immediately rearm another cache rewrite as the tail regrows.
+    if (
+        args.contextUsage.percentage > 0 &&
+        args.contextUsage.percentage < args.forceMaterializationPercentage - 5 &&
+        getEmergencyInputSample(args.db, args.sessionId) > 0
+    ) {
+        clearEmergencyDropSample(args.db, args.sessionId);
+    }
     const activeCompartmentRun = args.canRunCompartments
         ? getActiveCompartmentRun(args.sessionId)
         : undefined;
@@ -804,19 +1219,9 @@ export async function runPostTransformPhase(
         activeCompartmentRun !== undefined;
     const deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
     const materializationRequested = isExplicitFlush || deferredMaterialize;
-    // Known-bust fold: if m[0] is going to HARD-fold this pass (epoch / model /
-    // system-hash / ttl-idle / mutation-id / upgrade — whatever mustMaterialize
-    // decides), the Anthropic prefix is being re-cached regardless. Drain the
-    // queued tool-drops + run heuristics into THAT bust instead of busting a
-    // second time on a later execute pass. ADVISORY-ONLY: early-true widens the
-    // gates below; early-false changes nothing — injectM0M1 keeps its own
-    // independent late mustMaterialize recheck, so a cross-process epoch/mutation
-    // bump arriving after this point still folds (and its drops drain on a later
-    // pass, exactly as today). Correctness is never worse than today; the cost is
-    // one extra mustMaterialize (indexed DB reads + a cached docs stat).
-    // Kept a SEPARATE boolean — NEVER folded into materializationRequested, which
-    // drives the lastResponseTime TTL reset and pendingMaterialization cleanup;
-    // folding in would suppress those and oscillate.
+    // Persist eligible prefix work off-wire before authorizing automatic cleanup.
+    // Execute may refresh m[1] without changing it: only changed bytes supply a ride.
+    // A failed or contended advisory alone must never open the reduction lanes.
     // Re-gated for compaction-off mode (issue #266): injection runs when the
     // memory/docs identity is present AND (fullFeatureMode || compactionOff),
     // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
@@ -826,7 +1231,7 @@ export async function runPostTransformPhase(
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
-    const m0HardFoldThisPass =
+    const foldDueDecision =
         m0M1EnabledForFold && args.m0M1
             ? mustMaterialize({
                   db: args.db,
@@ -835,112 +1240,159 @@ export async function runPostTransformPhase(
                   projectPath: args.m0M1.projectPath,
                   projectDirectory: args.m0M1.projectDirectory,
                   injectDocs: args.m0M1.injectDocs,
+                  memoryEnabled: args.m0M1.memoryEnabled,
                   muralEnabled: args.m0M1.muralEnabled,
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
                   hardSignals: args.m0M1.hardSignals,
-              }).value
-            : false;
-    // Bypass the compartment-running veto when this pass is busting the Anthropic
-    // prefix REGARDLESS — so the pending-op drain + heuristics ride that one bust
-    // instead of being deferred into a SECOND bust ~a turn later. Two cases:
-    //   - forceMaterialization (the derived force band): overflow prevention trumps cache stability.
-    //   - m0HardFoldThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
-    //     re-caching m[0] this pass; the prefix is already gone, so draining into
-    //     it is free. Without this, a hard fold landing while the historian runs
-    //     leaves the drop vetoed -> it spills to a later soft bust (observed: a
-    //     system-prompt change folded m[0], then the 1807-op backlog drained ~30s
-    //     later as a second bust). Pi already gates this way (context-handler.ts).
-    // Safe in both cases because the historian and the drain touch DISJOINT DBs:
-    //   - Historian reads RAW OpenCode messages from opencode.db (read-only); its
-    //     in-flight snapshot is validated by computeRawRangeFingerprint, which
-    //     hashes raw content only (ids/part-types/lengths), NOT tag/drop state.
-    //   - Drops mutate context.db (tags + pending_ops) + the in-memory wire only.
-    //   - The historian's post-publish queueDropsForCompartmentalizedMessages is
-    //     idempotent against already-dropped tags (status !== "active"), so any
-    //     drain/publish ordering is benign.
-    const bypassCompartmentGate = forceMaterialization || m0HardFoldThisPass;
+              })
+            : { value: false, reason: null };
+    let preparedPrefix: InjectM0M1Result | undefined;
+    const shouldCaptureCachedPrefix =
+        (foldDueDecision.value || args.schedulerDecision === "execute") &&
+        m0M1EnabledForFold &&
+        !emergencyDropEligible;
+    const cachedPrefixBeforePreflight = shouldCaptureCachedPrefix
+        ? prepareCachedM0M1Replay(args.db, args.sessionId)
+        : undefined;
+    const completeCachedPrefixAvailable =
+        (args.sessionMeta.cachedM0Bytes != null && args.sessionMeta.cachedM1Bytes != null) ||
+        cachedPrefixBeforePreflight !== undefined ||
+        (m0M1EnabledForFold &&
+            !shouldCaptureCachedPrefix &&
+            hasCompleteCachedM0M1(args.db, args.sessionId));
+    const firstRenderBust = m0M1EnabledForFold && !completeCachedPrefixAvailable;
+    let foldExecutedThisPass = false;
+    let publishedM1RefreshedThisPass = false;
+    let prefixPreflightFailed = false;
+    const softRefreshOpportunity = args.schedulerDecision === "execute" || deferredMaterialize;
+    let m0RematerializedThisPass = false;
+    const m0CoverageBeforeFold =
+        args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
+    let m0MaterializeReason: string | null = null;
+    // The preflight is the decision site that decides whether m[0] must fold.
+    // Keep its observational tool-set operands even when it correctly declines
+    // to materialize, so a separate cache-busting pass can be attributed later.
+    let m0ComparisonDecision: MaterializeDecision | null = foldDueDecision;
+    if ((foldDueDecision.value || softRefreshOpportunity) && m0M1EnabledForFold && args.m0M1) {
+        try {
+            const previousM1 = args.sessionMeta.cachedM1Bytes?.toString("utf8");
+            // Omitting messages keeps prefix preparation off-wire. The final
+            // injection replays the persisted pair after reductions finish.
+            const foldResult = injectM0M1({
+                db: args.db,
+                sessionId: args.sessionId,
+                state: args.sessionMeta as M0M1State,
+                projectPath: args.m0M1.projectPath,
+                projectDirectory: args.m0M1.projectDirectory,
+                injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
+                memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
+                historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                temporalAwareness: args.m0M1.temporalAwareness,
+                isCacheBustingPass: true,
+                contentionFallbackPrefix: cachedPrefixBeforePreflight,
+                allowFreshContentionFallback: forceMaterialization || emergencyDropEligible,
+                hardSignals: args.m0M1.hardSignals,
+                muralEnabled: args.m0M1.muralEnabled,
+                compactionOff,
+            });
+            preparedPrefix = foldResult;
+            prefixPreflightFailed = foldResult.materializationContentionRetryExhausted === true;
+            foldExecutedThisPass = foldExecutesThisPass(
+                foldDueDecision.value || softRefreshOpportunity,
+                foldResult.m0RematerializedThisPass,
+            );
+            publishedM1RefreshedThisPass =
+                !foldResult.materializationContentionRetryExhausted &&
+                previousM1 !== args.sessionMeta.cachedM1Bytes?.toString("utf8");
+            m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
+            m0MaterializeReason = foldResult.decision.reason;
+            if (foldResult.m0RematerializedThisPass) {
+                m0ComparisonDecision = foldResult.decision;
+            }
+            try {
+                rearmChannel2AfterCoverageAdvancingHardFold({
+                    db: args.db,
+                    sessionId: args.sessionId,
+                    foldExecuted: foldExecutedThisPass,
+                    compactionOff,
+                    previousCoverage: m0CoverageBeforeFold,
+                    currentCoverage: args.sessionMeta.cachedM0MaxCompartmentSeq,
+                });
+            } catch (error) {
+                sessionLog(args.sessionId, "channel2 fold-cycle reset failed (ignored):", error);
+            }
+        } catch (error) {
+            preparedPrefix = cachedPrefixBeforePreflight;
+            prefixPreflightFailed = true;
+            args.passOutcome?.record("m0-m1-fold-preexecution-degradation");
+            sessionLog(
+                args.sessionId,
+                "transform: m[0] HARD fold pre-execution failed:",
+                getErrorMessage(error),
+            );
+        }
+        sessionLog(
+            args.sessionId,
+            `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass}`,
+        );
+    }
+
     const shouldReadPendingOps =
         !compactionOff &&
         (materializationRequested ||
+            publishedM1RefreshedThisPass ||
             args.schedulerDecision === "execute" ||
             forceMaterialization ||
-            m0HardFoldThisPass ||
+            foldExecutedThisPass ||
+            firstRenderBust ||
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
-    // Keep pending-op materialization coupled to the force signal itself. This
-    // prevents an escalation-band change from letting emergency cleanup mutate
-    // the wire while queued operations remain deferred.
-    const shouldApplyPendingOps =
-        !compactionOff &&
-        (args.schedulerDecision === "execute" ||
-            materializationRequested ||
-            forceMaterialization ||
-            m0HardFoldThisPass) &&
-        (!compartmentRunning || bypassCompartmentGate);
-    // Heuristic cleanup runs for ALL sessions — primary and subagent. Subagents
-    // previously skipped heuristics entirely (via fullFeatureMode gate), which
-    // meant their context grew unchecked until overflow. With this change,
-    // subagents run tool drops and reasoning clearing at execute threshold just
-    // like primary sessions, giving them a cache-safe reduction path without
-    // needing historian/compartments.
-    //
-    // `forceMaterialization` remains gated by `fullFeatureMode` above (line ~125)
-    // so subagents do NOT get force-band drop-all-tools or the 95% block. Subagents
-    // rely on normal overflow detection + clean failure if they exhaust context.
-    //
-    // Subagent once-per-turn bypass: a subagent's entire lifecycle is one user
-    // turn from the parent's POV. Heavy subagents (Oracle, Athena council, etc.)
-    // perform 100s of tool calls within that single turn. With the once-per-turn
-    // guard enforced, only ONE cleanup pass fires (typically when context first
-    // crosses the execute threshold ~50%), and subsequent tool calls accumulate
-    // unchecked until overflow. The guard exists for primary-session cache
-    // stability (mid-turn rewrites would bust Anthropic prompt cache across the
-    // user's tool-call sequence). Subagents have no provider-cache reuse to
-    // protect — they're short-lived, one-shot, and their tool-call bursts
-    // already invalidate cache constantly. So we let subagents re-run heuristics
-    // on every execute pass. The `schedulerDecision === "execute"` gate still
-    // prevents per-defer-pass thrash; only passes the scheduler explicitly
-    // approves for execution can fire heuristics.
+    const formatPendingOpsDepth = (): string => {
+        const depth = getPendingOpsCount(args.db, args.sessionId);
+        return depth === null ? "not loaded (deferred pass)" : String(depth);
+    };
+    // All first applications share an independently priced cache-bust permission.
+    const rideSignals = {
+        hardFold: foldExecutedThisPass || firstRenderBust,
+        force:
+            emergencyDropEligible &&
+            (args.contextUsage.percentage >= 95 ||
+                getEmergencyInputSample(args.db, args.sessionId) === 0),
+        explicitFlush: isExplicitFlush || (deferredMaterialize && !prefixPreflightFailed),
+        publishedHistory:
+            publishedM1RefreshedThisPass ||
+            (!m0M1EnabledForFold &&
+                (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
+                (args.historyRebuiltThisPass ||
+                    args.rebuiltHistoryFromInitialPrepare ||
+                    (args.canConsumeDeferredLate && args.deferredHistoryWasPendingAtPassStart))),
+    };
+    const publishedWorkDrainAllowed = !compactionOff && hasReclaimRide(rideSignals);
+    const shouldApplyPendingOps = publishedWorkDrainAllowed;
     const shouldRunHeuristics =
         !compactionOff &&
-        (!compartmentRunning || bypassCompartmentGate) &&
-        (materializationRequested ||
+        hasReclaimRide(rideSignals) &&
+        (rideSignals.publishedHistory ||
+            materializationRequested ||
             forceMaterialization ||
-            // Known m[0] hard-fold this pass: the prefix busts regardless, so
-            // running heuristics here folds the drops into the one bust. Bypasses
-            // the once-per-turn guard deliberately (the guard exists to avoid
-            // mid-turn cache busts; this pass busts anyway), so a hard fold that
-            // lands mid-turn still drains.
-            m0HardFoldThisPass ||
+            // The off-wire fold landed, so the prefix already busted. Heuristics
+            // may ride it and bypass the once-per-turn guard without creating an
+            // independent prefix rewrite.
+            foldExecutedThisPass ||
+            firstRenderBust ||
             // the derived force band emergency floor for BOTH primary and subagent. For a primary
             // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
             // for a subagent (no forceMaterialization) it's the only path that
-            // fires the tiered drop, even if the scheduler deferred mid-turn.
+            // fires the tiered drop even when the ordinary scheduler defers.
             emergencyDropEligible ||
             (args.schedulerDecision === "execute" &&
                 (!alreadyRanThisTurn || !args.fullFeatureMode)));
-    // Central cache-busting gate used by all mutation paths below.
-    //
-    // Definition: TRUE only when this pass actually mutates message state —
-    // either by applying pending ops or by running heuristic cleanup. This
-    // is the Oracle 2026-04-26 fix: the previous `isExplicitFlush ||
-    // shouldApplyPendingOps` definition was unsafe because `isExplicitFlush`
-    // could be true even on a defer pass where compartmentRunning blocked
-    // both materialization and heuristics, causing cache-busting-only
-    // cleanup (placeholder detection, sticky reminder retirement, nudge
-    // anchor retirement) to fire on a pass that produced no real mutations.
-    //
-    // Both `shouldApplyPendingOps` and `shouldRunHeuristics` already gate on
-    // `(!compartmentRunning || bypassCompartmentGate)` so they're
-    // genuine "will-actually-mutate" booleans. ORing them is the precise
-    // "did we mutate this pass" signal.
-    //
-    // Symmetry note: `system-prompt-hash.ts` and `inject-compartments.ts`
-    // remain narrow (each reads its own dedicated set) so adjunct refresh
-    // and history rebuild are decoupled from materialization timing.
-    const isCacheBustingPass = shouldApplyPendingOps || shouldRunHeuristics;
+    // Every first-application lane and m[1] refresh uses this same permission.
+    // It authorizes mutation; individual lanes may still find no eligible work.
+    const isCacheBustingPass = publishedWorkDrainAllowed;
     // ctx_reduce stays frozen for prompt-hash stability, but observe the live
     // permission signal on the same busts so an operator knows guidance may be
     // stale until the session restarts. This log never changes the wire.
@@ -982,8 +1434,8 @@ export async function runPostTransformPhase(
               ? "deferred_materialization"
               : forceMaterialization
                 ? `force_materialization (${args.contextUsage.percentage.toFixed(1)}% >= ${args.forceMaterializationPercentage}%)`
-                : m0HardFoldThisPass && args.schedulerDecision !== "execute"
-                  ? `m0_hard_fold (drain folded into known m[0] bust, scheduler=${args.schedulerDecision})`
+                : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                  ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
                   : subagentRerun
                     ? `scheduler_execute_subagent_rerun (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`
                     : `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
@@ -991,6 +1443,8 @@ export async function runPostTransformPhase(
             args.sessionId,
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
+    } else if (args.schedulerDeferReason !== undefined && args.schedulerDeferReason !== null) {
+        sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${args.schedulerDeferReason}`);
     }
     // Only show "skipping" log for primary sessions — subagents bypass the
     // once-per-turn guard and DO re-run, so logging "skipping" would be wrong.
@@ -1005,35 +1459,33 @@ export async function runPostTransformPhase(
             `transform: skipping heuristics (already ran for turn ${args.currentTurnId})`,
         );
     }
-    if (compartmentRunning && hasPendingUserOps) {
-        if (bypassCompartmentGate) {
-            const bypassReason = forceMaterialization
-                ? `emergency >=${args.forceMaterializationPercentage}%`
-                : "m0 hard fold";
-            sessionLog(
-                args.sessionId,
-                `transform: compartment-gate bypass (${bypassReason}) — applying ${pendingOps.length} pending ops while compartment agent runs (${args.contextUsage.percentage.toFixed(1)}%)`,
-            );
-        } else {
-            sessionLog(
-                args.sessionId,
-                "transform: deferring pending ops — compartment agent in progress",
-            );
-        }
+    if (
+        !shouldApplyPendingOps &&
+        args.schedulerDeferReason !== undefined &&
+        args.schedulerDeferReason !== null
+    ) {
+        sessionLog(
+            args.sessionId,
+            `pending ops WILL NOT APPLY — reason=${args.schedulerDeferReason} pendingOps=${formatPendingOpsDepth()} context=${args.contextUsage.percentage.toFixed(1)}%`,
+        );
+    }
+    if (hasPendingUserOps && !shouldApplyPendingOps) {
+        sessionLog(
+            args.sessionId,
+            `pending ops held — reason=no originating cache-bust opportunity; scheduler=${args.schedulerDecision}, historianRunning=${compartmentRunning}`,
+        );
     }
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
-    let heuristicsRanSuccessfully = false;
-    let pendingOpsRanSuccessfully = false;
     let pendingOpsDidMutate = false;
     let heuristicOrReasoningDidMutate = false;
     let droppedCount = 0;
-    const droppedTokens = 0;
+    let droppedTokens = 0;
+    const droppedTokenReductions: DroppedTokenReduction[] = [];
     let emergencyReclaimedTokens = 0;
     let emergency = false;
-    let m0RematerializedThisPass = false;
-    let m0MaterializeReason: string | null = null;
     let m0M1InjectedThisPass = false;
+    let deliveredPrefix: InjectM0M1Result | undefined;
     let prependedMessageCount = 0;
     const reasoningMutatedMessages = new Set<MessageLike>();
     let reasoningMutationTargetUnknown = false;
@@ -1050,10 +1502,12 @@ export async function runPostTransformPhase(
                 ? "explicit_flush"
                 : deferredMaterialize
                   ? "deferred_materialization"
-                  : `scheduler_execute (scheduler=${args.schedulerDecision})`;
+                  : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                    ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
+                    : `scheduler_execute (scheduler=${args.schedulerDecision})`;
             sessionLog(
                 args.sessionId,
-                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
+                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${formatPendingOpsDepth()}, context=${args.contextUsage.percentage.toFixed(1)}%`,
             );
             const tApply = performance.now();
             // P0 perf: don't pass `args.tags` here. applyPendingOperations
@@ -1071,9 +1525,14 @@ export async function runPostTransformPhase(
                 args.sessionId,
                 args.db,
                 args.targets,
-                args.protectedTags,
+                args.contextUsage.percentage >= 95
+                    ? newestCtxReduceTagNumbers(getTagsBySession(args.db, args.sessionId))
+                    : args.protectedTagIds,
                 undefined,
                 pendingOps,
+                [],
+                new Set(),
+                (reduction) => droppedTokenReductions.push(reduction),
             );
             if (pendingOpsDidMutate) {
                 droppedCount += pendingOps.length;
@@ -1100,16 +1559,44 @@ export async function runPostTransformPhase(
             const heuristicTags = shouldApplyPendingOps
                 ? getActiveTagsBySession(args.db, args.sessionId)
                 : args.tags;
+            const independentMutationBeforeHeuristics =
+                pendingOpsDidMutate ||
+                args.didMutateFromFlushedStatuses ||
+                foldExecutedThisPass ||
+                args.historyRebuiltThisPass ||
+                args.compartmentInjectionRebuiltFromDb ||
+                args.rebuiltHistoryFromInitialPrepare;
+            // An independent mutation is already pricing this pass. Rearm the
+            // emergency batch so all candidates accumulated during sustained
+            // force pressure can ride it instead of waiting for another episode.
+            if (
+                emergencyDropEligible &&
+                independentMutationBeforeHeuristics &&
+                getEmergencyInputSample(args.db, args.sessionId) > 0
+            ) {
+                clearEmergencyDropSample(args.db, args.sessionId);
+            }
+            // Force-originated tool and text rewrites share the durable episode.
+            // A small pressure dip or a process restart cannot rearm just the text lane.
+            // Independent work and the absolute emergency arm still admit all lanes.
+            let routineCleanupApplied =
+                (emergencyDropEligible
+                    ? args.contextUsage.percentage >= 95 ||
+                      getEmergencyInputSample(args.db, args.sessionId) === 0
+                    : !args.fullFeatureMode || !routinePressureAlreadyApplied) ||
+                materializationRequested ||
+                independentMutationBeforeHeuristics;
             // Pending ops run just before heuristics and can drop active tags.
             // Emergency floor math must see that post-op active set; otherwise
             // already-reclaimed tags stay in floorTags and the planner over-evicts.
-            const cleanup = applyHeuristicCleanup(
+            let cleanup = applyHeuristicCleanup(
                 args.sessionId,
                 args.db,
                 args.targets,
                 args.messageTagNumbers,
                 {
-                    protectedTags: args.protectedTags,
+                    protectedTagNumbers: args.protectedTagNumbers,
+                    protectedCutoff: args.protectedCutoff,
                     // Tiered emergency drop fires only at the derived force band (both primary and
                     // subagent) AND only when the ceiling is known. Undefined
                     // ceiling (cold start) or below-threshold usage → no
@@ -1122,12 +1609,50 @@ export async function runPostTransformPhase(
                             ? {
                                   currentTotalInputTokens: args.contextUsage.inputTokens,
                                   ceilingTokens: args.emergencyCeilingTokens,
+                                  usagePercentage: args.contextUsage.percentage,
                               }
                             : undefined,
+                    routine: routineCleanupApplied,
                     caveman: cavemanConfig,
                 },
                 heuristicTags,
             );
+            if (!routineCleanupApplied && cleanup.emergencyDroppedTools > 0) {
+                // The emergency selector just created the episode's one pressure
+                // bust. Drain the routine lanes into that same pass, then keep them
+                // frozen on later force-band passes.
+                const ridingCleanup = applyHeuristicCleanup(
+                    args.sessionId,
+                    args.db,
+                    args.targets,
+                    args.messageTagNumbers,
+                    {
+                        protectedTagNumbers: args.protectedTagNumbers,
+                        protectedCutoff: args.protectedCutoff,
+                        routine: true,
+                        caveman: cavemanConfig,
+                    },
+                    getActiveTagsBySession(args.db, args.sessionId),
+                );
+                cleanup = {
+                    droppedTools: cleanup.droppedTools + ridingCleanup.droppedTools,
+                    deduplicatedTools: cleanup.deduplicatedTools + ridingCleanup.deduplicatedTools,
+                    droppedInjections: cleanup.droppedInjections + ridingCleanup.droppedInjections,
+                    emergencyDroppedTools: cleanup.emergencyDroppedTools,
+                    emergencyReclaimedTokens: cleanup.emergencyReclaimedTokens,
+                    compressedTextTags:
+                        cleanup.compressedTextTags + ridingCleanup.compressedTextTags,
+                    mutatedTextTags: cleanup.mutatedTextTags + ridingCleanup.mutatedTextTags,
+                    droppedTokenReductions: [
+                        ...cleanup.droppedTokenReductions,
+                        ...ridingCleanup.droppedTokenReductions,
+                    ],
+                };
+                routineCleanupApplied = true;
+            }
+            if (routineCleanupApplied && args.fullFeatureMode && executePressureEligible) {
+                routinePressureAppliedBySession.set(args.sessionId, true);
+            }
             logTransformTiming(
                 args.sessionId,
                 "applyHeuristicCleanup",
@@ -1146,6 +1671,7 @@ export async function runPostTransformPhase(
                 cleanup.mutatedTextTags;
             emergency ||= cleanup.emergencyDroppedTools > 0;
             emergencyReclaimedTokens += cleanup.emergencyReclaimedTokens;
+            droppedTokenReductions.push(...cleanup.droppedTokenReductions);
             const t7 = performance.now();
             // Typed reasoning clearing is canonical-Anthropic-only. clearOldReasoning
             // rewrites a reasoning part's `thinking`/`text` to "[cleared]"; only
@@ -1160,22 +1686,21 @@ export async function runPostTransformPhase(
             // providers keep their reasoning intact. Inline-thinking stripping
             // below stays provider-independent (it removes literal <thinking> tags
             // from text, never touches typed reasoning parts).
-            const clearedReasoning = canUseEmptySentinels
-                ? clearOldReasoning(
-                      args.messages,
-                      args.reasoningByMessage,
-                      args.messageTagNumbers,
-                      args.clearReasoningAge,
-                  )
-                : 0;
-            if (canUseEmptySentinels) {
+            const clearedReasoning =
+                routineCleanupApplied && canUseEmptySentinels
+                    ? clearOldReasoning(
+                          args.messages,
+                          args.reasoningByMessage,
+                          args.messageTagNumbers,
+                          args.clearReasoningAge,
+                      )
+                    : 0;
+            if (routineCleanupApplied && canUseEmptySentinels) {
                 stripClearedReasoning(args.messages);
             }
-            const strippedInline = stripInlineThinking(
-                args.messages,
-                args.messageTagNumbers,
-                args.clearReasoningAge,
-            );
+            const strippedInline = routineCleanupApplied
+                ? stripInlineThinking(args.messages, args.messageTagNumbers, args.clearReasoningAge)
+                : 0;
             if (clearedReasoning > 0 || strippedInline > 0) {
                 // Compute and persist the reasoning watermark so future defer passes
                 // can replay the same clearing without re-computing the cutoff.
@@ -1226,11 +1751,14 @@ export async function runPostTransformPhase(
             updateSessionMeta(args.db, args.sessionId, { lastResponseTime: Date.now() });
         }
 
-        const toolReclaimExecutePass = !compactionOff && args.schedulerDecision === "execute";
-        const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
+        // Consume only after the shared tool/text batch actually changed bytes.
+        if (emergencyDropEligible && (pendingOpsDidMutate || heuristicOrReasoningDidMutate)) {
+            setEmergencyDropSample(args.db, args.sessionId, args.contextUsage.inputTokens);
+        }
+        const toolReclaimApplicationOpportunity = isCacheBustingPass;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
-        if (toolReclaimExecutePass && alreadyMutatingThisPass && !emergencyDropEligible) {
+        if (toolReclaimApplicationOpportunity && !emergencyDropEligible) {
             const syntheticPendingOps = buildSyntheticToolReclaimOps({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -1243,14 +1771,19 @@ export async function runPostTransformPhase(
             // superseded edits to an edit_marker (keep filePath + region hint).
             // Merged into the same gated apply as the age-based sweep. Dedupe
             // against those ops (a tag can qualify under more than one rule).
+            // The newest 20 owner messages remain untouched, matching the module
+            // lane's continuation floor independently of the token-mass protection window.
             const editMarkerTagIds = new Set<number>();
             if (args.smartDrops) {
+                const recentMessageIds = recentSupersessionOwnerMessageIds(args.db, args.sessionId);
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
                 const supersessionOps = buildSupersessionReclaimOps({
                     db: args.db,
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
+                    protectedTagNumbers: args.protectedTagNumbers,
                 });
                 for (const op of supersessionOps) {
                     if (!selectedIds.has(op.tagId)) {
@@ -1263,6 +1796,8 @@ export async function runPostTransformPhase(
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
+                    protectedTagNumbers: args.protectedTagNumbers,
                 });
                 for (const op of editReclaim.ops) {
                     // A superseded edit only compresses if no earlier rule already
@@ -1281,11 +1816,12 @@ export async function runPostTransformPhase(
                     args.sessionId,
                     args.db,
                     args.targets,
-                    args.protectedTags,
+                    args.protectedTagIds,
                     undefined,
                     [],
                     syntheticPendingOps,
                     editMarkerTagIds,
+                    (reduction) => droppedTokenReductions.push(reduction),
                 );
                 if (autoReclaimDidMutate) {
                     droppedCount += syntheticPendingOps.length;
@@ -1299,7 +1835,11 @@ export async function runPostTransformPhase(
             }
         }
         args.batch?.finalize();
-        if (toolReclaimExecutePass) {
+        // Advance whenever reclaim could have applied, even if no tags were
+        // selected. Plain execute-band residency does not advance the watermark;
+        // otherwise each newly eligible tag could drop separately instead of
+        // waiting for the next independently priced batch.
+        if (toolReclaimApplicationOpportunity) {
             const maxTagNumber = advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
             args.sessionMeta.toolReclaimWatermark = Math.max(
                 args.sessionMeta.toolReclaimWatermark ?? 0,
@@ -1319,16 +1859,27 @@ export async function runPostTransformPhase(
         if (shouldRunHeuristics) {
             if (isExplicitFlush) explicitMaterializedSuccessfully = true;
             if (deferredMaterialize) deferredMaterializedSuccessfully = true;
-            heuristicsRanSuccessfully = true;
-        }
-        if (shouldApplyPendingOps) {
-            pendingOpsRanSuccessfully = true;
         }
     } catch (error) {
         args.passOutcome?.record("pending-operation-failure");
         sessionLog(args.sessionId, "transform failed applying pending operations:", error);
         updateSessionMeta(args.db, args.sessionId, { lastTransformError: getErrorMessage(error) });
     }
+
+    if (isCacheBustingPass) {
+        droppedTokens = estimateDroppedTokensFromTagReductions(
+            args.db,
+            args.sessionId,
+            droppedTokenReductions,
+        );
+    }
+
+    // All replay-only fields below come from one coherent session_meta row.
+    // Writes that use compare-and-swap still perform their own winner re-read;
+    // this snapshot only coalesces independent reads between those mutations.
+    const replaySnapshot = !compactionOff
+        ? loadPostprocessReplaySnapshot(args.db, args.sessionId)
+        : undefined;
 
     // Stale ctx_reduce strip is a REPLAY-class transform driven by a FROZEN,
     // id-keyed watermark (`stale_reduce_stripped_ids`), mirroring reasoning /
@@ -1339,8 +1890,8 @@ export async function runPostTransformPhase(
     //   • DETECT (cache-busting passes only): additionally find aged ctx_reduce
     //     calls past the protected window, strip them, and CAS-persist their ids
     //     so future passes replay them.
-    // The earlier "run every pass with a live messages.length-protectedTags
-    // boundary" version busted the Anthropic cache: tail growth moved the
+    // The earlier version recomputed a live message-count boundary on every
+    // pass and busted the Anthropic cache: tail growth moved the
     // boundary, so a DEFER pass newly stripped an older ctx_reduce call
     // mid-prefix (empty sentinel filtered for Anthropic + dropped tool_result →
     // adjacent assistants merge → the message vanishes and the array shifts).
@@ -1348,13 +1899,13 @@ export async function runPostTransformPhase(
     // moving boundary entirely. Empty reduce sentinels are Anthropic-only: on
     // other providers even a previously frozen id must stay native so no empty
     // text block can reach the wire.
-    if (canUseEmptySentinels && !compactionOff) {
+    if (canUseEmptySentinels && !compactionOff && replaySnapshot) {
         try {
             const t8 = performance.now();
-            const frozenStaleReduceIds = getStaleReduceStrippedIds(args.db, args.sessionId);
+            const frozenStaleReduceIds = replaySnapshot.staleReduceStrippedIds;
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
-                protectedCount: args.protectedTags,
+                protectedCount: args.protectedCount,
             });
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
                 addStaleReduceStrippedIds(
@@ -1376,10 +1927,10 @@ export async function runPostTransformPhase(
     // that first strip on the live watermark let a DEFER pass cross an older
     // image message and remove its images mid-prefix, busting the cache.
     // Freeze the id set on cache-busting passes; replay it every pass.
-    if (canUseEmptySentinels && !compactionOff) {
+    if (canUseEmptySentinels && !compactionOff && replaySnapshot) {
         try {
             const tImg = performance.now();
-            const frozenImageIds = getProcessedImageStrippedIds(args.db, args.sessionId);
+            const frozenImageIds = replaySnapshot.processedImageStrippedIds;
             const imageResult = stripProcessedImages(args.messages, frozenImageIds, {
                 detect: isCacheBustingPass && args.watermark > 0,
                 watermark: args.watermark,
@@ -1408,10 +1959,13 @@ export async function runPostTransformPhase(
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 temporalAwareness: args.m0M1.temporalAwareness,
                 isCacheBustingPass,
+                preparedPrefix,
+                allowFreshContentionFallback: forceMaterialization || emergencyDropEligible,
                 hardSignals: args.m0M1.hardSignals,
                 muralEnabled: args.m0M1.muralEnabled,
                 // Compaction-off materializes through the zero-compartment
@@ -1419,11 +1973,15 @@ export async function runPostTransformPhase(
                 // compartment rows never reach <session-history>.
                 compactionOff,
             });
+            deliveredPrefix = result;
             if (result.injected) {
                 m0M1InjectedThisPass = true;
                 prependedMessageCount += result.prependedMessageCount;
                 m0RematerializedThisPass ||= result.m0RematerializedThisPass;
                 m0MaterializeReason = result.decision.reason ?? m0MaterializeReason;
+                if (result.m0RematerializedThisPass) {
+                    m0ComparisonDecision = result.decision;
+                }
                 sessionLog(
                     args.sessionId,
                     `transform: injected m[0]/m[1] (rematerialized=${result.m0RematerializedThisPass}, reason=${result.decision.reason ?? "cache_hit"})`,
@@ -1512,10 +2070,10 @@ export async function runPostTransformPhase(
 
     // Neutralize messages that are nothing but [dropped §N§] placeholders,
     // plus system-injected messages (notifications, reminders, internal markers).
-    // Both produce IDENTICAL empty-text-sentinel replacements that preserve array
-    // length between passes — cache-stable for both Anthropic-native (where
-    // OpenCode's upstream filter drops the empty parts at the wire) and proxy
-    // providers that hash the serialized message array.
+    // Canonical Anthropic uses empty sentinels that its adapter filters. A seam
+    // row hidden on the fold pass must instead be removed when replayed through a
+    // provider that rejects empty content; rendering `[dropped]` would introduce
+    // bytes that the fold never served.
     //
     // MUST run AFTER compartment injection: renderCompartmentInjection checks whether
     // messages[0] is a dropped placeholder to decide if it needs a synthetic carrier message.
@@ -1526,17 +2084,19 @@ export async function runPostTransformPhase(
     //
     // Compaction-off: placeholder/system-injected neutralization is strip
     // machinery — gated off; the wire keeps its original shape.
-    if (!compactionOff) {
+    if (!compactionOff && replaySnapshot) {
         const tPlaceholder = performance.now();
-        const persistedIds = getStrippedPlaceholderIds(args.db, args.sessionId);
+        const persistedIds = replaySnapshot.strippedPlaceholderIds;
+        const hiddenSeamIds = replaySnapshot.hiddenSeamPlaceholderIds;
 
-        // Step 1: Replay — re-apply sentinel to messages whose IDs were neutralized
-        // on a prior bust pass. Preserves array length — no splice.
+        // Step 1: Replay prior decisions. Ordinary rows keep provider-safe
+        // sentinels; non-Anthropic hidden-seam rows are removed to match the fold.
         if (persistedIds.size > 0) {
-            const { replayed, missingIds } = replaySentinelByMessageIds(
+            const { replayed } = replaySentinelByMessageIds(
                 args.messages,
                 persistedIds,
                 args.resolvedProviderID,
+                hiddenSeamIds,
             );
             if (replayed > 0) {
                 sessionLog(
@@ -1544,15 +2104,12 @@ export async function runPostTransformPhase(
                     `sentinel replay: neutralized ${replayed} previously-stripped messages`,
                 );
             }
-            // Prune IDs that no longer appear in the live message set (e.g., after
-            // compaction trimmed them out entirely). Don't prune if they're present
-            // but already sentinel — those are working as intended.
-            if (missingIds.length > 0) {
-                for (const id of missingIds) persistedIds.delete(id);
-                // CAS delta (remove) so a sibling process discovering new IDs in
-                // parallel isn't clobbered by this prune's whole-set overwrite.
-                applyStrippedPlaceholderDelta(args.db, args.sessionId, { remove: missingIds });
-            }
+            // Absence from one transform array is not deletion. Advancing the
+            // compaction marker can temporarily hide source rows on the fold pass
+            // and project them again on the next pass. Their frozen sentinel IDs
+            // must survive that gap so the reappearing rows keep the bytes already
+            // served at the seam. The message.deleted handler removes IDs only
+            // after OpenCode confirms that the durable source row was deleted.
         }
 
         // Step 2: Detect — only on cache-busting passes, find NEW eligible messages
@@ -1562,30 +2119,61 @@ export async function runPostTransformPhase(
                 args.messages,
                 args.resolvedProviderID,
             );
-            const protectedTailStart = Math.max(0, args.messages.length - args.protectedTags * 2);
+            const protectedTailStart = Math.max(
+                0,
+                args.messages.length - SYSTEM_INJECTION_ACTIONABLE_TAIL_MESSAGES,
+            );
             const systemInjectedResult = stripSystemInjectedMessages(
                 args.messages,
                 protectedTailStart,
                 args.resolvedProviderID,
             );
+            const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
+            const hiddenDroppedResult = stripDroppedPlaceholderMessages(
+                hiddenMessages,
+                args.resolvedProviderID,
+            );
+            const hiddenSystemInjectedResult = stripSystemInjectedMessages(
+                hiddenMessages,
+                hiddenMessages.length,
+                args.resolvedProviderID,
+            );
 
             const newlyNeutralized =
-                droppedResult.sentineledIds.length + systemInjectedResult.sentineledIds.length;
+                droppedResult.sentineledIds.length +
+                systemInjectedResult.sentineledIds.length +
+                hiddenDroppedResult.sentineledIds.length +
+                hiddenSystemInjectedResult.sentineledIds.length;
 
             if (newlyNeutralized > 0) {
                 const addedIds = [
                     ...droppedResult.sentineledIds,
                     ...systemInjectedResult.sentineledIds,
+                    ...hiddenDroppedResult.sentineledIds,
+                    ...hiddenSystemInjectedResult.sentineledIds,
                 ];
                 for (const id of addedIds) persistedIds.add(id);
                 // CAS delta (add) so a concurrent prune in a sibling process
                 // doesn't clobber these newly-discovered IDs.
-                applyStrippedPlaceholderDelta(args.db, args.sessionId, { add: addedIds });
+                applyStrippedPlaceholderDelta(args.db, args.sessionId, {
+                    add: addedIds,
+                    hiddenSeamAdd: [
+                        ...hiddenDroppedResult.sentineledIds,
+                        ...hiddenSystemInjectedResult.sentineledIds,
+                    ],
+                });
                 sessionLog(
                     args.sessionId,
-                    `neutralized ${droppedResult.stripped} dropped + ${systemInjectedResult.stripped} system-injected messages (${newlyNeutralized} new, ${persistedIds.size} total persisted)`,
+                    `neutralized ${droppedResult.stripped} dropped + ${systemInjectedResult.stripped} system-injected messages + ${hiddenDroppedResult.stripped + hiddenSystemInjectedResult.stripped} hidden-at-marker-seam (${newlyNeutralized} new, ${persistedIds.size} total persisted)`,
                 );
             }
+        }
+
+        const trimmedMessageIds = (args.trimmedMessagesAtCompactionBoundary ?? [])
+            .map((message) => message.info.id)
+            .filter((id): id is string => typeof id === "string");
+        if (trimmedMessageIds.length > 0) {
+            markTagsCompactedByMessageIds(args.db, args.sessionId, trimmedMessageIds);
         }
         logTransformTiming(args.sessionId, "pp.placeholderNeutralize", tPlaceholder);
     }
@@ -1602,11 +2190,11 @@ export async function runPostTransformPhase(
     // Sticky-injection replay (§2.4): every pass replays every persisted anchor
     // so cached user-message bytes remain identical until that message leaves
     // the visible window. Prune happens later, only on cache-busting passes.
-    if (args.fullFeatureMode && !compactionOff) {
-        for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
+    if (args.fullFeatureMode && !compactionOff && replaySnapshot) {
+        for (const anchor of replaySnapshot.noteNudgeAnchors) {
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
-        for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
+        for (const decision of replaySnapshot.autoSearchHintDecisions) {
             if (decision.decision === "hint") {
                 appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
             }
@@ -1627,6 +2215,9 @@ export async function runPostTransformPhase(
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
     const historyWasConsumedThisPass =
+        (!m0M1Enabled ||
+            (deliveredPrefix?.injected === true &&
+                !deliveredPrefix.materializationContentionRetryExhausted)) &&
         args.historyRebuiltThisPass &&
         (args.canConsumeDeferredLate ||
             args.phaseJustAwaitedPublication ||
@@ -1636,8 +2227,9 @@ export async function runPostTransformPhase(
     // Drain the persisted marker before todo synthesis so the todo anchor sees
     // the same summary representation that this pass will emit.
     let suppressV12HistoryDrain = false;
+    let persistedCompactionMarkerState = replaySnapshot?.compactionMarker ?? null;
     if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
-        const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
+        const pending = replaySnapshot?.pendingCompactionMarker ?? null;
         if (pending) {
             if (
                 !pendingMarkerCoveredByConsumedBoundary(pending, args.pendingCompartmentInjection)
@@ -1648,16 +2240,19 @@ export async function runPostTransformPhase(
                     `compaction-marker drain: pending ordinal ${pending.ordinal} is newer than consumed boundary ${args.pendingCompartmentInjection?.compartmentEndMessage ?? "<none>"}; preserving deferred history refresh signal`,
                 );
             } else {
-                const outcome = applyDeferredCompactionMarker(
-                    args.db,
-                    args.sessionId,
-                    pending,
-                    args.sessionDirectory,
-                );
+                const outcome = (
+                    args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
+                ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
                 switch (outcome.kind) {
                     case "applied":
                     case "already-current":
                     case "stale-skip":
+                        // Marker application performs compare-and-swap/write work.
+                        // Re-read its committed winner before reconciling the wire.
+                        persistedCompactionMarkerState = getPersistedCompactionMarkerState(
+                            args.db,
+                            args.sessionId,
+                        );
                         if (
                             clearPendingCompactionMarkerAfterSuccessfulDrain({
                                 db: args.db,
@@ -1689,14 +2284,15 @@ export async function runPostTransformPhase(
     // here has state to replay; leaving it live would re-insert a synthetic
     // summary into the wire of a mode that must stay additive-only.
     if (!compactionOff) {
-        reconcileMarkerRepresentation(
+        (args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy).reconcile(
             args.messages,
-            getPersistedCompactionMarkerState(args.db, args.sessionId),
+            persistedCompactionMarkerState,
             {
                 db: args.db,
                 sessionId: args.sessionId,
                 tagger: args.tagger,
                 ctxReduceAvailability: args.ctxReduceAvailability,
+                isCacheBustingPass,
             },
         );
     }
@@ -1759,6 +2355,7 @@ export async function runPostTransformPhase(
             todowriteAvailability: args.todowriteAvailability,
             client: args.client,
             activeAgent: args.activeAgent,
+            replaySnapshot,
         });
     }
 
@@ -1805,38 +2402,12 @@ export async function runPostTransformPhase(
         });
     }
 
-    const workExecutedSuccessfully =
-        explicitMaterializedSuccessfully ||
-        deferredMaterializedSuccessfully ||
-        heuristicsRanSuccessfully ||
-        pendingOpsRanSuccessfully;
-
     // Work-metrics (TUI sidebar Stats) are NOT computed here. They are a
     // display-only value read solely by the RPC sidebar handler, and the
     // computation is O(session age) — it was the dominant transform cost on
     // long sessions when run every pass. It now runs lazily and incrementally
     // in buildSidebarSnapshot (rpc-handlers.ts) when the TUI actually polls,
     // keeping the prompt path free of it.
-
-    if (workExecutedSuccessfully) {
-        try {
-            const currentFlag = peekDeferredExecutePending(args.db, args.sessionId);
-            if (currentFlag !== null) {
-                const cleared = clearDeferredExecutePendingIfMatches(
-                    args.db,
-                    args.sessionId,
-                    currentFlag,
-                );
-                sessionLog(
-                    args.sessionId,
-                    `[boundary-exec] deferred-execute drain: ${cleared ? "cleared" : "stale-noop"} reason=${currentFlag.reason}`,
-                );
-            }
-        } catch (err) {
-            args.passOutcome?.record("deferred-execute-drain-failure");
-            sessionLog(args.sessionId, `[boundary-exec] drain failed (continuing): ${err}`);
-        }
-    }
 
     if (args.fullFeatureMode && args.autoSearch?.enabled && args.projectPath) {
         // Resolve memory ids currently rendered in the <session-history>
@@ -1894,8 +2465,8 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
-    const bustedThisPass =
-        args.didMutateFromFlushedStatuses ||
+    let bustedThisPass =
+        firstRenderBust ||
         pendingOpsDidMutate ||
         heuristicOrReasoningDidMutate ||
         autoReclaimDidMutateThisPass ||
@@ -1929,6 +2500,206 @@ export async function runPostTransformPhase(
     // head count plus owning mutation targets preserves the old full-array result
     // without repeating its O(session) walk. A legacy/custom target that omits its
     // owner pays one mutation-pass discovery scan above; steady defer never does.
+    // Merged-assistant reasoning follows the same frozen WRITE/REPLAY split as
+    // stale ctx_reduce and processed images. Detection opens only on the shared
+    // cache-busting gate; replay applies the persisted id set on every pass.
+    // Persist before first mutation so a fresh defer rebuild can always reproduce
+    // any stripped bytes. The newest assistant is excluded from both detection
+    // and replay because Anthropic requires its signed blocks byte-identically.
+    const mergedReasoningStrippedIds = new Set(replaySnapshot?.mergedReasoningStrippedIds ?? []);
+    const thinkingBindingRecoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
+    if (canUseEmptySentinels && !compactionOff) {
+        try {
+            for (const id of mergedReasoningStrippedIds) {
+                if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
+                    const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                    if (messageId.length > 0) thinkingBindingRecoveryMessageIds.add(messageId);
+                }
+            }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? (replaySnapshot?.thinkingBindingRecoveryTarget ?? null)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        mergedReasoningStrippedIds.has(frozenId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        mergedReasoningStrippedIds.add(frozenId);
+                        thinkingBindingRecoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("thinking-binding-recovery-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+
+            if (isCacheBustingPass) {
+                const candidates = findMergedReasoningStripDecisions(
+                    args.messages,
+                    args.resolvedProviderID,
+                    mergedReasoningStrippedIds,
+                    { mutationExemptMessage: reasoningMutationExemptMessage },
+                );
+                const newlyDetectedIds = candidates.filter(
+                    (id) => !mergedReasoningStrippedIds.has(id),
+                );
+                if (newlyDetectedIds.length > 0) {
+                    const persisted = addMergedReasoningStrippedIds(
+                        args.db,
+                        args.sessionId,
+                        newlyDetectedIds,
+                    );
+                    if (persisted) {
+                        // A concurrent writer may have frozen a different part selection.
+                        // Serve only the committed winner, never our speculative plan.
+                        mergedReasoningStrippedIds.clear();
+                        for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                            mergedReasoningStrippedIds.add(id);
+                        }
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("merged-reasoning-strip-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "merged reasoning strip: persistence failed; leaving newly detected assistants intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            args.passOutcome?.record("merged-reasoning-strip-exception");
+            sessionLog(args.sessionId, "transform failed freezing merged reasoning strip:", error);
+        }
+    }
+
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>(
+        replaySnapshot?.trailingBlankDecisions ?? [],
+    );
+
+    const newestAssistantId =
+        typeof trailingBlankNewestAssistant?.info.id === "string"
+            ? trailingBlankNewestAssistant.info.id
+            : undefined;
+
+    if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
+        // A source snapshot can outlive the message's projection when a marker trims history.
+        // Heal only IDs still present now so the first strip cannot land later on a defer serve.
+        const visibleMessageIds = new Set(
+            args.messages.flatMap((message) =>
+                typeof message.info.id === "string" ? [message.info.id] : [],
+            ),
+        );
+        const poisonedKeepIds: string[] = [];
+        for (const [id, decision] of trailingBlankDecisions) {
+            if (
+                id === newestAssistantId ||
+                !visibleMessageIds.has(id) ||
+                trailingBlankSourceDecisions.get(id) !== "strip"
+            ) {
+                continue;
+            }
+            if (decision === "keep" || decision.startsWith("keep:")) {
+                poisonedKeepIds.push(id);
+            }
+        }
+        if (poisonedKeepIds.length > 0) {
+            try {
+                const demotedIds = demoteTrailingBlankKeepDecisions(
+                    args.db,
+                    args.sessionId,
+                    poisonedKeepIds,
+                );
+                if (demotedIds === null) {
+                    args.passOutcome?.record("trailing-blank-heal-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank heal: persistence failed; retaining frozen keep decisions",
+                    );
+                } else {
+                    for (const id of demotedIds) {
+                        trailingBlankDecisions.set(id, "strip");
+                        bustedThisPass = true;
+                        sessionLog(
+                            args.sessionId,
+                            `trailing blank heal: demoted message ${id} from keep to strip because its source has no trailing blank`,
+                        );
+                    }
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-heal-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed healing trailing blank decisions:",
+                    error,
+                );
+            }
+        }
+    }
+
+    if (canUseEmptySentinels && !compactionOff) {
+        // Observe every pass, including defers. A new decision or an allowed newest keep
+        // refresh is persisted before finalization, so a served demotion cannot outlive a
+        // failed compare-and-swap. An established strip never refreshes to keep: a harness
+        // blank arriving after the first serve stays stripped, and streaming, completion,
+        // and historical projections can only lose suffix bytes, never reintroduce them.
+        const detectedCandidates = findTrailingBlankDecisionCandidates(
+            args.messages,
+            trailingBlankDecisions,
+            {
+                refreshMessageId: newestAssistantId,
+                sourceDecisions: trailingBlankSourceDecisions,
+            },
+        );
+        // A defer pass can safely establish only the newest assistant's shape: it
+        // has no cached continuation after it. Historical messages without a prior
+        // decision wait for an independent cache-busting pass rather than guessing
+        // from bytes that the provider may already have changed.
+        const candidates = isCacheBustingPass
+            ? detectedCandidates
+            : detectedCandidates.filter(([id]) => id === newestAssistantId);
+        if (candidates.length > 0) {
+            try {
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: newestAssistantId,
+                });
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (decision) trailingBlankDecisions.set(id, decision);
+                    }
+                    if (isCacheBustingPass) bustedThisPass = true;
+                } else {
+                    args.passOutcome?.record("trailing-blank-decision-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank decision: persistence failed; serving the frozen decisions",
+                    );
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-decision-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed freezing trailing blank decision:",
+                    error,
+                );
+            }
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -1937,8 +2708,14 @@ export async function runPostTransformPhase(
             prependedMessageCount,
             reasoningMutatedMessages,
             reasoningMutationExemptMessage,
+            mergedReasoningStrippedIds,
+            thinkingBindingRecoveryMessageIds,
+            trailingBlankDecisions,
+            skipMergedReasoningStrip: compactionOff,
+            skipTrailingWhitespaceStrip: compactionOff,
         },
     );
+
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
@@ -1950,17 +2727,159 @@ export async function runPostTransformPhase(
         `clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
     );
 
+    let assertedBaseline:
+        | {
+              tags: TagEntry[];
+              protectedTagNumbers: ReadonlySet<number>;
+              contentSignature: string;
+              structuralSignature: TailHygieneStructuralSignature;
+          }
+        | undefined;
+    if (args.channel1StateBySession) {
+        if (args.ctxReduceAvailability.callable && !compactionOff) {
+            try {
+                const tags = getTailHygieneTags(args.db, args.sessionId);
+                // A queued ctx_reduce drop is already actioned by the agent. Keep its
+                // still-rendered bytes in T, but exclude it from the actionable U backlog.
+                const pendingDropTagNumbers = new Set(
+                    getPendingOps(args.db, args.sessionId)
+                        .filter((operation) => operation.operation === "drop")
+                        .map((operation) => operation.tagId),
+                );
+                const previous = args.channel1StateBySession.get(args.sessionId);
+                const baseline = refreshTailHygieneBaseline({
+                    messages: args.messages,
+                    tags,
+                    protectedTagNumbers: args.protectedTagNumbers,
+                    pendingDropTagNumbers,
+                    cacheBusting: bustedThisPass,
+                    previous,
+                });
+                const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                const effective = effectiveTailHygiene(baseline);
+                const durableGrace =
+                    baseline.evaluable && !baseline.generationInvalidated
+                        ? captureChannel1PostReduceGraceBaseline(
+                              args.db,
+                              args.sessionId,
+                              effective.u,
+                          )
+                        : getChannel1NudgeState(args.db, args.sessionId);
+                baseline.channel1PostReduceGrace =
+                    durableGrace.postReduceGracePending ||
+                    durableGrace.postReduceGraceBaselineU !== undefined
+                        ? {
+                              pending: durableGrace.postReduceGracePending === true,
+                              baselineU: durableGrace.postReduceGraceBaselineU,
+                              preReduceLevel:
+                                  durableGrace.postReduceGracePreLevel ?? durableGrace.level,
+                          }
+                        : undefined;
+                args.channel1StateBySession.set(args.sessionId, {
+                    ...baseline,
+                    usableWindow: args.usableWindow,
+                    realUserTurnCount: countRealUserMessages(args.messages),
+                    reducedSinceRefresh:
+                        baseline.baselineGeneration !== previous?.baselineGeneration
+                            ? false
+                            : (previous?.reducedSinceRefresh ?? false),
+                    agentDropsAppliedThisPass: pendingOpsDidMutate,
+                    oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
+                        args.db,
+                        args.sessionId,
+                        args.protectedTagNumbers,
+                    ),
+                });
+                try {
+                    rearmChannel2AfterMeasuredCollapse({
+                        db: args.db,
+                        sessionId: args.sessionId,
+                        baseline,
+                    });
+                } catch (error) {
+                    sessionLog(
+                        args.sessionId,
+                        "channel2 U-collapse reset failed (ignored):",
+                        error,
+                    );
+                }
+                assertedBaseline = {
+                    tags,
+                    protectedTagNumbers: args.protectedTagNumbers,
+                    contentSignature: baseline.contentSignature,
+                    structuralSignature,
+                };
+            } catch (error) {
+                const stale = args.channel1StateBySession.get(args.sessionId);
+                if (stale) {
+                    stale.evaluable = false;
+                    stale.generationInvalidated = true;
+                }
+                sessionLog(args.sessionId, "tail hygiene baseline refresh failed (held):", error);
+            }
+        } else {
+            args.channel1StateBySession.delete(args.sessionId);
+        }
+    }
+    if (assertedBaseline) {
+        try {
+            const servedSignature = tailHygieneStructuralSignature(args.messages);
+            if (
+                !sameTailHygieneStructuralSignature(
+                    assertedBaseline.structuralSignature,
+                    servedSignature,
+                )
+            ) {
+                sessionLog(
+                    args.sessionId,
+                    `ERROR [tail-hygiene-last-writer-mismatch]: served messages changed after tail-hygiene baseline refresh (expected messages=${assertedBaseline.structuralSignature.messageCount}, parts=[${assertedBaseline.structuralSignature.partCounts.join(",")}], bytes=${assertedBaseline.structuralSignature.totalBytes}; actual messages=${servedSignature.messageCount}, parts=[${servedSignature.partCounts.join(",")}], bytes=${servedSignature.totalBytes})`,
+                );
+            }
+        } catch (error) {
+            // This diagnostic must never interrupt a turn. The tail baseline still
+            // guides the nudge, and the next served pass can refresh it.
+            sessionLog(
+                args.sessionId,
+                "ERROR [tail-hygiene-last-writer-check-failed]: structural production guard failed open:",
+                error,
+            );
+        }
+        if (process.env.NODE_ENV !== "production") {
+            assertTailHygieneContentUnchanged({
+                messages: args.messages,
+                tags: assertedBaseline.tags,
+                protectedTagNumbers: assertedBaseline.protectedTagNumbers,
+                expectedSignature: assertedBaseline.contentSignature,
+            });
+        }
+    }
+
     return {
         explicitMaterializedSuccessfully,
         deferredMaterializedSuccessfully,
         materialized,
         historianFoldMaterializedThisPass: historyWasConsumedThisPass,
         materializeReason,
+        systemHashPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashPrev ?? null)
+            : null,
+        systemHashNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashNew ?? null)
+            : null,
+        m0ModelKeyPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyPrev ?? null)
+            : null,
+        m0ModelKeyNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyNew ?? null)
+            : null,
+        m0ToolSetHashPrev: m0ComparisonDecision?.m0ToolSetHashPrev ?? null,
+        m0ToolSetHashNew: m0ComparisonDecision?.m0ToolSetHashNew ?? null,
         droppedTokens,
         emergencyReclaimedTokens,
         droppedCount,
         emergency,
         bustedThisPass,
+        thinkingBindingRecovery,
     };
 }
 

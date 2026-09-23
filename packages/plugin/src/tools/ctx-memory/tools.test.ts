@@ -2,20 +2,24 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { DREAMER_AGENT } from "../../agents/dreamer";
-import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import {
     computeNormalizedHash,
     getMemoriesByProject,
     getMemoryById,
     getMemoryMutationsForRender,
+    getMemoryVerifications,
     getProjectState,
     getUnclassifiedMemoryIds,
     insertMemory,
     insertMemoryIdempotent,
     normalizeStoredProjectPath,
+    recordMemoryMapping,
     setMemoryClassification,
 } from "../../features/magic-context";
+import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
+import { writeTaskStateJson } from "../../features/magic-context/dreamer/storage-task-schedule";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -116,6 +120,7 @@ function createTestDb(dbPath = ":memory:"): Database {
             file_path TEXT NOT NULL,
             verified_at INTEGER NOT NULL,
             mapped_at INTEGER NOT NULL DEFAULT 0,
+            mapping_origin TEXT NOT NULL DEFAULT 'mapper',
             PRIMARY KEY (memory_id, file_path)
         );
         CREATE INDEX IF NOT EXISTS idx_memory_verifications_memory ON memory_verifications(memory_id);
@@ -216,8 +221,8 @@ function createTestDb(dbPath = ":memory:"): Database {
 const toolContext = (sessionID = "ses-memory", agent = "general") =>
     ({ sessionID, agent, directory: "/repo/project" }) as never;
 
-const dreamerToolContext = (directory: string) =>
-    ({ sessionID: "ses-dream", agent: DREAMER_AGENT, directory }) as never;
+const dreamerToolContext = (directory: string, sessionID = "ses-dream") =>
+    ({ sessionID, agent: DREAMER_AGENT, directory }) as never;
 
 function wait(ms = 0): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -409,10 +414,15 @@ describe("createCtxMemoryTools", () => {
                 { action: "update", ids: [1], content: "module update" },
                 { action: "archive", ids: [1] },
                 { action: "merge", ids: [1, 2], content: "module merge" },
+                { action: "list", limit: 5 },
                 { action: "get", ids: [1] },
             ] as const;
             for (const request of actions) {
-                const result = await moduleTools.ctx_memory.execute(request, toolContext());
+                const context =
+                    request.action === "list"
+                        ? dreamerToolContext("/repo/project", "ses-memory")
+                        : toolContext();
+                const result = await moduleTools.ctx_memory.execute(request, context);
                 expect(result).toContain(`module ${request.action}`);
             }
             expect(routed.map((request) => request.action)).toEqual([
@@ -420,6 +430,7 @@ describe("createCtxMemoryTools", () => {
                 "update",
                 "archive",
                 "merge",
+                "list",
                 "get",
             ]);
             expect(routed.every((request) => request.memoryProject === "/repo/project")).toBe(true);
@@ -448,9 +459,122 @@ describe("createCtxMemoryTools", () => {
                 toolContext(),
             );
             expect(result).toBe(
-                "Error: Rust memory authority is not ready; TypeScript fallback is disabled.",
+                "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)",
             );
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("keeps authority-state probe details in logs and returns capability copy", async () => {
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+            ).run("/repo/project", "store-1", Date.now());
+            const content = "preserve this exact prompt\nincluding its second line";
+            const authorityError = "supervisor state: MODULE transport unavailable";
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => {
+                        throw new Error(authorityError);
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "write", category: "CONSTRAINTS", content },
+                toolContext(),
+            );
+
+            expect(result).toBe(
+                "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)",
+            );
+            expect(result).not.toContain(authorityError);
+            expect(result).not.toContain(content);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("reports a durable authority mismatch instead of a transient read or write retry", async () => {
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+            ).run("/repo/project", "store-1", Date.now());
+            for (const authorityState of [null, "TS"] as const) {
+                const moduleTools = createCtxMemoryTools({
+                    db,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    rustToolBackends: {
+                        authorityState: async () => authorityState,
+                    },
+                });
+                const read = await moduleTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const write = await moduleTools.ctx_memory.execute(
+                    { action: "write", category: "CONSTRAINTS", content: "must not write" },
+                    toolContext(),
+                );
+                expect(read).toBe(
+                    "Memory authority is inconsistent between the host and module. Run `ck doctor drain-authority` before changing Rust mode. (MC-M02)",
+                );
+                expect(write).toBe(read);
+            }
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("keeps module call details in logs and returns capability copy", async () => {
+            const content = "module failure must preserve this content";
+            const moduleError = "supervisor state: MODULE call failed";
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => {
+                        throw new Error(moduleError);
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "merge", ids: [1, 2], content },
+                toolContext(),
+            );
+
+            expect(result).toBe(
+                "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)",
+            );
+            expect(result).not.toContain(moduleError);
+            expect(result).not.toContain(content);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("does not echo content attached to a read-only module refusal", async () => {
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => ({
+                        error: { code: "authority_draining", message: "authority is draining" },
+                    }),
+                },
+            });
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "get", ids: [1], content: "read-only content must not echo" },
+                toolContext(),
+            );
+            expect(result).toBe(
+                "Memory access is temporarily unavailable. Retry in a moment. (MC-C02)",
+            );
+            expect(result).not.toContain("read-only content must not echo");
         });
 
         it("fails closed when module authority is active without the memory protocol", async () => {
@@ -463,7 +587,9 @@ describe("createCtxMemoryTools", () => {
                 { action: "write", category: "CONSTRAINTS", content: "must not fall back" },
                 toolContext(),
             );
-            expect(result).toContain("does not support ctx_memory");
+            expect(result).toBe(
+                "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)",
+            );
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
@@ -971,6 +1097,41 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
     });
 
+    it("refuses a dreamer mutation outside the persisted curate category scope", async () => {
+        const projectRule = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "PROJECT_RULES",
+            content: "Keep category-scoped curation deterministic.",
+        });
+        const architecture = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE",
+            content: "The scheduler owns the dreamer task registry.",
+        });
+        writeTaskStateJson(
+            db,
+            "/repo/project",
+            "curate",
+            JSON.stringify({ curate: { cursor: 0, activeCategory: "PROJECT_RULES" } }),
+        );
+
+        const result = await tools.ctx_memory.execute(
+            {
+                action: "update",
+                ids: [architecture.id],
+                content: "The shared scheduler owns the dreamer task registry.",
+            },
+            dreamerToolContext("/repo/project"),
+        );
+
+        expect(result).toContain("memory ID");
+        expect(result).toContain("outside the scoped category");
+        expect(getMemoryById(db, architecture.id)?.content).toBe(
+            "The scheduler owns the dreamer task registry.",
+        );
+        expect(getMemoryById(db, projectRule.id)?.status).toBe("active");
+    });
+
     it("REJECTS merging memories from DIFFERENT categories (structural guard)", async () => {
         const arch = insertMemory(db, {
             projectPath: "/repo/project",
@@ -1107,6 +1268,324 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
     });
 
+    describe("#given curate safety gates", () => {
+        it("REFUSES the #14125 user-profile redundancy archive specimen", async () => {
+            const content =
+                "CACHE-BUST TRIAGE FLOW (Ufuk directive, 2026-08-15 — use the tool FIRST, never reason from screenshots/log vibes): when told to check a cache bust: (1) resolve the session id (session_projects for a project name, peer roster for peer sessions); (2) run `bun packages/plugin/scripts/analyze-cache-busts.ts <sessionIdPrefix> --show-diff` (supports --since/--until/--limit/--all-busts) — it identifies the bust passes and the causing region; (3) read the req-vs-req diff it produces to name the exact diverging bytes. This is the purpose-built instrument; hand-theorizing mechanisms before running it wastes the primary's turns and was called out explicitly. Investigation masons for busts must be briefed to run this script as step 1.";
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content,
+                importance: 75,
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [memory.id],
+                    reason: "Redundant with global user profile directives (U2, U3, U4, U11, U23, U24, U26) or superseded by canonical memory entries.",
+                },
+                dreamerToolContext("/repo/project", "ses-curate-14125"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(result).toContain("refused=1");
+            expect(result).not.toContain("Error:");
+            expect(takeCurateSafetyRefusalCount("ses-curate-14125")).toBe(1);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            expect(getMutationRows(db, "/repo/project", [memory.id])).toHaveLength(0);
+        });
+
+        it("allows an archive consolidation only with a named active same-category successor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The legacy loader initializes the project registry.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project loader initializes and validates the project registry.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: `Consolidated into memory ${successor.id}.`,
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Archived memory");
+            expect(getMemoryById(db, source.id)).toMatchObject({
+                status: "archived",
+                supersededByMemoryId: successor.id,
+            });
+            expect(getMutationRows(db, "/repo/project", [source.id])).toMatchObject([
+                {
+                    mutationType: "superseded",
+                    targetMemoryId: source.id,
+                    supersededById: successor.id,
+                },
+            ]);
+        });
+
+        it("applies destructive curate refusals before module-authority dispatch", async () => {
+            const successorless = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The legacy loader initializes the project registry.",
+            });
+            const profileSource = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "The build cache key includes the target platform.",
+            });
+            const profileSuccessor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "The build cache key includes the target platform and runtime version.",
+            });
+            const directiveSource = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "Always run the release checklist before publishing.",
+            });
+            const directiveSuccessor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "The release checklist lives at docs/release.md.",
+            });
+            const routed: string[] = [];
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push(request.action);
+                        return { content: [{ type: "text", text: `module ${request.action}` }] };
+                    },
+                },
+            });
+
+            const results = await Promise.all([
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [successorless.id],
+                        reason: "No longer useful.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-successorless"),
+                ),
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [profileSource.id],
+                        superseded_by: profileSuccessor.id,
+                        reason: "Redundant with the global user profile directive U7.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-profile"),
+                ),
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [directiveSource.id],
+                        superseded_by: directiveSuccessor.id,
+                        reason: "Consolidated into the release checklist location memory.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-directive"),
+                ),
+            ]);
+
+            expect(results).toEqual([
+                expect.stringContaining("missing-active-same-category-successor"),
+                expect.stringContaining("user-profile-is-not-project-memory"),
+                expect.stringContaining("directive-shaped-project-rule"),
+            ]);
+            expect(routed).toEqual([]);
+            for (const memory of [successorless, profileSource, directiveSource]) {
+                expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            }
+        });
+
+        it("routes an allowed module-authority archive as consolidation into its named survivor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The old loader initializes the registry.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The loader initializes and validates the registry.",
+            });
+            const routed: Array<{ action: string; ids?: number[]; content?: string }> = [];
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push({
+                            action: request.action,
+                            ids: request.ids,
+                            content: request.content,
+                        });
+                        return { content: [{ type: "text", text: `module ${request.action}` }] };
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Consolidated into the canonical loader memory.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("module merge");
+            expect(routed).toEqual([
+                {
+                    action: "merge",
+                    ids: [source.id, successor.id],
+                    content: successor.content,
+                },
+            ]);
+        });
+
+        it("allows a user-profile reason for a legacy user category when consolidation is valid", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "USER_PREFERENCES",
+                content: "The user prefers concise summaries.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "USER_PREFERENCES",
+                content: "The user prefers concise summaries with exact verification commands.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Redundant with the global user profile preference U2.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Archived memory");
+            expect(getMemoryById(db, source.id)?.supersededByMemoryId).toBe(successor.id);
+        });
+
+        it("REFUSES a user-profile archive reason for a project-scoped category", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project uses a generated registry for deterministic startup.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project registry is generated to make startup deterministic.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Redundant with user preferences in directive U7.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(getMemoryById(db, source.id)?.status).toBe("active");
+        });
+
+        it("REFUSES directive-shaped PROJECT_RULES archives despite a valid successor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "Always run the release checklist before publishing.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "The release checklist lives at docs/release.md.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Consolidated into the release checklist location memory.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(getMemoryById(db, source.id)?.status).toBe("active");
+        });
+
+        it("REFUSES rewrites that lose more than half the content without a consolidation target", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content:
+                    "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                { action: "update", ids: [source.id], content: "The registry loads." },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped update");
+            expect(getMemoryById(db, source.id)?.content).toBe(source.content);
+        });
+
+        it("allows a content-loss rewrite when it names a valid consolidation target", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content:
+                    "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The validator details live in the canonical registry memory.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [source.id],
+                    content: "The registry loads.",
+                    superseded_by: successor.id,
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Updated memory");
+            expect(getMemoryById(db, source.id)?.content).toBe("The registry loads.");
+        });
+    });
+
     describe("#given update action", () => {
         it("rejects updating a foreign workspace memory even when the category is shared", async () => {
             db.exec(`
@@ -1143,6 +1622,7 @@ describe("createCtxMemoryTools", () => {
                 category: "CONFIG_DEFAULTS",
                 content: "cache_ttl=5m",
             });
+            recordMemoryMapping(db, memory.id, [], 1_000, "host_rejected_fallback");
 
             const result = await tools.ctx_memory.execute(
                 {
@@ -1155,6 +1635,7 @@ describe("createCtxMemoryTools", () => {
 
             expect(result).toContain(`Updated memory [ID: ${memory.id}]`);
             expect(getMemoryById(db, memory.id)?.content).toBe("cache_ttl=10m");
+            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
             expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
             expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
                 {
@@ -1281,6 +1762,422 @@ describe("createCtxMemoryTools", () => {
             );
             expect(getMemoryById(db, memory.id)?.content).toBe("cache_ttl=5m");
             expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+        });
+
+        it("rejects recategorizing a legacy raw-path memory onto an existing duplicate", async () => {
+            const rawProjectPath = "/legacy/raw-project";
+            const projectIdentity = normalizeStoredProjectPath(rawProjectPath);
+            const legacyTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => projectIdentity,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            });
+            const existing = insertMemory(db, {
+                projectPath: rawProjectPath,
+                category: "CONSTRAINTS",
+                content: "timeout=5s",
+            });
+            const memory = insertMemory(db, {
+                projectPath: rawProjectPath,
+                category: "CONFIG_DEFAULTS",
+                content: "timeout=5s",
+            });
+
+            const result = await legacyTools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    category: "CONSTRAINTS",
+                    content: "timeout=5s",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(
+                `Error: Memory content already exists as ID ${existing.id}; merge or archive duplicates instead.`,
+            );
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONFIG_DEFAULTS",
+                content: "timeout=5s",
+                projectPath: rawProjectPath,
+            });
+        });
+
+        it("recategorizes a legacy raw-path memory when no duplicate exists under the stored path", async () => {
+            const rawProjectPath = "/legacy/raw-project";
+            const projectIdentity = normalizeStoredProjectPath(rawProjectPath);
+            const legacyTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => projectIdentity,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            });
+            const memory = insertMemory(db, {
+                projectPath: rawProjectPath,
+                category: "CONFIG_DEFAULTS",
+                content: "timeout=5s",
+            });
+
+            const result = await legacyTools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    category: "CONSTRAINTS",
+                    content: "timeout=5s",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(`Updated memory [ID: ${memory.id}] in CONSTRAINTS.`);
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONSTRAINTS",
+                content: "timeout=5s",
+                projectPath: rawProjectPath,
+            });
+        });
+
+        it("persists a valid category change on update", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=5m",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    category: "CONSTRAINTS",
+                    content: "cache_ttl=10m",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(`Updated memory [ID: ${memory.id}] in CONSTRAINTS.`);
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONSTRAINTS",
+                content: "cache_ttl=10m",
+            });
+            expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
+                {
+                    mutationType: "update",
+                    targetMemoryId: memory.id,
+                    category: "CONSTRAINTS",
+                    newContent: "cache_ttl=10m",
+                },
+            ]);
+        });
+
+        it("keeps the current category when update omits category", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=5m",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    content: "cache_ttl=10m",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(`Updated memory [ID: ${memory.id}] in CONFIG_VALUES.`);
+            expect(getMemoryById(db, memory.id)?.category).toBe("CONFIG_VALUES");
+            expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
+                { mutationType: "update", category: "CONFIG_VALUES" },
+            ]);
+        });
+
+        it("keeps the current category when update receives an invalid category", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=5m",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    category: "NOT_A_CATEGORY",
+                    content: "cache_ttl=10m",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(`Updated memory [ID: ${memory.id}] in CONFIG_VALUES.`);
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=10m",
+            });
+            expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
+                { mutationType: "update", category: "CONFIG_VALUES" },
+            ]);
+        });
+
+        it("still rewrites content when recategorizing or omitting category", async () => {
+            const recategorized = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "old recategorize content",
+            });
+            const omitted = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "NAMING",
+                content: "old omitted-category content",
+            });
+
+            const recategorizeResult = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [recategorized.id],
+                    category: "PROJECT_RULES",
+                    content: "new recategorize content",
+                },
+                toolContext("ses-primary", "general"),
+            );
+            const omitResult = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [omitted.id],
+                    content: "new omitted-category content",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(recategorizeResult).toContain("in PROJECT_RULES");
+            expect(omitResult).toContain("in NAMING");
+            expect(getMemoryById(db, recategorized.id)).toMatchObject({
+                category: "PROJECT_RULES",
+                content: "new recategorize content",
+            });
+            expect(getMemoryById(db, omitted.id)).toMatchObject({
+                category: "NAMING",
+                content: "new omitted-category content",
+            });
+        });
+
+        it("rejects recategorizing onto an existing duplicate without throwing a constraint", async () => {
+            const existing = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "timeout=5s",
+            });
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "timeout=5s",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    category: "CONSTRAINTS",
+                    content: "timeout=5s",
+                },
+                toolContext("ses-primary", "general"),
+            );
+
+            expect(result).toBe(
+                `Error: Memory content already exists as ID ${existing.id}; merge or archive duplicates instead.`,
+            );
+            expect(String(result)).not.toContain("UNIQUE constraint failed");
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONFIG_VALUES",
+                content: "timeout=5s",
+            });
+        });
+
+        it("returns a friendly duplicate error after a unique-constraint fallback", async () => {
+            const originalPrepare = db.prepare.bind(db);
+            const originalExec = db.exec.bind(db);
+            let inTx = false;
+            (db as { exec: (sql: string) => unknown }).exec = (sql: string) => {
+                const text = String(sql);
+                if (/\bBEGIN\b/i.test(text)) inTx = true;
+                try {
+                    return originalExec(sql);
+                } catch (error) {
+                    inTx = false;
+                    throw error;
+                } finally {
+                    if (/\bCOMMIT\b/i.test(text) || /\bROLLBACK\b/i.test(text)) inTx = false;
+                }
+            };
+            (db as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+                const stmt = originalPrepare(sql);
+                if (
+                    sql.includes(
+                        "FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?",
+                    )
+                ) {
+                    const originalGet = stmt.get.bind(stmt);
+                    stmt.get = (...args: unknown[]) => (inTx ? undefined : originalGet(...args));
+                }
+                return stmt;
+            };
+
+            try {
+                const existing = insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONSTRAINTS",
+                    content: "timeout=5s",
+                });
+                const memory = insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONFIG_VALUES",
+                    content: "cache_ttl=5m",
+                });
+                const result = await tools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [memory.id],
+                        category: "CONSTRAINTS",
+                        content: "timeout=5s",
+                    },
+                    toolContext("ses-primary", "general"),
+                );
+
+                expect(result).toBe(
+                    `Error: Memory content already exists as ID ${existing.id}; merge or archive duplicates instead.`,
+                );
+                expect(String(result)).not.toContain("UNIQUE constraint failed");
+                expect(getMemoryById(db, memory.id)).toMatchObject({
+                    category: "CONFIG_VALUES",
+                    content: "cache_ttl=5m",
+                });
+            } finally {
+                (db as { prepare: typeof originalPrepare }).prepare = originalPrepare;
+                (db as { exec: typeof originalExec }).exec = originalExec;
+            }
+        });
+
+        it("returns a friendly duplicate error when the constraint code is remapped but the message matches", async () => {
+            const originalPrepare = db.prepare.bind(db);
+            const originalExec = db.exec.bind(db);
+            let inTx = false;
+            (db as { exec: (sql: string) => unknown }).exec = (sql: string) => {
+                const text = String(sql);
+                if (/\bBEGIN\b/i.test(text)) inTx = true;
+                try {
+                    return originalExec(sql);
+                } catch (error) {
+                    inTx = false;
+                    throw error;
+                } finally {
+                    if (/\bCOMMIT\b/i.test(text) || /\bROLLBACK\b/i.test(text)) inTx = false;
+                }
+            };
+            (db as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+                const stmt = originalPrepare(sql);
+                if (
+                    sql.includes(
+                        "FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?",
+                    )
+                ) {
+                    const originalGet = stmt.get.bind(stmt);
+                    stmt.get = (...args: unknown[]) => (inTx ? undefined : originalGet(...args));
+                }
+                if (sql.includes("UPDATE memories SET content = ?")) {
+                    return {
+                        run: () => {
+                            const error = new Error(
+                                "UNIQUE constraint failed: memories.project_path, memories.category, memories.normalized_hash",
+                            ) as Error & { code?: string };
+                            error.code = "SQLITE_ERROR";
+                            throw error;
+                        },
+                    };
+                }
+                return stmt;
+            };
+
+            try {
+                const existing = insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONSTRAINTS",
+                    content: "timeout=5s",
+                });
+                const memory = insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONFIG_VALUES",
+                    content: "cache_ttl=5m",
+                });
+                const result = await tools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [memory.id],
+                        category: "CONSTRAINTS",
+                        content: "timeout=5s",
+                    },
+                    toolContext("ses-primary", "general"),
+                );
+
+                expect(result).toBe(
+                    `Error: Memory content already exists as ID ${existing.id}; merge or archive duplicates instead.`,
+                );
+                expect(String(result)).not.toContain("UNIQUE constraint failed");
+                expect(getMemoryById(db, memory.id)).toMatchObject({
+                    category: "CONFIG_VALUES",
+                    content: "cache_ttl=5m",
+                });
+            } finally {
+                (db as { prepare: typeof originalPrepare }).prepare = originalPrepare;
+                (db as { exec: typeof originalExec }).exec = originalExec;
+            }
+        });
+
+        it("rethrows authority errors instead of treating them as duplicates", async () => {
+            const originalPrepare = db.prepare.bind(db);
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=5m",
+            });
+            (db as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+                const stmt = originalPrepare(sql);
+                if (sql.includes("UPDATE memories SET content = ?")) {
+                    return {
+                        run: () => {
+                            const error = new Error("authority is draining") as Error & {
+                                code: string;
+                            };
+                            error.code = "authority_draining";
+                            throw error;
+                        },
+                    };
+                }
+                return stmt;
+            };
+
+            let thrown: unknown;
+            try {
+                await tools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [memory.id],
+                        content: "cache_ttl=10m",
+                    },
+                    toolContext("ses-primary", "general"),
+                );
+            } catch (error) {
+                thrown = error;
+            } finally {
+                (db as { prepare: typeof originalPrepare }).prepare = originalPrepare;
+            }
+
+            expect(thrown).toBeInstanceOf(Error);
+            expect(String(thrown)).toContain("authority is draining");
+            expect(String(thrown)).not.toContain("already exists as ID");
+            expect(getMemoryById(db, memory.id)).toMatchObject({
+                category: "CONFIG_VALUES",
+                content: "cache_ttl=5m",
+            });
         });
 
         it("rolls back content updates when queueing the mutation fails", async () => {
@@ -1553,7 +2450,7 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given archive action", () => {
-        it("archives the memory and stores the archive reason in metadata", async () => {
+        it("lets a primary agent archive a memory and stores the reason in metadata", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "KNOWN_ISSUES",
@@ -1566,7 +2463,7 @@ describe("createCtxMemoryTools", () => {
                     ids: [memory.id],
                     reason: "Removed subsystem no longer exists",
                 },
-                toolContext("ses-dreamer", DREAMER_AGENT),
+                toolContext("ses-primary", "general"),
             );
 
             expect(result).toContain("Archived memory");
@@ -1607,20 +2504,6 @@ describe("createCtxMemoryTools", () => {
     describe("#given restricted actions", () => {
         // Primary set = write/archive/update/merge. list/verified/classify are dreamer-only.
         const PRIMARY_ACTIONS = ["write", "archive", "update", "merge"] as const;
-
-        it("rejects sidekick ctx_memory calls even if the tool is exposed", async () => {
-            const result = await tools.ctx_memory.execute(
-                {
-                    action: "write",
-                    category: "USER_DIRECTIVES",
-                    content: "Sidekick should not be able to write this.",
-                },
-                toolContext("ses-sidekick", SIDEKICK_AGENT),
-            );
-
-            expect(result).toBe("Error: ctx_memory is not available to the sidekick agent.");
-            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
-        });
 
         it("keeps the dreamer-only `list` action in the schema so OpenCode can deliver it to execute", () => {
             const primaryTools = createCtxMemoryTools({
@@ -1914,6 +2797,309 @@ describe("createCtxMemoryTools", () => {
             expect(result).toContain(String(own.id));
             expect(result).toContain("Own constraint present.");
             expect(result).toContain(`id ${missing}: not found or not visible from this project`);
+        });
+    });
+
+    describe("required-all filler", () => {
+        const isolatedWrite = async (args: Record<string, unknown>) => {
+            const isolated = createTestDb();
+            try {
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                return await isolatedTools.ctx_memory.execute(args, toolContext());
+            } finally {
+                closeQuietly(isolated);
+            }
+        };
+
+        it("write ignores ids/limit/reason filler, including ids:[0]", async () => {
+            const clean = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+            });
+            const filler = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [1],
+                limit: 0,
+                reason: "",
+            });
+            const zeroIds = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [0],
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(zeroIds).toBe(clean);
+            expect(clean).toContain("Saved memory [ID: 1] in PROJECT_RULES.");
+        });
+
+        it("archive with empty reason and unused-field filler matches a clean archive", async () => {
+            const run = async (archiveArgs: Record<string, unknown>) => {
+                const isolated = createTestDb();
+                try {
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const created = await isolatedTools.ctx_memory.execute(
+                        {
+                            action: "write",
+                            category: "PROJECT_RULES",
+                            content: "Archive this fact.",
+                        },
+                        toolContext(),
+                    );
+                    expect(created).toContain("Saved memory [ID: 1]");
+                    return await isolatedTools.ctx_memory.execute(archiveArgs, toolContext());
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const clean = await run({ action: "archive", ids: [1] });
+            const filler = await run({
+                action: "archive",
+                ids: [1],
+                content: "",
+                category: "PROJECT_RULES",
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Archived memory [ID: 1]");
+        });
+
+        it("update/get/merge ignore unused-field filler and match the clean call", async () => {
+            const seed = async () => {
+                const isolated = createTestDb();
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Original fact.",
+                    },
+                    toolContext(),
+                );
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Duplicate fact to merge.",
+                    },
+                    toolContext(),
+                );
+                return { isolated, isolatedTools };
+            };
+
+            const updateCleanDb = await seed();
+            const updateFillerDb = await seed();
+            const getCleanDb = await seed();
+            const getFillerDb = await seed();
+            const mergeCleanDb = await seed();
+            const mergeFillerDb = await seed();
+            try {
+                const updateClean = await updateCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "update", ids: [1], content: "Updated fact." },
+                    toolContext(),
+                );
+                const updateFiller = await updateFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [1],
+                        content: "Updated fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const getClean = await getCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const getFiller = await getFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "get",
+                        ids: [1],
+                        content: "",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const mergeClean = await mergeCleanDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                    },
+                    toolContext(),
+                );
+                const mergeFiller = await mergeFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+                expect(updateFiller).toBe(updateClean);
+                expect(getFiller.replace(stamp, "<ts>")).toBe(getClean.replace(stamp, "<ts>"));
+                expect(mergeFiller).toBe(mergeClean);
+            } finally {
+                closeQuietly(updateCleanDb.isolated);
+                closeQuietly(updateFillerDb.isolated);
+                closeQuietly(getCleanDb.isolated);
+                closeQuietly(getFillerDb.isolated);
+                closeQuietly(mergeCleanDb.isolated);
+                closeQuietly(mergeFillerDb.isolated);
+            }
+        });
+
+        it("keeps unused ids and category filler inert under an active dreamer category scope", async () => {
+            const run = async (action: "write" | "get" | "list", filler: boolean) => {
+                const isolated = createTestDb();
+                try {
+                    const projectRule = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "PROJECT_RULES",
+                        content: "Different scoped fact.",
+                    });
+                    const architecture = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "ARCHITECTURE",
+                        content: "Scoped architecture fact.",
+                    });
+                    writeTaskStateJson(
+                        isolated,
+                        "/repo/project",
+                        "curate",
+                        JSON.stringify({ curate: { cursor: 0, activeCategory: "ARCHITECTURE" } }),
+                    );
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const args =
+                        action === "write"
+                            ? {
+                                  action,
+                                  category: "ARCHITECTURE",
+                                  content: "New scoped architecture fact.",
+                                  ...(filler
+                                      ? { ids: [projectRule.id], limit: 0, reason: "" }
+                                      : {}),
+                              }
+                            : action === "get"
+                              ? {
+                                    action,
+                                    ids: [architecture.id],
+                                    ...(filler
+                                        ? {
+                                              content: "",
+                                              category: "PROJECT_RULES",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                }
+                              : {
+                                    action,
+                                    category: "ARCHITECTURE",
+                                    ...(filler
+                                        ? {
+                                              ids: [projectRule.id],
+                                              content: "",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                };
+                    return await isolatedTools.ctx_memory.execute(
+                        args,
+                        toolContext("ses-dreamer", DREAMER_AGENT),
+                    );
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+            const clean = {
+                write: await run("write", false),
+                get: (await run("get", false)).replace(stamp, "<ts>"),
+                list: (await run("list", false)).replace(stamp, "<ts>"),
+            };
+            const filler = {
+                write: await run("write", true),
+                get: (await run("get", true)).replace(stamp, "<ts>"),
+                list: (await run("list", true)).replace(stamp, "<ts>"),
+            };
+
+            expect(filler).toEqual(clean);
+            expect(clean.write).toContain("Saved memory");
+            expect(clean.get).toContain("Scoped architecture fact");
+            expect(clean.list).toContain("Scoped architecture fact");
+        });
+
+        it("list treats limit 0 as the default and filler ids do not bypass the dreamer-only gate", async () => {
+            for (const label of ["one", "two", "three"]) {
+                insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "PROJECT_RULES",
+                    content: `List filler ${label}.`,
+                });
+            }
+            const dreamer = toolContext("ses-dreamer", DREAMER_AGENT);
+            const clean = await tools.ctx_memory.execute({ action: "list" }, dreamer);
+            const filler = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                dreamer,
+            );
+            const primaryFiller = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                toolContext(),
+            );
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Found 3 active memories");
+            expect(primaryFiller).toBe("Error: Action 'list' is not allowed in this context.");
         });
     });
 });

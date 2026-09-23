@@ -1,7 +1,6 @@
 import { homedir } from "node:os";
 import { z } from "zod";
 import { isValidLanguageCode } from "../../agents/language-directive";
-import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { isValidCron } from "../../features/magic-context/dreamer/cron";
 import type {
     AGENTIC_DREAM_TASKS,
@@ -16,8 +15,13 @@ export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
 // escalation derives above the effective threshold and the 95% wall stays fixed.
 export const EXECUTE_THRESHOLD_CAP_MESSAGE =
     "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
-export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
+export const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
+
+// Minimum absolute token floor for protected_tokens. Kept as a named constant so
+// the schema's `.min()` and the loader's below-minimum warning share ONE source
+// of truth — the loader must not duplicate the literal 4000.
+export const PROTECTED_TOKENS_MIN = 4000;
 
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 
@@ -35,6 +39,12 @@ export const PiThinkingLevelSchema = z
     .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     .optional();
 export type PiThinkingLevel = z.infer<typeof PiThinkingLevelSchema>;
+
+/** OMP accepts Pi's thinking levels plus host-managed inheritance and automatic selection. */
+export const OmpThinkingLevelSchema = z
+    .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "inherit", "auto"])
+    .optional();
+export type OmpThinkingLevel = z.infer<typeof OmpThinkingLevelSchema>;
 
 /** Pi-only child-process controls. This block is intentionally optional so an
  * absent allowlist preserves Pi's normal extension discovery behavior. */
@@ -104,6 +114,360 @@ export const PromptSurfaceConfigSchema = z
     );
 export type PromptSurfaceConfig = z.infer<typeof PromptSurfaceConfigSchema>;
 
+/**
+ * The flat model-resolution fields are the only fields that move into harness
+ * blocks. Keeping this inventory next to the schema gives the loader migration
+ * an exhaustive contract instead of a catch-all rule.
+ */
+export const PER_HARNESS_MIGRATION_INVENTORY = {
+    historian: {
+        retained: [
+            "temperature",
+            "top_p",
+            "prompt",
+            "tools",
+            "disable",
+            "description",
+            "mode",
+            "color",
+            "maxSteps",
+            "permission",
+            "maxTokens",
+            "two_pass",
+            "disallowed_tools",
+        ],
+        migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+    },
+    dreamer: {
+        retained: [
+            "temperature",
+            "top_p",
+            "prompt",
+            "tools",
+            "disable",
+            "description",
+            "mode",
+            "color",
+            "maxSteps",
+            "permission",
+            "maxTokens",
+            "inject_docs",
+        ],
+        migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+    },
+    task: {
+        retained: ["schedule", "promotion_threshold"],
+        migrated_execution: [
+            "model",
+            "fallback_models",
+            "variant",
+            "thinking_level",
+            "timeout_minutes",
+        ],
+    },
+} as const;
+
+/** Harness keys that own independent hidden-agent model-selection blocks. */
+export const PER_HARNESS_MODEL_KEYS = ["opencode", "pi", "omp"] as const;
+
+/** OpenCode entry objects permit `variant` and reject Pi-only `thinking_level`. */
+const OcEntryObjectSchema = z
+    .object({
+        model: z.string().describe("OpenCode model ID (for example, provider/model)."),
+        variant: z.string().optional().describe("OpenCode reasoning variant for this entry."),
+    })
+    .strict();
+export const OcEntrySchema = z.union([z.string(), OcEntryObjectSchema]);
+export type OcEntry = z.infer<typeof OcEntrySchema>;
+
+/** Pi entry objects permit `thinking_level` and reject OpenCode-only `variant`. */
+const PiEntryObjectSchema = z
+    .object({
+        model: z.string().describe("Pi model ID (for example, provider/model)."),
+        thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for this entry."),
+    })
+    .strict();
+export const PiEntrySchema = z.union([z.string(), PiEntryObjectSchema]);
+export type PiEntry = z.infer<typeof PiEntrySchema>;
+
+/** OMP entry objects use Pi's qualifier vocabulary, including OMP-only auto/inherit. */
+const OmpEntryObjectSchema = z
+    .object({
+        model: z.string().describe("OMP model ID (for example, provider/model)."),
+        thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for this entry."),
+    })
+    .strict();
+export const OmpEntrySchema = z.union([z.string(), OmpEntryObjectSchema]);
+export type OmpEntry = z.infer<typeof OmpEntrySchema>;
+
+/** Strict model-resolution block used by historian.opencode. */
+export const OpenCodeHarnessBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
+    })
+    .strict()
+    .describe("Strict OpenCode model-resolution block. It accepts no Pi vocabulary.");
+export type OpenCodeHarnessBlock = z.infer<typeof OpenCodeHarnessBlockSchema>;
+
+/** Strict model-resolution block used by historian.pi. */
+export const PiHarnessBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+    })
+    .strict()
+    .describe("Strict Pi model-resolution block. It accepts no OpenCode vocabulary.");
+export type PiHarnessBlock = z.infer<typeof PiHarnessBlockSchema>;
+
+/** Strict model-resolution block used by historian.omp. */
+export const OmpHarnessBlockSchema = z
+    .object({
+        model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+        fallback_models: z
+            .array(OmpEntrySchema)
+            .optional()
+            .describe("Ordered fallback OMP entries."),
+        thinking_level: OmpThinkingLevelSchema.describe(
+            "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+    })
+    .strict()
+    .describe("Strict OMP model-resolution block. It accepts no OpenCode vocabulary.");
+export type OmpHarnessBlock = z.infer<typeof OmpHarnessBlockSchema>;
+
+/** Strict OpenCode-only execution override for one dreamer task. */
+export const OpenCodeTaskExecutionSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("OpenCode model entry for this task."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe("Ordered OpenCode fallback entries for this task."),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "OpenCode reasoning variant for this task's primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
+        timeout_minutes: z
+            .number()
+            .min(5)
+            .optional()
+            .describe("Minutes allowed for this task before it is aborted."),
+    })
+    .strict();
+export type OpenCodeTaskExecution = z.infer<typeof OpenCodeTaskExecutionSchema>;
+
+/** Strict Pi-only execution override for one dreamer task. */
+export const PiTaskExecutionSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Pi model entry for this task."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe("Ordered Pi fallback entries for this task."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+        timeout_minutes: z
+            .number()
+            .min(5)
+            .optional()
+            .describe("Minutes allowed for this task before it is aborted."),
+    })
+    .strict();
+export type PiTaskExecution = z.infer<typeof PiTaskExecutionSchema>;
+
+/** Strict OMP-only execution override for one dreamer task. */
+export const OmpTaskExecutionSchema = z
+    .object({
+        model: OmpEntrySchema.optional().describe("OMP model entry for this task."),
+        fallback_models: z
+            .array(OmpEntrySchema)
+            .optional()
+            .describe("Ordered OMP fallback entries for this task."),
+        thinking_level: OmpThinkingLevelSchema.describe(
+            "OMP thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+        timeout_minutes: z
+            .number()
+            .min(5)
+            .optional()
+            .describe("Minutes allowed for this task before it is aborted."),
+    })
+    .strict();
+export type OmpTaskExecution = z.infer<typeof OmpTaskExecutionSchema>;
+
+/** Strict OpenCode harness block for dreamer execution and task overrides. */
+export const DreamerOpenCodeHarnessBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
+        tasks: z
+            .record(z.string(), OpenCodeTaskExecutionSchema)
+            .optional()
+            .describe(
+                "OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.",
+            ),
+    })
+    .strict()
+    .describe("Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary.");
+export type DreamerOpenCodeHarnessBlock = z.infer<typeof DreamerOpenCodeHarnessBlockSchema>;
+
+/** Strict Pi harness block for dreamer execution and task overrides. */
+export const DreamerPiHarnessBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+        tasks: z
+            .record(z.string(), PiTaskExecutionSchema)
+            .optional()
+            .describe(
+                "Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+            ),
+    })
+    .strict()
+    .describe("Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary.");
+export type DreamerPiHarnessBlock = z.infer<typeof DreamerPiHarnessBlockSchema>;
+
+/** Strict OMP harness block for dreamer execution and task overrides. */
+export const DreamerOmpHarnessBlockSchema = z
+    .object({
+        model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+        fallback_models: z
+            .array(OmpEntrySchema)
+            .optional()
+            .describe("Ordered fallback OMP entries."),
+        thinking_level: OmpThinkingLevelSchema.describe(
+            "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
+        tasks: z
+            .record(z.string(), OmpTaskExecutionSchema)
+            .optional()
+            .describe(
+                "OMP task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+            ),
+    })
+    .strict()
+    .describe("Strict OMP dreamer model-resolution block. It accepts no OpenCode vocabulary.");
+export type DreamerOmpHarnessBlock = z.infer<typeof DreamerOmpHarnessBlockSchema>;
+
+/**
+ * A profile may select models but must not alter execution policy. Keep this
+ * separate from the full harness schemas, whose dreamer blocks also admit task
+ * overrides such as timeout_minutes.
+ */
+const ProfileOpenCodeModelBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe("Ordered fallback OpenCode model entries."),
+        variant: z
+            .string()
+            .optional()
+            .describe("OpenCode reasoning variant for the primary model entry."),
+    })
+    .strict()
+    .describe("Strict profile-only OpenCode model-selection block.");
+const ProfilePiModelBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe("Ordered fallback Pi model entries."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary model entry.",
+        ),
+    })
+    .strict()
+    .describe("Strict profile-only Pi model-selection block.");
+const ProfileOmpModelBlockSchema = z
+    .object({
+        model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+        fallback_models: z
+            .array(OmpEntrySchema)
+            .optional()
+            .describe("Ordered fallback OMP model entries."),
+        thinking_level: OmpThinkingLevelSchema.describe(
+            "OMP thinking level for the primary model entry.",
+        ),
+    })
+    .strict()
+    .describe("Strict profile-only OMP model-selection block.");
+const ProfileHistorianSchema = z
+    .object({
+        opencode: ProfileOpenCodeModelBlockSchema.optional(),
+        pi: ProfilePiModelBlockSchema.optional(),
+        omp: ProfileOmpModelBlockSchema.optional(),
+    })
+    .strict();
+const ProfileDreamerSchema = z
+    .object({
+        opencode: ProfileOpenCodeModelBlockSchema.optional(),
+        pi: ProfilePiModelBlockSchema.optional(),
+        omp: ProfileOmpModelBlockSchema.optional(),
+    })
+    .strict();
+
+export const ConfigProfileSchema = z
+    .object({
+        historian: ProfileHistorianSchema.optional(),
+        dreamer: ProfileDreamerSchema.optional(),
+    })
+    .strict()
+    .describe(
+        "User-owned model-selection overlay. Only historian/dreamer harness model blocks are allowed.",
+    );
+export type ConfigProfile = z.infer<typeof ConfigProfileSchema>;
+
+export const ConfigProfilesSchema = z.record(
+    z.string().trim().min(1, "Profile names must not be empty or whitespace-only."),
+    ConfigProfileSchema,
+);
+export type ConfigProfiles = z.infer<typeof ConfigProfilesSchema>;
+
 /** A 5-field cron expression, or "" to disable the task. */
 const CronScheduleSchema = z
     .string()
@@ -113,23 +477,15 @@ const CronScheduleSchema = z
     })
     .describe('5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task.');
 
-/** Per-task scheduling + model config. Model/fallback/thinking inherit the
- *  dreamer-level defaults when omitted. Task-specific params (promotion_threshold)
- *  are optional and only meaningful for their owning task. */
-const DreamTaskBaseConfigSchema = z.object({
-    schedule: CronScheduleSchema.default(""),
-    model: z.string().optional().describe("Per-task model override (inherits dreamer.model)"),
-    fallback_models: z
-        .union([z.string(), z.array(z.string())])
-        .optional()
-        .describe("Per-task fallback chain (inherits dreamer.fallback_models)"),
-    thinking_level: PiThinkingLevelSchema.describe("Pi only: per-task thinking level"),
-    timeout_minutes: z
-        .number()
-        .min(5)
-        .default(20)
-        .describe("Minutes allowed for this task before it is aborted"),
-});
+/**
+ * Harness-independent task metadata. These fields stay at dreamer.tasks.<task>
+ * during per-harness migration; model execution fields are deliberately absent.
+ */
+const DreamTaskBaseConfigSchema = z
+    .object({
+        schedule: CronScheduleSchema.default(""),
+    })
+    .strict();
 
 const PromotionThresholdSchema = z
     .number()
@@ -188,11 +544,8 @@ function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigS
     return base;
 }
 
-// `.default()` in Zod 4 wants the OUTPUT shape; the function form lets us derive
-// it by parsing the (partial) input default so timeout_minutes etc. fill in.
-/** The `tasks` record: one entry per canonical task, each defaulting to its
- *  v1-behavior-preserving schedule. Written explicitly (not via fromEntries) so
- *  the inferred type stays a precise per-key object. */
+/** The harness-independent task metadata record. Schedule remains the only
+ * disable control; runtime gates are not configuration fields. */
 export const DreamTasksSchema = z
     .object({
         "map-memories": DreamTaskBaseConfigSchema.default(() =>
@@ -233,50 +586,52 @@ export const DreamTasksSchema = z
         ),
     })
     .describe(
-        "Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model.",
+        "Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks, dreamer.pi.tasks, or dreamer.omp.tasks.",
     );
 
-/** Combined dreamer agent + per-task scheduling configuration (Dreamer v2). */
-export const DreamerConfigSchema = AgentOverrideConfigSchema.merge(
-    z.object({
-        tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
-        inject_docs: z
-            .boolean()
-            .default(true)
-            .describe(
-                "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
-            ),
-        thinking_level: PiThinkingLevelSchema.describe(
-            "Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.",
+const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
+    temperature: true,
+    top_p: true,
+    prompt: true,
+    tools: true,
+    disable: true,
+    description: true,
+    mode: true,
+    color: true,
+    maxSteps: true,
+    permission: true,
+    maxTokens: true,
+});
+
+/** Combined dreamer metadata plus independent strict execution blocks. */
+export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
+    pi: DreamerPiHarnessBlockSchema.optional(),
+    omp: DreamerOmpHarnessBlockSchema.optional(),
+    tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
+    inject_docs: z
+        .boolean()
+        .default(true)
+        .describe(
+            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
         ),
-    }),
-);
+});
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
 
-export const SidekickConfigSchema = AgentOverrideConfigSchema.extend({
-    timeout_ms: z.number().default(30000).describe("Timeout for sidekick calls in milliseconds"),
-    system_prompt: z.string().optional().describe("Custom system prompt for sidekick"),
-    thinking_level: PiThinkingLevelSchema.describe(
-        "Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level.",
-    ),
-}).optional();
-export type SidekickConfig = NonNullable<z.infer<typeof SidekickConfigSchema>>;
-
-/** Historian agent configuration — includes all agent overrides plus two_pass mode.
- *  Two-pass mode runs a second editor pass after the initial historian pass to clean
- *  up low-signal U: lines and cross-compartment duplicates. Recommended for models
- *  without extended thinking; not needed for Claude Sonnet/Opus when reasoning is
- *  enabled via OpenCode variant config. */
-export const HistorianConfigSchema = AgentOverrideConfigSchema.extend({
+/**
+ * Historian metadata remains harness-independent. Only model resolution moves to
+ * the strict opencode, pi, and omp blocks; two_pass and disallowed_tools stay here.
+ */
+export const HistorianConfigSchema = AgentMetadataSchema.extend({
+    opencode: OpenCodeHarnessBlockSchema.optional(),
+    pi: PiHarnessBlockSchema.optional(),
+    omp: OmpHarnessBlockSchema.optional(),
     two_pass: z
         .boolean()
         .default(false)
         .describe(
             "Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)",
         ),
-    thinking_level: PiThinkingLevelSchema.describe(
-        "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max",
-    ),
     disallowed_tools: z
         .array(z.enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"]))
         .default([])
@@ -327,6 +682,18 @@ const BaseEmbeddingConfigSchema = z
             .describe(
                 "Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type.",
             ),
+        query_instruction: z
+            .union([z.string(), z.literal(false)])
+            .optional()
+            .describe(
+                "OpenAI-compatible query prefix override. A string is prepended verbatim to search queries; false disables the built-in model-family instruction. Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families have built-in recipes. Query-only changes do not re-embed stored content. User-level only; project values are ignored.",
+            ),
+        document_prefix: z
+            .string()
+            .optional()
+            .describe(
+                "OpenAI-compatible stored-document prefix override, prepended verbatim. Defaults to the model-family recipe (empty for Qwen3/gte/e5 instruct; 'search_document: ' for Nomic). Changing it changes stored vectors and triggers re-embedding. User-level only; project values are ignored.",
+            ),
         truncate: z
             .string()
             .optional()
@@ -340,6 +707,12 @@ const BaseEmbeddingConfigSchema = z
             .optional()
             .describe(
                 "Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted.",
+            ),
+        local_runtime: z
+            .enum(["auto", "native", "wasm"])
+            .default("auto")
+            .describe(
+                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon.",
             ),
         local_dtype: z
             .enum([
@@ -398,6 +771,12 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             ...(apiKey ? { api_key: apiKey } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(data.query_instruction !== undefined
+                ? { query_instruction: data.query_instruction }
+                : {}),
+            ...(data.document_prefix !== undefined
+                ? { document_prefix: data.document_prefix }
+                : {}),
             ...(truncate ? { truncate } : {}),
             ...(data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}),
         };
@@ -407,6 +786,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
         return {
             provider: "local" as const,
             model: data.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+            local_runtime: data.local_runtime,
             ...(data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}),
             // local_dtype is spread CONDITIONALLY: omitting it when unset keeps
             // the identity byte-identical for the common no-dtype config, so
@@ -430,6 +810,12 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             ...(apiKey ? { api_key: apiKey } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(data.query_instruction !== undefined
+                ? { query_instruction: data.query_instruction }
+                : {}),
+            ...(data.document_prefix !== undefined
+                ? { document_prefix: data.document_prefix }
+                : {}),
             ...(truncate ? { truncate } : {}),
             ...(data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}),
         };
@@ -468,6 +854,10 @@ export interface MagicContextConfig {
     auto_update?: boolean;
     /** Output language for generated Magic Context prose. USER config only. */
     language?: string;
+    /** Active user-owned model profile after user/project resolution. */
+    profile?: string;
+    /** Named user-owned model profiles. Declarations are consumed during resolution. */
+    profiles?: ConfigProfiles;
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     smart_notes: {
@@ -479,6 +869,8 @@ export interface MagicContextConfig {
     prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
+    /** User-only model metadata inputs. */
+    models?: { window_overlay_path?: string };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
@@ -486,7 +878,8 @@ export interface MagicContextConfig {
      *  this overrides `execute_threshold_percentage` for that model. Useful for hard caps
      *  matching provider input limits. Values above 90% × context_limit are clamped with a warning. */
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
-    protected_tags: number;
+    protected_tokens?: number;
+    protected_tags?: number;
     clear_reasoning_age: number;
     history_budget_percentage: number;
     historian_timeout_ms: number;
@@ -532,10 +925,12 @@ export interface MagicContextConfig {
      *  Graduated from `experimental.temporal_awareness`; default: true. */
     temporal_awareness: boolean;
     /** Debug: when true, keep the child sessions Magic Context spawns for its
-     *  own subagents (historian, dreamer, sidekick, memory-migration) instead
+     *  own subagents (historian, dreamer, memory-migration) instead
      *  of deleting them on success. For short-term inspection/data collection;
      *  kept sessions accumulate until manually cleared. Default false. */
     keep_subagents: boolean;
+    /** Enable loopback-only diagnostic RPCs that expose memory usage and heap snapshots. */
+    debug_rpc?: boolean;
     /**
      * When true (default), deterministic inoperability (schema fence, storage
      * open/migration failure) blocks the primary-session transform with a loud
@@ -626,7 +1021,6 @@ export interface MagicContextConfig {
             max_commits: number;
         };
     };
-    sidekick?: SidekickConfig;
 }
 
 export const MagicContextConfigSchema = z
@@ -678,7 +1072,7 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Output language for Magic Context's generated content and guidance, as a " +
                     '2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the ' +
-                    "historian, dreamer, sidekick, and the agent-guidance block instruct the model to " +
+                    "historian, dreamer, and the agent-guidance block instruct the model to " +
                     "write its PROSE in this language while keeping all structural tokens (XML tags, " +
                     "the five memory category names, code identifiers, file paths) in English. " +
                     "USER-LEVEL ONLY (ignored in project config for security). Unset = today's " +
@@ -686,11 +1080,22 @@ export const MagicContextConfigSchema = z
                     "triggers one cache re-materialization; existing compartments/memories keep their " +
                     "original language until naturally rewritten.",
             ),
+        profile: z
+            .string()
+            .trim()
+            .min(1)
+            .optional()
+            .describe(
+                "Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration.",
+            ),
+        profiles: ConfigProfilesSchema.optional().describe(
+            "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
+        ),
         historian: HistorianConfigSchema.describe(
-            "Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)",
+            "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
-            "Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)",
+            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
         ),
         smart_notes: z
             .object({
@@ -707,10 +1112,10 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
-            "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
+            "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
         ),
         output_reserve: z
             .union([
@@ -719,7 +1124,15 @@ export const MagicContextConfigSchema = z
             ])
             .optional()
             .describe(
-                'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+                'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+            ),
+        models: z
+            .object({
+                window_overlay_path: z.string().trim().min(1).optional(),
+            })
+            .optional()
+            .describe(
+                "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
             ),
         toast_duration_ms: z
             .number()
@@ -749,14 +1162,22 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000.",
             ),
-        protected_tags: z
+        protected_tokens: z
             .number()
-            .min(1)
-            .max(100)
+            .int()
+            .min(PROTECTED_TOKENS_MIN)
+            .max(1_000_000)
             .optional()
             .describe(
-                "Number of recent tags to protect from dropping (min: 1, max: 100, default: 20)",
+                "Positive integer token floor to protect from automatic reclaim (min: 4_000, max: 1_000_000). When omitted, the derived default is clamp(round(0.05 × usableSoft), min(16_000, round(0.08 × usableSoft)), 64_000).",
             ),
+        protected_tags: z
+            .unknown()
+            .optional()
+            .describe(
+                "Deprecated: number of recent tags to protect. Ignored for behaviour; use protected_tokens instead.",
+            )
+            .meta({ deprecated: true }),
         clear_reasoning_age: z
             .number()
             .min(10)
@@ -774,7 +1195,7 @@ export const MagicContextConfigSchema = z
             .number()
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
-            .describe("Timeout for each historian prompt call in milliseconds (default: 300000)"),
+            .describe("Timeout for each historian prompt call in milliseconds (default: 600000)"),
         commit_cluster_trigger: z
             .object({
                 enabled: z
@@ -858,6 +1279,7 @@ export const MagicContextConfigSchema = z
         embedding: EmbeddingConfigSchema.default({
             provider: "local",
             model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+            local_runtime: "auto",
         }).describe("Embedding provider configuration"),
         subc: z
             .object({
@@ -889,7 +1311,13 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+                "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+            ),
+        debug_rpc: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Developer-only: enable authenticated loopback RPCs for memory counters and heap snapshots. Disabled by default. USER-LEVEL ONLY and requires a restart.",
             ),
         fail_closed_blocking: z
             .boolean()
@@ -936,7 +1364,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
+                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
             ),
         caveman_text_compression: z
             .object({
@@ -1054,13 +1482,28 @@ export const MagicContextConfigSchema = z
                 git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 },
             })
             .describe("Cross-session memory configuration"),
-        sidekick: SidekickConfigSchema.describe(
-            "Optional sidekick agent configuration for session-start memory retrieval",
-        ),
     })
     .transform((data): MagicContextConfig => {
         return {
             ...data,
-            protected_tags: data.protected_tags ?? DEFAULT_PROTECTED_TAGS,
+            protected_tags: data.protected_tags as number | undefined,
         };
     });
+
+/**
+ * Derived default protected_tokens formula:
+ * clamp(round(0.05 × usableSoft), min(16000, round(0.08 × usableSoft)), 64000)
+ *
+ * Sizing table:
+ *   100k -> 8,000
+ *   200k -> 16,000
+ *   372k -> 18,600
+ *   872k -> 43,600
+ *   1M   -> 50,000
+ */
+export function deriveDefaultProtectedTokens(usableSoft: number): number {
+    const clampedUsable = Math.max(0, usableSoft);
+    const lowerBound = Math.min(16_000, Math.round(0.08 * clampedUsable));
+    const target = Math.round(0.05 * clampedUsable);
+    return Math.min(64_000, Math.max(lowerBound, target));
+}

@@ -84,6 +84,16 @@ function compactTokens(value) {
   if (value >= 1_000) return `${(value / 1_000).toFixed(0)}K`;
   return String(value);
 }
+
+/**
+ * Sidebar form of the tail-hygiene reading: the reclaimable share and the
+ * two masses it is computed from, in the same compact token unit as the
+ * breakdown rows so the value fits beside its label at sidebar width. The
+ * long, unit-spelled form stays in the status dialog.
+ */
+function hygieneValue(status) {
+  return `${(status.severity * 100).toFixed(1)}% · ${compactTokens(status.u)}/${compactTokens(status.t)}`;
+}
 function relativeTime(ms) {
   const diff = Date.now() - ms;
   if (diff < 60_000) return "just now";
@@ -805,8 +815,8 @@ const SidebarContent = props => {
             _$setProp(_el$42, "flexDirection", "row");
             _$setProp(_el$42, "justifyContent", "space-between");
             _$insert(_el$42, (() => {
-              var _c$8 = _$memo(() => !!compactionOff());
-              return () => _c$8() ? (() => {
+              var _c$9 = _$memo(() => !!compactionOff());
+              return () => _c$9() ? (() => {
                 var _el$45 = _$createElement("text"),
                   _el$46 = _$createElement("b");
                 _$insertNode(_el$45, _el$46);
@@ -848,6 +858,21 @@ const SidebarContent = props => {
             return collapsed();
           }
         }), null);
+        _$insert(_el$41, (() => {
+          var _c$8 = _$memo(() => s().tailHygiene !== undefined);
+          return () => _c$8() && _$createComponent(StatRow, {
+            get theme() {
+              return props.theme;
+            },
+            label: "Hygiene",
+            get value() {
+              return hygieneValue(s().tailHygiene);
+            },
+            get warning() {
+              return !s().tailHygiene.evaluable;
+            }
+          });
+        })(), null);
         _$effect(_$p => _$setProp(_el$41, "marginTop", collapsed() ? 0 : 1, _$p));
         return _el$41;
       })();
@@ -859,8 +884,8 @@ const SidebarContent = props => {
         _$setProp(_el$52, "width", "100%");
         _$setProp(_el$52, "flexDirection", "column");
         _$insert(_el$52, (() => {
-          var _c$9 = _$memo(() => !!compactionOff());
-          return () => _c$9() ? compactionOffSidebarRows(s()).map(row => _$createComponent(StatRow, {
+          var _c$0 = _$memo(() => !!compactionOff());
+          return () => _c$0() ? compactionOffSidebarRows(s()).map(row => _$createComponent(StatRow, {
             get theme() {
               return props.theme;
             },
@@ -885,8 +910,8 @@ const SidebarContent = props => {
             _$setProp(_el$53, "justifyContent", "space-between");
             _$insertNode(_el$54, _$createTextNode(`Historian`));
             _$insert(_el$53, (() => {
-              var _c$0 = _$memo(() => !!s()?.historianRunning);
-              return () => _c$0() ? (() => {
+              var _c$1 = _$memo(() => !!s()?.historianRunning);
+              return () => _c$1() ? (() => {
                 var _el$67 = _$createElement("text");
                 _$insertNode(_el$67, _$createTextNode(`comparting ⟳`));
                 _$effect(_$p => _$setProp(_el$67, "fg", props.theme.warning, _$p));
@@ -944,8 +969,8 @@ const SidebarContent = props => {
             _$setProp(_el$56, "justifyContent", "space-between");
             _$insertNode(_el$57, _$createTextNode(`Memories`));
             _$insert(_el$59, (() => {
-              var _c$1 = _$memo(() => (s()?.memoryBlockCount ?? 0) > 0);
-              return () => _c$1() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
+              var _c$10 = _$memo(() => (s()?.memoryBlockCount ?? 0) > 0);
+              return () => _c$10() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
             })());
             _$effect(_p$ => {
               var _v$15 = props.theme.textMuted,
@@ -1019,8 +1044,8 @@ const SidebarContent = props => {
         _$insertNode(_el$78, _el$79);
         _$insertNode(_el$79, _$createTextNode(`Historian`));
         _$insert(_el$77, (() => {
-          var _c$10 = _$memo(() => !!s()?.historianRunning);
-          return () => _c$10() ? (() => {
+          var _c$11 = _$memo(() => !!s()?.historianRunning);
+          return () => _c$11() ? (() => {
             var _el$81 = _$createElement("text");
             _$insertNode(_el$81, _$createTextNode(`comparting ⟳`));
             _$effect(_$p => _$setProp(_el$81, "fg", props.theme.warning, _$p));

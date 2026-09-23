@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -14,6 +15,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { setChannel2NudgeState } from "../../features/magic-context/storage-meta-persisted";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
     insertTag,
@@ -21,16 +23,20 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
+import { flushLogger, getLogFilePath } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    __moduleStateSyncTest,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     loadModuleWatermarks,
     type ModuleStateSyncState,
     mirrorModuleCompartments,
+    resetCompartmentMirrorCursorsForTest,
     syncModuleState,
 } from "./module-state-sync";
+import { StateSyncTiming } from "./module-state-sync-timing";
 import {
     MODULE_PAGE_MAX_BYTES,
     moduleWireBodyBytes,
@@ -41,6 +47,7 @@ import { closeReadOnlySessionDb } from "./read-session-db";
 const databases: Database[] = [];
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
+const originalLogPath = process.env.MAGIC_CONTEXT_LOG_PATH;
 
 afterEach(() => {
     for (const db of databases.splice(0)) closeQuietly(db);
@@ -48,12 +55,17 @@ afterEach(() => {
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    resetCompartmentMirrorCursorsForTest();
+    __moduleStateSyncTest.setBoundaryDiagnosticObserver(null);
+    if (originalLogPath === undefined) delete process.env.MAGIC_CONTEXT_LOG_PATH;
+    else process.env.MAGIC_CONTEXT_LOG_PATH = originalLogPath;
 });
 
 function useTempDataHome(prefix: string): void {
     const dir = mkdtempSync(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
+    process.env.MAGIC_CONTEXT_LOG_PATH = join(dir, "state-sync.log");
 }
 
 function createOpenCodeDb(
@@ -233,6 +245,31 @@ describe("module drop-state cold-start seed", () => {
     });
 });
 
+describe("module Channel-2 lease cold-start seed", () => {
+    it("carries the durable terminal lease into a restarted module", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-channel2-restart-seed";
+        setChannel2NudgeState(db, sessionId, "delivered");
+        const calls: Array<Record<string, unknown>> = [];
+
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body as Record<string, unknown>);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.channel2_nudge_state).toBe("delivered");
+    });
+});
+
 describe("module strip-state cold-start seed", () => {
     it("carries frozen placeholder, stale-reduce, and image ids plus the tag watermark", async () => {
         const db = createContextDb();
@@ -295,6 +332,72 @@ describe("historian compartment sync fence", () => {
         expect(calls).toBe(1);
         expect(state.lastAckedSeq).toBe(0);
         expect(state.lastAckedWatermarks).toBeNull();
+    });
+});
+
+describe("authority cold-start sequence matrix", () => {
+    it("bootstraps or adopts every adapter/module age combination without rewinding", async () => {
+        const cases = [
+            { name: "both fresh", senderSeq: 0, durableSeq: 0, senderWarm: false },
+            { name: "fresh module + old adapter", senderSeq: 7, durableSeq: 0, senderWarm: true },
+            { name: "fresh adapter + old module", senderSeq: 0, durableSeq: 7, senderWarm: false },
+            { name: "mid-turn adapter restart", senderSeq: 7, durableSeq: 7, senderWarm: false },
+        ] as const;
+
+        for (const fixture of cases) {
+            const db = createContextDb();
+            const sessionId = `ses-cold-matrix-${fixture.name.replaceAll(" ", "-")}`;
+            const baseline = loadModuleWatermarks({ db, sessionId });
+            const state: ModuleStateSyncState = {
+                ...syncState(),
+                lastAckedSeq: fixture.senderSeq,
+                lastAckedWatermarks: fixture.senderWarm ? baseline : null,
+                seedPassPending: !fixture.senderWarm,
+            };
+            if (fixture.senderWarm) {
+                updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"delta"}]' });
+            }
+            let durableSeq = fixture.durableSeq;
+            const observedExpectedSeqs: number[] = [];
+            const acceptedSeqs: number[] = [];
+            let mismatches = 0;
+
+            const result = await syncModuleState({
+                client: {
+                    async call(args) {
+                        const body = args.body as Record<string, unknown>;
+                        const expected = Number(body.expected_shadow_seq);
+                        observedExpectedSeqs.push(expected);
+                        if (expected !== durableSeq) {
+                            mismatches += 1;
+                            const error = new Error(
+                                JSON.stringify({
+                                    code: "authority_seq_mismatch",
+                                    durable_authority_seq: durableSeq,
+                                }),
+                            ) as Error & { code: string };
+                            error.code = "authority_seq_mismatch";
+                            throw error;
+                        }
+                        acceptedSeqs.push(expected);
+                        durableSeq += 1;
+                        return { result: { shadow_seq: durableSeq } };
+                    },
+                },
+                state,
+                pass: { db, sessionId, nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: !fixture.senderWarm,
+                options: { authority: true, authoritySeqAdoption: { used: false } },
+            });
+
+            expect(result.status, fixture.name).toBe("acked");
+            expect(state.lastAckedSeq, fixture.name).toBe(durableSeq);
+            expect(durableSeq, fixture.name).toBeGreaterThan(fixture.durableSeq);
+            expect(acceptedSeqs, fixture.name).toEqual([fixture.durableSeq]);
+            expect(mismatches, fixture.name).toBe(fixture.senderSeq === fixture.durableSeq ? 0 : 1);
+            expect(observedExpectedSeqs.at(-1), fixture.name).toBe(fixture.durableSeq);
+        }
     });
 });
 
@@ -758,6 +861,152 @@ describe("module compartment ordinal serialization", () => {
         ]);
     });
 
+    it("repairs dangling boundaries without refusing the entire cold seed", async () => {
+        useTempDataHome("module-state-sync-dangling-boundary-");
+        const sessionId = "ses-dangling-boundary";
+        createOpenCodeDb(
+            sessionId,
+            Array.from({ length: 8 }, (_, index) => ({
+                id: `m${index + 1}`,
+                role: index % 2 === 0 ? "user" : "assistant",
+            })),
+        );
+        const db = createContextDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "missing-first-start",
+                endMessageId: "m2",
+                title: "First",
+                content: "first",
+            },
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m3",
+                endMessageId: "m3",
+                title: "Prior",
+                content: "prior",
+            },
+            {
+                sequence: 2,
+                startMessage: 4,
+                endMessage: 5,
+                startMessageId: "missing-interior-start",
+                endMessageId: "m5",
+                title: "Incident",
+                content: "incident",
+            },
+            {
+                sequence: 3,
+                startMessage: 6,
+                endMessage: 7,
+                startMessageId: "m6",
+                endMessageId: "missing-interior-end",
+                title: "End repair",
+                content: "end repair",
+            },
+            {
+                sequence: 4,
+                startMessage: 8,
+                endMessage: 8,
+                startMessageId: "m8",
+                endMessageId: "m8",
+                title: "Next",
+                content: "next",
+            },
+            {
+                sequence: 5,
+                startMessage: 9,
+                endMessage: 9,
+                startMessageId: "missing-both-start",
+                endMessageId: "missing-both-end",
+                title: "Skipped",
+                content: "skipped",
+            },
+        ]);
+
+        const boundaryDiagnostics: string[] = [];
+        __moduleStateSyncTest.setBoundaryDiagnosticObserver((message) => {
+            boundaryDiagnostics.push(message);
+        });
+        const payload = await buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            force: true,
+        });
+
+        expect(payload).toBeObject();
+        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
+        expect(payload.params.compartments).toEqual([
+            expect.objectContaining({ sequence: 0, start_message: 1, end_message: 2 }),
+            expect.objectContaining({ sequence: 1, start_message: 3, end_message: 3 }),
+            expect.objectContaining({ sequence: 2, start_message: 4, end_message: 5 }),
+            expect.objectContaining({ sequence: 3, start_message: 6, end_message: 7 }),
+            expect.objectContaining({ sequence: 4, start_message: 8, end_message: 8 }),
+        ]);
+
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=0 side=start missing_id=missing-first-start resolved_ordinal=1 method=raw_store_first_ordinal",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=2 side=start missing_id=missing-interior-start resolved_ordinal=4 method=previous_compartment_end_plus_one",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=3 side=end missing_id=missing-interior-end resolved_ordinal=7 method=next_compartment_start_minus_one",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync compartment skipped session=ses-dangling-boundary sequence=5 missing_start_id=missing-both-start missing_end_id=missing-both-end method=both_boundaries_dangling",
+        );
+    });
+
+    it("pins clean compartment seed bytes when every boundary still resolves", async () => {
+        useTempDataHome("module-state-sync-clean-boundary-");
+        const sessionId = "ses-clean-boundary";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user" },
+            { id: "m2", role: "assistant" },
+            { id: "m3", role: "user" },
+        ]);
+        const db = createContextDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Clean one",
+                content: "first clean summary",
+            },
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m3",
+                endMessageId: "m3",
+                title: "Clean two",
+                content: "second clean summary",
+            },
+        ]);
+
+        db.prepare("UPDATE compartments SET created_at = 1234 WHERE session_id = ?").run(sessionId);
+        const payload = await buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            force: true,
+        });
+        expect(payload).toBeObject();
+        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
+        const digest = createHash("sha256")
+            .update(JSON.stringify(payload.params.compartments))
+            .digest("hex");
+        expect(digest).toBe("48b79d5c8864fbbc6ffb9c639e5ae058c3f99f81d67ff7bc917ecd8552abe1bf");
+    });
+
     it("keeps canonical ordinal drift fail-loud when the wire resolver finds a conflict", async () => {
         useTempDataHome("module-state-sync-ordinal-drift-");
         const sessionId = "ses-ordinal-drift";
@@ -769,14 +1018,16 @@ describe("module compartment ordinal serialization", () => {
         const state = syncState(3);
         state.idOrdinalMemo.set("m2", 3);
 
+        state.idOrdinalMemo.set("m1", 1);
         const result = await resolveOrdinalsForModule({
             sessionId,
-            messages: [wireMessage(sessionId, "m2")],
+            messages: [wireMessage(sessionId, "m2"), wireMessage(sessionId, "unseen")],
             generation: state.moduleGeneration,
             memoGeneration: state.idOrdinalMemoGeneration,
             memo: state.idOrdinalMemo,
-            memoStoredCount: 3,
-            memoCanonicalCount: 0,
+            memoAnchor: { timeCreated: 1, id: "m1" },
+            memoStoredCount: 1,
+            memoCanonicalCount: 1,
         });
 
         expect(result).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
@@ -920,19 +1171,22 @@ describe("module incremental and paged assembly", () => {
         }) as typeof JSON.stringify;
         let pages: ReturnType<typeof buildPagedModuleStateSyncPayloads> = [];
         try {
-            pages = buildPagedModuleStateSyncPayloads({
-                moduleGeneration: 1,
-                expectedShadowSeq: 0,
-                seedId: "seed",
-                seedBoundaryId: null,
-                compartments: items,
-                memories: [],
-                memoryMutations: [],
-                userProfile: [],
-                workspace: null,
-                lastTodoState: "",
-                watermarks,
-            });
+            pages = buildPagedModuleStateSyncPayloads(
+                {
+                    moduleGeneration: 1,
+                    expectedShadowSeq: 0,
+                    seedId: "seed",
+                    seedBoundaryId: null,
+                    compartments: items,
+                    memories: [],
+                    memoryMutations: [],
+                    userProfile: [],
+                    workspace: null,
+                    lastTodoState: "",
+                    watermarks,
+                },
+                512 * 1024,
+            );
         } finally {
             JSON.stringify = originalStringify;
         }
@@ -1036,7 +1290,7 @@ describe("module compartment mirror-back", () => {
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
 
-        expect(calls).toEqual([-1, -1]);
+        expect(calls).toEqual([-1, 2]);
         expect(getCompartments(db, "ses-mirror").map((row) => row.sequence)).toEqual([1, 2]);
     });
 
@@ -1093,4 +1347,541 @@ describe("module compartment mirror-back", () => {
             }),
         );
     });
+
+    function mirrorRow(
+        sequence: number,
+        extras: Partial<{
+            end_message: number;
+            end_message_id: string;
+            title: string;
+            content: string;
+        }> = {},
+    ) {
+        return {
+            sequence,
+            start_message: sequence * 2 - 1,
+            end_message: extras.end_message ?? sequence * 2,
+            start_message_id: `m${sequence * 2 - 1}#0`,
+            end_message_id: extras.end_message_id ?? `m${sequence * 2}#0`,
+            title: extras.title ?? `Compartment ${sequence}`,
+            content: extras.content ?? `content ${sequence}`,
+            created_at: sequence,
+        };
+    }
+
+    function pagingReader(
+        getRows: () => Array<ReturnType<typeof mirrorRow>>,
+        extra: () => {
+            set_changed?: boolean;
+            revert_epoch?: number;
+            compartment_count?: number;
+        } = () => ({}),
+    ) {
+        const calls: number[] = [];
+        return {
+            calls,
+            reader: {
+                async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                    calls.push(afterSequence);
+                    const rows = getRows();
+                    const extras = extra();
+                    return {
+                        max_sequence: rows.at(-1)?.sequence ?? -1,
+                        compartments: rows
+                            .filter((row) => row.sequence > afterSequence)
+                            .slice(0, 2),
+                        ...extras,
+                    };
+                },
+            },
+        };
+    }
+
+    it("skips every local statement on the unchanged fast path", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-fast";
+        const rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        expect(calls[0]).toBe(-1);
+
+        const originalPrepare = db.prepare.bind(db);
+        let statements = 0;
+        db.prepare = ((sql: string) => {
+            statements += 1;
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+        const originalTransaction = db.transaction.bind(db);
+        let transactions = 0;
+        db.transaction = ((fn: Parameters<typeof db.transaction>[0]) => {
+            transactions += 1;
+            return originalTransaction(fn);
+        }) as typeof db.transaction;
+
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls).toEqual([3]);
+        expect(statements).toBe(0);
+        expect(transactions).toBe(0);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
+    });
+
+    it("full-resyncs a recut that regresses max_sequence", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recut-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [
+            mirrorRow(1),
+            mirrorRow(2),
+            mirrorRow(3, {
+                end_message: 30,
+                end_message_id: "recut-m30#0",
+                title: "Recut",
+                content: "recut content",
+            }),
+        ];
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(4);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
+        expect(getCompartments(db, sessionId)[2]).toEqual(
+            expect.objectContaining({ title: "Recut", content: "recut content" }),
+        );
+    });
+
+    it("full-resyncs a revert that truncates the published suffix", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-revert-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4), mirrorRow(5)];
+        let revertEpoch = 0;
+        const { calls, reader } = pagingReader(
+            () => rows,
+            () => ({ revert_epoch: revertEpoch }),
+        );
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [mirrorRow(1), mirrorRow(2)];
+        revertEpoch = 1;
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(5);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2]);
+    });
+
+    it("full-resyncs a recomp that rewrites the set at the same max_sequence", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recomp-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
+        let setChanged = false;
+        const { calls, reader } = pagingReader(
+            () => rows,
+            () => (setChanged ? { set_changed: true } : {}),
+        );
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [
+            mirrorRow(1, { title: "Rebuilt 1", content: "recomp 1" }),
+            mirrorRow(2, { title: "Rebuilt 2", content: "recomp 2" }),
+            mirrorRow(3, { title: "Rebuilt 3", content: "recomp 3" }),
+        ];
+        setChanged = true;
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(3);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.content)).toEqual([
+            "recomp 1",
+            "recomp 2",
+            "recomp 3",
+        ]);
+    });
+
+    it("full-resyncs when a sequence gap appears after the cursor", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-gap-arm";
+        let rows = [mirrorRow(1), mirrorRow(2)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [mirrorRow(1), mirrorRow(2), mirrorRow(4)];
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(2);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 4]);
+    });
+
+    it("still rejects an authoritative set that changes while it is read", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-changed-while-read";
+        let maxSequence = 3;
+        const reader = {
+            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                const page = {
+                    max_sequence: maxSequence,
+                    compartments: [
+                        mirrorRow(afterSequence + 1),
+                        mirrorRow(afterSequence + 2),
+                    ].filter((row) => row.sequence <= 3),
+                };
+                maxSequence = 4;
+                return page;
+            },
+        };
+
+        await expect(mirrorModuleCompartments({ db, sessionId, reader })).rejects.toThrow(
+            "module compartment mirror changed while its authoritative set was read",
+        );
+    });
+});
+
+describe("state-sync resumable series", () => {
+    it("a deadline mid-series resumes only the remaining pages", async () => {
+        useTempDataHome("state-sync-resume-");
+        const sessionId = "ses-resume";
+        createOpenCodeDb(sessionId, [{ id: "m1", role: "user" }]);
+        const db = createContextDb();
+        appendCompartments(
+            db,
+            sessionId,
+            Array.from({ length: 5 }, (_, sequence) => ({
+                sequence,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                title: "large",
+                content: "x".repeat(20 * 1024 * 1024),
+            })),
+        );
+        const state = syncState();
+        let next = 0;
+        let seedId: unknown;
+        let fail = true;
+        const sent: number[] = [];
+        const client = {
+            getCachedStateSyncCapabilities: () => ({
+                state_sync_deltas: true,
+                state_sync_resume: true,
+            }),
+            async call(args: { method: string; body: unknown }) {
+                const body = args.body as Record<string, unknown>;
+                if (args.method === "session.status")
+                    return {
+                        state_sync: {
+                            seed_id: seedId,
+                            generation: 1,
+                            next_expected_index: next,
+                            shadow_seq: 0,
+                            completed: false,
+                        },
+                    };
+                seedId ??= body.seed_id;
+                expect(body.seed_id).toBe(seedId);
+                const index = body.seed_batch_index as number;
+                sent.push(index);
+                if (index === 1 && fail) {
+                    fail = false;
+                    await new Promise((_resolve, reject) =>
+                        setTimeout(
+                            () =>
+                                reject(
+                                    Object.assign(new Error("state_sync transport timeout"), {
+                                        code: "state_sync_timeout",
+                                    }),
+                                ),
+                            1,
+                        ),
+                    );
+                }
+                next = index + 1;
+                return { ok: true };
+            },
+        };
+        const sync = () =>
+            syncModuleState({
+                client,
+                state,
+                pass: { db, sessionId, nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: true,
+            });
+        await expect(sync()).rejects.toMatchObject({ code: "state_sync_timeout" });
+        await expect(sync()).resolves.toMatchObject({ status: "acked" });
+        expect(sent).toEqual([0, 1, 1, 2]);
+    });
+});
+
+it("AFT warm inventory sends only boundary-owned seeds with one raw batch", async () => {
+    useTempDataHome("aft-warm-seed-");
+    const sessionId = "ses-aft-warm";
+    createOpenCodeDb(
+        sessionId,
+        Array.from({ length: 770 }, (_, index) => ({ id: `tail${index}`, role: "user" })),
+    );
+    const rawDb = new Database(join(process.env.XDG_DATA_HOME ?? "", "opencode", "opencode.db"));
+    rawDb.exec(
+        `UPDATE message SET time_created=time_created+100000; CREATE INDEX parts_by_owner ON part(session_id, message_id);`,
+    );
+    rawDb
+        .prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+        INSERT INTO message SELECT 'old'||i, ?, i, i, json_object('id','old'||i,'role','user') FROM n`)
+        .run(sessionId);
+    rawDb
+        .prepare(`INSERT INTO part(message_id, session_id, time_created, time_updated, data)
+        SELECT id, session_id, time_created, time_updated, '{"type":"text","text":"old"}' FROM message WHERE id LIKE 'old%'`)
+        .run();
+    closeQuietly(rawDb);
+    const db = createContextDb();
+    appendCompartments(
+        db,
+        sessionId,
+        Array.from({ length: 1500 }, (_, sequence) => ({
+            sequence,
+            startMessage: 1,
+            endMessage: 100000,
+            startMessageId: "old1",
+            endMessageId: "old100000",
+            title: "folded",
+            content: "x".repeat(2048),
+        })),
+    );
+    db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+        INSERT INTO tags(session_id, tag_number, message_id, type, status, byte_size)
+        SELECT ?, i, 'old'||i||':p0', 'message', 'dropped', 100 FROM n`).run(sessionId);
+    for (let index = 0; index < 282; index++) {
+        insertTag(db, sessionId, `tail${index}:p0`, "message", 100, 100001 + index);
+        updateTagStatus(db, sessionId, 100001 + index, "dropped");
+    }
+    const timing = new StateSyncTiming();
+    const bodies: Record<string, unknown>[] = [];
+    const budgets: number[] = [];
+    await syncModuleState({
+        state: syncState(),
+        force: true,
+        pass: { db, sessionId, nowMs: 1 },
+        projectRoot: "/tmp/project",
+        options: { timing },
+        client: {
+            getCachedStateSyncCapabilities: () => ({
+                state_sync_deltas: true,
+                state_sync_resume: true,
+            }),
+            async call(args) {
+                const body = args.body as Record<string, unknown>;
+                if (body.state_sync_inventory)
+                    return {
+                        state_sync_inventory: {
+                            generation: 1,
+                            max_compartment_sequence: 1499,
+                            boundary_id: "tail0#0",
+                        },
+                    };
+                if (args.method === "session.status") return { state_sync: null };
+                bodies.push(body);
+                budgets.push(args.timeoutMs ?? 0);
+                return { ok: true };
+            },
+        },
+    });
+    if (process.env.MC_STATE_SYNC_TIMING_FIXTURE === "1") {
+        flushLogger();
+        console.log(
+            readFileSync(getLogFilePath(), "utf8")
+                .split("\n")
+                .find((line) => line.includes("stage=rust.state_sync_detail")),
+        );
+    }
+    expect(bodies.flatMap((body) => body.compartments as unknown[])).toHaveLength(0);
+    const seeds = bodies.flatMap((body) => body.drop_seeds as Array<{ block_id: string }>);
+    expect(seeds).toHaveLength(282);
+    expect(seeds.every((seed) => seed.block_id.startsWith("tail"))).toBe(true);
+    expect(budgets).toEqual([17_104]);
+    expect(timing.rawReads).toBe(1);
+    expect(timing.rawMessages).toBe(770);
+    expect(timing.tags).toBe(282);
+    expect(timing.bytes).toBeLessThan(30000);
+    if (process.env.MC_STATE_SYNC_TIMING_FIXTURE === "1") {
+        flushLogger();
+        const line = readFileSync(getLogFilePath(), "utf8")
+            .split("\n")
+            .find((line) => line.includes("stage=rust.state_sync_detail"));
+        expect(line).toBeDefined();
+        expect(line).toContain(`collect_ms=${timing.collect.toFixed(3)}`);
+        expect(line).toContain(`serialize_ms=${timing.serialize.toFixed(3)}`);
+        expect(line).toContain(`page_build_ms=${timing.pageBuild.toFixed(3)}`);
+        expect(timing.collect).toBeGreaterThan(0);
+        expect(timing.serialize).toBeGreaterThan(0);
+        expect(timing.pageBuild).toBeGreaterThan(0);
+        console.log(line);
+    }
+});
+
+it("completed series receipts are reusable only in their module generation", async () => {
+    const db = createContextDb();
+    const sessionId = "ses-receipt-generation";
+    let receiptGeneration = 1;
+    let sends = 0;
+    const client = {
+        getCachedStateSyncCapabilities: () => ({
+            state_sync_deltas: true,
+            state_sync_resume: true,
+        }),
+        async call(args: { method: string; body: unknown }) {
+            const body = args.body as Record<string, unknown>;
+            if (body.state_sync_inventory) return {};
+            if (args.method === "session.status")
+                return {
+                    state_sync: {
+                        seed_id: body.state_sync_seed_id,
+                        generation: receiptGeneration,
+                        shadow_seq: 1,
+                        completed: true,
+                    },
+                };
+            sends++;
+            return { ok: true };
+        },
+    };
+    const run = () =>
+        syncModuleState({
+            client,
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+    await expect(run()).resolves.toMatchObject({ status: "acked" });
+    expect(sends).toBe(0);
+    receiptGeneration = 0;
+    await expect(run()).resolves.toMatchObject({ status: "acked" });
+    expect(sends).toBe(1);
+});
+
+it("a committed final-page deadline is adopted after adapter restart without reupload", async () => {
+    useTempDataHome("state-sync-final-receipt-");
+    const sessionId = "ses-final-receipt";
+    createOpenCodeDb(sessionId, [{ id: "m1", role: "user" }]);
+    const db = createContextDb();
+    appendCompartments(db, sessionId, [
+        {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 1,
+            startMessageId: "m1",
+            endMessageId: "m1",
+            title: "seed",
+            content: "content",
+        },
+    ]);
+    let committedId: unknown;
+    let sends = 0;
+    const client = {
+        getCachedStateSyncCapabilities: () => ({
+            state_sync_deltas: true,
+            state_sync_resume: true,
+        }),
+        async call(args: { method: string; body: unknown }) {
+            const body = args.body as Record<string, unknown>;
+            if (body.state_sync_inventory)
+                return {
+                    state_sync_inventory: {
+                        generation: 1,
+                        max_compartment_sequence: committedId ? 0 : -1,
+                        boundary_id: committedId ? "m1#0" : null,
+                    },
+                };
+            if (args.method === "session.status")
+                return {
+                    state_sync: committedId
+                        ? { seed_id: committedId, generation: 1, shadow_seq: 1, completed: true }
+                        : null,
+                };
+            sends++;
+            committedId = body.seed_id;
+            await new Promise((_resolve, reject) =>
+                setTimeout(
+                    () =>
+                        reject(
+                            Object.assign(new Error("deadline after durable commit"), {
+                                code: "state_sync_timeout",
+                            }),
+                        ),
+                    1,
+                ),
+            );
+        },
+    };
+    const run = () =>
+        syncModuleState({
+            client,
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+    await expect(run()).rejects.toMatchObject({ code: "state_sync_timeout" });
+    await expect(run()).resolves.toMatchObject({ status: "acked" });
+    expect(sends).toBe(1);
+});
+
+it("an old module without state_sync_resume keeps the previous paged protocol", async () => {
+    const db = createContextDb();
+    for (const deltas of [true, false]) {
+        const calls: Record<string, unknown>[] = [];
+        await expect(
+            syncModuleState({
+                state: syncState(),
+                force: true,
+                pass: { db, sessionId: `ses-legacy-${deltas}`, nowMs: 1 },
+                projectRoot: "/tmp/project",
+                client: {
+                    getCachedStateSyncCapabilities: () => ({ state_sync_deltas: deltas }),
+                    async call(args) {
+                        expect(args.method).toBe("state_sync");
+                        calls.push(args.body as Record<string, unknown>);
+                        return { result: { shadow_seq: 1 } };
+                    },
+                },
+            }),
+        ).resolves.toMatchObject({ status: "acked" });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({
+            seed_batch_index: 0,
+            seed_batch_total: 1,
+            seed_complete: true,
+            compartments: [],
+            memories: [],
+            memory_mutations: [],
+        });
+    }
+});
+
+it("a batched seed read refuses ordinal drift instead of overwriting the wire memo", async () => {
+    useTempDataHome("state-sync-batch-drift-");
+    const sessionId = "ses-batch-drift";
+    createOpenCodeDb(sessionId, [{ id: "m1", role: "user" }]);
+    const db = createContextDb();
+    const state = syncState();
+    state.idOrdinalMemo.set("m1", 99);
+    await expect(
+        buildModuleStateSyncPayload({
+            state,
+            pass: { db, sessionId, nowMs: 1 },
+            force: true,
+            options: { seedInventory: { maxCompartmentSequence: -1, boundaryId: "m1#0" } },
+        }),
+    ).resolves.toBe("mismatch");
+    expect(state.idOrdinalMemo.get("m1")).toBe(99);
 });

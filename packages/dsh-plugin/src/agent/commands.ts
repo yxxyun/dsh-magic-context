@@ -5,16 +5,16 @@
  * command body resolves the receiving agent → canonical Magic session key +
  * project identity and calls the shared core execution functions
  * (executeStatus / executeFlush / runManualDream / formatEmbedStatusText /
- * runSidekick / executeContextRecompWithResult / wrapup + upgrade variants).
+ * executeContextRecompWithResult / wrapup + upgrade variants).
  *
  * Output channel (dsh-reference §B.6): the DSH command registry renders the
  * handler's `CommandResult` directly in the dispatching UI — it is
  * model-invisible, exactly like Pi's `appendEntry` status entries, and never
  * routes into the model context.
  *
- * LLM-dependent commands (ctx-dream / ctx-aug / ctx-recomp / ctx-wrapup /
+ * LLM-dependent commands (ctx-dream / ctx-recomp / ctx-wrapup /
  * ctx-session-upgrade) run their full guard/validation logic here and call the
- * core functions through seams (`dreamerExecutor`, `runSidekick`,
+ * core functions through seams (`dreamerExecutor`,
  * `runRecomp`, `runWrapup`, `runUpgrade`) that the historian/dreamer/subagent
  * slices wire in. Until wired, they answer with an explicit "not wired"
  * message instead of failing.
@@ -22,7 +22,6 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { DEFAULT_PROTECTED_TAGS } from "@magic-context/core/features/magic-context/defaults";
 import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import {
@@ -79,14 +78,6 @@ export interface CtxCommandSeams {
     runnable?: boolean;
     scheduleSummary?: string;
   };
-  /** Sidekick runner (subagent slice): run one augmentation prompt, return text. */
-  runSidekick?: (deps: {
-    agent: Agent;
-    prompt: string;
-    cwd?: string;
-    projectIdentity?: string;
-    signal: AbortSignal;
-  }) => Promise<string | null>;
   /** Recomp runner (historian slice): full/partial recomp; returns the status text. */
   runRecomp?: (deps: {
     agent: Agent;
@@ -179,7 +170,9 @@ export function registerCtxStatusCommand(ctx: Context, opts: CtxCommandsOptions)
         const statusText = executeStatus(
           db,
           sessionId,
-          opts.protectedTags ?? DEFAULT_PROTECTED_TAGS,
+          // v0.42.6 dropped the protected_tags parameter from executeStatus: the
+          // newest-N count was superseded by the token-window model
+          // (getProtectionWindowForSession).
           opts.executeThresholdPercentage,
           modelKeyOf(agent),
           opts.historyBudgetPercentage,
@@ -350,56 +343,6 @@ export function registerCtxEmbedCommand(ctx: Context, opts: CtxCommandsOptions):
         return successResult(`## Embedding Status\n\n${statusText}`);
       } catch (error) {
         return errorResult(`## /ctx-embed — Failed\n\n${describeError(error).brief}`);
-      }
-    },
-  });
-}
-
-/* ──────────────────────────────── /ctx-aug ─────────────────────────────── */
-
-export function registerCtxAugCommand(ctx: Context, opts: CtxCommandsOptions): () => void {
-  return registerCommand(ctx, {
-    name: "ctx-aug",
-    description: "Augment your prompt with relevant project context (sidekick)",
-    handler: async (invocation) => {
-      const agent = invocation.agent;
-      const prompt = invocation.rawInput.trim();
-      if (prompt.length === 0) {
-        return errorResult(
-          "/ctx-aug: Usage `/ctx-aug <your prompt>` — provide a prompt to augment with project memory context.",
-        );
-      }
-      if (!opts.runSidekick) {
-        return successResult(
-          "/ctx-aug: Sidekick runner is not wired yet (Phase 2 slice C). Add `sidekick.model` to your magic-context.jsonc to enable this command.",
-        );
-      }
-      try {
-        const cwd = cwdOf(agent);
-        const projectIdentity = cwd ? resolveProjectIdentity(ctx, opts, cwd) : undefined;
-        const sidekickText = await opts.runSidekick({
-          agent,
-          prompt,
-          cwd,
-          projectIdentity,
-          signal: invocation.signal,
-        });
-        if (!sidekickText) {
-          agent.followup(magicUserMessage(prompt, MAGIC_SOURCE));
-          return successResult(
-            "/ctx-aug: sidekick returned no augmentation; the prompt was sent unchanged.",
-          );
-        }
-        const augmentedPrompt = `${prompt}\n\n<sidekick-augmentation>\n${sidekickText}\n</sidekick-augmentation>`;
-        agent.followup(magicUserMessage(augmentedPrompt, MAGIC_SOURCE));
-        return successResult(
-          "/ctx-aug: augmentation queued as the next user message.",
-        );
-      } catch (error) {
-        agent.followup(magicUserMessage(prompt, MAGIC_SOURCE));
-        return successResult(
-          `/ctx-aug: sidekick failed (${describeError(error).brief}). Sending prompt without augmentation.`,
-        );
       }
     },
   });
@@ -679,7 +622,6 @@ export function registerCtxCommands(ctx: Context, opts: CtxCommandsOptions = {})
     registerCtxFlushCommand(ctx, opts),
     registerCtxDreamCommand(ctx, opts),
     registerCtxEmbedCommand(ctx, opts),
-    registerCtxAugCommand(ctx, opts),
     registerCtxRecompCommand(ctx, opts),
     registerCtxWrapupCommand(ctx, opts),
     registerCtxSessionUpgradeCommand(ctx, opts),

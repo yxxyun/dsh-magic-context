@@ -6,7 +6,9 @@ import { createChildSessionWithFence } from "../../../hooks/magic-context/child-
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import { teardownChildSession } from "../../../shared/child-session-teardown";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { nextOccurrence, parseCron } from "../dreamer/cron";
@@ -31,8 +33,8 @@ interface CompileSmartNoteArgs {
     capabilityFactory: SmartNoteCapabilityFactory;
     signal: AbortSignal;
     deadline: number;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
 }
 
 export interface CompileSmartNoteSuccess {
@@ -81,6 +83,7 @@ Remember: output only the JSON object described by the system prompt.`;
 
     const startedAt = Date.now();
     let childSessionId: string | null = null;
+    let promptSettled = false;
     let invocationRecorded = false;
     const recordInvocation = (params: {
         status: "completed" | "failed" | "aborted";
@@ -156,6 +159,7 @@ Remember: output only the JSON object described by the system prompt.`;
                     parseCompilerOutput(extractLatestAssistantText(messages)),
             },
         );
+        promptSettled = true;
         const response = run.validated;
         const compiledCheck = normalizeCompiledCheck(response.compiled_check);
         const manifest = normalizeManifest(response.manifest);
@@ -193,11 +197,15 @@ Remember: output only the JSON object described by the system prompt.`;
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
         return { ok: false, cancelled, error: message };
     } finally {
-        // Compiler prompts include note content and conditions, so they are
-        // deleted regardless of debug-retention settings.
-        if (childSessionId) {
-            await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-        }
+        await teardownChildSession({
+            client: args.client,
+            sessionId: childSessionId,
+            sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+            promptSettled,
+            privacySensitive: true,
+            context: `[dreamer] smart note #${args.note.id} compiler`,
+            log,
+        });
     }
 }
 

@@ -43,8 +43,6 @@ describe("migration v76: retina condition compilation", () => {
                     "compile_status",
                 ]),
             );
-            // The v76 test asserts the fence still tracks the live lane; the
-            // literal moved to 85 when the fork ported upstream v77..v85.
             expect(LATEST_SUPPORTED_VERSION).toBe(85);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(() =>

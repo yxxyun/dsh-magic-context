@@ -2,6 +2,7 @@ import { getHarness } from "../../shared/harness";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian";
+import { withContentLanguageDirective } from "../../agents/language-directive";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { openDatabase } from "../../features/magic-context/storage";
 import type { SubagentKind } from "../../features/magic-context/storage-subagent-invocations";
@@ -15,22 +16,32 @@ import {
     extractLatestAssistantText,
     hasLengthCappedOutput,
 } from "../../shared/assistant-message-extractor";
+import { teardownChildSession } from "../../shared/child-session-teardown";
 import {
     ensureCortexKitArtifactGitignore,
     getProjectMagicContextHistorianDir,
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
-import { shouldKeepSubagents } from "../../shared/keep-subagents";
+import type { ModelInput, ResolvedModelEntry } from "../../shared/model-resolution";
 import { isRecord } from "../../shared/record-type-guard";
+import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
-import { buildHistorianEditorPrompt } from "./compartment-prompt";
+import {
+    buildHistorianEditorPrompt,
+    COMPARTMENT_AGENT_SYSTEM_PROMPT,
+    HISTORIAN_EDITOR_SYSTEM_PROMPT,
+} from "./compartment-prompt";
 import type {
+    HiddenCompletion,
+    HiddenCompletionExecutor,
+    HiddenRunHandle,
     HistorianProgressCallbacks,
     HistorianRunResult,
     StoredCompartmentRange,
     ValidatedHistorianPassResult,
 } from "./compartment-runner-types";
+import { HiddenCompletionRefusal } from "./compartment-runner-types";
 import {
     buildHistorianRepairPrompt,
     type HistorianValidationChunk,
@@ -48,11 +59,6 @@ function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
 const MAX_HISTORIAN_RETRIES = 2;
-
-interface HistorianModelOverride {
-    providerID: string;
-    modelID: string;
-}
 
 const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
@@ -98,8 +104,65 @@ function historianMessageCreatedAt(message: Record<string, unknown>): number {
     return typeof message.info.time.created === "number" ? message.info.time.created : 0;
 }
 
+export function createV1HiddenCompletionExecutor(
+    client: PluginContext["client"] | undefined,
+    db: Database,
+    directory: string,
+): HiddenCompletionExecutor {
+    return {
+        capabilities: { tools: true, harness: getHarness() },
+        async open(run) {
+            if (!client) throw new Error("Hidden completion client is unavailable");
+            const response = await createChildSessionWithFence({
+                client,
+                db,
+                parentSessionId: run.parentSessionId,
+                title: run.title,
+                directory: run.directory,
+            });
+            const created = shared.normalizeSDKResponse(response, null as { id?: string } | null, {
+                preferResponseOnMissingData: true,
+            });
+            const id = typeof created?.id === "string" ? created.id : "";
+            return { id, childSessionId: id || undefined };
+        },
+        async attempt(_handle, request) {
+            if (!client) throw new Error("Hidden completion client is unavailable");
+            await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
+        },
+        async collect(handle, limit) {
+            if (!client) throw new Error("Hidden completion client is unavailable");
+            const response = await client.session.messages({
+                path: { id: handle.id },
+                query: { directory, limit },
+            });
+            const messages = shared.normalizeSDKResponse(response, [] as unknown[], {
+                preferResponseOnMissingData: true,
+            });
+            const text = extractLatestAssistantText(messages);
+            return {
+                messages,
+                text,
+                reasoning: text ? null : extractLatestHistorianReasoning(messages),
+                lengthCapped: hasLengthCappedOutput(messages),
+                usage: sumTokensFromChildMessages(messages),
+            };
+        },
+        async close(handle, settlement) {
+            if (!client) return;
+            await teardownChildSession({
+                client,
+                sessionId: handle?.id || null,
+                sessionDirectory: directory,
+                ...settlement,
+            });
+        },
+    };
+}
+
 export async function runValidatedHistorianPass(args: {
-    client: PluginContext["client"];
+    client: PluginContext["client"] | undefined;
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     db: Database;
     parentSessionId: string;
     sessionDirectory: string;
@@ -109,6 +172,9 @@ export async function runValidatedHistorianPass(args: {
     sequenceOffset: number;
     dumpLabelBase: string;
     timeoutMs?: number;
+    maxOutputTokens?: number;
+    /** Active OpenCode historian entry, including its outbound request variant. */
+    model?: ModelInput;
     fallbackModelId?: string;
     /**
      * Resolved historian fallback chain ("provider/modelID" entries). When the
@@ -116,7 +182,7 @@ export async function runValidatedHistorianPass(args: {
      * each fallback is tried in order. Independent of `fallbackModelId` (which
      * is a last-ditch single-model retry against the active session model).
      */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     callbacks?: HistorianProgressCallbacks;
     /** When true, run a second editor pass after successful historian output
      *  to clean low-signal U: lines and cross-compartment duplicates. If editor
@@ -129,9 +195,12 @@ export async function runValidatedHistorianPass(args: {
     const firstRun = await runHistorianPrompt({
         ...args,
         dumpLabel: `${args.dumpLabelBase}-initial`,
+        modelOverride: args.model,
         agentId: args.agentId,
     });
     if (!firstRun.ok || !firstRun.result) {
+        if (firstRun.refusal?.terminal)
+            return { ok: false, error: firstRun.error ?? firstRun.refusal.message };
         return runFallbackHistorianPass({
             ...args,
             prompt: args.prompt,
@@ -172,9 +241,12 @@ export async function runValidatedHistorianPass(args: {
         ...args,
         prompt: repairPrompt,
         dumpLabel: `${args.dumpLabelBase}-repair`,
+        modelOverride: args.model,
         agentId: args.agentId,
     });
     if (!repairRun.ok || !repairRun.result) {
+        if (repairRun.refusal?.terminal)
+            return { ok: false, error: repairRun.error ?? repairRun.refusal.message };
         return runFallbackHistorianPass({
             ...args,
             prompt: repairPrompt,
@@ -230,7 +302,8 @@ export async function runValidatedHistorianPass(args: {
  * silently no-op back to the draft is the cheaper and safer behavior.
  */
 async function runEditorPassOrFallback(args: {
-    client: PluginContext["client"];
+    client: PluginContext["client"] | undefined;
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     db: Database;
     parentSessionId: string;
     sessionDirectory: string;
@@ -244,22 +317,29 @@ async function runEditorPassOrFallback(args: {
     sequenceOffset: number;
     dumpLabelBase: string;
     timeoutMs?: number;
+    maxOutputTokens?: number;
     draftXml: string;
+    language?: string;
     draftValidation: ValidatedHistorianPassResult;
     draftDumpPath?: string;
     draftInvocationId?: number | null;
+    model?: ModelInput;
 }): Promise<ValidatedHistorianPassResult> {
     shared.sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
     const editorRun = await runHistorianPrompt({
         client: args.client,
+        hiddenCompletionExecutor: args.hiddenCompletionExecutor,
         db: args.db,
         parentSessionId: args.parentSessionId,
         sessionDirectory: args.sessionDirectory,
         prompt: buildHistorianEditorPrompt(args.draftXml),
         timeoutMs: args.timeoutMs,
+        maxOutputTokens: args.maxOutputTokens,
+        language: args.language,
         dumpLabel: `${args.dumpLabelBase}-editor`,
         agentId: HISTORIAN_EDITOR_AGENT,
         parentInvocationId: args.draftInvocationId ?? null,
+        modelOverride: args.model,
     });
 
     if (!editorRun.ok || !editorRun.result) {
@@ -293,19 +373,22 @@ async function runEditorPassOrFallback(args: {
 }
 
 async function runHistorianPrompt(args: {
-    client: PluginContext["client"];
+    client: PluginContext["client"] | undefined;
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     db: Database;
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
     timeoutMs?: number;
+    maxOutputTokens?: number;
     dumpLabel?: string;
-    modelOverride?: HistorianModelOverride;
+    language?: string;
+    modelOverride?: ModelInput;
     /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
      *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
     agentId?: string;
     /** Resolved historian fallback chain (forwarded to the prompt helper). */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     subagentKind?: SubagentKind;
     parentInvocationId?: number | null;
 }): Promise<HistorianRunResult> {
@@ -324,12 +407,15 @@ async function runHistorianPrompt(args: {
         parentInvocationId,
     } = args;
     let agentSessionId: string | null = null;
+    let handle: HiddenRunHandle | null = null;
+    let completion: HiddenCompletion | undefined;
+    const executor =
+        args.hiddenCompletionExecutor ??
+        createV1HiddenCompletionExecutor(client, db, sessionDirectory);
+    let promptSettled = false;
+    let hadUnsettledPrompt = false;
     const startedAt = Date.now();
     let invocationRecorded = false;
-    // Keep FAILED historian child sessions for debugging (the model output, the
-    // exact prompt, and the error are all inspectable in the child session). Only
-    // delete on SUCCESS, where the result is already persisted as a compartment.
-    let outcomeOk = false;
 
     const recordInvocation = (params: {
         status: "completed" | "failed" | "aborted";
@@ -341,7 +427,7 @@ async function runHistorianPrompt(args: {
         return recordChildInvocation({
             db: openDatabase(),
             parentSessionId,
-            harness: getHarness(),
+            harness: executor.capabilities.harness,
             subagent:
                 agentId === HISTORIAN_EDITOR_AGENT
                     ? "historian_editor"
@@ -349,6 +435,13 @@ async function runHistorianPrompt(args: {
             startedAt,
             status: params.status,
             messages: params.messages,
+            ...(completion && !completion.messages
+                ? {
+                      tokens: completion.usage,
+                      providerId: completion.providerId,
+                      modelId: completion.modelId,
+                  }
+                : {}),
             error: params.error,
             parentInvocationId:
                 agentId === HISTORIAN_EDITOR_AGENT ? (parentInvocationId ?? null) : null,
@@ -358,22 +451,34 @@ async function runHistorianPrompt(args: {
     try {
         shared.sessionLog(
             parentSessionId,
-            `historian: creating child session (agent=${agentId}, model=${modelOverride ? `${modelOverride.providerID}/${modelOverride.modelID}` : `agent:${agentId}`})`,
+            `historian: creating child session (agent=${toModelEntry(modelOverride)?.model ?? `agent:${agentId}`})`,
         );
-        const createResponse = await createChildSessionWithFence({
-            client,
-            db,
+        handle = await executor.open({
             parentSessionId,
+            parentInvocationId,
+            agent: agentId,
+            kind: agentId === HISTORIAN_EDITOR_AGENT ? "historian-editor" : "historian",
+            system: withContentLanguageDirective(
+                agentId === HISTORIAN_EDITOR_AGENT
+                    ? HISTORIAN_EDITOR_SYSTEM_PROMPT
+                    : COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                args.language,
+            ),
+            maxOutputTokens: args.maxOutputTokens,
+            model: modelOverride,
+            configuredModels: [
+                ...(modelOverride ? [modelOverride] : []),
+                ...(fallbackModels ?? []),
+            ],
+            timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
             title: "magic-context-compartment",
             directory: sessionDirectory,
+            metadata: { dumpLabel, subagentKind },
         });
-
-        const createdSession = shared.normalizeSDKResponse(
-            createResponse,
-            null as { id?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        agentSessionId = typeof createdSession?.id === "string" ? createdSession.id : null;
+        agentSessionId = handle.id || null;
+        // The retry transport closes over the opened run; bind it once so the closure
+        // sees the resolved handle rather than the nullable slot it was assigned to.
+        const opened = handle;
 
         if (!agentSessionId) {
             recordInvocation({
@@ -397,7 +502,7 @@ async function runHistorianPrompt(args: {
                             // OpenCode uses the override model but still loads the agent's
                             // registered system prompt.
                             agent: agentId,
-                            ...(modelOverride ? { model: modelOverride } : {}),
+                            ...modelBodyField(modelOverride),
                             // synthetic: true keeps this big internal prompt out of the
                             // OpenCode TUI subagent pane (would otherwise render as a huge
                             // unreadable visible message — see issue #50). The historian
@@ -407,6 +512,11 @@ async function runHistorianPrompt(args: {
                         },
                     },
                     {
+                        transport: Object.assign(
+                            (request: import("../../shared/model-suggestion-retry").PromptArgs) =>
+                                executor.attempt(opened, request),
+                            { childSessionId: opened.childSessionId },
+                        ),
                         timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
                         // When modelOverride is set we're already in the last-ditch retry
                         // path; iterating fallbacks again would be redundant.
@@ -415,12 +525,15 @@ async function runHistorianPrompt(args: {
                             agentId === HISTORIAN_EDITOR_AGENT ? "historian:editor" : "historian",
                     },
                 );
+                promptSettled = !hadUnsettledPrompt;
                 shared.sessionLog(
                     parentSessionId,
                     `historian: prompt completed (attempt ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES + 1})`,
                 );
                 break;
             } catch (error: unknown) {
+                hadUnsettledPrompt = true;
+                promptSettled = false;
                 const errorMsg = getErrorMessage(error);
                 shared.sessionLog(
                     parentSessionId,
@@ -441,19 +554,16 @@ async function runHistorianPrompt(args: {
             }
         }
 
-        const messagesResponse = await client.session.messages({
-            path: { id: agentSessionId },
-            query: { directory: sessionDirectory, limit: 50 },
+        completion = await executor.collect(handle, 50);
+        const invocationId = recordInvocation({
+            status: "completed",
+            messages: completion.messages,
         });
-        const messages = shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-            preferResponseOnMissingData: true,
-        });
-        const invocationId = recordInvocation({ status: "completed", messages });
-        const lengthCapped = hasLengthCappedOutput(messages);
-        const textResult = extractLatestAssistantText(messages);
-        const reasoningResult = textResult ? null : extractLatestHistorianReasoning(messages);
+        const lengthCapped = completion.lengthCapped;
+        const textResult = completion.text;
+        const reasoningResult = textResult ? null : completion.reasoning;
         if (!textResult && reasoningResult && lengthCapped) {
-            const outputTokens = sumTokensFromChildMessages(messages).output;
+            const outputTokens = completion.usage.output;
             return {
                 ok: false,
                 error: `historian output length-capped at ${outputTokens} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`,
@@ -476,7 +586,6 @@ async function runHistorianPrompt(args: {
             dumpLabel ?? "historian-response",
             result,
         );
-        outcomeOk = true;
         return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
     } catch (modelError: unknown) {
         const desc = describeError(modelError);
@@ -488,32 +597,21 @@ async function runHistorianPrompt(args: {
         return {
             ok: false,
             error: `Historian failed while processing this session: ${desc.brief}`,
+            ...(modelError instanceof HiddenCompletionRefusal ? { refusal: modelError } : {}),
         };
     } finally {
-        // Delete the child session ONLY on success. On failure, keep it so the
-        // failed model output / prompt / error can be inspected for debugging
-        // (the run is already recorded as failed in subagent_invocations +
-        // historian_runs; the live child session is the missing piece). A periodic
-        // sweep can GC old failed child sessions later if needed.
-        if (agentSessionId && outcomeOk && !shouldKeepSubagents()) {
-            await client.session.delete({ path: { id: agentSessionId } }).catch((e: unknown) => {
-                shared.sessionLog(
-                    parentSessionId,
-                    "compartment agent: session cleanup failed",
-                    getErrorMessage(e),
-                );
-            });
-        } else if (agentSessionId && (!outcomeOk || shouldKeepSubagents())) {
-            shared.sessionLog(
-                parentSessionId,
-                `historian: KEEPING child session ${agentSessionId} (${outcomeOk ? "keep_subagents" : "failed"}) — not deleted`,
-            );
-        }
+        await executor.close(handle, {
+            promptSettled,
+            privacySensitive: false,
+            context: "historian",
+            log: (message) => shared.sessionLog(parentSessionId, message),
+        });
     }
 }
 
 async function runFallbackHistorianPass(args: {
-    client: PluginContext["client"];
+    client: PluginContext["client"] | undefined;
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     db: Database;
     parentSessionId: string;
     sessionDirectory: string;
@@ -528,6 +626,9 @@ async function runFallbackHistorianPass(args: {
     sequenceOffset: number;
     dumpLabelBase: string;
     timeoutMs?: number;
+    maxOutputTokens?: number;
+    /** Active primary entry, used to avoid re-running the exact same attempt. */
+    model?: ModelInput;
     /**
      * Configured historian fallback chain (e.g. `anthropic/claude-sonnet-4-6`),
      * tried IN ORDER before the session-model last resort. Each candidate's
@@ -536,7 +637,7 @@ async function runFallbackHistorianPass(args: {
      * instead of emitting compartments) escalates to the next candidate rather
      * than failing the whole pass.
      */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     /**
      * The live session provider/model, used as the absolute last resort AFTER
      * the configured chain is exhausted.
@@ -545,6 +646,7 @@ async function runFallbackHistorianPass(args: {
     callbacks?: HistorianProgressCallbacks;
     agentId?: string;
     error: string;
+    language?: string;
     dumpPaths: Array<string | undefined>;
 }): Promise<ValidatedHistorianPassResult> {
     // Ordered escalation that matches the intended fallback policy:
@@ -556,10 +658,22 @@ async function runFallbackHistorianPass(args: {
     // empty-but-successful response never throws and so never triggers the
     // throw-based chain inside the prompt call.
     const seen = new Set<string>();
-    const chain: string[] = [];
-    for (const candidate of [...(args.fallbackModels ?? []), args.fallbackModelId ?? ""]) {
-        if (!candidate || seen.has(candidate)) continue;
-        seen.add(candidate);
+    const chain: ResolvedModelEntry[] = [];
+    const primary = toModelEntry(args.model);
+    for (const candidateInput of [
+        ...(args.fallbackModels ?? []),
+        ...(args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
+    ]) {
+        const candidate = toModelEntry(candidateInput);
+        if (!candidate) continue;
+        const key = `${candidate.model}\u0000${candidate.qualifier ?? ""}`;
+        if (!candidate.model || seen.has(key)) continue;
+        // Do not repeat the primary attempt, but keep the same model when its
+        // fallback intentionally selects a different variant.
+        if (primary?.model === candidate.model && primary.qualifier === candidate.qualifier) {
+            continue;
+        }
+        seen.add(key);
         chain.push(candidate);
     }
     if (chain.length === 0) {
@@ -568,9 +682,9 @@ async function runFallbackHistorianPass(args: {
 
     let lastError = args.error;
     for (let i = 0; i < chain.length; i += 1) {
-        const modelId = chain[i];
-        const modelOverride = parseModelOverride(modelId);
-        if (!modelOverride) continue;
+        const modelOverride = chain[i];
+        const modelId = modelOverride.model;
+        if (!parseModelOverride(modelId)) continue;
 
         const isSessionModelLastResort = modelId === args.fallbackModelId && i === chain.length - 1;
         shared.sessionLog(
@@ -583,11 +697,14 @@ async function runFallbackHistorianPass(args: {
 
         const fallbackRun = await runHistorianPrompt({
             client: args.client,
+            hiddenCompletionExecutor: args.hiddenCompletionExecutor,
             db: args.db,
             parentSessionId: args.parentSessionId,
             sessionDirectory: args.sessionDirectory,
             prompt: args.prompt,
             timeoutMs: args.timeoutMs,
+            maxOutputTokens: args.maxOutputTokens,
+            language: args.language,
             dumpLabel: `${args.dumpLabelBase}-fallback-${i + 1}`,
             modelOverride,
             agentId: args.agentId,
@@ -617,7 +734,7 @@ async function runFallbackHistorianPass(args: {
     return { ok: false, error: lastError };
 }
 
-function parseModelOverride(modelId: string): HistorianModelOverride | null {
+function parseModelOverride(modelId: string): { providerID: string; modelID: string } | null {
     const [providerID, ...modelParts] = modelId.split("/");
     const modelID = modelParts.join("/");
     if (!providerID || modelID.length === 0) {

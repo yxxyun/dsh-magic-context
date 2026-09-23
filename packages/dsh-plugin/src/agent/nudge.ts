@@ -7,8 +7,17 @@
  * shared core's (`ctx-reduce-nudge`), and delivery rides `agent.inject(...)`
  * (visible on the next pre-step batch), deduplicated by a `mc-nudge:<kind>`
  * watermark on the live surface. State persistence (last_nudge_undropped /
- * last_nudge_level / channel2_nudge_state) uses the shared storage-meta
+ * channel1_nudge_state / channel2_nudge_state) uses the shared storage-meta
  * accessors, so a Pi↔DSH session pair shares cadence.
+ *
+ * v0.42.6 API note: the core replaced the absolute Channel-1 inputs
+ * (`undroppedTokens` / `pressure` / `workingWindowTokens`) with a tail-hygiene
+ * baseline plus per-turn deltas, and replaced `shouldTriggerChannel2` with
+ * `evaluateChannel2`. The DSH port has no tail-hygiene pass of its own, so it
+ * projects its tag aggregate onto that form: U = reclaimable tool output,
+ * T = the whole live tail, deltas 0. Protected tags moved from a newest-N count
+ * to an exact membership set (+ tag-number cutoff); the port converts its
+ * configured count into that representation in `protectedWindow`.
  */
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import {
@@ -16,17 +25,19 @@ import {
   buildChannel2Reminder,
   CHANNEL1_FLOOR_TOKENS,
   decideChannel1,
-  shouldTriggerChannel2,
-  type ToolReclaimHint,
+  evaluateChannel2,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
-import { getActiveTagTokenAggregate } from "@magic-context/core/features/magic-context/storage-tags";
+import {
+  getActiveTagTokenAggregate,
+  getOldestActiveUnprotectedToolTags,
+} from "@magic-context/core/features/magic-context/storage-tags";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage";
 import {
+  getChannel1NudgeState,
   getChannel2NudgeState,
-  getLastNudgeLevel,
   getLastNudgeUndropped,
+  setChannel1NudgeState,
   setChannel2NudgeState,
-  setLastNudgeLevel,
   setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -64,23 +75,36 @@ export function scanSessionMetrics(agent: Agent): {
   return { lastInputTokens, contextWindow };
 }
 
-/** Oldest reclaimable tool tags, as reclaim hints (max 4, oldest first). */
-function oldestReclaimableToolTags(tags: readonly TagEntry[], protectedTags: number): ToolReclaimHint[] {
-  const active = [...tags]
+/**
+ * Convert the legacy newest-N protected-tag count into the v0.42.6
+ * token-window representation: an exact membership set plus a tag-number
+ * cutoff. Tags with `tag_number < cutoff` are reclaimable; a null cutoff means
+ * no threshold is applied (nothing is protected).
+ */
+function protectedWindow(
+  tags: readonly TagEntry[],
+  newestCount: number,
+): { numbers: ReadonlySet<number>; cutoff: number | null } {
+  if (newestCount <= 0) return { numbers: new Set<number>(), cutoff: null };
+  const newest = tags
     .filter((t) => t.type === "tool" && t.status === "active")
-    .sort((a, b) => a.tagNumber - b.tagNumber);
-  const protectedSet =
-    protectedTags > 0
-      ? new Set(
-          [...tags]
-            .filter((t) => t.type === "tool" && t.status === "active")
-            .map((t) => t.tagNumber)
-            .sort((a, b) => b - a)
-            .slice(0, protectedTags),
-        )
-      : new Set<number>();
-  return active.filter((t) => !protectedSet.has(t.tagNumber)).slice(0, 4)
-    .map((t) => ({ tagNumber: t.tagNumber, toolName: t.toolName }));
+    .sort((a, b) => b.tagNumber - a.tagNumber)
+    .slice(0, newestCount);
+  const oldestProtected = newest[newest.length - 1];
+  return {
+    numbers: new Set(newest.map((t) => t.tagNumber)),
+    cutoff: oldestProtected === undefined ? null : oldestProtected.tagNumber,
+  };
+}
+
+/** How many tool outputs are reclaimable (active and outside the window). */
+function reclaimableOutputCount(
+  tags: readonly TagEntry[],
+  protectedNumbers: ReadonlySet<number>,
+): number {
+  return tags.filter(
+    (t) => t.type === "tool" && t.status === "active" && !protectedNumbers.has(t.tagNumber),
+  ).length;
 }
 
 function injectNudge(
@@ -138,45 +162,80 @@ export function maybeNudgeChannels(
     const contextWindow = opts.contextWindow ?? scanWindow ?? 1_000_000;
     if (typeof contextWindow !== "number" || contextWindow <= 0) return;
 
-    const agg = getActiveTagTokenAggregate(db, sessionId, protectedTags);
+    const tags = getTagsBySession(db, sessionId);
+    const window = protectedWindow(tags, protectedTags);
+    const agg = getActiveTagTokenAggregate(db, sessionId, window.cutoff);
     const reclaimable = agg.toolOutput ?? 0;
+
+    // Project the tag aggregate onto the v0.42.6 tail-hygiene baseline form.
+    const baselineU = reclaimable;
+    const baselineT = Math.max(baselineU, agg.conversation + agg.toolCall + reclaimable);
 
     // ── Channel 1: in-turn gentle/firm/urgent reminder ──
     if (reclaimable >= CHANNEL1_FLOOR_TOKENS) {
-      const workingWindowTokens = Math.round((contextWindow * threshold) / 100);
-      const pressure = lastInputTokens > 0 ? lastInputTokens / contextWindow : 0;
+      const nudgeState = getChannel1NudgeState(db, sessionId);
       const decision = decideChannel1({
-        undroppedTokens: reclaimable,
-        pressure,
-        estimatedInputTokens: lastInputTokens + reclaimable,
-        workingWindowTokens,
+        baselineU,
+        baselineT,
+        turnDeltaU: 0,
+        turnDeltaT: 0,
         lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
-        lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+        lastNudgeLevel: nudgeState.level,
+        lastFireOrdinal: nudgeState.ordinal,
         hasRecentReduce: false,
       });
       setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
-      setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
+      // Cadence level and dampening ordinal travel together in one persisted state.
+      setChannel1NudgeState(db, sessionId, {
+        ...nudgeState,
+        level: decision.nextLastNudgeLevel,
+        postReduceGracePending: decision.clearPostReduceGrace
+          ? undefined
+          : nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: decision.clearPostReduceGrace
+          ? undefined
+          : nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: decision.clearPostReduceGrace
+          ? undefined
+          : nudgeState.postReduceGracePreLevel,
+      });
       if (decision.fire) {
-        const tags = getTagsBySession(db, sessionId);
-        const hint = oldestReclaimableToolTags(tags, protectedTags);
-        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, hint);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const reminder = buildChannel1Reminder(
+          decision.level,
+          decision.undroppedTokens,
+          reclaimableOutputCount(tags, window.numbers),
+          hint,
+          decision.sticky,
+        );
         injectNudge(agent, sessionId, "channel1", reminder);
         opts.log?.(`[magic-context] channel1 nudge fired: level=${decision.level} reclaimable~${Math.round(reclaimable / 1000)}k`);
       }
     }
 
     // ── Channel 2: ceiling escalation (one-shot per session) ──
-    const usable = Math.max(0, Math.round((contextWindow * threshold) / 100) - lastInputTokens + agg.conversation + agg.toolCall);
-    if (shouldTriggerChannel2({ reclaimableTokens: reclaimable, usableTokens: usable })) {
+    const evaluation = evaluateChannel2({
+      baselineU,
+      baselineT,
+      turnDeltaU: 0,
+      turnDeltaT: 0,
+      evaluable: true,
+      generationInvalidated: false,
+    });
+    void lastInputTokens;
+    if (evaluation.shouldTrigger) {
       const state = getChannel2NudgeState(db, sessionId);
       if (state === "") {
-        const tags = getTagsBySession(db, sessionId);
-        const hint = oldestReclaimableToolTags(tags, protectedTags);
-        const reminder = buildChannel2Reminder(reclaimable, hint);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const reminder = buildChannel2Reminder(
+          evaluation.reclaimableTokens,
+          reclaimableOutputCount(tags, window.numbers),
+          hint,
+        );
         // 一次性发送语义：注入前占位的状态机（pending → delivered）。
         setChannel2NudgeState(db, sessionId, "delivered");
         injectNudge(agent, sessionId, "channel2", reminder);
-        opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(reclaimable / 1000)}k`);
+        opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(evaluation.reclaimableTokens / 1000)}k`);
       }
     }
   } catch {

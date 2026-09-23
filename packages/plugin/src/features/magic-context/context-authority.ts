@@ -2,10 +2,47 @@ import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
 export type AuthorityState = "TS" | "PREPARING" | "MODULE" | "DRAINING";
+
+type AuthorityRoutingLocation = "TS" | "MODULE";
+
+// Authority status is sampled on every transform pass. Keep this process-local
+// memory so the declaration tells an operator about a real routing change rather
+// than repeating after every pass while the module remains authoritative.
+const observedAuthorityRoutingByProject = new Map<string, AuthorityRoutingLocation>();
+
+/**
+ * Declare the user-visible host-path routing only when the project changes owner.
+ * A first MODULE observation is intentional: a restarted host must still explain
+ * that an already-active module owns those paths.
+ */
+export function observeAuthorityRouting(
+    projectPath: string,
+    location: AuthorityRoutingLocation,
+): void {
+    const previous = observedAuthorityRoutingByProject.get(projectPath);
+    if (previous === location) return;
+    observedAuthorityRoutingByProject.set(projectPath, location);
+
+    if (location === "MODULE") {
+        log(
+            `[magic-context] project ${projectPath} authority → MODULE: host backends → MODULE: ctx_memory, ctx_note; historian: module-side`,
+        );
+    } else if (previous === "MODULE") {
+        log(
+            `[magic-context] project ${projectPath} authority → TS: host backends → TypeScript: ctx_memory, ctx_note; historian: host-side`,
+        );
+    }
+}
+
+/** Test-only reset for process-local routing observation state. */
+export function resetAuthorityRoutingObservationsForTest(): void {
+    observedAuthorityRoutingByProject.clear();
+}
 
 export interface AuthorityStatus {
     context_store_uuid: string;
@@ -53,6 +90,7 @@ export interface AuthorityModuleClient {
         project: string;
         projectRoot?: string;
         domain: AuthorityDomain;
+        sessionId?: string;
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
     authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
@@ -66,6 +104,15 @@ export interface AuthorityModuleClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
+    mirrorMemory?(args: {
+        module_row_id: number;
+        projectRoot?: string;
+    }): Promise<{ row: ChangefeedRow | null }>;
+    memoryIdentityAck?(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }>;
 }
 
 export interface ModuleNoteEvaluationBridge {
@@ -402,6 +449,7 @@ function installMarkerAndCaptureBounds(args: {
     contextStoreUuid: string;
     domains: readonly AuthorityDomain[];
 }): void {
+    const transactionStartedAt = performance.now();
     args.db.exec("BEGIN IMMEDIATE");
     try {
         withPrivilegedWriter(args.db, () => {
@@ -424,6 +472,7 @@ function installMarkerAndCaptureBounds(args: {
             }
         });
         args.db.exec("COMMIT");
+        logSlowWriteTransaction("authority_marker_capture", transactionStartedAt);
     } catch (error) {
         try {
             args.db.exec("ROLLBACK");
@@ -439,6 +488,7 @@ function capturedBoundsUnchanged(
     projectPath: string,
     domains: readonly AuthorityDomain[],
 ): boolean {
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     try {
         const read = db.prepare(
@@ -455,6 +505,7 @@ function capturedBoundsUnchanged(
             );
         });
         db.exec("COMMIT");
+        logSlowWriteTransaction("authority_capture_check", transactionStartedAt);
         return unchanged;
     } catch (error) {
         try {
@@ -529,6 +580,8 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                                     args.projectPath,
                                     identity.moduleRowId,
                                     identity.sourceRowId,
+                                    undefined,
+                                    true,
                                 );
                             }
                         })
@@ -691,6 +744,9 @@ export async function drainAuthority(args: {
             const next = getMirrorCursor(args.db, args.domain);
             if (next === cursor) break;
         }
+        if (args.domain === "memories") {
+            resolvePendingMemoryReferencesForDrain(args.db);
+        }
         for (const step of [
             "seed",
             "memories",
@@ -777,6 +833,16 @@ export async function drainAuthority(args: {
         if (finished.state !== "TS") {
             throw new Error("memory authority drain did not reactivate TypeScript ownership");
         }
+        if (args.domain === "memories") {
+            // These rows only describe the module-owned read model. Once TypeScript owns the
+            // project again they are not consulted, and retaining them can make a later mirror
+            // replay treat stale module identities as current.
+            withPrivilegedWriter(args.db, () => {
+                args.db
+                    .prepare("DELETE FROM mirror_live_memory_rows WHERE module_project = ?")
+                    .run(args.projectPath);
+            });
+        }
         // A project marker fences both authority domains. Remove it only after neither
         // domain remains module-owned; a one-domain drain must not reopen the other domain.
         const remaining = await Promise.all(
@@ -825,6 +891,61 @@ function chunkRowsForFrame<T>(rows: readonly T[]): T[][] {
     }
     if (current.length > 0) chunks.push(current);
     return chunks;
+}
+
+export interface MemoryMirrorStatus {
+    cursor: number;
+    cursorUpdatedAt: number | null;
+    cursorAgeMs: number | null;
+    liveRows: number;
+    feedHead: number | null;
+    pendingRows: number | null;
+    stalled: boolean;
+    code: "MC-M01" | null;
+}
+
+export const MEMORY_MIRROR_STALL_THRESHOLD_MS = 40_000;
+
+export function getMemoryMirrorStatus(
+    db: Database,
+    feedHead?: number | null,
+    nowMs = Date.now(),
+): MemoryMirrorStatus {
+    const cursorRow = db
+        .prepare("SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'")
+        .get() as { cursor?: number; updated_at?: number } | undefined;
+    const liveRow = db.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get() as
+        | { count?: number }
+        | undefined;
+    const cursor = typeof cursorRow?.cursor === "number" ? cursorRow.cursor : 0;
+    const cursorUpdatedAt =
+        typeof cursorRow?.updated_at === "number" && cursorRow.updated_at > 0
+            ? cursorRow.updated_at
+            : null;
+    const cursorAgeMs =
+        cursorUpdatedAt === null ? null : Math.max(0, Math.floor(nowMs - cursorUpdatedAt));
+    const liveRows = typeof liveRow?.count === "number" ? liveRow.count : 0;
+    const resolvedFeedHead =
+        typeof feedHead === "number" && Number.isSafeInteger(feedHead) && feedHead >= 0
+            ? feedHead
+            : null;
+    const pendingRows = resolvedFeedHead === null ? null : Math.max(0, resolvedFeedHead - cursor);
+    const stalled =
+        liveRows > 0 &&
+        pendingRows !== null &&
+        pendingRows > 0 &&
+        cursorAgeMs !== null &&
+        cursorAgeMs >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
+    return {
+        cursor,
+        cursorUpdatedAt,
+        cursorAgeMs,
+        liveRows,
+        feedHead: resolvedFeedHead,
+        pendingRows,
+        stalled,
+        code: stalled ? "MC-M01" : null,
+    };
 }
 
 export function getMirrorCursor(db: Database, domain: AuthorityDomain): number {
@@ -882,6 +1003,136 @@ const MEMORY_SNAPSHOT_COLUMNS = [
     "mural_cue_at",
     "mural_cue_rejection_count",
 ] as const;
+
+const IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS = ["project_path", "first_seen_at", "created_at"] as const;
+const CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+    "importance",
+    "scope",
+    "shareable",
+    "source_type",
+    "classified_at",
+] as const;
+const VERIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+    "verification_status",
+    "verified_at",
+    "mapping",
+    "mapping_origin",
+] as const;
+const MURAL_MEMORY_SNAPSHOT_COLUMNS = [
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+const UPDATED_MEMORY_SNAPSHOT_COLUMNS = [
+    "category",
+    "content",
+    "normalized_hash",
+    "source_session_id",
+    "seen_count",
+    "retrieval_count",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+] as const;
+
+type ExistingMemoryRow = {
+    project_path?: string;
+    category?: string;
+    content?: string;
+    normalized_hash?: string;
+    importance?: number | null;
+    scope?: string;
+    shareable?: number;
+    source_session_id?: string | null;
+    source_type?: string | null;
+    seen_count?: number;
+    retrieval_count?: number;
+    first_seen_at?: number;
+    created_at?: number;
+    updated_at?: number;
+    last_seen_at?: number;
+    last_retrieved_at?: number | null;
+    status?: string;
+    expires_at?: number | null;
+    verification_status?: string;
+    verified_at?: number | null;
+    classified_at?: number | null;
+    superseded_by_memory_id?: number | null;
+    merged_from?: string | null;
+    metadata_json?: string | null;
+    mural_cue?: string | null;
+    mural_cue_hash?: string | null;
+    mural_cue_at?: number | null;
+    mural_cue_rejection_count?: number | null;
+};
+
+interface MemoryRecencyGuard {
+    effectiveRow: Record<string, unknown>;
+    hostUpdatedNewer: boolean;
+    hostVerificationNewer: boolean;
+}
+
+function memorySnapshotTimestamp(row: Record<string, unknown>, key: string): number {
+    const value = row[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function parsedMemorySnapshot(
+    snapshotJson: string,
+    fallback: Record<string, unknown>,
+): Record<string, unknown> {
+    try {
+        const parsed: unknown = JSON.parse(snapshotJson);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function guardMemorySnapshotByRecency(args: {
+    row: Record<string, unknown>;
+    snapshot: Record<string, unknown>;
+    existing?: ExistingMemoryRow;
+}): MemoryRecencyGuard {
+    const effectiveRow = { ...args.row };
+    if (!args.existing) {
+        return { effectiveRow, hostUpdatedNewer: false, hostVerificationNewer: false };
+    }
+    const existing = args.existing as Record<string, unknown>;
+    const preserve = (columns: readonly string[]): void => {
+        for (const column of columns) {
+            if (Object.hasOwn(existing, column)) {
+                effectiveRow[column] = existing[column];
+            }
+        }
+    };
+    preserve(IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS);
+
+    const hostUpdatedNewer =
+        memorySnapshotTimestamp(existing, "updated_at") >
+        memorySnapshotTimestamp(args.snapshot, "updated_at");
+    const hostClassificationNewer =
+        hostUpdatedNewer ||
+        memorySnapshotTimestamp(existing, "classified_at") >
+            memorySnapshotTimestamp(args.snapshot, "classified_at");
+    const snapshotCarriesUpdatedAt = hasSnapshotField(args.snapshot, "updated_at");
+    const hostVerificationNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+    const hostMuralNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+
+    if (hostUpdatedNewer) preserve(UPDATED_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostClassificationNewer) preserve(CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostVerificationNewer) preserve(VERIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostMuralNewer) preserve(MURAL_MEMORY_SNAPSHOT_COLUMNS);
+    return { effectiveRow, hostUpdatedNewer, hostVerificationNewer };
+}
 
 function hasSnapshotField(row: Record<string, unknown>, key: string): boolean {
     // Own-property checks distinguish a missing snapshot field from an explicit null clear.
@@ -1044,6 +1295,7 @@ function installStagedLiveMemorySnapshot(db: Database, generation: string): bool
 interface MirrorPageStatements {
     identityByModule: Statement;
     insertIdentity: Statement;
+    deleteIdentityByContext: Statement;
     deleteLiveMemory: Statement;
     deletePendingReferencesForMemory: Statement;
     deleteIdentity: Statement;
@@ -1109,6 +1361,9 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         insertIdentity: db.prepare(
             "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
         ),
+        deleteIdentityByContext: db.prepare(
+            "DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?",
+        ),
         deleteLiveMemory: db.prepare(
             "DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
         ),
@@ -1166,7 +1421,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
               mural_cue_rejection_count = ? WHERE id = ?`,
         ),
         updateSuperseded: db.prepare(
-            "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
+            "UPDATE memories SET superseded_by_memory_id = ?, updated_at = ? WHERE id = ?",
         ),
         deletePendingReference: db.prepare(
             "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
@@ -1178,7 +1433,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             "DELETE FROM memory_verifications WHERE memory_id = ?",
         ),
         insertMemoryVerification: db.prepare(
-            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at, mapping_origin) VALUES (?, ?, ?, ?, ?)",
         ),
         noteById: db.prepare("SELECT * FROM notes WHERE id = ?"),
         noteIdByStoreId: db.prepare(
@@ -1201,7 +1456,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
              policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
         ),
         upsertNoteRevision: db.prepare(
-            "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
+            "INSERT OR REPLACE INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?)",
         ),
         translateMemoryReferences: db.prepare(
             `UPDATE memories
@@ -1218,7 +1473,8 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
                        AND target.module_row_id = pending.target_module_row_id
                      WHERE pending.domain = 'memories'
                        AND source.context_row_id = memories.id
-                )
+                ),
+                    updated_at = ?
               WHERE id IN (
                     SELECT source.context_row_id
                       FROM mirror_pending_references pending
@@ -1256,7 +1512,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             "UPDATE mirror_memory_repair_state SET dirty = 0, updated_at = ? WHERE id = 1",
         ),
         repairCandidates: db.prepare(
-            `SELECT memory.id, live.full_row_snapshot
+            `SELECT memory.id, memory.updated_at, memory.classified_at, live.full_row_snapshot
                FROM memories memory
                JOIN mirror_identity identity
                  ON identity.domain = 'memories'
@@ -1272,9 +1528,14 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         ),
         repairMemory: db.prepare(
             `UPDATE memories
-                SET source_type = COALESCE(?, source_type),
-                    importance = COALESCE(?, importance)
-              WHERE id = ?`,
+                SET source_type = COALESCE(source_type, ?),
+                    importance = COALESCE(importance, ?),
+                    updated_at = ?
+              WHERE id = ?
+                AND COALESCE(updated_at, 0) <= ?
+                AND COALESCE(classified_at, 0) <= ?
+                AND ((source_type IS NULL AND ? IS NOT NULL)
+                  OR (importance IS NULL AND ? IS NOT NULL))`,
         ),
         updateCursor: db.prepare(
             "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
@@ -1300,6 +1561,43 @@ function mirrorIdentity(
     );
 }
 
+export interface MemoryMirrorIdentity {
+    moduleProject: string;
+    moduleRowId: number;
+    contextRowId: number;
+}
+
+export function moduleMemoryIdentityForHostId(
+    db: Database,
+    contextRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = db
+        .prepare(
+            `SELECT module_project, module_row_id, context_row_id
+               FROM mirror_identity
+              WHERE domain = 'memories' AND context_row_id = ?`,
+        )
+        .get(contextRowId) as
+        | { module_project: string; module_row_id: number; context_row_id: number }
+        | undefined;
+    return row
+        ? {
+              moduleProject: row.module_project,
+              moduleRowId: row.module_row_id,
+              contextRowId: row.context_row_id,
+          }
+        : null;
+}
+
+export function hostMemoryIdentityForModuleId(
+    db: Database,
+    moduleProject: string,
+    moduleRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = mirrorIdentity(db, "memories", moduleProject, moduleRowId);
+    return row ? { moduleProject, moduleRowId, contextRowId: row.context_row_id } : null;
+}
+
 export interface MirroredNoteCompileFields {
     compiledProvider: string | null;
     compiledConfig: string | null;
@@ -1317,7 +1615,8 @@ export function applyMirroredNoteCompileFields(args: {
         const result = args.db
             .prepare(
                 `UPDATE notes
-                    SET compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?
+                    SET compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?,
+                        updated_at = ?
                   WHERE id = (
                         SELECT context_row_id
                           FROM mirror_identity
@@ -1329,6 +1628,7 @@ export function applyMirroredNoteCompileFields(args: {
                 args.fields.compiledConfig,
                 args.fields.compiledAt,
                 args.fields.compileStatus,
+                Date.now(),
                 args.moduleProject,
                 args.moduleRowId,
             );
@@ -1343,11 +1643,30 @@ function rememberIdentity(
     moduleRowId: number,
     contextRowId: number,
     statements?: MirrorPageStatements,
+    replaceContextIdentity = domain === "notes",
 ): void {
     const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
-    if (existing) return;
-    // A context row has one canonical module identity. A duplicate feed row may
-    // still update that row, but it must not claim a second identity for it.
+    if (existing?.context_row_id === contextRowId) return;
+    if (existing) {
+        if (!replaceContextIdentity) return;
+        (
+            statements?.deleteIdentity ??
+            db.prepare(
+                "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
+            )
+        ).run(domain, moduleProject, moduleRowId);
+    }
+    // Stable source identity is authoritative when a module row is re-minted. Replace
+    // the stale backlink before inserting the new module id; INSERT OR IGNORE alone
+    // would lose to UNIQUE(domain, context_row_id) and leave the tombstoned id canonical.
+    if (replaceContextIdentity) {
+        (
+            statements?.deleteIdentityByContext ??
+            db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?")
+        ).run(domain, contextRowId);
+    }
+    // A natural-key-only duplicate memory feed row may update the canonical context row,
+    // but it must not claim a second identity without stable source identity.
     (
         statements?.insertIdentity ??
         db.prepare(
@@ -1363,9 +1682,9 @@ function contextMemoryId(
     row: Record<string, unknown>,
     moduleRowId: number,
     statements?: MirrorPageStatements,
-): number {
+): { contextId: number; inserted: boolean } {
     const mapped = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
-    if (mapped) return mapped.context_row_id;
+    if (mapped) return { contextId: mapped.context_row_id, inserted: false };
     const sourceUuid = rowNullableString(row, "context_store_uuid");
     const sourceId = rowNumber(row, "context_row_id", -1);
     const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
@@ -1377,8 +1696,8 @@ function contextMemoryId(
             db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
         ).get(sourceId, moduleProject) as { id?: number } | undefined;
         if (existing?.id !== undefined) {
-            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements);
-            return existing.id;
+            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements, true);
+            return { contextId: existing.id, inserted: false };
         }
     }
     // A legacy facade row may have no source identity even though this project in the
@@ -1395,7 +1714,7 @@ function contextMemoryId(
         ).all(moduleProject, category, normalizedHash) as Array<{ id?: number }>;
         if (candidates.length === 1 && candidates[0]?.id !== undefined) {
             rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id, statements);
-            return candidates[0].id;
+            return { contextId: candidates[0].id, inserted: false };
         }
     }
     const result = (
@@ -1406,7 +1725,7 @@ function contextMemoryId(
     ).run(moduleProject, rowString(row, "category", "CONSTRAINTS"));
     const contextId = Number(result.lastInsertRowid);
     rememberIdentity(db, domain, moduleProject, moduleRowId, contextId, statements);
-    return contextId;
+    return { contextId, inserted: true };
 }
 
 function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
@@ -1484,7 +1803,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         (hasSnapshotField(row, "importance") &&
             !(typeof row.importance === "number" && Number.isFinite(row.importance)));
     if (metadataClobberRisk) statements.markRepairPending.run(Date.now());
-    const contextId = contextMemoryId(
+    const { contextId, inserted } = contextMemoryId(
         db,
         feed.domain,
         moduleProject,
@@ -1492,38 +1811,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         feed.module_row_id,
         statements,
     );
-    const existing = statements.memoryById.get(contextId) as
-        | {
-              project_path?: string;
-              category?: string;
-              content?: string;
-              normalized_hash?: string;
-              importance?: number | null;
-              scope?: string;
-              shareable?: number;
-              source_session_id?: string | null;
-              source_type?: string | null;
-              seen_count?: number;
-              retrieval_count?: number;
-              first_seen_at?: number;
-              created_at?: number;
-              updated_at?: number;
-              last_seen_at?: number;
-              last_retrieved_at?: number | null;
-              status?: string;
-              expires_at?: number | null;
-              verification_status?: string;
-              verified_at?: number | null;
-              classified_at?: number | null;
-              superseded_by_memory_id?: number | null;
-              merged_from?: string | null;
-              metadata_json?: string | null;
-              mural_cue?: string | null;
-              mural_cue_hash?: string | null;
-              mural_cue_at?: number | null;
-              mural_cue_rejection_count?: number | null;
-          }
-        | undefined;
+    const existing = statements.memoryById.get(contextId) as ExistingMemoryRow | undefined;
     if (existing && existing.project_path !== moduleProject) {
         // Mirror identities identify rows but never authorize moving ownership between projects;
         // keep the durable row untouched when stale or corrupt metadata points across that boundary.
@@ -1532,53 +1820,74 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         );
         return;
     }
+    const retainedRecencySnapshot = parsedMemorySnapshot(snapshotJson, row);
+    const recencySnapshot = hasSnapshotField(row, "updated_at")
+        ? row
+        : hasSnapshotField(row, "classified_at")
+          ? { ...retainedRecencySnapshot, classified_at: row.classified_at }
+          : retainedRecencySnapshot;
+    const recencyGuard = guardMemorySnapshotByRecency({
+        row,
+        snapshot: recencySnapshot,
+        // The placeholder was allocated only to obtain a context id. Its zero-valued
+        // immutable fields are not host history and must not override the module snapshot.
+        existing: inserted ? undefined : existing,
+    });
+    const projectedRow = recencyGuard.effectiveRow;
     const has = (key: string): boolean => hasSnapshotField(row, key);
     const nullableNumber = (key: string, previous: number | null | undefined): number | null =>
         has(key)
-            ? typeof row[key] === "number" && Number.isFinite(row[key])
-                ? row[key]
+            ? typeof projectedRow[key] === "number" && Number.isFinite(projectedRow[key])
+                ? projectedRow[key]
                 : null
             : (previous ?? null);
     const nullableString = (key: string, previous: string | null | undefined): string | null =>
-        has(key) ? rowNullableString(row, key) : (previous ?? null);
-    const hasSuperseded = has("superseded_by_memory_id");
+        has(key) ? rowNullableString(projectedRow, key) : (previous ?? null);
+    const hasSuperseded = has("superseded_by_memory_id") && !recencyGuard.hostUpdatedNewer;
     const previousHash = existing?.normalized_hash;
 
     // A feed update is allowed to be a sparse legacy snapshot. An absent property means
     // "unchanged"; only a property explicitly present as null is a genuine clear.
     statements.updateMemory.run(
         has("project_path")
-            ? rowString(row, "project_path")
+            ? rowString(projectedRow, "project_path")
             : (existing?.project_path ?? moduleProject),
         has("category")
-            ? rowString(row, "category", "CONSTRAINTS")
+            ? rowString(projectedRow, "category", "CONSTRAINTS")
             : (existing?.category ?? "CONSTRAINTS"),
-        has("content") ? rowString(row, "content") : (existing?.content ?? ""),
+        has("content") ? rowString(projectedRow, "content") : (existing?.content ?? ""),
         has("normalized_hash")
-            ? rowString(row, "normalized_hash")
+            ? rowString(projectedRow, "normalized_hash")
             : (existing?.normalized_hash ?? ""),
         has("importance")
-            ? typeof row.importance === "number" && Number.isFinite(row.importance)
-                ? row.importance
+            ? typeof projectedRow.importance === "number" &&
+              Number.isFinite(projectedRow.importance)
+                ? projectedRow.importance
                 : null
             : (existing?.importance ?? null),
-        has("scope") ? rowString(row, "scope", "project") : (existing?.scope ?? "project"),
-        has("shareable") ? rowNumber(row, "shareable") : (existing?.shareable ?? 0),
+        has("scope") ? rowString(projectedRow, "scope", "project") : (existing?.scope ?? "project"),
+        has("shareable") ? rowNumber(projectedRow, "shareable") : (existing?.shareable ?? 0),
         nullableString("source_session_id", existing?.source_session_id),
         nullableString("source_type", existing?.source_type),
-        has("seen_count") ? rowNumber(row, "seen_count", 1) : (existing?.seen_count ?? 1),
+        has("seen_count") ? rowNumber(projectedRow, "seen_count", 1) : (existing?.seen_count ?? 1),
         has("retrieval_count")
-            ? rowNumber(row, "retrieval_count")
+            ? rowNumber(projectedRow, "retrieval_count")
             : (existing?.retrieval_count ?? 0),
-        has("first_seen_at") ? rowNumber(row, "first_seen_at") : (existing?.first_seen_at ?? 0),
-        has("created_at") ? rowNumber(row, "created_at") : (existing?.created_at ?? 0),
-        has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
-        has("last_seen_at") ? rowNumber(row, "last_seen_at") : (existing?.last_seen_at ?? 0),
+        has("first_seen_at")
+            ? rowNumber(projectedRow, "first_seen_at")
+            : (existing?.first_seen_at ?? 0),
+        has("created_at") ? rowNumber(projectedRow, "created_at") : (existing?.created_at ?? 0),
+        has("updated_at") ? rowNumber(projectedRow, "updated_at") : (existing?.updated_at ?? 0),
+        has("last_seen_at")
+            ? rowNumber(projectedRow, "last_seen_at")
+            : (existing?.last_seen_at ?? 0),
         nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
-        has("status") ? rowString(row, "status", "active") : (existing?.status ?? "active"),
+        has("status")
+            ? rowString(projectedRow, "status", "active")
+            : (existing?.status ?? "active"),
         nullableNumber("expires_at", existing?.expires_at),
         has("verification_status")
-            ? rowString(row, "verification_status", "unverified")
+            ? rowString(projectedRow, "verification_status", "unverified")
             : (existing?.verification_status ?? "unverified"),
         nullableNumber("verified_at", existing?.verified_at),
         nullableNumber("classified_at", existing?.classified_at),
@@ -1589,49 +1898,63 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         nullableString("mural_cue_hash", existing?.mural_cue_hash),
         nullableNumber("mural_cue_at", existing?.mural_cue_at),
         has("mural_cue_rejection_count")
-            ? rowNumber(row, "mural_cue_rejection_count")
+            ? rowNumber(projectedRow, "mural_cue_rejection_count")
             : (existing?.mural_cue_rejection_count ?? 0),
         contextId,
     );
-    if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {
+    if (hasSuperseded && typeof projectedRow.superseded_by_memory_id === "number") {
         const translated = mirrorIdentity(
             db,
             "memories",
             moduleProject,
-            row.superseded_by_memory_id,
+            projectedRow.superseded_by_memory_id,
             statements,
         );
         if (translated) {
-            statements.updateSuperseded.run(translated.context_row_id, contextId);
+            statements.updateSuperseded.run(translated.context_row_id, Date.now(), contextId);
             statements.deletePendingReference.run(moduleProject, feed.module_row_id);
         } else {
             statements.upsertPendingReference.run(
                 moduleProject,
                 feed.module_row_id,
-                row.superseded_by_memory_id,
+                projectedRow.superseded_by_memory_id,
             );
         }
     } else if (hasSuperseded) {
         statements.deletePendingReference.run(moduleProject, feed.module_row_id);
     }
-    const appliedHash = has("normalized_hash") ? rowString(row, "normalized_hash") : previousHash;
+    const appliedHash = has("normalized_hash")
+        ? rowString(projectedRow, "normalized_hash")
+        : previousHash;
     if (previousHash !== appliedHash && appliedHash !== undefined) {
         statements.deleteMemoryEmbeddings.run(contextId);
     }
     // Mapping snapshots replace the whole side table. An array is a durable mapping (an empty
     // array is the file-independent sentinel); null is a mapping tombstone and leaves no rows.
-    if (has("mapping")) {
+    if (has("mapping") && !recencyGuard.hostVerificationNewer) {
         statements.deleteMemoryVerifications.run(contextId);
-        if (Array.isArray(row.mapping)) {
+        if (Array.isArray(projectedRow.mapping)) {
             const files = [
                 ...new Set(
-                    row.mapping.filter((file): file is string => typeof file === "string").sort(),
+                    projectedRow.mapping
+                        .filter((file): file is string => typeof file === "string")
+                        .sort(),
                 ),
             ];
-            const verifiedAt = rowNumber(row, "verified_at");
-            const mappedAt = rowNumber(row, "updated_at", Date.now());
+            const verifiedAt = rowNumber(projectedRow, "verified_at");
+            const mappedAt = rowNumber(projectedRow, "updated_at", Date.now());
+            const mappingOrigin =
+                projectedRow.mapping_origin === "host_rejected_fallback"
+                    ? "host_rejected_fallback"
+                    : "mapper";
             for (const file of files.length > 0 ? files : [""]) {
-                statements.insertMemoryVerification.run(contextId, file, verifiedAt, mappedAt);
+                statements.insertMemoryVerification.run(
+                    contextId,
+                    file,
+                    verifiedAt,
+                    mappedAt,
+                    mappingOrigin,
+                );
             }
         }
     }
@@ -1642,6 +1965,8 @@ function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
     if (pending?.dirty !== 1) return;
     const candidates = statements.repairCandidates.all() as Array<{
         id: number;
+        updated_at?: number | null;
+        classified_at?: number | null;
         full_row_snapshot?: string | null;
     }>;
     for (const candidate of candidates) {
@@ -1665,9 +1990,24 @@ function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
                 ? snapshot.importance
                 : null;
         if (sourceType === null && importance === null) continue;
-        // This idempotent repair handles stores where sparse mapping records overwrote
-        // source_type and importance with null before the mirror retained full snapshots.
-        statements.repairMemory.run(sourceType, importance, candidate.id);
+        const snapshotVintage = Math.max(
+            memorySnapshotTimestamp(snapshot, "updated_at"),
+            memorySnapshotTimestamp(snapshot, "classified_at"),
+        );
+        const hostVintage = Math.max(candidate.updated_at ?? 0, candidate.classified_at ?? 0);
+        if (hostVintage > snapshotVintage) continue;
+        // Fill only missing metadata. A non-null host value is never replaced by an older
+        // retained snapshot, and the SQL repeats the vintage check at the write boundary.
+        statements.repairMemory.run(
+            sourceType,
+            importance,
+            Date.now(),
+            candidate.id,
+            snapshotVintage,
+            snapshotVintage,
+            sourceType,
+            importance,
+        );
     }
     // The candidate query is an intentional full pass only while dirty. Clearing the flag
     // makes subsequent mirror pages avoid the unindexed scan entirely.
@@ -1715,8 +2055,21 @@ function contextNoteId(
 }
 
 function translateMemoryReferences(statements: MirrorPageStatements): void {
-    statements.translateMemoryReferences.run();
+    statements.translateMemoryReferences.run(Date.now());
     statements.clearTranslatedReferences.run();
+}
+
+function resolvePendingMemoryReferencesForDrain(db: Database): void {
+    withPrivilegedWriter(db, () => {
+        db.transaction(() => {
+            const statements = prepareMirrorPageStatements(db);
+            // While queued mirror updates are being drained, mirroring is paused. Leave
+            // targets that still lack an identity in the durable pending-reference table,
+            // and resolve references whose target identity is now available before the
+            // TypeScript implementation regains control of memory writes.
+            translateMemoryReferences(statements);
+        }).immediate();
+    });
 }
 
 function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
@@ -1802,6 +2155,29 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
     );
 }
 
+export function applyTargetedMemoryMirrorRow(args: {
+    db: Database;
+    row: ChangefeedRow;
+}): MemoryMirrorIdentity | null {
+    const { db, row } = args;
+    if (row.domain !== "memories" || row.op === "tombstone") {
+        throw new Error("targeted memory mirror requires a live memory row");
+    }
+    const project = rowString(row.full_row_snapshot, "project_path");
+    if (!project) throw new Error("memory feed snapshot has no project_path");
+    withPrivilegedWriter(db, () => {
+        db.transaction(() => {
+            ensureMemoryRepairState(db);
+            const statements = prepareMirrorPageStatements(db);
+            applyMemoryRow(db, row, statements);
+            translateMemoryReferences(statements);
+            repairNullClobberedMemoryRows(statements);
+            bumpDomainMutationEpoch(db, project, "memories");
+        }).immediate();
+    });
+    return hostMemoryIdentityForModuleId(db, project, row.module_row_id);
+}
+
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
     const { db, page } = args;
     if (!AUTHORITY_DOMAINS.includes(page.domain)) throw new Error("unknown mirror domain");
@@ -1877,6 +2253,46 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 // tombstone until the module's current live identities have been captured.
                 throw new Error("memory mirror resnapshot must complete before tombstones");
             }
+            if (page.domain === "memories") {
+                // A module transaction can retire one row id and mint its replacement before
+                // this page is consumed. Bind every replacement carrying local source identity
+                // first, so an earlier tombstone cannot delete the durable host row or its
+                // id-keyed satellites before the replacement updates it in place.
+                for (const feed of page.rows) {
+                    if (
+                        feed.domain !== "memories" ||
+                        feed.op === "tombstone" ||
+                        feed.feed_seq <= durableCursor
+                    ) {
+                        continue;
+                    }
+                    const row = feed.full_row_snapshot;
+                    const moduleProject = rowString(row, "project_path");
+                    const sourceUuid = rowNullableString(row, "context_store_uuid");
+                    const sourceId = rowNumber(row, "context_row_id", -1);
+                    if (
+                        !moduleProject ||
+                        !sourceUuid ||
+                        sourceUuid !== statements.contextStoreUuid ||
+                        sourceId < 0
+                    ) {
+                        continue;
+                    }
+                    const existing = statements.memoryIdByStoreId.get(sourceId, moduleProject) as
+                        | { id?: number }
+                        | undefined;
+                    if (existing?.id === undefined) continue;
+                    rememberIdentity(
+                        db,
+                        "memories",
+                        moduleProject,
+                        feed.module_row_id,
+                        existing.id,
+                        statements,
+                        true,
+                    );
+                }
+            }
             const touchedProjects = new Set<string>();
             for (const feed of page.rows) {
                 if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
@@ -1903,9 +2319,11 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
+type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull" | "memoryIdentityAck">;
+
 export async function ensureLiveMemoryResnapshot(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     limit: number;
 }): Promise<void> {
     let adoptedWinner = false;
@@ -2032,12 +2450,18 @@ export async function ensureLiveMemoryResnapshot(args: {
     });
 }
 
-export async function pullAndApplyMirrorPage(args: {
+interface AppliedMirrorPage {
+    cursor: number;
+    hasMore: boolean;
+    rowsApplied: number;
+}
+
+async function pullAndApplyMirrorPageWithStatus(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     domain: AuthorityDomain;
     limit?: number;
-}): Promise<number> {
+}): Promise<AppliedMirrorPage> {
     if (!args.module.mirrorPull) {
         throw new Error("memory mirror consumer requires the mirror.pull module route");
     }
@@ -2051,28 +2475,123 @@ export async function pullAndApplyMirrorPage(args: {
         cursor,
         limit,
     });
-    return applyMirrorPage({ db: args.db, page: response.page });
+    const nextCursor = applyMirrorPage({ db: args.db, page: response.page });
+    if (args.domain === "memories" && args.module.memoryIdentityAck) {
+        const rowsByProject = new Map<
+            string,
+            Array<{ module_row_id: number; context_row_id: number }>
+        >();
+        for (const feed of response.page.rows) {
+            if (feed.domain !== "memories" || feed.op === "tombstone") continue;
+            const project = rowString(feed.full_row_snapshot, "project_path");
+            if (!project) continue;
+            const identity = mirrorIdentity(args.db, "memories", project, feed.module_row_id);
+            if (!identity) continue;
+            const rows = rowsByProject.get(project) ?? [];
+            rows.push({
+                module_row_id: feed.module_row_id,
+                context_row_id: identity.context_row_id,
+            });
+            rowsByProject.set(project, rows);
+        }
+        for (const [project, rows] of rowsByProject) {
+            await args.module.memoryIdentityAck({ project, rows });
+        }
+    }
+    return {
+        cursor: nextCursor,
+        hasMore: response.page.has_more,
+        rowsApplied: response.page.rows.filter(
+            (row) => row.domain === args.domain && row.feed_seq > cursor,
+        ).length,
+    };
 }
 
-const mirrorFlights = new WeakMap<object, Promise<number>>();
+export async function pullAndApplyMirrorPage(args: {
+    db: Database;
+    module: MirrorPullModuleClient;
+    domain: AuthorityDomain;
+    limit?: number;
+}): Promise<number> {
+    return (await pullAndApplyMirrorPageWithStatus(args)).cursor;
+}
+
+export interface MirrorDrainResult {
+    cursor: number;
+    pagesPulled: number;
+    rowsApplied: number;
+    complete: boolean;
+    budgetExhausted: boolean;
+}
+
+/**
+ * Drain the paged mirror protocol until the producer reports completion. This is
+ * shared by explicit tool synchronization and transform-driven background pulls
+ * so both callers preserve the same cursor-progress rule.
+ */
+export async function drainMirrorPages(args: {
+    db: Database;
+    module: MirrorPullModuleClient;
+    domain: AuthorityDomain;
+    limit?: number;
+    pageBudget?: number;
+}): Promise<MirrorDrainResult> {
+    const pageBudget =
+        args.pageBudget === undefined
+            ? Number.MAX_SAFE_INTEGER
+            : Math.max(1, Math.floor(args.pageBudget));
+    let pagesPulled = 0;
+    let rowsApplied = 0;
+    let cursor = getMirrorCursor(args.db, args.domain);
+    while (pagesPulled < pageBudget) {
+        const priorCursor = cursor;
+        const page = await pullAndApplyMirrorPageWithStatus(args);
+        pagesPulled += 1;
+        rowsApplied += page.rowsApplied;
+        cursor = page.cursor;
+        if (!page.hasMore) {
+            return { cursor, pagesPulled, rowsApplied, complete: true, budgetExhausted: false };
+        }
+        if (cursor === priorCursor) {
+            return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: false };
+        }
+    }
+    return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: true };
+}
+
+export const TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET = 20;
+
+export interface MemoryMirrorDrainResult extends MirrorDrainResult {
+    cuePoolVersion: number;
+}
+
+const mirrorFlights = new WeakMap<object, Promise<MemoryMirrorDrainResult>>();
 
 /**
  * The rust transform pass is the mirror cadence. Coalesce overlapping passes so a
  * slower pull can never race a second cursor application on the same connection.
+ * One flight drains a bounded page batch; an incomplete result remains eligible on
+ * the next transform pass.
  */
 export function pullMemoryMirrorOnce(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     limit?: number;
-}): Promise<number> {
+    pageBudget?: number;
+}): Promise<MemoryMirrorDrainResult> {
     const existing = mirrorFlights.get(args.module);
     if (existing) return existing;
-    const flight = pullAndApplyMirrorPage({
+    const flight = drainMirrorPages({
         db: args.db,
         module: args.module,
         domain: "memories",
-        limit: args.limit,
-    }).finally(() => mirrorFlights.delete(args.module));
+        // A page is capped at 1,000 rows by both protocol peers. Using that cap keeps the
+        // bounded transform ride-along at at most 20 requests for a 20,000-row backlog.
+        limit: args.limit ?? 1000,
+        pageBudget: args.pageBudget ?? TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
+    })
+        .then((result) => ({ ...result, cuePoolVersion: result.cursor }))
+        .finally(() => mirrorFlights.delete(args.module));
     mirrorFlights.set(args.module, flight);
     return flight;
 }

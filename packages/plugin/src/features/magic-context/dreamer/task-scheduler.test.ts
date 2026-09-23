@@ -324,6 +324,31 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(state?.nextDueAt).toBeGreaterThan(now);
     });
 
+    it("advances last_run_at from the run START on completion (not completion time)", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "verify", now);
+
+        // Slow executor: a long run makes the start↔finish gap visible, so the
+        // assertion can discriminate run-start from run-completion advancement.
+        const executor = async (): Promise<TaskExecOutcome> => {
+            await new Promise((r) => setTimeout(r, 200));
+            return { status: "completed" };
+        };
+        const before = Date.now();
+        await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+        const after = Date.now();
+        const state = getTaskScheduleState(db, PROJECT, "verify");
+        expect(state?.lastStatus).toBe("completed");
+        // last_run_at reflects the run START (~before), not the completion (~after):
+        // a message landing mid-run is newer than the cutoff and re-triggers next slot.
+        expect(state?.lastRunAt).toBeGreaterThanOrEqual(before);
+        expect(state?.lastRunAt).toBeLessThan(after - 150);
+    });
+
     it("skips a due task whose gate fails (no active memories) and advances it", async () => {
         db = freshDb();
         // No memories → verify gate fails.
@@ -607,6 +632,24 @@ describe("task-scheduler — runManualDream", () => {
         expect(result.ran).toEqual(["verify"]);
     });
 
+    it("returns successful task detail for the manual command", async () => {
+        db = freshDb();
+        const tasks = [cfg("curate", "")];
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "completed",
+            detail: "curate: 2 memory operations applied (merge, archive)",
+        });
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            task: "curate",
+        });
+
+        expect(result.details).toEqual(["curate: 2 memory operations applied (merge, archive)"]);
+    });
+
     it("a single DISABLED task can still be force-run by name", async () => {
         db = freshDb();
         const tasks = [cfg("maintain-docs", "")]; // disabled
@@ -634,6 +677,28 @@ describe("task-scheduler — runManualDream", () => {
         const result = await runManualDream({ db, projectIdentity: PROJECT, tasks, executor });
         expect(result.ran).toEqual([]);
         expect(result.skippedNoWork).toEqual(["verify"]);
+    });
+
+    it("reports structured failure detail while preserving the legacy scheduler error", async () => {
+        db = freshDb();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "failed",
+            transient: true,
+            error: "verify returned no output",
+            failureDetail: "empty_completion · model: provider/model",
+        });
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            task: "verify",
+        });
+        expect(result.failureDetails).toEqual(["verify: empty_completion · model: provider/model"]);
+        expect(getTaskScheduleState(db, PROJECT, "verify")?.lastError).toBe(
+            "verify returned no output",
+        );
     });
 
     it("an unknown forced task name is a no-op", async () => {

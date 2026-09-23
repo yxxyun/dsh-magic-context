@@ -1,17 +1,21 @@
-import * as crypto from "node:crypto";
+import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import {
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
+    observeAuthorityRouting,
 } from "../../features/magic-context/context-authority";
 import {
+    isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
+import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
@@ -19,14 +23,10 @@ import {
     type ContextDatabase,
     deriveTagLoadFloor,
     getActiveTagsBySession,
-    getActiveTagTokenAggregate,
     getActiveTagTokenTotalsByMessage,
-    getHistorianFailureState,
+    getDroppedTagsByNumbers,
     getMaxDroppedTagNumber,
-    getOldestActiveUnprotectedToolTags,
     getOrCreateSessionMeta,
-    getTagsByNumbers,
-    loadPersistedUsage,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
@@ -36,12 +36,15 @@ import {
     clearEmergencyRecovery,
     clearHistorianFailureState,
     clearPersistedReasoningWatermark,
+    clearThinkingBindingRecoveryIf,
+    getChannel1NudgeState,
+    getChannel2NudgeState,
+    getLastNudgeUndropped,
     getOverflowState,
-    loadProtectedTailMeta,
+    loadTransformPassStateSnapshot,
     recordOverflowDetected,
-    resetLastNudgeCycleIfTailShrank,
     resetProtectedTailNoEligibleHead,
-    setDeferredExecutePendingIfAbsent,
+    resolveEpochFloorForPass,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -54,10 +57,12 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
+import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
-import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
+import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
@@ -69,11 +74,17 @@ import {
     resolveTodowriteAvailabilityFromMessages,
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
-import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
+import {
+    decideChannel1,
+    evaluateChannel2,
+    formatChannel1Evaluation,
+    formatChannel2Evaluation,
+} from "./ctx-reduce-nudge";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
@@ -85,11 +96,14 @@ import {
 } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
 import {
+    mustMaterialize,
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
+    selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
+import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
-import { dropSlot } from "./lkg-slot";
+import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
 import {
@@ -101,22 +115,28 @@ import {
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
 import { readRawSessionMessages } from "./read-session-chunk";
-import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
+import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { sendStatusNotification } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
 import { runCompartmentPhase } from "./transform-compartment-phase";
-import { loadContextUsage, resolveSchedulerDecision } from "./transform-context-state";
+import {
+    contextUsagePassSnapshot,
+    loadContextUsage,
+    resolveSchedulerDecision,
+} from "./transform-context-state";
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
     applyFlushedStatuses,
+    hasRecentAssistantCommit,
     type MessageLike,
     stripStructuralNoise,
     type TagTarget,
@@ -124,6 +144,8 @@ import {
 } from "./transform-operations";
 import {
     abortSessionFailClosed,
+    type CompactionMarkerStrategy,
+    defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
@@ -169,12 +191,14 @@ function maybeSendProjectIdentityWarning(
     if (!deps.client) return;
     const warning = takeDubiousOwnershipProjectIdentityWarning(directory);
     if (!warning) return;
-    void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch((error) => {
-        sessionLog(
-            sessionId,
-            `project identity warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-    });
+    void sendStatusNotification(deps.client, sessionId, warning, notificationParams).catch(
+        (error) => {
+            sessionLog(
+                sessionId,
+                `project identity warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        },
+    );
 }
 
 export function clearMessageTokensCache(sessionId: string, messageId?: string): void {
@@ -392,6 +416,18 @@ export async function recoverTsAuthorityProject(args: {
         })),
     );
 
+    // A restarted TypeScript host may find a project that is still module-owned.
+    // Record MODULE routing before the authority drain clears its marker so the
+    // later return to TypeScript is legible as a routing transition.
+    if (
+        statuses.some(
+            ({ authority }) =>
+                authority !== null && authority !== undefined && authority.state !== "TS",
+        )
+    ) {
+        observeAuthorityRouting(args.projectPath, "MODULE");
+    }
+
     let drainedDomain = false;
     for (const { domain, authority } of statuses) {
         if (!authority || authority.state === "TS") continue;
@@ -430,18 +466,21 @@ export async function recoverTsAuthorityProject(args: {
     // view re-renders any changes mirrored during recovery.
     if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
         bumpProjectMemoryEpoch(args.db, args.projectPath);
+        observeAuthorityRouting(args.projectPath, "TS");
         return "completed";
     }
     return "retryable";
 }
 
-function scheduleTsAuthorityRecovery(args: {
+export function scheduleTsAuthorityRecovery(args: {
     db: ContextDatabase;
     projectPath: string;
     projectRoot: string;
     module?: RustModeModuleClient;
+    isLinkedWorktree?: (directory: string) => boolean;
 }): void {
     if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
+    if ((args.isLinkedWorktree ?? isLinkedGitWorktree)(args.projectRoot)) return;
     if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
     const module = args.module;
 
@@ -488,6 +527,17 @@ function scheduleTsAuthorityRecovery(args: {
 }
 
 export interface TransformDeps {
+    hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
+    /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
+    compactionMarkerStrategy?: CompactionMarkerStrategy & {
+        setPending?: typeof import("../../features/magic-context/storage").setPendingCompactionMarkerState;
+        publish?: typeof import("./compaction-marker-manager").updateCompactionMarkerAfterPublication;
+    };
+    /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
+    hostRawMessages?: typeof readRawSessionMessages;
+    hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
+    hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
+    hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
     scheduler: Scheduler;
     contextUsageMap: Map<
@@ -508,7 +558,10 @@ export interface TransformDeps {
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
     /** Module-authored Channel 2 text held until the terminal `message.updated` event, when the host delivers the pending nudge. */
     channel2DirectiveTextBySession?: Map<string, string>;
-    protectedTags: number;
+    /** Direct absolute override for callers that do not load tiered config. */
+    protectedTokens?: number;
+    /** User/project values retained until the pass supplies usableSoft geometry. */
+    protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
     /**
      * ctx_reduce visibility is resolved per session from the session's tool
      * allow-list. Tag DB rows are still maintained when the tool is unavailable,
@@ -536,6 +589,8 @@ export interface TransformDeps {
      */
     pendingMaterializationSessions: Set<string>;
     deferredMaterializationSessions?: Set<string>;
+    /** Live OpenCode reasoning variant, forwarded only as a provider-cache identity signal. */
+    variantBySession?: Map<string, string | undefined>;
     lastHeuristicsTurnId: Map<string, string>;
     commitSeenLastPass?: Map<string, boolean>;
     client?: PluginContext["client"];
@@ -564,8 +619,12 @@ export interface TransformDeps {
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historianTimeoutMs?: number;
+    /** Active OpenCode historian entry, including its outbound request variant. */
+    historianModel?: ModelInput;
+    historianContextLimit?: number;
+    historianMaxOutputTokens?: number;
     /** Resolved fallback chain for historian-family calls. */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
     /**
@@ -585,6 +644,11 @@ export interface TransformDeps {
         sessionId: string,
     ) => import("./send-session-notification").NotificationParams;
     getModelKey?: (sessionId: string) => string | undefined;
+    /**
+     * Observed provider-tool-set fingerprint for the session route. This is
+     * telemetry only: a change is recorded but never asks m[0] to fold.
+     */
+    getToolSetHash?: (sessionId: string) => string;
     getFallbackModelId?: (sessionId: string) => string | undefined;
     projectPath?: string;
     experimentalUserMemories?: boolean;
@@ -610,7 +674,7 @@ export interface TransformDeps {
     sessionDirectoryBySession?: Map<string, string>;
     /**
      * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/sidekick/memory-migration), detected by title prefix
+     * (historian/dreamer/memory-migration), detected by title prefix
      * at `session.created`. When a session is in this set the transform returns
      * immediately (messages unmodified) — these children have their own fixed
      * agent identity and never use any MC feature, so even reduced-mode work
@@ -645,6 +709,8 @@ export interface TransformDeps {
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
     promptSurface?: PromptSurfaceConfig;
+    /** Resolves trusted USER guidance files before crossing the module boundary. */
+    promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
     /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
@@ -657,10 +723,33 @@ export interface TransformDeps {
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string) => void;
+    onRustEngineReconnectRefusal?: (args: {
+        sessionId: string;
+        projectRoot: string;
+        refusedUserMessageId: string;
+        providerProvenEmergency: boolean;
+        compactionOff: boolean;
+    }) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
 }
 
+export function resolveTransformHostSeams(
+    deps: Pick<
+        TransformDeps,
+        "hostRawMessages" | "hostProtectedTailBoundary" | "hostModelFallback" | "hostRefuse"
+    >,
+) {
+    return {
+        hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
+        hostProtectedTailBoundary:
+            deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
+        hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
+        hostRefuse: deps.hostRefuse ?? abortSessionFailClosed,
+    };
+}
+
 export function createTransform(deps: TransformDeps) {
+    const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     const rustModeTransform =
         deps.transformMode === "rust" && deps.rustModeModuleClient
@@ -670,6 +759,7 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
+                  onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,
@@ -678,6 +768,21 @@ export function createTransform(deps: TransformDeps) {
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
+
+    const observeCommitNudgeTransition = (
+        sessionId: string,
+        hasRecentCommit: boolean,
+        isSubagent: boolean,
+    ): void => {
+        const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
+        const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
+        // The first pass establishes a restart-safe baseline. Only a later
+        // absent→present edge is a new commit, and subagents never deliver note nudges.
+        if (!isSubagent && hadPriorCommitState && hasRecentCommit && !sawCommitLastPass) {
+            onNoteTrigger(deps.db, sessionId, "commit_detected");
+        }
+        deps.commitSeenLastPass?.set(sessionId, hasRecentCommit);
+    };
 
     const transform = async (
         _input: Record<string, never>,
@@ -692,12 +797,13 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
         const resolvedSessionId = sessionId;
+        beginLkgPass(sessionId);
         clearOpenCodePendingTransformDecision(sessionId);
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
         if (deps.client !== undefined) {
-            scheduleReconciliation(db, sessionId, readRawSessionMessages);
+            scheduleReconciliation(db, sessionId, host.hostRawMessages);
         }
 
         const tUserMsg = performance.now();
@@ -717,8 +823,8 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
 
-        // Magic Context's OWN hidden children (historian/dreamer/sidekick/
-        // memory-migration) are fully exempt from the transform. They have a
+        // Magic Context's OWN hidden children (historian/dreamer/memory-migration)
+        // are fully exempt from the transform. They have a
         // fixed agent identity + single-shot/bounded job and use zero MC
         // features, so even reduced-mode work (tagging, heuristic drops) is
         // pure overhead and conceptual noise. Detected at session.created by
@@ -789,7 +895,7 @@ export function createTransform(deps: TransformDeps) {
                     // record in place, accepting a duplicate after a crash
                     // rather than permanently losing the notice.
                     noticeDelivered =
-                        (await sendIgnoredMessage(
+                        (await sendStatusNotification(
                             deps.client,
                             sessionId,
                             notice,
@@ -811,21 +917,34 @@ export function createTransform(deps: TransformDeps) {
         }
 
         // Rust mode is an authority adapter, not a second implementation of the
-        // TypeScript renderer. Compaction-off leaves native compaction in charge,
-        // so no mutating module transform may run after reconciliation.
+        // TypeScript renderer. Compaction-off still dispatches so the module can
+        // provide the shared additive-only memory/docs contract.
         if (deps.transformMode === "rust") {
-            if (compactionOff) return;
             if (!rustModeTransform) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;
             }
+            if (!compactionOff) {
+                observeCommitNudgeTransition(
+                    sessionId,
+                    hasRecentAssistantCommit(messages),
+                    sessionMeta.isSubagent,
+                );
+            }
             await rustModeTransform.run(sessionId, messages, output, sessionMeta);
+            // Rust returns before the TypeScript post-pass hook below. Run the
+            // host-owned embedding trigger after either implementation publishes.
+            deps.maybeAutoEmbedSession?.(sessionId);
             return;
         }
 
         // System prompt change detection is handled in experimental.chat.system.transform
         // (see system-prompt-hash.ts), not here. The messages transform only receives
         // user/assistant messages, not the system prompt.
+
+        // Freeze the harness-derived suffix shape before tagging, structural-noise
+        // sentinels, and synthetic injections can alter the live message graph.
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
@@ -919,7 +1038,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode &&
             !compactionOff &&
             historianRunnable &&
-            deps.client !== undefined &&
+            (deps.client !== undefined || deps.hiddenCompletionExecutor !== undefined) &&
             compartmentDirectory.length > 0;
         const fallbackModelId = deps.getFallbackModelId?.(sessionId);
 
@@ -929,7 +1048,7 @@ export function createTransform(deps: TransformDeps) {
         // zero last_context_percentage / last_input_tokens; the proactive
         // shrinking-switch arm and the protected-tail boundary sizing need the
         // pre-reset values, so capture them once, here, up front.
-        const persistedUsageBeforeResets = loadPersistedUsage(db, sessionId);
+        const persistedUsageBeforeResets = contextUsagePassSnapshot(sessionMeta).persistedUsage;
 
         // Detect model changes early in the transform, BEFORE loading context
         // usage, so threshold checks (95% blocking, 80% emergency nudge) and the
@@ -977,7 +1096,8 @@ export function createTransform(deps: TransformDeps) {
                 if (
                     lastUsageModelKey != null &&
                     outgoingModelKey != null &&
-                    lastUsageModelKey !== outgoingModelKey
+                    piModelRefToCanonical(lastUsageModelKey) !==
+                        piModelRefToCanonical(outgoingModelKey)
                 ) {
                     dropSlot(sessionId, "model-change");
                     sessionLog(
@@ -1029,7 +1149,8 @@ export function createTransform(deps: TransformDeps) {
         // `persistedUsageBeforeResets` (captured above, before the model-change
         // clear too) holds the pre-reset usage that restart recovery and
         // protected-tail boundary sizing rely on.
-        const historianFailureState = getHistorianFailureState(db, sessionId);
+        const earlyStateSnapshot = loadTransformPassStateSnapshot(db, sessionId);
+        const historianFailureState = earlyStateSnapshot.historianFailure;
 
         if (isFirstTransformPassForSession && sessionMeta) {
             const persistedPct = sessionMeta.lastContextPercentage ?? 0;
@@ -1055,10 +1176,18 @@ export function createTransform(deps: TransformDeps) {
 
         // Compute context usage AFTER first-pass reset so threshold checks use
         // clean state (0%) instead of stale values from a previous model/session.
-        let contextUsageEarly = loadContextUsage(deps.contextUsageMap, db, sessionId);
+        let contextUsageEarly = loadContextUsage(
+            deps.contextUsageMap,
+            db,
+            sessionId,
+            contextUsagePassSnapshot(sessionMeta),
+        );
 
         let recoveryNoHeadEscapeActive = false;
         let emergencyRecoveryArmed = false;
+        let overflowStateMutatedThisPass = false;
+        let recoveryNoEligibleHeadCount =
+            earlyStateSnapshot.protectedTail.recoveryNoEligibleHeadCount;
         let emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null = null;
         let usagePercentageSynthetic = false;
 
@@ -1120,8 +1249,9 @@ export function createTransform(deps: TransformDeps) {
                     // model other than the one we're about to send to.
                     lastMeasuredModelKey != null &&
                     armModelKey != null &&
-                    lastMeasuredModelKey !== armModelKey &&
-                    !getOverflowState(db, sessionId).needsEmergencyRecovery
+                    piModelRefToCanonical(lastMeasuredModelKey) !==
+                        piModelRefToCanonical(armModelKey) &&
+                    !earlyStateSnapshot.overflow.needsEmergencyRecovery
                 ) {
                     sessionLog(
                         sessionId,
@@ -1143,18 +1273,24 @@ export function createTransform(deps: TransformDeps) {
                     // noHeadEscape (below) suppress the bump we just armed, so
                     // reset it for a fresh evaluation against the new model.
                     resetProtectedTailNoEligibleHead(db, sessionId);
+                    recoveryNoEligibleHeadCount = 0;
+                    overflowStateMutatedThisPass = true;
                 }
 
-                const overflowState = getOverflowState(db, sessionId);
+                // A proactive arm is a deliberate write-after-read boundary. Only
+                // that path re-reads; otherwise the pass uses its coherent snapshot.
+                const overflowState = overflowStateMutatedThisPass
+                    ? getOverflowState(db, sessionId)
+                    : earlyStateSnapshot.overflow;
                 emergencyRecoveryArmed = overflowState.needsEmergencyRecovery;
                 emergencyRecoveryOrigin = overflowState.emergencyRecoveryOrigin;
                 if (contextUsageEarly.percentage < 80 && !overflowState.needsEmergencyRecovery) {
                     resetProtectedTailNoEligibleHead(db, sessionId);
+                    recoveryNoEligibleHeadCount = 0;
                 }
-                const protectedTailMeta = loadProtectedTailMeta(db, sessionId);
                 const noHeadEscape =
                     overflowState.needsEmergencyRecovery &&
-                    protectedTailMeta.recoveryNoEligibleHeadCount >= RECOVERY_NO_HEAD_LIMIT;
+                    recoveryNoEligibleHeadCount >= RECOVERY_NO_HEAD_LIMIT;
                 recoveryNoHeadEscapeActive = noHeadEscape;
                 if (
                     overflowState.needsEmergencyRecovery &&
@@ -1171,7 +1307,7 @@ export function createTransform(deps: TransformDeps) {
                     };
                     usagePercentageSynthetic = true;
                 } else if (recoveryNoHeadEscapeActive && deps.client) {
-                    void sendIgnoredMessage(
+                    void sendStatusNotification(
                         deps.client,
                         sessionId,
                         "Magic Context can't compact yet — the recent history is a single in-progress block. Continuing; it will compact once the block completes. Run `/ctx-recomp` if this persists.",
@@ -1208,7 +1344,7 @@ export function createTransform(deps: TransformDeps) {
         // deliberately fall through to the live-usage path inside the resolver.
         let modelForBudget = deps.liveModelBySession?.get(sessionId);
         if (!modelForBudget) {
-            const recovered = findLastAssistantModelFromOpenCodeDb(sessionId);
+            const recovered = host.hostModelFallback(sessionId);
             if (recovered) {
                 modelForBudget = recovered;
                 // Seed the live map so the scheduler / notification / sidebar
@@ -1228,6 +1364,17 @@ export function createTransform(deps: TransformDeps) {
                   sessionID: sessionId,
               })
             : undefined;
+        const windowGeometry = modelForBudget
+            ? resolveContextWindowGeometry(modelForBudget.providerID, modelForBudget.modelID, {
+                  db,
+                  sessionID: sessionId,
+              })
+            : undefined;
+        const emergencyUsagePercentageEarly = usagePercentageSynthetic
+            ? Math.max(95, contextUsageEarly.percentage)
+            : windowGeometry?.usableHard && contextUsageEarly.inputTokens > 0
+              ? (contextUsageEarly.inputTokens / windowGeometry.usableHard) * 100
+              : contextUsageEarly.percentage;
         const currentModelKeyForBoundary = deps.getModelKey?.(sessionId);
         const thresholdContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
@@ -1253,7 +1400,8 @@ export function createTransform(deps: TransformDeps) {
             Date.now() - persistedUsageBeforeResets.updatedAt <= 10 * 60 * 1000 &&
             (persistedUsageBeforeResets.lastObservedModelKey === null ||
                 currentModelKeyForBoundary === undefined ||
-                persistedUsageBeforeResets.lastObservedModelKey === currentModelKeyForBoundary) &&
+                piModelRefToCanonical(persistedUsageBeforeResets.lastObservedModelKey) ===
+                    piModelRefToCanonical(currentModelKeyForBoundary)) &&
             (resolvedContextLimit === undefined ||
                 persistedUsageBeforeResets.lastUsageContextLimit === 0 ||
                 persistedUsageBeforeResets.lastUsageContextLimit === resolvedContextLimit)
@@ -1287,7 +1435,7 @@ export function createTransform(deps: TransformDeps) {
         // approves an execute pass, so no pending-op drain, heuristic cleanup,
         // age sweep or smart drop can fire, and the execute-only
         // lastResponseTime watermark write below stays quiet too.
-        const schedulerDecisionEarly = compactionOff
+        const schedulerDecision = compactionOff
             ? ("defer" as const)
             : resolveSchedulerDecision(
                   deps.scheduler,
@@ -1297,34 +1445,8 @@ export function createTransform(deps: TransformDeps) {
                   deps.getModelKey?.(sessionId),
                   resolvedContextLimit,
               );
-        const midTurn = isMidTurn(deps, resolvedSessionId);
-        const bypassReason = detectMidTurnBypassReason({
-            contextUsage: contextUsageEarly,
-            sessionMeta,
-            historyRefreshSessions: deps.historyRefreshSessions,
-            sessionId,
-            effectiveExecuteThresholdPercentage,
-        });
-
-        const { midTurnAdjustedSchedulerDecision, sideEffect } = applyMidTurnDeferral({
-            base: schedulerDecisionEarly,
-            bypassReason,
-            midTurn,
-        });
-
-        if (sideEffect === "set-flag") {
-            const flagPayload = {
-                id: crypto.randomUUID(),
-                reason: `${schedulerDecisionEarly}-${bypassReason}`,
-                recordedAt: Date.now(),
-            };
-            setDeferredExecutePendingIfAbsent(db, sessionId, flagPayload);
-        }
-
-        sessionLog(
-            sessionId,
-            `[boundary-exec] base=${schedulerDecisionEarly} bypass=${bypassReason} midTurn=${midTurn} effective=${midTurnAdjustedSchedulerDecision} sideEffect=${sideEffect}`,
-        );
+        const schedulerDeferReason =
+            schedulerDecision === "defer" ? ("scheduler_defer" as const) : null;
         // Capture explicit history refresh immediately before the first
         // prepareCompartmentInjection consumer and before any drain. This is a
         // per-pass local, not shared deps state: concurrent transforms must not
@@ -1337,7 +1459,7 @@ export function createTransform(deps: TransformDeps) {
                 sessionMeta.compartmentInProgress) &&
             contextUsageEarly.percentage < forceMaterializationPercentage;
         const canConsumeDeferredEarly = canConsumeDeferredOnThisPass({
-            schedulerDecision: midTurnAdjustedSchedulerDecision,
+            schedulerDecision,
             contextPercentage: contextUsageEarly.percentage,
             justAwaitedPublication: false,
             activeRunBlocksMaterialization: earlyActiveRunBlocksMaterialization,
@@ -1372,7 +1494,7 @@ export function createTransform(deps: TransformDeps) {
         ): ProtectedTailBoundarySnapshot | null => {
             if (!canRunCompartments) return null;
             if (_boundarySnapshotCache === undefined || emergencyTailScale) {
-                const snapshot = resolveOpenCodeProtectedTailBoundary({
+                const snapshot = host.hostProtectedTailBoundary({
                     db,
                     sessionId: resolvedSessionId,
                     mode: "transform-force",
@@ -1381,6 +1503,7 @@ export function createTransform(deps: TransformDeps) {
                     usage: boundaryUsageForProtectedTail,
                     usageSource: boundaryUsageSource,
                     emergencyTailScale,
+                    protectedTailMeta: earlyStateSnapshot.protectedTail,
                 });
                 if (emergencyTailScale) return snapshot;
                 _boundarySnapshotCache = snapshot;
@@ -1400,7 +1523,7 @@ export function createTransform(deps: TransformDeps) {
         let skipCompartmentAwaitForThisPass = false;
 
         const startRecoveryRun = (): boolean => {
-            const scale = contextUsageEarly.percentage >= 95 ? 0.25 : 0.5;
+            const scale = emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5;
             let boundarySnapshot = getRunnableBoundaryForCompartment();
             if (!boundarySnapshot || !hasRunnableCompartmentWindow(boundarySnapshot)) {
                 boundarySnapshot = getRunnableBoundaryForCompartment(scale);
@@ -1417,7 +1540,7 @@ export function createTransform(deps: TransformDeps) {
             }
             if (
                 !canRunCompartments ||
-                !deps.client ||
+                (!deps.client && !deps.hiddenCompletionExecutor) ||
                 !boundarySnapshot ||
                 !hasRunnableCompartmentWindow(boundarySnapshot)
             ) {
@@ -1430,6 +1553,8 @@ export function createTransform(deps: TransformDeps) {
             updateSessionMeta(db, sessionId, { compartmentInProgress: true });
             startCompartmentAgent({
                 client: deps.client,
+                hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+                compactionMarkerStrategy: deps.compactionMarkerStrategy,
                 db,
                 sessionId,
                 historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
@@ -1437,6 +1562,7 @@ export function createTransform(deps: TransformDeps) {
                 currentContextLimit: boundaryContextLimit,
                 historyBudgetTokens,
                 historianTimeoutMs: deps.historianTimeoutMs,
+                model: deps.historianModel,
                 fallbackModels: deps.fallbackModels,
                 directory: compartmentDirectory,
                 fallbackModelId,
@@ -1473,7 +1599,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode &&
             !compactionOff &&
             historianFailureState.failureCount > 0 &&
-            contextUsageEarly.percentage >= 95 &&
+            emergencyUsagePercentageEarly >= 95 &&
             !recoveryNoHeadEscapeActive
         ) {
             skipCompartmentAwaitForThisPass = true;
@@ -1487,7 +1613,7 @@ export function createTransform(deps: TransformDeps) {
             if (!recoveryStarted && !getEligibleHistoryForCompartment()) {
                 const noHeadSnapshot =
                     getRunnableBoundaryForCompartment(
-                        contextUsageEarly.percentage >= 95 ? 0.25 : 0.5,
+                        emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5,
                     ) ?? getRunnableBoundaryForCompartment();
                 if (noHeadSnapshot) {
                     recordHighPressureNoEligibleHead(db, noHeadSnapshot);
@@ -1514,7 +1640,7 @@ export function createTransform(deps: TransformDeps) {
                 `transform: historian recovery triggered on session load after ${historianFailureState.failureCount} failure(s)`,
             );
             if (deps.client) {
-                void sendIgnoredMessage(
+                void sendStatusNotification(
                     deps.client,
                     sessionId,
                     `## Historian recovery\n\nHistorian previously failed ${historianFailureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
@@ -1677,6 +1803,10 @@ export function createTransform(deps: TransformDeps) {
 
         let pendingCompartmentInjection: PreparedCompartmentInjection | null = null;
         let rebuiltHistoryFromInitialPrepare = false;
+        let hiddenMessagesAtCompactionSeam: MessageLike[] = [];
+        let trimmedMessagesAtCompactionBoundary: MessageLike[] = [];
+        const messagesBeforeInitialPrepare =
+            isCacheBusting && deferredHistoryWasPendingAtPassStart ? [...messages] : null;
         // Compaction-off bypasses compartment-history preparation entirely,
         // even when historical compartment rows exist: no <session-history>
         // render, no raw-tail trim, no boundary splice, no marker write.
@@ -1693,6 +1823,18 @@ export function createTransform(deps: TransformDeps) {
                 deps.memoryConfig?.injectionBudgetTokens,
                 deps.experimentalTemporalAwareness,
             );
+            if (messagesBeforeInitialPrepare) {
+                const skippedVisibleMessages =
+                    pendingCompartmentInjection?.skippedVisibleMessages ?? 0;
+                trimmedMessagesAtCompactionBoundary = messagesBeforeInitialPrepare.slice(
+                    0,
+                    skippedVisibleMessages,
+                );
+                hiddenMessagesAtCompactionSeam = selectHiddenMessagesAtCompactionSeam(
+                    messagesBeforeInitialPrepare,
+                    skippedVisibleMessages,
+                );
+            }
             logTransformTiming(sessionId, "prepareCompartmentInjection", tInj);
 
             // ── Drain historyRefreshSessions (one-shot semantics) ──
@@ -1791,7 +1933,17 @@ export function createTransform(deps: TransformDeps) {
                 // maintained either way so heuristics and drops continue to work;
                 // only the agent-visible prefix is gated.
                 const skipPrefixInjection = !ctxReduceCallable;
-                const result = tagMessages(sessionId, messages, deps.tagger, db, {
+                // History preparation trims a prefix before the compaction marker is
+                // written later in this pass. OpenCode uses that new marker to build
+                // the next request, where rows hidden only from this transform can
+                // return. Tag the pre-trim objects now so persisted drops mutate them
+                // and postprocess can save their empty-sentinel decisions. Ordinary
+                // passes keep the smaller post-trim walk.
+                const messagesForTagging =
+                    messagesBeforeInitialPrepare && hiddenMessagesAtCompactionSeam.length > 0
+                        ? messagesBeforeInitialPrepare
+                        : messages;
+                const result = tagMessages(sessionId, messagesForTagging, deps.tagger, db, {
                     skipPrefixInjection,
                 });
                 targets = result.targets;
@@ -1799,21 +1951,7 @@ export function createTransform(deps: TransformDeps) {
                 messageTagNumbers = result.messageTagNumbers;
                 batch = result.batch;
                 hasRecentReduceCall = result.hasRecentReduceCall;
-                const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
-                const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
-                // Only trigger on NEW commits — not on first pass after restart where
-                // we have no baseline. First pass establishes the baseline silently.
-                // Subagents never deliver note nudges (gated in postprocess), so skip
-                // accumulating orphan trigger state.
-                if (
-                    fullFeatureMode &&
-                    hadPriorCommitState &&
-                    result.hasRecentCommit &&
-                    !sawCommitLastPass
-                ) {
-                    onNoteTrigger(db, sessionId, "commit_detected");
-                }
-                deps.commitSeenLastPass?.set(sessionId, result.hasRecentCommit);
+                observeCommitNudgeTransition(sessionId, result.hasRecentCommit, !fullFeatureMode);
                 logTransformTiming(sessionId, "tagMessages", t0);
                 taggingSucceeded = true;
             } catch (error) {
@@ -1837,27 +1975,15 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        // P0 perf: replace single SELECT-everything load with three
-        // targeted queries. The hot transform path used to load every
-        // tag in the session (~50k rows on long-lived sessions) every
-        // pass; benchmark in scripts/benchmark-tag-queries.ts showed
-        // this single change recovers ~67ms per pass.
-        //
-        //   activeTags          → drives heuristic cleanup, nudger,
-        //                         caveman scope (active subset only;
-        //                         partial-index scan, ~0.6ms)
-        //   targetsSliceTags    → drives applyFlushedStatuses + caveman
-        //                         replay (visible target subset only;
-        //                         IN-list lookup against the existing
-        //                         (session_id, tag_number) index)
-        //   maxDroppedTagNumber → replaces the watermark for-loop with
-        //                         a single MAX() aggregate
-        //
-        // applyHeuristicCleanup and nudger both filter on
-        // status === "active" and short-circuit otherwise, so feeding
-        // them active-only is identical behavior. applyFlushedStatuses
-        // and caveman replay both filter to targets.has(tagNumber), so
-        // pre-filtering by tag_number is a no-op for correctness.
+        // Load only the tag subsets each consumer can act on:
+        //   activeTags          → heuristic cleanup, nudger and caveman replay.
+        //                         Caveman further filters to visible message tags
+        //                         with persisted compression depth > 0.
+        //   targetsSliceTags    → applyFlushedStatuses: dropped visible targets
+        //                         only, using the dropped-tag partial index.
+        //   maxDroppedTagNumber → watermark via a single MAX() aggregate.
+        // Fetching active/compacted rows again for status replay would hydrate
+        // the whole visible window just to discard those rows in its drop gate.
         const t1 = performance.now();
         const activeTags = compactionOff ? [] : getActiveTagsBySession(db, sessionId);
         logTransformTiming(sessionId, "getActiveTagsBySession", t1, `count=${activeTags.length}`);
@@ -1866,10 +1992,10 @@ export function createTransform(deps: TransformDeps) {
         const targetTagNumbers = [...targets.keys()];
         const targetsSliceTags = compactionOff
             ? []
-            : getTagsByNumbers(db, sessionId, targetTagNumbers);
+            : getDroppedTagsByNumbers(db, sessionId, targetTagNumbers);
         logTransformTiming(
             sessionId,
-            "getTagsByNumbers",
+            "getDroppedTagsByNumbers",
             t1b,
             `targets=${targetTagNumbers.length} fetched=${targetsSliceTags.length}`,
         );
@@ -1957,18 +2083,12 @@ export function createTransform(deps: TransformDeps) {
         // matches the gate that lets applyCavemanCleanup deepen depth in the
         // first place.
         //
-        // We feed the targets-slice subset (already loaded above for
-        // applyFlushedStatuses) — replay only acts on tags whose
-        // tag_number is in `targets` anyway, so passing the wider list
-        // would just give it more rows to filter and discard.
+        // Reuse this pass's active tags; replay filters to targets.has itself.
+        // Only message bytes have changed since that load: no await or tag
+        // status/depth write intervenes, so the snapshot is still current.
         if (!reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled) {
             const tCavemanReplay = performance.now();
-            const replayedCaveman = replayCavemanCompression(
-                sessionId,
-                db,
-                targets,
-                targetsSliceTags,
-            );
+            const replayedCaveman = replayCavemanCompression(sessionId, db, targets, activeTags);
             if (replayedCaveman > 0) {
                 sessionLog(sessionId, `caveman replay: re-applied ${replayedCaveman} text tags`);
             }
@@ -1996,10 +2116,11 @@ export function createTransform(deps: TransformDeps) {
 
         // Reuse the early scheduler result — inputs haven't changed.
         const contextUsage = contextUsageEarly;
-        const schedulerDecision = midTurnAdjustedSchedulerDecision;
         const rawGetNotifParams = deps.getNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
+            hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+            compactionMarkerStrategy: deps.compactionMarkerStrategy,
             canRunCompartments,
             fullFeatureMode,
             compactionOff,
@@ -2018,6 +2139,9 @@ export function createTransform(deps: TransformDeps) {
             historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
             historyBudgetTokens,
             historianTimeoutMs: deps.historianTimeoutMs,
+            historianModel: deps.historianModel,
+            historianContextLimit: deps.historianContextLimit,
+            historianMaxOutputTokens: deps.historianMaxOutputTokens,
             fallbackModels: deps.fallbackModels,
             compartmentDirectory,
             messages,
@@ -2032,8 +2156,7 @@ export function createTransform(deps: TransformDeps) {
             // Scheduler "execute" passes are safe for compressor (they already bust cache
             // via pending ops); snapshot-drain keeps same-pass compressor signals safe.
             safeForBackgroundCompression:
-                historianRunnable &&
-                (isCacheBusting || midTurnAdjustedSchedulerDecision === "execute"),
+                historianRunnable && (isCacheBusting || schedulerDecision === "execute"),
             deferredHistoryRefreshSessions,
             skipAwaitForThisPass: skipCompartmentAwaitForThisPass,
             experimentalUserMemories: deps.experimentalUserMemories,
@@ -2068,15 +2191,16 @@ export function createTransform(deps: TransformDeps) {
             deferredMaterializationSessions.add(sessionId);
         }
 
-        // HARD-bust signals for the m[0]/m[1] materialization decision. These
-        // capture provider-side cache-eviction events (model switch, system-block
-        // change, tools-block change) plus the TTL idle window. A change in any
-        // means the Anthropic prompt cache was already dead, so folding m[1] into
-        // m[0] is "free". systemHash is the PERSISTED last-turn hash (system.transform
-        // runs AFTER this messages.transform), so a system change is detected on the
-        // next pass — the accepted one-pass lag.
+        // HARD-bust signals for the m[0]/m[1] materialization decision capture
+        // provider-side cache eviction, such as a model switch or system-block
+        // change, plus the TTL idle window. The tool-set fingerprint is observed
+        // alongside them but never folds m[0] because its process-global scope
+        // would create false-positive folds across sessions. Because system.transform
+        // runs after messages.transform, systemHash is the persisted last-turn hash,
+        // so system changes are detected on the next pass.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
+        const hardToolSetHash = deps.getToolSetHash?.(sessionId) ?? "";
         const hardSystemHash =
             typeof sessionMeta.systemPromptHash === "string" ? sessionMeta.systemPromptHash : "";
         const hardCacheExpired = computeHardCacheExpired(
@@ -2090,6 +2214,7 @@ export function createTransform(deps: TransformDeps) {
         );
         const m0HardSignals = {
             systemHash: hardSystemHash,
+            toolSetHash: hardToolSetHash,
             modelKey: hardModelKey,
             cacheExpired: hardCacheExpired,
             lastResponseTime: sessionMeta.lastResponseTime,
@@ -2099,7 +2224,7 @@ export function createTransform(deps: TransformDeps) {
             getActiveCompartmentRun(sessionId) !== undefined &&
             contextUsageEarly.percentage < forceMaterializationPercentage;
         const canConsumeDeferredLate = canConsumeDeferredOnThisPass({
-            schedulerDecision: midTurnAdjustedSchedulerDecision,
+            schedulerDecision,
             contextPercentage: contextUsageEarly.percentage,
             justAwaitedPublication: compartmentPhase.justAwaitedPublication,
             activeRunBlocksMaterialization: lateActiveRunBlocksMaterialization,
@@ -2112,8 +2237,63 @@ export function createTransform(deps: TransformDeps) {
             ? compartmentPhase.rebuiltHistoryThisPass
             : rebuiltHistoryFromInitialPrepare || compartmentPhase.rebuiltHistoryThisPass;
 
+        const protectionFoldWillBust =
+            (!!projectIdentity || !!sessionDirectory) &&
+            (fullFeatureMode || compactionOff) &&
+            mustMaterialize({
+                db,
+                sessionId,
+                state: sessionMeta,
+                projectPath: projectIdentity,
+                projectDirectory: sessionDirectory,
+                injectDocs: deps.injectDocs,
+                memoryEnabled: deps.memoryConfig?.enabled,
+                muralEnabled: deps.muralEnabled,
+                memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
+                historyBudgetTokens,
+                hardSignals: m0HardSignals,
+            }).value;
+        const protectionCacheBustingPass =
+            !compactionOff &&
+            (schedulerDecision === "execute" ||
+                isCacheBusting ||
+                contextUsage.percentage >= forceMaterializationPercentage ||
+                deps.pendingMaterializationSessions.has(sessionId) ||
+                (canConsumeDeferredLate && deferredMaterializationSessions.has(sessionId)) ||
+                protectionFoldWillBust);
+        const protectionUsableSoft = windowGeometry?.usableSoft ?? boundaryContextLimit;
+        const protectionFloor = resolveEpochFloorForPass(db, sessionId, {
+            configuredOverride: deps.protectedTokens,
+            tierOverrides: deps.protectedTokenTierOverrides,
+            usableSoft: protectionUsableSoft,
+            isCacheBustingPass: protectionCacheBustingPass,
+            onRejectedProjectOverride: (warning) => sessionLog(sessionId, warning),
+        });
+        if (protectionFloor.snapshotChanged) {
+            sessionLog(
+                sessionId,
+                `protected token floor snapshot: floor=${protectionFloor.floor} provenance=${protectionFloor.provenance === "override" ? "absolute" : protectionFloor.provenance} usableSoft=${protectionUsableSoft}`,
+            );
+        } else if (protectionFloor.preSnapshotInputChanged) {
+            sessionLog(
+                sessionId,
+                `protected token floor remains frozen until next priced pass: floor=${protectionFloor.floor} reason=${protectionFloor.preSnapshotBustReason}`,
+            );
+        }
+        const protectionWindow = getProtectionWindowForSession(
+            db,
+            sessionId,
+            protectionFloor.floor,
+        );
+        const protectedTagNumbers = protectionWindow.protectedTagNumbers;
+        // Pending operation IDs use tag-number coordinates despite the older "ID" name.
+        const protectedTagIds = protectedTagNumbers;
+        const protectedCutoff = protectionWindow.cutoff;
+
         const tPostProcess = performance.now();
         const postTransformResult = await runPostTransformPhase({
+            compactionMarkerStrategy:
+                deps.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy,
             sessionId,
             db,
             messages,
@@ -2132,12 +2312,15 @@ export function createTransform(deps: TransformDeps) {
             messageTagNumbers,
             tagger: deps.tagger,
             ctxReduceAvailability,
+            channel1StateBySession: deps.channel1StateBySession,
             todowriteAvailability,
             client: deps.client,
             activeAgent,
             batch,
             contextUsage,
+            usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
+            schedulerDeferReason,
             fullFeatureMode,
             compactionOff,
             canRunCompartments,
@@ -2161,9 +2344,14 @@ export function createTransform(deps: TransformDeps) {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: deps.lastHeuristicsTurnId,
             clearReasoningAge: deps.clearReasoningAge,
-            protectedTags: deps.protectedTags,
+            protectedTagIds,
+            protectedTagNumbers,
+            protectedCutoff,
+            protectedCount: protectionWindow.status.protectedCount,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
+            hiddenMessagesAtCompactionSeam,
+            trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
             watermark,
             forceMaterializationPercentage,
@@ -2183,6 +2371,11 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                modelForBudget?.providerID,
+                modelForBudget?.modelID,
+            ),
+            trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
@@ -2196,6 +2389,7 @@ export function createTransform(deps: TransformDeps) {
                 projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
                 injectDocs: deps.injectDocs,
+                memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
                 temporalAwareness: deps.experimentalTemporalAwareness,
@@ -2214,8 +2408,13 @@ export function createTransform(deps: TransformDeps) {
             // Fresh-tokenize only in the emergency band. This estimate is telemetry,
             // never an abort gate: provider-accurate accounting is deferred to the
             // module-side implementation.
+            const emergencyUsagePercentage = usagePercentageSynthetic
+                ? Math.max(95, contextUsage.percentage)
+                : windowGeometry?.usableHard && contextUsage.inputTokens > 0
+                  ? (contextUsage.inputTokens / windowGeometry.usableHard) * 100
+                  : contextUsage.percentage;
             finalWireEstimate =
-                contextUsage.percentage >= 95
+                emergencyUsagePercentage >= 95
                     ? estimateFinalWireInputTokens({
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -2243,12 +2442,13 @@ export function createTransform(deps: TransformDeps) {
                 typeof currentModelKeyForRecovery === "string" &&
                 currentModelKeyForRecovery.length > 0 &&
                 overflowStateForFinalWire.detectedContextLimit > 0 &&
-                overflowStateForFinalWire.detectedContextLimitModelKey ===
-                    currentModelKeyForRecovery
+                piModelRefToCanonical(
+                    overflowStateForFinalWire.detectedContextLimitModelKey ?? "",
+                ) === piModelRefToCanonical(currentModelKeyForRecovery)
                     ? overflowStateForFinalWire.detectedContextLimit
                     : undefined;
             const emergencyFailClosed = evaluateEmergencyFailClosed({
-                usagePercentage: contextUsage.percentage,
+                usagePercentage: emergencyUsagePercentage,
                 emergencyRecoveryArmed,
                 emergencyRecoveryOrigin,
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
@@ -2269,9 +2469,9 @@ export function createTransform(deps: TransformDeps) {
                     );
                 }
                 // The notice must finish before self-abort so recovery instructions survive interruption.
-                let notification: Awaited<ReturnType<typeof sendIgnoredMessage>>;
+                let notification: Awaited<ReturnType<typeof sendStatusNotification>>;
                 try {
-                    notification = await sendIgnoredMessage(
+                    notification = await sendStatusNotification(
                         deps.client,
                         sessionId,
                         "Context full — /ctx-flush or /clear to continue.",
@@ -2288,7 +2488,7 @@ export function createTransform(deps: TransformDeps) {
                     );
                 }
                 try {
-                    await abortSessionFailClosed(deps.client, sessionId);
+                    await host.hostRefuse(deps.client, sessionId);
                 } catch (error) {
                     sessionLog(
                         sessionId,
@@ -2335,6 +2535,17 @@ export function createTransform(deps: TransformDeps) {
                 modelKey,
                 providerKey,
             });
+            if (captured) {
+                // Keep the durable snapshot in step with the TS-mode capture too:
+                // replay consumes the last successful capture of either mode, and
+                // drops clear the durable row regardless of mode. Deferred so the
+                // pass tail does not pay a synchronous multi-MB write; the slot
+                // copy is detached from live messages.
+                const capturedSlot = getInMemorySlot(sessionId);
+                if (capturedSlot) {
+                    setImmediate(() => saveLkgSlotToDb(db, sessionId, capturedSlot));
+                }
+            }
             if (postTransformResult.bustedThisPass && !captured) {
                 dropSlot(sessionId, "lkg_refresh_declined");
             }
@@ -2355,6 +2566,12 @@ export function createTransform(deps: TransformDeps) {
                     postTransformResult.materializeReason,
                     postTransformResult.materialized,
                 ),
+                systemHashPrev: postTransformResult.systemHashPrev,
+                systemHashNew: postTransformResult.systemHashNew,
+                m0ToolSetHashPrev: postTransformResult.m0ToolSetHashPrev,
+                m0ToolSetHashNew: postTransformResult.m0ToolSetHashNew,
+                m0ModelKeyPrev: postTransformResult.m0ModelKeyPrev,
+                m0ModelKeyNew: postTransformResult.m0ModelKeyNew,
                 emergency: postTransformResult.emergency,
                 droppedTokens: postTransformResult.droppedTokens,
                 droppedCount: postTransformResult.droppedCount,
@@ -2408,14 +2625,20 @@ export function createTransform(deps: TransformDeps) {
         // total to isolate real conversation). A message with any NULL-count tag
         // (legacy, mid-backfill) is absent here this pass and live-tokenizes,
         // converging to the stored path once the tagger backfills it.
-        let storedByMessage: Map<
+        let storedByMessage = new Map<
             string,
             { conversation: number; toolCall: number; hasNull: boolean }
-        >;
-        try {
-            storedByMessage = getActiveTagTokenTotalsByMessage(db, sessionId);
-        } catch {
-            storedByMessage = new Map();
+        >();
+        const hasUncachedMessageId = messages.some((message) => {
+            const messageId = (message.info as { id?: string }).id;
+            return messageId !== undefined && !msgTokens.has(messageId);
+        });
+        if (hasUncachedMessageId) {
+            try {
+                storedByMessage = getActiveTagTokenTotalsByMessage(db, sessionId);
+            } catch {
+                storedByMessage = new Map();
+            }
         }
         let conversationTokens = 0;
         let toolCallTokens = 0;
@@ -2455,138 +2678,55 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        // Channel 1 baseline snapshot (post-drop, post-injection). Computed from
-        // the final `messages` array, which the compartment-injection step has
-        // already trimmed to the live tail — so summing non-dropped tool output
-        // gives the post-boundary undropped tokens directly. Refreshing here (a
-        // proven transform boundary) zeroes the per-turn accumulator without the
-        // chat.message mid-turn race.
-        //
-        // Gated on ctx_reduce being effective (NOT fullFeatureMode): Channel 1
-        // nudges the agent to call ctx_reduce, so it's meaningful exactly when
-        // the agent has the §N§ prefix + the tool — i.e. any session with
-        // ctx_reduce enabled, INCLUDING subagents (which self-manage tool
-        // bloat). It must NOT fire when the session's tool allow-list denies
-        // ctx_reduce. Channel 2 (the synthetic-user ceiling) rides the same gate
-        // — it fires for any ctx_reduce-effective session, subagents included.
-        if (ctxReduceCallable && !compactionOff && deps.channel1StateBySession) {
+        // The final-array walk runs inside runPostTransformPhase after its last
+        // byte mutation. Report both channel verdicts from that same baseline;
+        // only Channel 2 mutates its lease here because Channel 1 delivers at a
+        // later tool-result boundary.
+        const channelBaseline = deps.channel1StateBySession?.get(sessionId);
+        if (ctxReduceCallable && !compactionOff && channelBaseline) {
             try {
-                // Always resolve through resolveExecuteThreshold — even when the
-                // percentage config is a bare number — so an execute_threshold_tokens
-                // override is honored (a per-model absolute cap converts to an
-                // effective %). Skipping it for the numeric case made the Channel
-                // pressure math use the wrong threshold on token-configured models.
-                const resolvedExecuteThresholdPct = resolveExecuteThreshold(
-                    deps.executeThresholdPercentage ?? 65,
-                    deps.getModelKey?.(sessionId),
-                    65,
-                    {
-                        tokensConfig: deps.executeThresholdTokens,
-                        contextLimit: resolvedContextLimit ?? 0,
-                    },
-                );
-                // Real-tokenizer counts from the durable tag store (injected
-                // m[0]/m[1] blocks are never tagged, so this is the injected-free
-                // live tail). reclaimable = non-dropped tool OUTPUT; liveTail =
-                // conversation + tool I/O. Falls back to a byte-approx live-tail walk
-                // only if the store read fails. Replaces the old output-only path.
-                let tailToolTokens: number;
-                let liveTailTokens: number;
-                try {
-                    // reclaimable (toolOutput) excludes the protected top-N tags —
-                    // the agent can't ctx_reduce those, so they must not count
-                    // toward the nudge's "reclaimable" figure (else it nags forever
-                    // about protected-tail output it cannot drop).
-                    const agg = getActiveTagTokenAggregate(db, sessionId, deps.protectedTags);
-                    tailToolTokens = agg.toolOutput;
-                    liveTailTokens = agg.conversation + agg.toolCall;
-                } catch {
-                    const estimate = computeTailTokenEstimate(messages);
-                    tailToolTokens = estimate.tailToolTokens;
-                    liveTailTokens = estimate.liveTailTokens;
-                }
-                const executeThresholdTokens = Math.round(
-                    ((resolvedContextLimit ?? 0) * resolvedExecuteThresholdPct) / 100,
-                );
-                const usableTokens = Math.max(
-                    0,
-                    executeThresholdTokens - contextUsage.inputTokens + liveTailTokens,
-                );
-                // If the measured tail already shrank below the last persisted
-                // watermark before this tool turn (historian publish, emergency
-                // drop, pending-op replay), the old band referred to a pile that
-                // no longer exists. Clear it now so regrowth starts a fresh cycle.
-                resetLastNudgeCycleIfTailShrank(db, sessionId, tailToolTokens);
-                const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
-                    db,
-                    sessionId,
-                    deps.protectedTags,
-                );
-                deps.channel1StateBySession.set(sessionId, {
-                    tailToolTokens,
-                    historyBudgetTokens: historyBudgetTokens ?? 0,
-                    contextLimit: resolvedContextLimit ?? 0,
-                    executeThresholdPercentage: resolvedExecuteThresholdPct,
-                    lastInputTokens: contextUsage.inputTokens,
-                    turnToolTokens: 0,
-                    usableTokens,
-                    reducedSinceRefresh: false,
-                    oldestReclaimableToolTags,
+                const channel1State = getChannel1NudgeState(db, sessionId);
+                const channel1Decision = decideChannel1({
+                    ...channelBaseline,
+                    lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
+                    lastNudgeLevel: channel1State.level,
+                    lastFireOrdinal: channel1State.ordinal,
+                    currentRealUserTurnCount: channelBaseline.realUserTurnCount,
+                    hasRecentReduce: channelBaseline.reducedSinceRefresh,
+                    agentDropsAppliedThisPass: channelBaseline.agentDropsAppliedThisPass,
+                    postReduceGracePending: channel1State.postReduceGracePending,
+                    postReduceGraceBaselineU: channel1State.postReduceGraceBaselineU,
+                    postReduceGracePreLevel: channel1State.postReduceGracePreLevel,
                 });
+                sessionLog(sessionId, formatChannel1Evaluation(channel1Decision));
 
-                // Channel 2 (ceiling) trigger — record a one-shot pending intent
-                // when pressure is near the execute threshold AND a large pile of
-                // reclaimable tool output remains. Delivery happens later from the
-                // event handler (`message.updated`) via the in-process client.
-                // Uses the real post-transform pressure (current usage% / threshold)
-                // and the just-computed tail tokens. Only escalate from the empty
-                // ('') state so we never reset an in-flight claim/delivery; the cap
-                // is one delivery per session lifetime.
-                //
-                // Subagents included: Channel 2 injects a synthetic user message
-                // via promptAsync, which a subagent's run loop picks up at its next
-                // step boundary and addresses like any queued message — verified
-                // safe (a subagent runs under the same in-process client as a
-                // primary). The only gate is ctx_reduce being effectively enabled
-                // (this whole block), so we never nudge toward an uncallable tool.
-                // resolvedContextLimit/threshold known is all that's required.
-                // usable = the agent's working range = the gap between the fixed
-                // overhead floor (everything that ISN'T live tail: system + tool
-                // defs + m[0] + m[1]) and the execute-threshold ceiling. Derived
-                // by identity: executeThresholdTokens − inputTokens + liveTail
-                // (inputTokens − liveTail IS the fixed overhead on the wire). As
-                // pressure rises, usable shrinks toward 0, so the single
-                // reclaimable ≥ usable/3 ratio encodes both "near comparting" and
-                // "big reclaimable pile" without a separate pressure gate.
-                // (executeThresholdTokens/usableTokens computed above, alongside
-                // the Channel-1 baseline they're persisted with.)
-                const channel2MetricsKnown =
-                    resolvedContextLimit !== undefined &&
-                    resolvedContextLimit > 0 &&
-                    resolvedExecuteThresholdPct > 0;
-                if (channel2MetricsKnown) {
-                    const channel2ShouldTrigger = shouldTriggerChannel2({
-                        reclaimableTokens: tailToolTokens,
-                        usableTokens,
-                    });
-                    try {
-                        if (channel2ShouldTrigger) {
-                            casChannel2NudgeState(db, sessionId, "", "pending");
-                        } else {
-                            // Cancel stale, undelivered intents when the same
-                            // trigger predicate no longer holds; never touch an
-                            // in-flight claim or the delivered terminal cap.
-                            casChannel2NudgeState(db, sessionId, "pending", "");
-                        }
-                    } catch (error) {
-                        sessionLog(sessionId, "channel2 trigger CAS failed (ignored):", error);
+                const channel2Evaluation = evaluateChannel2(channelBaseline);
+                const leaseBefore = getChannel2NudgeState(db, sessionId);
+                if (
+                    channelBaseline.evaluable &&
+                    !channelBaseline.generationInvalidated &&
+                    !channelBaseline.reducedSinceRefresh
+                ) {
+                    if (channel2Evaluation.shouldTrigger) {
+                        casChannel2NudgeState(db, sessionId, "", "pending");
+                    } else {
+                        casChannel2NudgeState(db, sessionId, "pending", "");
                     }
                 }
+                const leaseAfter = getChannel2NudgeState(db, sessionId);
+                sessionLog(
+                    sessionId,
+                    formatChannel2Evaluation(channel2Evaluation, {
+                        leaseBefore,
+                        leaseAfter,
+                        gateHoldReason: channelBaseline.reducedSinceRefresh
+                            ? "recent-reduce-refresh"
+                            : undefined,
+                    }),
+                );
             } catch (error) {
-                sessionLog(sessionId, "channel1 baseline snapshot failed (ignored):", error);
+                sessionLog(sessionId, "nudge evaluation/CAS failed (ignored):", error);
             }
-        } else {
-            deps.channel1StateBySession?.delete(sessionId);
         }
 
         const elapsed = (performance.now() - startTime).toFixed(1);
@@ -2596,14 +2736,37 @@ export function createTransform(deps: TransformDeps) {
         );
 
         deps.maybeAutoEmbedSession?.(sessionId);
+
+        const bindingRecovery = postTransformResult.thinkingBindingRecovery;
+        if (bindingRecovery) {
+            const cleared = clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                bindingRecovery.flagTarget,
+            );
+            sessionLog(
+                sessionId,
+                `thinking binding recovery: stripped bound reasoning from assistant ${bindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+            );
+        }
     };
 
     return Object.assign(transform, {
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);
         },
-        clearRustSession(sessionId: string): void {
-            rustModeTransform?.clearSession(sessionId);
+        async clearRustSession(sessionId: string): Promise<void> {
+            await rustModeTransform?.clearSession(sessionId);
+        },
+        getRustWireCacheHeapStats() {
+            return (
+                rustModeTransform?.getHeapStats() ?? {
+                    snapshots: 0,
+                    rawContentSnapshots: 0,
+                    estimatedBytes: 0,
+                    sessions: [],
+                }
+            );
         },
     });
 }

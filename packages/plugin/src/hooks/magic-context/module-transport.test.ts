@@ -25,7 +25,15 @@ import {
     type SubcClient,
 } from "@cortexkit/subc-client";
 
-import { __moduleTransportTest, SubcModuleTransport } from "./module-transport";
+import {
+    __moduleTransportTest,
+    SubcModuleTransport,
+    transformColdStartExecuteTimeoutMs,
+} from "./module-transport";
+
+function decodedBody(body: unknown): unknown {
+    return body instanceof Uint8Array ? JSON.parse(Buffer.from(body).toString("utf8")) : body;
+}
 
 class FakeServerReader {
     private buffered = Buffer.alloc(0);
@@ -110,7 +118,7 @@ function deferred<T = void>(): {
 }
 
 describe("SubcModuleTransport", () => {
-    it("uses the shared v2 client while preserving route identity and flat request bytes", async () => {
+    it("omits an ambient supervised identity while preserving route identity and flat request bytes", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-v2-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
         const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
@@ -127,6 +135,10 @@ describe("SubcModuleTransport", () => {
             resolveServer = resolve;
             rejectServer = reject;
         });
+        const previousModuleId = process.env.SUBC_MODULE_ID;
+        const previousLaunchNonce = process.env.SUBC_LAUNCH_NONCE;
+        process.env.SUBC_MODULE_ID = "other-supervised-module";
+        process.env.SUBC_LAUNCH_NONCE = "a".repeat(64);
         const server = createServer((socket) => {
             acceptedSocket = socket;
             void (async () => {
@@ -204,15 +216,6 @@ describe("SubcModuleTransport", () => {
             transport.closeSession("session-1");
             await serverWork;
 
-            const consumerIdentity =
-                process.env.SUBC_MODULE_ID && process.env.SUBC_LAUNCH_NONCE
-                    ? {
-                          consumer_identity: {
-                              module_id: process.env.SUBC_MODULE_ID,
-                              launch_nonce: process.env.SUBC_LAUNCH_NONCE,
-                          },
-                      }
-                    : {};
             expect(routeOpenBody).toEqual({
                 op: "route.open",
                 target: { kind: "tool_provider", module_id: "magic-context" },
@@ -221,7 +224,6 @@ describe("SubcModuleTransport", () => {
                     harness: "opencode",
                     session: "session-1",
                 },
-                ...consumerIdentity,
             });
             expect(requestBody).toEqual(flatBody);
             expect(routeHeader).toEqual(
@@ -252,6 +254,10 @@ describe("SubcModuleTransport", () => {
             acceptedSocket?.destroy();
             await new Promise<void>((resolve) => server.close(() => resolve()));
             rmSync(tempDir, { recursive: true, force: true });
+            if (previousModuleId === undefined) delete process.env.SUBC_MODULE_ID;
+            else process.env.SUBC_MODULE_ID = previousModuleId;
+            if (previousLaunchNonce === undefined) delete process.env.SUBC_LAUNCH_NONCE;
+            else process.env.SUBC_LAUNCH_NONCE = previousLaunchNonce;
         }
     });
 
@@ -436,6 +442,114 @@ describe("SubcModuleTransport", () => {
         expect(requestCount).toBe(2);
     });
 
+    it("scales cold execution for ENGRAM and ASTRO while retaining a bounded ceiling", () => {
+        expect(transformColdStartExecuteTimeoutMs(0)).toBe(15_000);
+        expect(transformColdStartExecuteTimeoutMs(7_400)).toBe(29_800);
+        expect(transformColdStartExecuteTimeoutMs(9_600)).toBe(34_200);
+        expect(transformColdStartExecuteTimeoutMs(100_000)).toBe(90_000);
+    });
+
+    it("uses a cold-start deadline only for a completed transform page series", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        const observedTimeouts: number[] = [];
+        const client = {
+            request: async (
+                _route: RouteHandle,
+                _body: unknown,
+                options: { timeoutMs: number },
+            ) => {
+                observedTimeouts.push(options.timeoutMs);
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-attempt-class\0/workspace/project",
+            generation: 0,
+        });
+        const base = {
+            sessionId: "session-attempt-class",
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+        };
+
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: false },
+            attemptClass: "transform_page_upload",
+        });
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: true },
+            attemptClass: "transform_series_execute",
+        });
+
+        expect(observedTimeouts).toHaveLength(2);
+        expect(observedTimeouts[0]).toBeGreaterThan(4_500);
+        expect(observedTimeouts[0]).toBeLessThanOrEqual(5_000);
+        expect(observedTimeouts[1]).toBeGreaterThan(14_500);
+        expect(observedTimeouts[1]).toBeLessThanOrEqual(15_000);
+    });
+
+    it("fails a completed-series deadline without reconnecting or retrying", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        let requestCount = 0;
+        let closeCount = 0;
+        const client = {
+            request: () => {
+                requestCount += 1;
+                return new Promise<never>(() => undefined);
+            },
+            close: () => {
+                closeCount += 1;
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-execute-timeout\0/workspace/project",
+            generation: 0,
+        });
+
+        await expect(
+            transport.call({
+                sessionId: "session-execute-timeout",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", transform_page_complete: true },
+                generationSensitive: true,
+                attemptClass: "transform_series_execute",
+                timeoutMs: 25,
+            }),
+        ).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        expect(requestCount).toBe(1);
+        expect(closeCount).toBe(0);
+        expect(internals.client).toBe(client);
+    });
+
     it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -578,7 +692,7 @@ describe("SubcModuleTransport", () => {
         let wrapupSettled = false;
         const client = {
             request: async (_route: RouteHandle, body: unknown) => {
-                const method = (body as { method: string }).method;
+                const method = (decodedBody(body) as { method: string }).method;
                 if (method === "session.wrapup") {
                     wrapupStarted.resolve();
                     await releaseWrapup.promise;
@@ -640,7 +754,7 @@ describe("SubcModuleTransport", () => {
         const starts: string[] = [];
         const client = {
             request: async (_route: RouteHandle, body: unknown) => {
-                const method = (body as { method: string }).method;
+                const method = (decodedBody(body) as { method: string }).method;
                 starts.push(method);
                 if (method === "state_sync") {
                     stateSyncStarted.resolve();
@@ -696,6 +810,55 @@ describe("SubcModuleTransport", () => {
         expect(starts).toEqual(["state_sync", "transform", "session.status"]);
     });
 
+    it("queues session.delete behind an in-flight transform on the same route", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const transformStarted = deferred();
+        const releaseTransform = deferred();
+        const starts: string[] = [];
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                const method = (decodedBody(body) as { method: string }).method;
+                starts.push(method);
+                if (method === "transform") {
+                    transformStarted.resolve();
+                    await releaseTransform.promise;
+                }
+                return { result: { method } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "delete-race-session\0/workspace/project",
+            generation: 0,
+        });
+        const transform = transport.call({
+            sessionId: "delete-race-session",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform" },
+        });
+        await transformStarted.promise;
+
+        const deletion = transport.deleteSession("delete-race-session", "/workspace/project");
+        await Promise.resolve();
+        expect(starts).toEqual(["transform"]);
+        releaseTransform.resolve();
+        await Promise.all([transform, deletion]);
+        expect(starts).toEqual(["transform", "session.delete"]);
+    });
+
     it("coalesces concurrent connection recovery and retries two sessions on one fresh generation", async () => {
         const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
         const oldRouteA = { channel: 7, epoch: 70 } as RouteHandle;
@@ -726,7 +889,7 @@ describe("SubcModuleTransport", () => {
                 } as unknown as RouteHandle;
             },
             request: async (_route: RouteHandle, body: unknown) => {
-                const sessionId = (body as { session_id: string }).session_id;
+                const sessionId = (decodedBody(body) as { session_id: string }).session_id;
                 freshRequestSessions.push(sessionId);
                 return { result: { sessionId } };
             },
@@ -816,7 +979,7 @@ describe("SubcModuleTransport", () => {
         let activeCallsStarted = 0;
         const client = {
             request: async (_route: RouteHandle, body: unknown) => {
-                if ((body as { active?: boolean }).active) {
+                if ((decodedBody(body) as { active?: boolean }).active) {
                     activeCallsStarted += 1;
                     if (activeCallsStarted === 4) allActiveCallsStarted.resolve();
                     await releaseActiveCalls.promise;
@@ -885,7 +1048,7 @@ describe("SubcModuleTransport", () => {
         const observedTimeouts = new Map<string, number>();
         const client = {
             request: async (_route: RouteHandle, body: unknown, options: { timeoutMs: number }) => {
-                const method = (body as { method: string }).method;
+                const method = (decodedBody(body) as { method: string }).method;
                 observedTimeouts.set(method, options.timeoutMs);
                 if (method === "session.wrapup") {
                     markWrapupStarted?.();
@@ -974,4 +1137,359 @@ describe("SubcModuleTransport", () => {
         expect(ensured.generation).toBe(1);
         expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
     });
+});
+
+describe("connection backoff in-pass wait", () => {
+    function makeBackoffTransport(): {
+        transport: SubcModuleTransport;
+        internals: {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        client: SubcClient;
+        connectCount: () => number;
+    } {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let connects = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async (_route: RouteHandle, body: unknown) => ({
+                result: {
+                    sessionId: (decodedBody(body) as { session_id?: string }).session_id ?? "ok",
+                },
+            }),
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        internals.connectClient = async () => {
+            connects += 1;
+            return client;
+        };
+        return { transport, internals, client, connectCount: () => connects };
+    }
+
+    it("waits out an under-budget backoff remainder and serves the pass", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        // A latch armed by an earlier failure with only 300ms left — far under
+        // the wait budget. The pass must wait and connect, not fail.
+        internals.nextProbeMs = Date.now() + 300;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-wait",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-wait" },
+            }),
+        ).resolves.toEqual({ result: { sessionId: "session-backoff-wait" } });
+
+        const elapsedMs = performance.now() - startedAt;
+        expect(elapsedMs).toBeGreaterThanOrEqual(280);
+        // Remainder plus jitter only — no retry ladder, no budget overrun.
+        expect(elapsedMs).toBeLessThan(1_000);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("fails fast when the backoff remainder exceeds the wait budget", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 20_000;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-over-budget",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        ).rejects.toMatchObject({ code: "SUBC_CONNECTION_BACKOFF" });
+
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
+    });
+
+    it("does not serialize sibling sessions behind one session's backoff wait", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 500;
+        const startedAt = performance.now();
+
+        const [responseA, responseB] = await Promise.all([
+            transport.call({
+                sessionId: "session-backoff-a",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-a" },
+            }),
+            transport.call({
+                sessionId: "session-backoff-b",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-b" },
+            }),
+        ]);
+
+        const wallMs = performance.now() - startedAt;
+        expect(responseA).toEqual({ result: { sessionId: "session-backoff-a" } });
+        expect(responseB).toEqual({ result: { sessionId: "session-backoff-b" } });
+        // Each pass waits on its own timer; a serialized (global) wait would pay
+        // the ~500ms remainder twice. The connection itself coalesces once.
+        expect(wallMs).toBeGreaterThanOrEqual(450);
+        expect(wallMs).toBeLessThan(900);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("stops waiting when the pass is aborted mid-backoff", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 2_000;
+        const controller = new AbortController();
+        const startedAt = performance.now();
+        const call = transport.call({
+            sessionId: "session-backoff-abort",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+            signal: controller.signal,
+        });
+        setTimeout(() => controller.abort(new Error("turn cancelled")), 50);
+
+        await expect(call).rejects.toThrow("turn cancelled");
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
+    });
+});
+
+describe("beforeDeadline orphan safety", () => {
+    it("a request rejecting after the deadline lost the race never raises an unhandled rejection", async () => {
+        const transport = new SubcModuleTransport("/nonexistent-connection-file");
+        const unhandled: unknown[] = [];
+        const onUnhandled = (error: unknown) => {
+            unhandled.push(error);
+        };
+        process.on("unhandledRejection", onUnhandled);
+        try {
+            let rejectLater: ((error: Error) => void) | undefined;
+            const operation = new Promise<never>((_resolve, reject) => {
+                rejectLater = reject;
+            });
+            const beforeDeadline = (
+                transport as unknown as {
+                    beforeDeadline(
+                        op: Promise<never>,
+                        deadline: number,
+                        detail: string,
+                    ): Promise<never>;
+                }
+            ).beforeDeadline.bind(transport);
+            // Deadline already passed relative to the operation: the race loses immediately.
+            await expect(beforeDeadline(operation, Date.now() + 5, "test")).rejects.toThrow();
+            // The abandoned operation now rejects — exactly what close() does to
+            // every pending request when a connection is invalidated.
+            rejectLater?.(new Error("client closed"));
+            // Give the runtime a macrotask to surface an unhandled rejection if any.
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(unhandled).toHaveLength(0);
+        } finally {
+            process.off("unhandledRejection", onUnhandled);
+        }
+    });
+});
+
+it("a per-call abort preserves the shared client for another session", async () => {
+    const transport = new SubcModuleTransport("unused");
+    const started = deferred();
+    const pending = deferred<unknown>();
+    let closed = 0;
+    const client = {
+        request: async (_route: RouteHandle, body: unknown) => {
+            if ((decodedBody(body) as { method: string }).method === "state_sync") {
+                started.resolve();
+                return pending.promise;
+            }
+            return { ok: true };
+        },
+        close: () => {
+            closed++;
+            pending.reject(new Error("client closed"));
+        },
+    } as unknown as SubcClient;
+    const internals = transport as unknown as {
+        client: SubcClient | null;
+        ensureRoute: () => Promise<{
+            client: SubcClient;
+            route: RouteHandle;
+            routeKey: string;
+            generation: number;
+        }>;
+    };
+    internals.client = client;
+    internals.ensureRoute = async () => ({
+        client,
+        route: { channel: 7, epoch: 77 } as RouteHandle,
+        routeKey: "abort",
+        generation: 0,
+    });
+    const controller = new AbortController();
+    const reason = Object.assign(new Error("state_sync transport timeout"), {
+        code: "state_sync_timeout",
+    });
+    const call = transport.call({
+        sessionId: "slow",
+        projectRoot: "/tmp/project",
+        method: "state_sync",
+        body: { method: "state_sync" },
+        signal: controller.signal,
+    });
+    call.catch(() => {});
+    await started.promise;
+    controller.abort(reason);
+    await expect(call).rejects.toBe(reason);
+    expect(closed).toBe(0);
+    await expect(
+        transport.call({
+            sessionId: "other",
+            projectRoot: "/tmp/project",
+            method: "session.status",
+            body: { method: "session.status" },
+        }),
+    ).resolves.toEqual({ ok: true });
+    pending.resolve({ ok: true });
+});
+
+it("a state-sync deadline is typed with page progress and does not reconnect", async () => {
+    const transport = new SubcModuleTransport("unused");
+    let closed = 0;
+    const client = {
+        request: async (_route: RouteHandle, body: unknown) =>
+            (decodedBody(body) as { method: string }).method === "state_sync"
+                ? new Promise(() => {})
+                : { ok: true },
+        close: () => {
+            closed++;
+        },
+    } as unknown as SubcClient;
+    const internals = transport as unknown as {
+        client: SubcClient | null;
+        ensureRoute: () => Promise<{
+            client: SubcClient;
+            route: RouteHandle;
+            routeKey: string;
+            generation: number;
+        }>;
+    };
+    internals.client = client;
+    internals.ensureRoute = async () => ({
+        client,
+        route: { channel: 7, epoch: 77 } as RouteHandle,
+        routeKey: "deadline",
+        generation: 0,
+    });
+    // A request below the 25ms correctness-lane floor never reaches the module.
+    await expect(
+        transport.call({
+            sessionId: "below-floor",
+            projectRoot: "/tmp/project",
+            method: "state_sync",
+            body: {
+                method: "state_sync",
+                seed_id: "series",
+                seed_batch_index: 1,
+                seed_batch_total: 3,
+            },
+            timeoutMs: 5,
+        }),
+    ).rejects.toMatchObject({
+        code: "state_sync_timeout",
+        stage: "correctness_lane",
+        page: 1,
+        pages: 3,
+        series: "series",
+    });
+    await expect(
+        transport.call({
+            sessionId: "slow",
+            projectRoot: "/tmp/project",
+            method: "state_sync",
+            body: {
+                method: "state_sync",
+                seed_id: "series",
+                seed_batch_index: 1,
+                seed_batch_total: 3,
+            },
+            timeoutMs: 50,
+        }),
+    ).rejects.toMatchObject({
+        code: "state_sync_timeout",
+        stage: "module_ack",
+        page: 1,
+        pages: 3,
+        series: "series",
+    });
+    expect(closed).toBe(0);
+    await expect(
+        transport.call({
+            sessionId: "other",
+            projectRoot: "/tmp/project",
+            method: "session.status",
+            body: { method: "session.status" },
+        }),
+    ).resolves.toEqual({ ok: true });
+});
+
+it("attributes encode, route, request issue, response wait and settlement on one call", async () => {
+    const transport = new SubcModuleTransport("unused");
+    const route = { channel: 7, epoch: 77 } as RouteHandle;
+    const samples: import("./module-transport").ModuleCallTimings[] = [];
+    const client = {
+        request: async (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+            expect(body).toBeInstanceOf(Uint8Array);
+            expect(options.binary).not.toBe(true);
+            expect(decodedBody(body)).toEqual({ method: "transform", text: "🚀" });
+            await Bun.sleep(20);
+            return { ok: true };
+        },
+    } as unknown as SubcClient;
+    const internals = transport as unknown as {
+        client: SubcClient;
+        ensureRoute: () => Promise<{
+            client: SubcClient;
+            route: RouteHandle;
+            routeKey: string;
+            generation: number;
+        }>;
+    };
+    internals.client = client;
+    internals.ensureRoute = async () => {
+        await Bun.sleep(10);
+        return { client, route, routeKey: "timing", generation: 0 };
+    };
+    const start = performance.now();
+    expect(
+        await transport.call({
+            sessionId: "timing",
+            projectRoot: ".",
+            method: "transform",
+            body: { method: "transform", text: "🚀" },
+            onTimings: (timings) => samples.push(timings),
+        }),
+    ).toEqual({ ok: true });
+    const elapsed = performance.now() - start;
+    expect(samples).toHaveLength(1);
+    expect(samples[0].route).toBeGreaterThanOrEqual(8);
+    expect(samples[0].responseWait).toBeGreaterThanOrEqual(18);
+    expect(Object.keys(samples[0]).sort()).toEqual([
+        "encode",
+        "issue",
+        "lane",
+        "responseWait",
+        "route",
+        "settle",
+    ]);
+    const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
+    expect(sum).toBeLessThanOrEqual(elapsed);
+    expect(elapsed - sum).toBeLessThan(10);
 });

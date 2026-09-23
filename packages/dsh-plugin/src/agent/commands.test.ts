@@ -104,14 +104,13 @@ function findCommand(registered: FakeCommandRecord[], name: string): FakeCommand
 }
 
 describe("registerCtxCommands (DSH /ctx-* commands)", () => {
-  it("registers all eight commands and unregisters via the disposer", async () => {
+  it("registers all seven commands and unregisters via the disposer", async () => {
     const { db, dir } = await openDb();
     try {
       const { ctx, registered } = makeFakeCtx();
       const dispose = registerCtxCommands(ctx, baseOpts(db));
       const names = registered.map((record) => record.name).sort();
       expect(names).toEqual([
-        "ctx-aug",
         "ctx-dream",
         "ctx-embed",
         "ctx-flush",
@@ -201,30 +200,6 @@ describe("LLM-dependent commands (guard / not-wired messages)", () => {
       expect(unknown.text).toContain('Unknown task "bogus-task"');
 
       const notWired = (await command.handler(invocation(agent))) as CommandResult;
-      expect(notWired.kind).toBe("success");
-      if (notWired.kind !== "success") return;
-      expect(notWired.text).toContain("not wired");
-    } finally {
-      db.close();
-      await removeTestDir(dir);
-    }
-  });
-
-  it("/ctx-aug reports usage and the not-wired sidekick runner", async () => {
-    const { db, dir } = await openDb();
-    try {
-      const { ctx, registered } = makeFakeCtx();
-      registerCtxCommands(ctx, baseOpts(db));
-      const command = findCommand(registered, "ctx-aug");
-      const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
-
-      const usage = (await command.handler(invocation(agent))) as CommandResult;
-      expect(usage.kind).toBe("error");
-      expect(usage.text).toContain("Usage `/ctx-aug <your prompt>`");
-
-      const notWired = (await command.handler(
-        invocation(agent, "why does the build fail"),
-      )) as CommandResult;
       expect(notWired.kind).toBe("success");
       if (notWired.kind !== "success") return;
       expect(notWired.text).toContain("not wired");

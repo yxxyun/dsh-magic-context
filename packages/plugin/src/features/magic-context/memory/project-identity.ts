@@ -26,6 +26,7 @@ import { log } from "../../../shared/logger";
 const GIT_TIMEOUT_MS = 5_000;
 const TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const identityCache = new Map<string, string>();
+const linkedGitWorktreeCache = new Map<string, boolean>();
 const lastKnownGitIdentityCache = new Map<string, string>();
 // Cached `dir:` fallbacks for directories that have NO `.git` entry in their
 // ancestor chain. We only cache the no-`.git` case: once a `.git` appears we
@@ -44,9 +45,15 @@ const dubiousOwnershipFallbackDirectories = new Set<string>();
 const dubiousOwnershipLoggedDirectories = new Set<string>();
 const dubiousOwnershipWarnedDirectories = new Set<string>();
 const transientGitIdentityReuseLoggedDirectories = new Set<string>();
+interface SessionIdentityCacheEntry {
+    identity: string | undefined;
+    revalidateAt: number | null;
+}
+const sessionIdentityCache = new Map<string, SessionIdentityCacheEntry>();
 let execFileSyncForIdentity: typeof execFileSync = execFileSync;
 let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
+let filesystemProbeObserverForTests: (() => void) | undefined;
 
 /**
  * Type-checked project identity failure classes (Finding #16).
@@ -413,7 +420,15 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
  * checks descendants whose nearest git root is the home directory.
  */
 function canonicalUserHomeDirectory(): string {
-    return realpathSync.native(userHomeDirectoryForIdentity());
+    const homeDirectory = userHomeDirectoryForIdentity();
+    try {
+        return realpathSync.native(homeDirectory);
+    } catch {
+        // Sandboxed OpenCode processes may know $HOME but be denied access to its
+        // metadata. Returning the original path lets later checks still recognize
+        // projects under the user's home directory without aborting plugin startup.
+        return homeDirectory;
+    }
 }
 
 export function isUserHomeDirectory(directory: string): boolean {
@@ -536,27 +551,54 @@ function gitRootDirectory(canonical: string): string | null {
     }
 }
 
+/** Cheap metadata probe for user-facing commit-search availability. This avoids
+ * running `git log` on every ctx_search call while still distinguishing a true
+ * non-repository directory from a transient `dir:` identity fallback. */
+export function directoryHasGitMetadata(directory: string): boolean {
+    return gitRootDirectory(path.resolve(directory)) !== null;
+}
+
 export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,
 ): string | undefined {
+    const resolvedDirectory = path.resolve(directory);
+    const cacheKey = `${allowHomeProject ? "1" : "0"}\0${resolvedDirectory}`;
+    const cached = sessionIdentityCache.get(cacheKey);
+    if (cached && (cached.revalidateAt === null || nowMs() < cached.revalidateAt)) {
+        return cached.identity;
+    }
+    sessionIdentityCache.delete(cacheKey);
+
+    filesystemProbeObserverForTests?.();
     const canonicalHome = canonicalUserHomeDirectory();
     const canonicalDirectory = (() => {
         try {
-            return realpathSync.native(path.resolve(directory));
+            filesystemProbeObserverForTests?.();
+            return realpathSync.native(resolvedDirectory);
         } catch {
-            return path.resolve(directory);
+            return resolvedDirectory;
         }
     })();
+    filesystemProbeObserverForTests?.();
     const inheritsHomeRepository = gitRootDirectory(canonicalDirectory) === canonicalHome;
+    let identity: string | undefined;
     if (canonicalDirectory === canonicalHome || inheritsHomeRepository) {
-        if (!allowHomeProject) return undefined;
-        // A session whose effective git root is $HOME belongs to the same protected
-        // home identity as an exact-home session. This prevents a child directory
-        // from bypassing the opt-in by inheriting $HOME/.git.
-        return directoryFallback(canonicalHome);
+        identity = allowHomeProject ? directoryFallback(canonicalHome) : undefined;
+    } else {
+        identity = resolveProjectIdentityOrFallback(directory);
     }
-    return resolveProjectIdentityOrFallback(directory);
+
+    // Successful git identities are immutable. Directory/home fallbacks are
+    // revalidated after the same cooldown used for recoverable git failures so a
+    // newly initialized repository or recovered checkout is observed without
+    // probing the filesystem on every context pass. A cwd change uses a new key.
+    sessionIdentityCache.set(cacheKey, {
+        identity,
+        revalidateAt:
+            identity?.startsWith("git:") === true ? null : nowMs() + TRANSIENT_FAILURE_COOLDOWN_MS,
+    });
+    return identity;
 }
 
 /**
@@ -598,34 +640,83 @@ export function storedPathBelongsToIdentity(
     );
 }
 
+/**
+ * Detect whether a directory belongs to a linked Git worktree. Linked worktrees
+ * have a per-worktree git dir while sharing the primary checkout's common dir.
+ * The probe is cached because authority recovery can be considered every pass.
+ */
+export function isLinkedGitWorktree(directory: string): boolean {
+    const resolvedDirectory = path.resolve(directory);
+    const cached = linkedGitWorktreeCache.get(resolvedDirectory);
+    if (cached !== undefined) return cached;
+
+    let linked = false;
+    try {
+        const output = execFileSyncForIdentity(
+            "git",
+            ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            {
+                cwd: resolvedDirectory,
+                encoding: "utf8",
+                timeout: GIT_TIMEOUT_MS,
+                windowsHide: true,
+            },
+        );
+        const [gitDir, commonDir] = String(output)
+            .split(/\r?\n/u)
+            .map((line) => line.trim())
+            .filter(Boolean);
+        linked = Boolean(gitDir && commonDir && path.resolve(gitDir) !== path.resolve(commonDir));
+    } catch {
+        // If Git metadata exists but its topology cannot be resolved, fail closed:
+        // the checkout may be linked and must not be allowed to drain shared authority.
+        linked = hasGitDir(resolvedDirectory);
+    }
+    linkedGitWorktreeCache.set(resolvedDirectory, linked);
+    return linked;
+}
+
 export function __setProjectIdentityTestHooks(hooks: {
     execFileSync?: typeof execFileSync;
     homeDirectory?: () => string;
     nowMs?: () => number;
+    onFilesystemProbe?: () => void;
 }): void {
     execFileSyncForIdentity = hooks.execFileSync ?? execFileSync;
     userHomeDirectoryForIdentity = hooks.homeDirectory ?? (() => homedir());
     nowMs = hooks.nowMs ?? (() => Date.now());
+    filesystemProbeObserverForTests = hooks.onFilesystemProbe;
 }
 
 export function __clearProjectIdentityTransientCooldownForTests(directory?: string): void {
     if (directory === undefined) {
         transientFailureCooldown.clear();
+        sessionIdentityCache.clear();
         return;
     }
-    transientFailureCooldown.delete(path.resolve(directory));
+    const resolvedDirectory = path.resolve(directory);
+    transientFailureCooldown.delete(resolvedDirectory);
+    for (const allowHome of ["0", "1"]) {
+        sessionIdentityCache.delete(`${allowHome}\0${resolvedDirectory}`);
+    }
 }
 
 export function __clearProjectIdentityResolutionCacheForTests(directory?: string): void {
     if (directory === undefined) {
         identityCache.clear();
+        sessionIdentityCache.clear();
         return;
     }
-    identityCache.delete(path.resolve(directory));
+    const resolvedDirectory = path.resolve(directory);
+    identityCache.delete(resolvedDirectory);
+    for (const allowHome of ["0", "1"]) {
+        sessionIdentityCache.delete(`${allowHome}\0${resolvedDirectory}`);
+    }
 }
 
 export function __resetProjectIdentityForTests(): void {
     identityCache.clear();
+    linkedGitWorktreeCache.clear();
     lastKnownGitIdentityCache.clear();
     directoryFallbackCache.clear();
     transientFailureCooldown.clear();
@@ -633,7 +724,9 @@ export function __resetProjectIdentityForTests(): void {
     dubiousOwnershipLoggedDirectories.clear();
     dubiousOwnershipWarnedDirectories.clear();
     transientGitIdentityReuseLoggedDirectories.clear();
+    sessionIdentityCache.clear();
     execFileSyncForIdentity = execFileSync;
     userHomeDirectoryForIdentity = (): string => homedir();
     nowMs = (): number => Date.now();
+    filesystemProbeObserverForTests = undefined;
 }

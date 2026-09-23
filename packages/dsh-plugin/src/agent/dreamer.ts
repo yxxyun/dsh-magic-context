@@ -442,7 +442,7 @@ async function runDreamTick(
       projectIdentity,
       // Full canonical set (disabled tasks get their rows reconciled to
       // next_due_at NULL by the scheduler, so config stays authoritative).
-      tasks: buildDreamTaskRuntimeConfigs(state.coreConfig),
+      tasks: buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS),
       executor,
     });
     if (ran > 0) log(`[dreamer] timer tick ${projectIdentity} — ran ${ran} task(s)`);
@@ -579,7 +579,7 @@ export function dshDreamSeams(
   const state = dreamerRuntime.get(ctx) ?? defaultState();
   const facade = (state.facade ??= createDshDreamClient(ctx, deps));
   const executor = buildDreamExecutor(facade, state);
-  const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig).filter(
+  const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS).filter(
     (task) => task.schedule.trim() !== "",
   );
   const runnable = state.enabled && !readDreamerCompactionOff(deps);

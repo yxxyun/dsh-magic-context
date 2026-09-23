@@ -4,7 +4,9 @@ import { createChildSessionWithFence } from "../../../hooks/magic-context/child-
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import { teardownChildSession } from "../../../shared/child-session-teardown";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getModuleNoteEvaluationBridge } from "../context-authority";
@@ -24,6 +26,7 @@ import {
     storeCompiledSmartNoteCheck,
 } from "../smart-notes/storage";
 import type { SmartNoteCheckNote } from "../smart-notes/types";
+import { wakePlaneStatus } from "../smart-notes/wake-plane";
 import { getPendingSmartNotes, markNoteChecked, markNoteReady } from "../storage-notes";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
@@ -38,9 +41,15 @@ export interface EvaluateSmartNotesArgs {
     /** Keyed lease this task holds (Dreamer v2: per-project evaluate-smart-notes domain). */
     leaseKey: string;
     deadline: number;
+    /**
+     * Wall-clock budget for one due-check sweep. Defaults to 10s in production;
+     * tests lower it so a sweep queued behind slow sandbox infrastructure cancels
+     * fast instead of eating the whole test timeout.
+     */
+    sweepBudgetMs?: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
     retinaHandoff?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
@@ -90,6 +99,12 @@ function createPromptAbortSignal(
 export async function evaluateSmartNotes(
     args: EvaluateSmartNotesArgs,
 ): Promise<EvaluateSmartNotesResult> {
+    if ((await wakePlaneStatus()) === "present") {
+        const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
+        log("[dreamer] evaluate-smart-notes: skipped (wake plane active)");
+        return { surfaced: 0, pending, ran: false };
+    }
+
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
     const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
     await moduleBridge?.sync();
@@ -165,7 +180,7 @@ export async function evaluateSmartNotes(
             projectIdentity: args.projectIdentity,
             projectRoot,
             maxChecks: 10,
-            sweepBudgetMs: 10_000,
+            sweepBudgetMs: args.sweepBudgetMs ?? 10_000,
             leaseHeld,
             signal: leaseAbortController.signal,
             retinaHandoff: args.retinaHandoff,
@@ -430,6 +445,7 @@ async function confirmReadOnly(
     leaseSignal: AbortSignal,
 ): Promise<boolean> {
     let childSessionId: string | null = null;
+    let promptSettled = false;
     const startedAt = Date.now();
     let invocationRecorded = false;
     const recordInvocation = (params: {
@@ -527,6 +543,7 @@ Output exactly JSON: {"met": false}`;
                     },
                 },
             );
+            promptSettled = true;
         } finally {
             promptSignal.cleanup();
         }
@@ -537,10 +554,14 @@ Output exactly JSON: {"met": false}`;
         log(`[dreamer] smart note #${noteId}: read-only confirmation failed — ${error}`);
         return false;
     } finally {
-        // Confirmation prompts include note content and conditions, so they are
-        // deleted regardless of debug-retention settings.
-        if (childSessionId) {
-            await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-        }
+        await teardownChildSession({
+            client: args.client,
+            sessionId: childSessionId,
+            sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+            promptSettled,
+            privacySensitive: true,
+            context: `[dreamer] smart note #${noteId} confirmation`,
+            log,
+        });
     }
 }

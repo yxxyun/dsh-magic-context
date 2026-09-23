@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { open, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,6 +6,7 @@ import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-cont
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
 import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
+import { classifyLocalEmbeddingFailure, type EmbeddingFailure } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 
@@ -27,6 +28,63 @@ export type LocalEmbeddingDtype =
     | "q2f16"
     | "q1"
     | "q1f16";
+
+export type LocalEmbeddingRuntime = "auto" | "native" | "wasm";
+export type ResolvedLocalEmbeddingRuntime = "native" | "wasm" | "electron";
+
+const BUN_NAPI_TEARDOWN_FIX_VERSION = [1, 4, 0] as const;
+
+export type LocalEmbeddingHost = {
+    isElectron: boolean;
+    isBun: boolean;
+    bunVersion?: string;
+    /** True only when this host can persist model files through Node's fs API. */
+    hasNodeFilesystem?: boolean;
+};
+
+function currentLocalEmbeddingHost(): LocalEmbeddingHost {
+    const bun = (globalThis as { Bun?: unknown }).Bun;
+    const hasProcess = typeof process !== "undefined";
+    const bunVersion =
+        hasProcess && typeof process.versions?.bun === "string" ? process.versions.bun : undefined;
+    return {
+        isElectron: hasProcess && Boolean(process.versions?.electron),
+        // Check both globals because Bun hosts have exposed each form across releases.
+        isBun: Boolean(bun) || Boolean(bunVersion),
+        bunVersion,
+        // Only the Node-target twin may evaluate real node:fs. Browser-like hosts
+        // keep the existing web bundle, while Electron retains its injected path.
+        hasNodeFilesystem:
+            hasProcess &&
+            (typeof process.versions?.node === "string" || typeof bunVersion === "string"),
+    };
+}
+
+function bunHasNapiTeardownFix(version: string | undefined): boolean {
+    const match = version?.match(
+        /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/,
+    );
+    if (!match || match[4]) return false;
+    const parsed = [Number(match[1]), Number(match[2]), Number(match[3])];
+    return parsed.some((part) => !Number.isSafeInteger(part))
+        ? false
+        : parsed[0] > BUN_NAPI_TEARDOWN_FIX_VERSION[0] ||
+              (parsed[0] === BUN_NAPI_TEARDOWN_FIX_VERSION[0] &&
+                  (parsed[1] > BUN_NAPI_TEARDOWN_FIX_VERSION[1] ||
+                      (parsed[1] === BUN_NAPI_TEARDOWN_FIX_VERSION[1] &&
+                          parsed[2] >= BUN_NAPI_TEARDOWN_FIX_VERSION[2])));
+}
+
+/** Resolves the local ONNX runtime without loading either implementation. */
+export function resolveLocalEmbeddingRuntime(
+    preference: LocalEmbeddingRuntime = "auto",
+    host: LocalEmbeddingHost = currentLocalEmbeddingHost(),
+): ResolvedLocalEmbeddingRuntime {
+    if (preference === "native" || preference === "wasm") return preference;
+    if (host.isElectron) return "electron";
+    if (host.isBun && !bunHasNapiTeardownFix(host.bunVersion)) return "wasm";
+    return "native";
+}
 
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes
@@ -134,105 +192,378 @@ function startLockHeartbeat(lockPath: string): () => void {
     return () => clearInterval(timer);
 }
 
-/**
- * Pre-inject the WASM ONNX runtime so transformers.js skips its native
- * `onnxruntime-node` path entirely.
- *
- * Why this exists:
- *   `@huggingface/transformers@4.x` does a top-level static `import "onnxruntime-node"`.
- *   On Electron Desktop (e.g. OpenCode Desktop's main process), that native
- *   `.node` binary fails to load for several environmental reasons — missing
- *   Visual C++ Redistributables on Windows, ASAR archive layout issues,
- *   onnxruntime's own dependency DLLs not being resolvable. The failure
- *   propagates up the import chain and Node reports it as `ERR_MODULE_NOT_FOUND`
- *   targeting `transformers.node.mjs`, even though that file exists.
- *
- *   transformers.js exposes `Symbol.for("onnxruntime")` as an override hook
- *   (added in 3.4.x via PR #1231). If that global symbol is set before the
- *   first `import("@huggingface/transformers")`, the library uses whatever ORT
- *   we provide instead of attempting its own native-or-web backend selection.
- *
- *   `onnxruntime-web` (WASM backend) is already a direct dependency of
- *   `@huggingface/transformers`, so it's installed alongside `onnxruntime-node`
- *   with no extra package needed. WASM is slower than native CPU on Node/Bun
- *   but on Electron Desktop it's the only path that actually loads.
- *
- * Why only Electron:
- *   Plain Node and Bun runtimes (Pi, terminal OpenCode, dashboard backend)
- *   load `onnxruntime-node` correctly. We don't want to regress those to WASM.
- *   `process.versions.electron` is the canonical check — it's only present
- *   inside Electron processes.
- *
- * Refs:
- *   - https://github.com/cortexkit/magic-context/issues/78
- *   - https://github.com/huggingface/transformers.js/pull/1231 (ORT_SYMBOL)
- *   - https://github.com/huggingface/transformers.js/issues/1240 (Electron picks wrong ORT)
- */
-async function injectWasmOrtForElectron(): Promise<boolean> {
-    if (typeof process === "undefined" || !process.versions?.electron) {
-        return false;
+type TransformersModule = Record<string, unknown>;
+
+type WasmOrtModule = {
+    env?: {
+        wasm?: {
+            numThreads?: number;
+            wasmPaths?: string | Record<string, string>;
+        };
+    };
+    default?: unknown;
+};
+
+type ImportWasmOrtModule = (specifier: string) => Promise<WasmOrtModule>;
+
+type LocalEmbeddingRuntimeMode = "native" | "wasm" | "disabled";
+
+type LocalEmbeddingTestHooks = {
+    host?: () => LocalEmbeddingHost;
+    injectWasmOrt?: () => Promise<boolean>;
+    resolveWasmOrt?: () => string | undefined;
+    importWasmOrt?: ImportWasmOrtModule;
+    importTransformers?: () => Promise<TransformersModule>;
+    importTransformersWasmFallback?: () => Promise<TransformersModule>;
+    importTransformersNodeWasmFallback?: () => Promise<TransformersModule>;
+    modelCacheDir?: () => string;
+    log?: (message: string, data?: unknown) => void;
+};
+
+const ONNX_RUNTIME_WEB_SPECIFIER = "onnxruntime-web";
+
+let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
+let localEmbeddingProcessFailure: EmbeddingFailure | null = null;
+let wasmRuntimeInjected = false;
+let localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+let resolveWasmOrtForRuntime = (): string | undefined => {
+    try {
+        return typeof import.meta.resolve === "function"
+            ? import.meta.resolve(ONNX_RUNTIME_WEB_SPECIFIER)
+            : undefined;
+    } catch {
+        return undefined;
     }
+};
+const importWasmOrtModule = async (specifier: string): Promise<WasmOrtModule> =>
+    (await import(specifier)) as WasmOrtModule;
+let importWasmOrtModuleForRuntime: ImportWasmOrtModule = importWasmOrtModule;
+let importWasmOrtForRuntime = async (): Promise<{
+    module: WasmOrtModule;
+    entryPath: string;
+}> => {
+    const { createRequire: createRequireFn } = await import("node:module");
+    const requireFn = createRequireFn(import.meta.url);
+    const ortEntry = requireFn.resolve(ONNX_RUNTIME_WEB_SPECIFIER);
+
+    // Resolve before importing because a host loader may rewrite a bare
+    // specifier with a reload tag; a second query-free import of the same file
+    // would otherwise create another identity and register the CPU backend twice.
+    const ortSpecifier = resolveWasmOrtForRuntime() ?? ONNX_RUNTIME_WEB_SPECIFIER;
+    return {
+        module: await importWasmOrtModuleForRuntime(ortSpecifier),
+        entryPath: ortEntry,
+    };
+};
+let importTransformersForRuntime = async (): Promise<TransformersModule> => {
+    // Keep transformers in a lazy split chunk: the host can load the plugin and
+    // use remote embeddings without evaluating the optional native accelerator.
+    return (await import("@huggingface/transformers")) as TransformersModule;
+};
+let importTransformersWasmFallbackForRuntime = async (): Promise<TransformersModule> => {
+    // The browser-condition sibling remains the compatibility path for Electron
+    // and hosts without Node filesystem access.
+    const webEntry = new URL("./transformers-web.js", import.meta.url).href;
+    return (await import(webEntry)) as TransformersModule;
+};
+let importTransformersNodeWasmFallbackForRuntime = async (): Promise<TransformersModule> => {
+    // This sibling resolves Transformers.js's Node source (real node:fs) while
+    // aliasing optional native addons away from their platform loaders.
+    const nodeWasmEntry = new URL("./transformers-node-wasm.js", import.meta.url).href;
+    return (await import(nodeWasmEntry)) as TransformersModule;
+};
+let modelCacheDirForRuntime = () => join(getMagicContextStorageDir(), "models");
+let logForRuntime: (message: string, data?: unknown) => void = log;
+let injectWasmOrtForRuntime: () => Promise<boolean> = injectWasmOrt;
+
+interface LoadedLocalEmbeddingRuntime {
+    model: string;
+    runtime: "native" | "wasm";
+    rssDeltaAtLoad: number;
+    externalDeltaAtLoad: number;
+    arrayBuffersDeltaAtLoad: number;
+}
+
+const loadedLocalEmbeddingRuntimes = new Map<number, LoadedLocalEmbeddingRuntime>();
+let nextLocalEmbeddingRuntimeId = 1;
+
+export interface LocalEmbeddingNativeMemoryStats {
+    loaded: boolean;
+    providerCount: number;
+    models: string[];
+    runtimes: Array<"native" | "wasm">;
+    modelCacheBytes: number | null;
+    rssDeltaAtLoad: number;
+    externalDeltaAtLoad: number;
+    arrayBuffersDeltaAtLoad: number;
+}
+
+function directoryBytes(path: string): number | null {
+    let total = 0;
+    try {
+        for (const entry of readdirSync(path, { withFileTypes: true })) {
+            const entryPath = join(path, entry.name);
+            if (entry.isDirectory()) {
+                const childBytes = directoryBytes(entryPath);
+                if (childBytes === null) return null;
+                total += childBytes;
+            } else if (entry.isFile()) {
+                total += statSync(entryPath).size;
+            }
+        }
+        return total;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null;
+    }
+}
+
+/** ONNX does not expose arena residency; report loaded runtimes and serialized model bytes. */
+export function getLocalEmbeddingNativeMemoryStats(): LocalEmbeddingNativeMemoryStats {
+    const loaded = [...loadedLocalEmbeddingRuntimes.values()];
+    return {
+        loaded: loaded.length > 0,
+        providerCount: loaded.length,
+        models: [...new Set(loaded.map((entry) => entry.model))].sort(),
+        runtimes: [...new Set(loaded.map((entry) => entry.runtime))].sort(),
+        modelCacheBytes: loaded.length > 0 ? directoryBytes(modelCacheDirForRuntime()) : 0,
+        rssDeltaAtLoad: loaded.reduce((sum, entry) => sum + entry.rssDeltaAtLoad, 0),
+        externalDeltaAtLoad: loaded.reduce((sum, entry) => sum + entry.externalDeltaAtLoad, 0),
+        arrayBuffersDeltaAtLoad: loaded.reduce(
+            (sum, entry) => sum + entry.arrayBuffersDeltaAtLoad,
+            0,
+        ),
+    };
+}
+
+/** Test-only seams keep native-loader failures reproducible without loading a real addon. */
+export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): void {
+    localEmbeddingHostForRuntime = hooks.host ?? (() => ({ isElectron: false, isBun: false }));
+    injectWasmOrtForRuntime = hooks.injectWasmOrt ?? injectWasmOrt;
+    resolveWasmOrtForRuntime = hooks.resolveWasmOrt ?? resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = hooks.importWasmOrt ?? importWasmOrtModuleForRuntimeDefault;
+    importTransformersForRuntime = hooks.importTransformers ?? importTransformersForRuntimeDefault;
+    importTransformersWasmFallbackForRuntime =
+        hooks.importTransformersWasmFallback ?? importTransformersWasmFallbackForRuntimeDefault;
+    importTransformersNodeWasmFallbackForRuntime =
+        hooks.importTransformersNodeWasmFallback ??
+        importTransformersNodeWasmFallbackForRuntimeDefault;
+    modelCacheDirForRuntime =
+        hooks.modelCacheDir ?? (() => join(getMagicContextStorageDir(), "models"));
+    logForRuntime = hooks.log ?? log;
+}
+
+/** Reset process-global runtime decisions between isolated provider tests. */
+export function __resetLocalEmbeddingForTests(): void {
+    localEmbeddingRuntimeMode = "native";
+    localEmbeddingProcessFailure = null;
+    wasmRuntimeInjected = false;
+    localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+    resolveWasmOrtForRuntime = resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = importWasmOrtModuleForRuntimeDefault;
+    importWasmOrtForRuntime = importWasmOrtForRuntimeDefault;
+    importTransformersForRuntime = importTransformersForRuntimeDefault;
+    importTransformersWasmFallbackForRuntime = importTransformersWasmFallbackForRuntimeDefault;
+    importTransformersNodeWasmFallbackForRuntime =
+        importTransformersNodeWasmFallbackForRuntimeDefault;
+    modelCacheDirForRuntime = () => join(getMagicContextStorageDir(), "models");
+    logForRuntime = log;
+    injectWasmOrtForRuntime = injectWasmOrt;
+    loadedLocalEmbeddingRuntimes.clear();
+}
+
+const resolveWasmOrtForRuntimeDefault = resolveWasmOrtForRuntime;
+const importWasmOrtModuleForRuntimeDefault = importWasmOrtModuleForRuntime;
+const importWasmOrtForRuntimeDefault = importWasmOrtForRuntime;
+const importTransformersForRuntimeDefault = importTransformersForRuntime;
+const importTransformersWasmFallbackForRuntimeDefault = importTransformersWasmFallbackForRuntime;
+const importTransformersNodeWasmFallbackForRuntimeDefault =
+    importTransformersNodeWasmFallbackForRuntime;
+
+/**
+ * Inject the WASM ONNX runtime before transformers evaluates its web bundle.
+ * This path is used by Electron before a native attempt and by the fallback
+ * after a broken native binding is detected.
+ */
+async function ensureWasmOrtInjected(): Promise<boolean> {
+    if (wasmRuntimeInjected) return true;
+    if (!(await injectWasmOrtForRuntime())) return false;
+    wasmRuntimeInjected = true;
+    return true;
+}
+
+async function injectWasmOrt(): Promise<boolean> {
+    if (wasmRuntimeInjected) return true;
 
     try {
-        // Non-literal specifier — same trick we use for `@huggingface/transformers`
-        // to keep Bun's static analyzer from eagerly probing the package at plugin
-        // load time. We need lazy resolution because non-Electron runtimes never
-        // need onnxruntime-web at all. See issue #4.
-        const ortWebSpec = `onnxruntime-${"web"}`;
-        const ortWeb = (await import(ortWebSpec)) as {
-            env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-            default?: unknown;
-        };
+        const { module: ortWeb, entryPath } = await importWasmOrtForRuntime();
 
-        // Resolve the actual on-disk location of onnxruntime-web/dist/ so we can
-        // point WASM loading at the local .wasm/.mjs files rather than the
-        // jsdelivr CDN. Without this, the first embedding init would require
-        // network access — and would fail offline or behind corporate proxies.
-        try {
-            const { createRequire: createRequireFn } = await import("node:module");
-            const requireFn = createRequireFn(import.meta.url);
-            // Resolve the package's MAIN export ('.') rather than its
-            // package.json: onnxruntime-web ships an `exports` map that does NOT
-            // expose './package.json' (resolving it throws ERR_PACKAGE_PATH_NOT_
-            // EXPORTED), whereas '.' is always exported and lands inside dist/.
-            // Its dirname is the dist/ dir that holds the .wasm/.mjs assets. See
-            // issue #195.
-            const mainEntry = requireFn.resolve("onnxruntime-web");
-            const distDir = dirname(mainEntry);
-            const wasmPathsPrefix = `${pathToFileURL(distDir).href}/`;
-            if (ortWeb.env?.wasm) {
-                ortWeb.env.wasm.wasmPaths = wasmPathsPrefix;
-            }
-        } catch (pathError) {
-            // Non-fatal — onnxruntime-web will fall back to its default CDN.
-            // First embedding init may need network, but subsequent ones use
-            // the WASM cache. We log and continue rather than blocking embeddings.
-            log(
-                "[magic-context] could not resolve local onnxruntime-web/dist, falling back to default WASM paths:",
-                pathError instanceof Error ? pathError.message : String(pathError),
-            );
+        if (ortWeb.env?.wasm) {
+            // ORT's WASM worker threads can spin between runs and cannot currently
+            // be terminated. A single thread keeps the host event loop idle.
+            ortWeb.env.wasm.numThreads = 1;
+
+            // Prefer package-local assets so first use works offline instead of
+            // requiring the default CDN path.
+            ortWeb.env.wasm.wasmPaths = `${pathToFileURL(dirname(entryPath)).href}/`;
         }
 
-        // transformers.js does `if (ORT_SYMBOL in globalThis) { ONNX = globalThis[ORT_SYMBOL] }`
-        // at module-evaluation time. Setting this BEFORE the first
-        // `await import("@huggingface/transformers")` (immediately after this
-        // function returns) ensures the library picks up our WASM runtime
-        // instead of its own native selection logic.
         (globalThis as Record<symbol, unknown>)[Symbol.for("onnxruntime")] = ortWeb;
-        log(
-            "[magic-context] Electron detected — using onnxruntime-web (WASM) for embeddings (bypasses onnxruntime-node native load)",
-        );
+        wasmRuntimeInjected = true;
         return true;
     } catch (error) {
-        // If onnxruntime-web import itself fails (e.g. it's not installed for
-        // some reason), we fall through and let transformers do its normal
-        // native load. That will likely fail too, but the error will be the
-        // user's actual problem rather than something masked by our shim.
         log(
-            "[magic-context] failed to inject onnxruntime-web for Electron — letting transformers fall back to native:",
+            "[magic-context] failed to inject onnxruntime-web:",
             error instanceof Error ? error.message : String(error),
         );
         return false;
+    }
+}
+
+function likelyMuslHint(): string {
+    if (process.platform !== "linux" || typeof process.report?.getReport !== "function") return "";
+    try {
+        const report = process.report.getReport() as {
+            header?: { glibcVersionRuntime?: unknown };
+        };
+        return typeof report.header?.glibcVersionRuntime === "string"
+            ? ""
+            : " Linux process report has no glibc runtime version (musl likely).";
+    } catch {
+        return "";
+    }
+}
+
+function localEmbeddingRuntimeIsDisabled(): boolean {
+    return localEmbeddingRuntimeMode === "disabled";
+}
+
+class LocalEmbeddingFallbackError extends Error {
+    readonly nativeError: unknown;
+
+    constructor(nativeError: unknown, wasmError: unknown) {
+        super("the native local embedding runtime and its WASM fallback both failed", {
+            cause: wasmError,
+        });
+        this.name = "LocalEmbeddingFallbackError";
+        this.nativeError = nativeError;
+    }
+}
+
+class LocalEmbeddingFsUnavailableError extends Error {
+    readonly code = "MC_EMBEDDING_FS_UNAVAILABLE";
+
+    constructor() {
+        super("MC_EMBEDDING_FS_UNAVAILABLE: Node WASM bundle has no filesystem cache");
+        this.name = "LocalEmbeddingFsUnavailableError";
+    }
+}
+
+async function importWasmTransformersForHost(): Promise<TransformersModule> {
+    const host = localEmbeddingHostForRuntime();
+    if (host.isElectron) {
+        return importTransformersForRuntime();
+    }
+    return host.hasNodeFilesystem
+        ? importTransformersNodeWasmFallbackForRuntime()
+        : importTransformersWasmFallbackForRuntime();
+}
+
+function disableLocalEmbeddingsAfterRuntimeFailure(detail: string): void {
+    localEmbeddingRuntimeMode = "disabled";
+    logForRuntime(
+        "[magic-context] local embeddings are disabled because both the onnxruntime-node native " +
+            "binding and the onnxruntime-web (WASM) fallback failed to load. " +
+            `Native failure: ${detail}. Run \`npx @cortexkit/magic-context@latest doctor\` for diagnostics; ` +
+            "reinstalling repairs missing package files but cannot add a native binding that upstream does not ship. " +
+            "Alternatively, configure an `openai-compatible` embedding HTTP endpoint. Existing memories are unaffected.",
+    );
+}
+
+async function loadTransformersForLocalEmbedding(
+    runtimePreference: LocalEmbeddingRuntime,
+): Promise<{
+    module: TransformersModule;
+    usesWasm: boolean;
+}> {
+    if (localEmbeddingRuntimeMode === "disabled") {
+        throw new Error("local embedding runtime is disabled");
+    }
+
+    const resolvedRuntime = resolveLocalEmbeddingRuntime(
+        runtimePreference,
+        localEmbeddingHostForRuntime(),
+    );
+    if (resolvedRuntime === "wasm") {
+        if (!(await ensureWasmOrtInjected())) {
+            disableLocalEmbeddingsAfterRuntimeFailure("the selected WASM runtime is unavailable");
+            throw new Error("onnxruntime-web failed to load");
+        }
+        return { module: await importWasmTransformersForHost(), usesWasm: true };
+    }
+
+    if (localEmbeddingRuntimeMode === "wasm") {
+        if (!(await ensureWasmOrtInjected())) {
+            disableLocalEmbeddingsAfterRuntimeFailure(
+                "the previously selected WASM runtime is unavailable",
+            );
+            throw new Error("onnxruntime-web failed to load");
+        }
+        try {
+            return { module: await importWasmTransformersForHost(), usesWasm: true };
+        } catch (wasmError) {
+            disableLocalEmbeddingsAfterRuntimeFailure(
+                "the previously selected WASM runtime failed to load",
+            );
+            throw wasmError;
+        }
+    }
+
+    const electron = resolvedRuntime === "electron";
+    if (electron) {
+        const wasInjected = wasmRuntimeInjected;
+        if (await ensureWasmOrtInjected()) {
+            if (!wasInjected) {
+                logForRuntime(
+                    "[magic-context] Electron detected — using onnxruntime-web (WASM) for embeddings (bypasses onnxruntime-node native load)",
+                );
+            }
+            // Electron keeps its existing Transformers consumer path because the
+            // injected onnxruntime-web global must exist before Transformers resolves.
+            return { module: await importTransformersForRuntime(), usesWasm: true };
+        }
+    }
+
+    try {
+        return { module: await importTransformersForRuntime(), usesWasm: false };
+    } catch (nativeError) {
+        if (!isNativeRuntimeMissingError(nativeError) || electron) {
+            throw nativeError;
+        }
+
+        if (!(await ensureWasmOrtInjected())) {
+            disableLocalEmbeddingsAfterRuntimeFailure(
+                nativeError instanceof Error ? nativeError.message : String(nativeError),
+            );
+            throw nativeError;
+        }
+
+        // Once native has failed, all later providers must choose the same WASM
+        // path instead of repeating the broken native import while this retry loads.
+        localEmbeddingRuntimeMode = "wasm";
+        try {
+            const module = await importWasmTransformersForHost();
+            logForRuntime(
+                "[magic-context] onnxruntime-node failed to load; using onnxruntime-web (WASM) for local embeddings. " +
+                    "WASM inference is slower than native; a remote `openai-compatible` provider may be faster." +
+                    likelyMuslHint(),
+            );
+            return { module, usesWasm: true };
+        } catch (wasmError) {
+            disableLocalEmbeddingsAfterRuntimeFailure(
+                nativeError instanceof Error ? nativeError.message : String(nativeError),
+            );
+            throw new LocalEmbeddingFallbackError(nativeError, wasmError);
+        }
     }
 }
 
@@ -284,27 +615,10 @@ async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Recognizes transient ONNX/transformers load failures that should be retried
- * rather than surfaced to the user. Seen in live logs when multiple plugin
- * processes (Desktop sidecar + TUI + dashboard) initialize the embedding
- * pipeline within the same window. The on-disk model file is intact; the
- * failure mode is ephemeral and resolves on retry.
+ * Recognizes the permanent native-runtime load failure. A missing package or a
+ * broken platform binding is environmental rather than transient, and triggers
+ * exactly one WASM retry before the process is permanently disabled.
  */
-/**
- * Recognizes the PERMANENT "native runtime not installed" failure: the plugin's
- * `@huggingface/transformers` Node entry does a static `import "onnxruntime-node"`,
- * so when that package is missing/broken in the install tree (seen on Windows
- * when its platform binary fails to install, issue #128), the import throws
- * `Cannot find package 'onnxruntime-node'` / `ERR_MODULE_NOT_FOUND` before
- * transformers' own WASM-fallback hook is even reachable. This is environmental,
- * not transient — retrying just re-spams the cryptic resolver error every time an
- * embedding is needed. We latch it and degrade cleanly with one actionable line.
- */
-// Process-global latch: once the native ONNX runtime is confirmed missing, every
-// LocalEmbeddingProvider in this process short-circuits initialize() instead of
-// re-importing transformers and re-failing. Process-global (not per-instance)
-// because the missing package affects the whole install, not one model.
-let nativeRuntimeMissing = false;
 
 export function isNativeRuntimeMissingError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? "");
@@ -323,6 +637,11 @@ export function isNativeRuntimeMissingError(error: unknown): boolean {
         return true;
     }
 
+    // transformers' Node entry also loads optional Sharp bindings at module
+    // initialization. Treat its known loader failure like an absent ONNX addon:
+    // the bundled web entry does not need either native dependency.
+    if (lower.includes('could not load the "sharp" module')) return true;
+
     const mentionsNativeRuntime =
         lower.includes("onnxruntime-node") || lower.includes("onnxruntime_binding");
     if (!mentionsNativeRuntime) return false;
@@ -335,6 +654,12 @@ export function isNativeRuntimeMissingError(error: unknown): boolean {
     );
 }
 
+/**
+ * Recognizes transient ONNX/transformers load failures that should be retried
+ * rather than surfaced to the user. Seen in live logs when multiple plugin
+ * processes initialize the embedding pipeline within the same window. The
+ * on-disk model file is intact; the failure is ephemeral and resolves on retry.
+ */
 function isTransientLoadError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? "");
     if (!message) return false;
@@ -411,10 +736,14 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;
     readonly maxInputTokens: number;
 
+    private readonly memoryStatsId = nextLocalEmbeddingRuntimeId++;
     private readonly model: string;
     private readonly dtype: LocalEmbeddingDtype;
+    private readonly runtimePreference: LocalEmbeddingRuntime;
     private pipeline: EmbeddingPipeline | null = null;
     private initPromise: Promise<void> | null = null;
+    private lastFailureReason: EmbeddingFailure | null = null;
+    private usesWasm = false;
     private inFlight = 0;
     private disposing = false;
     private disposePromise: Promise<void> | null = null;
@@ -424,13 +753,16 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         model = DEFAULT_LOCAL_EMBEDDING_MODEL,
         maxInputTokens = 512,
         dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
+        runtimePreference: LocalEmbeddingRuntime = "auto",
     ) {
         this.model = model;
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+        this.runtimePreference = runtimePreference;
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
             model,
+            local_runtime: runtimePreference,
             // Only fold non-default dtype into identity so the default config
             // produces the byte-identical identity string as before this field
             // existed (no forced re-embed on upgrade). See issue #259.
@@ -447,9 +779,12 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
             return true;
         }
 
-        // Native runtime confirmed missing earlier this process — don't re-import
-        // transformers just to re-fail and re-spam the resolver error (issue #128).
-        if (nativeRuntimeMissing) {
+        // A process that proved both runtimes unusable must not retry imports on
+        // every embedding request. A successful WASM choice remains reusable.
+        if (localEmbeddingRuntimeMode === "disabled") {
+            this.lastFailureReason =
+                localEmbeddingProcessFailure ??
+                classifyLocalEmbeddingFailure(new Error("local embedding runtime is disabled"));
             return false;
         }
 
@@ -458,37 +793,35 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
             return this.pipeline !== null;
         }
 
+        const memoryBeforeLoad = process.memoryUsage();
         this.initPromise = (async () => {
             try {
                 if (this.disposing) {
                     return;
                 }
 
-                // Pre-inject WASM ORT runtime for Electron Desktop. This MUST run
-                // before the first `await import("@huggingface/transformers")` below
-                // — transformers.js reads `Symbol.for("onnxruntime")` at module
-                // evaluation time and uses whatever we provide instead of doing its
-                // own native-vs-web backend selection. No-op on plain Node/Bun.
-                // See: https://github.com/cortexkit/magic-context/issues/78
-                const injectedWasmOrt = await injectWasmOrtForElectron();
-
-                // Non-literal import specifier prevents Bun from eagerly resolving
-                // @huggingface/transformers at plugin load time. Desktop sidecar spawns
-                // hit ENOENT on JSDoc-referenced files inside transformers' webpack dist
-                // when the literal string triggers Bun's static module analysis.
-                // See: https://github.com/cortexkit/magic-context/issues/4
-                const transformersSpec = `@huggingface/${"transformers"}`;
-                const transformersModule = (await import(transformersSpec)) as Record<
-                    string,
-                    unknown
-                >;
+                const { module: transformersModule, usesWasm } =
+                    await loadTransformersForLocalEmbedding(this.runtimePreference);
+                this.usesWasm = usesWasm;
                 const env = transformersModule.env as {
                     logLevel?: unknown;
                     cacheDir?: string;
+                    useFS?: boolean;
+                    useFSCache?: boolean;
                 };
                 const LogLevel = transformersModule.LogLevel as Record<string, unknown> | undefined;
                 if (LogLevel && "ERROR" in LogLevel) {
                     env.logLevel = LogLevel.ERROR;
+                }
+
+                const host = localEmbeddingHostForRuntime();
+                if (
+                    usesWasm &&
+                    host.hasNodeFilesystem &&
+                    !host.isElectron &&
+                    (env.useFS !== true || env.useFSCache !== true)
+                ) {
+                    throw new LocalEmbeddingFsUnavailableError();
                 }
 
                 // Set a stable model cache directory outside of node_modules.
@@ -496,7 +829,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 // (e.g. ~\.cache\opencode\packages\...\node_modules\@huggingface\transformers\.cache)
                 // can be inaccessible or non-writable, causing "Unable to get model file path
                 // or buffer" failures. Using our own storage dir survives plugin updates too.
-                const modelCacheDir = join(getMagicContextStorageDir(), "models");
+                const modelCacheDir = modelCacheDirForRuntime();
                 try {
                     // Keep the cache owner-only by default because it shares the
                     // storage tree with memories/history. Trusted-group deployments
@@ -547,7 +880,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             // here. See issue #259.
                             //
                             // device: "auto" is REQUIRED when we injected our own ORT
-                            // via Symbol.for("onnxruntime") (the Electron WASM path):
+                            // via Symbol.for("onnxruntime") (the WASM path):
                             // transformers then skips its device-registration branch, so
                             // supportedDevices stays []. Any concrete device (incl. the
                             // "cpu" it defaults to under IS_NODE_ENV) fails the
@@ -559,7 +892,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             const pipeline = await withQuietConsole(() =>
                                 createPipeline("feature-extraction", this.model, {
                                     dtype: this.dtype,
-                                    ...(injectedWasmOrt ? { device: "auto" } : {}),
+                                    ...(usesWasm ? { device: "auto" } : {}),
                                 }),
                             );
                             if (this.disposing) {
@@ -585,6 +918,18 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     }
 
                     if (this.pipeline) {
+                        this.lastFailureReason = null;
+                        localEmbeddingProcessFailure = null;
+                        const memoryAfterLoad = process.memoryUsage();
+                        loadedLocalEmbeddingRuntimes.set(this.memoryStatsId, {
+                            model: this.model,
+                            runtime: this.usesWasm ? "wasm" : "native",
+                            rssDeltaAtLoad: memoryAfterLoad.rss - memoryBeforeLoad.rss,
+                            externalDeltaAtLoad:
+                                memoryAfterLoad.external - memoryBeforeLoad.external,
+                            arrayBuffersDeltaAtLoad:
+                                memoryAfterLoad.arrayBuffers - memoryBeforeLoad.arrayBuffers,
+                        });
                         log(`[magic-context] embedding model loaded: ${this.model}`);
                     } else if (this.disposing) {
                         return;
@@ -596,23 +941,26 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                     await releaseLock();
                 }
             } catch (error) {
-                if (isNativeRuntimeMissingError(error)) {
-                    // Permanent, environmental: latch so we degrade once and stop
-                    // re-importing (which would re-spam the cryptic resolver error
-                    // on every embedding). One actionable line; local embeddings
-                    // are disabled for this process until the install is repaired.
-                    nativeRuntimeMissing = true;
-                    log(
-                        "[magic-context] local embeddings are disabled because the " +
-                            "onnxruntime-node native binding is missing or failed to load. " +
-                            "Run `npx @cortexkit/magic-context@latest doctor` for repair " +
-                            "guidance (use `doctor --force` to reinstall cached plugin packages), " +
-                            "or configure an `openai-compatible` embedding HTTP endpoint. " +
-                            "Existing memories are unaffected.",
+                const nativeError =
+                    error instanceof LocalEmbeddingFallbackError ? error.nativeError : undefined;
+                const failure = classifyLocalEmbeddingFailure(error, {
+                    platform: process.platform,
+                    arch: process.arch,
+                    usesWasm: this.usesWasm,
+                    nativeError,
+                });
+                this.lastFailureReason = failure;
+                localEmbeddingProcessFailure = failure;
+
+                if (!localEmbeddingRuntimeIsDisabled() && isNativeRuntimeMissingError(error)) {
+                    disableLocalEmbeddingsAfterRuntimeFailure(
+                        error instanceof Error ? error.message : String(error),
                     );
-                } else {
-                    log("[magic-context] embedding model failed to load:", error);
                 }
+                logForRuntime(
+                    `[magic-context] embedding model failed to load (${failure.class}: ${failure.reason}):`,
+                    error,
+                );
                 this.pipeline = null;
             } finally {
                 this.initPromise = null;
@@ -646,6 +994,8 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
         _purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null> {
+        // MiniLM and gte-modernbert are plain encoders, so query/document text
+        // stays byte-identical unless a future local model owns its own recipe.
         // Local inference is fast (typically <100ms) and can't be cancelled
         // mid-compute with transformers.js, so we honor `signal` only as a
         // pre-flight check — callers whose timeout already fired get null
@@ -672,9 +1022,23 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 }),
             );
 
-            return extractBatchEmbeddings(result, 1)[0] ?? null;
+            const embedding = extractBatchEmbeddings(result, 1)[0] ?? null;
+            if (!embedding) {
+                this.lastFailureReason = classifyLocalEmbeddingFailure(
+                    new Error("local embedding pipeline returned no vector"),
+                    { usesWasm: this.usesWasm },
+                );
+            } else {
+                this.lastFailureReason = null;
+            }
+            return embedding;
         } catch (error) {
-            log("[magic-context] embedding failed:", error);
+            const failure = classifyLocalEmbeddingFailure(error, { usesWasm: this.usesWasm });
+            this.lastFailureReason = failure;
+            logForRuntime(
+                `[magic-context] embedding failed (${failure.class}: ${failure.reason}):`,
+                error,
+            );
             return null;
         } finally {
             this.finishInFlight();
@@ -686,6 +1050,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
         _purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]> {
+        // Plain local encoders intentionally receive the original text for both purposes.
         if (texts.length === 0) {
             return [];
         }
@@ -717,9 +1082,23 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 }),
             );
 
-            return extractBatchEmbeddings(result, texts.length);
+            const embeddings = extractBatchEmbeddings(result, texts.length);
+            if (embeddings.every((embedding) => embedding === null)) {
+                this.lastFailureReason = classifyLocalEmbeddingFailure(
+                    new Error("local embedding pipeline returned no vectors"),
+                    { usesWasm: this.usesWasm },
+                );
+            } else {
+                this.lastFailureReason = null;
+            }
+            return embeddings;
         } catch (error) {
-            log("[magic-context] embedding batch failed:", error);
+            const failure = classifyLocalEmbeddingFailure(error, { usesWasm: this.usesWasm });
+            this.lastFailureReason = failure;
+            logForRuntime(
+                `[magic-context] embedding batch failed (${failure.class}: ${failure.reason}):`,
+                error,
+            );
             return Array.from({ length: texts.length }, () => null);
         } finally {
             this.finishInFlight();
@@ -742,6 +1121,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
             const pipelineToDispose = this.pipeline;
             this.pipeline = null;
             this.initPromise = null;
+            loadedLocalEmbeddingRuntimes.delete(this.memoryStatsId);
             if (!pipelineToDispose) {
                 return;
             }
@@ -758,5 +1138,9 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
     isLoaded(): boolean {
         return this.pipeline !== null;
+    }
+
+    getLastFailureReason(): EmbeddingFailure | null {
+        return this.lastFailureReason;
     }
 }

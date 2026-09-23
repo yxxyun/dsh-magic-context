@@ -2,21 +2,21 @@ import {
     isCompactionEnabled,
     isDreamerRunnable,
     isHistorianRunnable,
-    isSidekickRunnable,
 } from "../../config/agent-disable";
+import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import {
     DEFAULT_HISTORIAN_TIMEOUT_MS,
     type DreamerConfig,
     type HistorianConfig,
-    type SidekickConfig,
+    type MagicContextConfig,
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirroredNoteCompileFields,
-    applyMirrorPage,
+    applyTargetedMemoryMirrorRow,
+    drainMirrorPages,
     ensureContextStoreUuid,
-    getMirrorCursor,
     getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
@@ -41,6 +41,7 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import {
     embedSessionCompartmentChunks,
+    embedUnembeddedMemoriesForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
@@ -51,26 +52,40 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
+    type DatabaseBootTimings,
     getMigrationOnOpenRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { getCurrentToolSetHash } from "../../features/magic-context/tool-definition-tokens";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import {
+    moduleMemoryOperation,
+    translateHostMemoryIds,
+    translateModuleMemoryMutationReply,
+} from "../../plugin/memory-id-translation";
+import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
+import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
-import { deriveHistorianChunkTokens, resolveHistorianContextLimit } from "./derive-budgets";
+import {
+    deriveHistorianChunkTokens,
+    resolveHistorianContextLimit,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
+import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
 import {
     autoEmbedAttemptedBySession,
     clearEmbedSessionState,
@@ -84,10 +99,12 @@ import {
     resolveExecuteThresholdDetail,
     resolveModelKey,
 } from "./event-resolvers";
+import { formatEmbedFailureSummary } from "./format-embed-failure";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
-import { dropSlot } from "./lkg-slot";
-import { SubcModuleTransport } from "./module-transport";
+import { createDbLkgPersistence } from "./lkg-persist";
+import { dropSlot, registerLkgPersistence } from "./lkg-slot";
+import { getDefaultSubcConnectionFile, SubcModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -97,6 +114,7 @@ import {
     setRecompTerminal,
 } from "./recomp-orchestrator";
 import type { RustModeModuleClient } from "./rust-mode-transform";
+import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -112,7 +130,11 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
-import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
+import {
+    type NotificationParams,
+    sendIgnoredMessage,
+    sendStatusNotification,
+} from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
@@ -129,7 +151,8 @@ export interface MagicContextDeps {
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     liveSessionState?: LiveSessionState;
     config: {
-        protected_tags: number;
+        protected_tokens?: number;
+        protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
         language?: string;
@@ -138,7 +161,9 @@ export interface MagicContextDeps {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
-        cache_ttl: string | Record<string, string>;
+        cache_ttl: MagicContextConfig["cache_ttl"];
+        cacheTtlConfigured?: boolean;
+        configParseFailures?: ConfigParseFailure[];
         prompt_surface?: PromptSurfaceConfig;
 
         historian?: HistorianConfig;
@@ -160,7 +185,6 @@ export interface MagicContextDeps {
         embedding?: {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
-        sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
         smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
@@ -174,6 +198,10 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
+        /** Path to the subc daemon's connection file. Threaded to the module
+         *  transport so a host that publishes it outside the default data-dir
+         *  location (e.g. a systemd RuntimeDirectory) is actually reachable. */
+        subc?: { connection_file: string };
         /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
@@ -186,6 +214,8 @@ export interface MagicContextDeps {
     rustModeModuleClient?: RustModeModuleClient;
     /** Test and async-boot seam for supplying a database already opened by the caller. */
     openDatabaseForHook?: () => Database | null;
+    /** Plugin-factory diagnostics for the boot-time storage phases. */
+    onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -274,7 +304,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             notifyMagicContextDisabled(deps.client, reason);
             const migration = getMigrationOnOpenRefusal();
             const blockingProcesses =
-                migration?.serverPids.map((pid) => ({ harness: "OpenCode server", pid })) ?? [];
+                migration?.blockingProcesses ??
+                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
+                [];
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
@@ -350,9 +382,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // context, not the main session model's. Re-derived per historian invocation
     // (matching RPC/TUI paths) so config/model changes take effect without
     // restart, and so all trigger sources produce consistent chunk sizes.
+    const resolveHistorianAttempts = () => resolveHistorianModel(deps.config, "opencode");
     const getHistorianChunkTokens = (): number =>
-        deriveHistorianChunkTokens(resolveHistorianContextLimit(deps.config.historian?.model));
-    const historianFallbackModels = resolveFallbackChain(deps.config.historian?.fallback_models);
+        deriveHistorianChunkTokens(
+            resolveHistorianContextLimit(resolveHistorianAttempts().primary?.model),
+        );
+    const historianModel = resolveHistorianAttempts().primary;
+    const historianContextLimit = resolveKnownHistorianContextLimit(historianModel?.model);
+    const historianMaxOutputTokens = deps.config.historian?.maxTokens ?? 32_000;
+    const historianFallbackModels = resolveHistorianAttempts().fallbacks;
 
     // Three independent cache-busting signal sets, sourced from the
     // process-scoped LiveSessionState so RPC handlers (TUI recomp) can
@@ -396,6 +434,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const liveModelBySession =
         deps.liveSessionState?.liveModelBySession ??
         new Map<string, { providerID: string; modelID: string }>();
+    const latestAssistantMessageIdBySession =
+        deps.liveSessionState?.latestAssistantMessageIdBySession ?? new Map<string, string>();
     const agentBySession = deps.liveSessionState?.agentBySession ?? new Map<string, string>();
     const sessionDirectoryBySession =
         deps.liveSessionState?.sessionDirectoryBySession ?? new Map<string, string>();
@@ -414,7 +454,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline.
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
-    const channel1StateBySession = new Map<string, import("./ctx-reduce-nudge").Channel1State>();
+    const channel1StateBySession =
+        deps.liveSessionState?.channel1StateBySession ??
+        new Map<string, import("./ctx-reduce-nudge").Channel1State>();
     const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
@@ -451,7 +493,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             agentBySession,
             deps.config.toast_duration_ms,
         );
-        void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch(
+        void sendStatusNotification(deps.client, sessionId, warning, notificationParams).catch(
             (error) => {
                 log(
                     `[magic-context] failed to send project identity warning for ${directory}: ${getErrorMessage(error)}`,
@@ -481,6 +523,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            latestAssistantMessageIdBySession,
+            channel1StateBySession,
             variantBySession,
             agentBySession,
             historyRefreshSessions,
@@ -498,6 +542,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
         memoryEnabled: deps.config.memory?.enabled ?? true,
         autoPromote: deps.config.memory?.auto_promote ?? true,
+        historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         language: deps.config.language,
         fallbackModelId: (() => {
@@ -505,7 +552,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!deps.config.historian?.model,
+        runMigration: deps.config.memory?.enabled !== false && !!historianModel?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
@@ -649,7 +696,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             case "stalled":
                 return terminal(
                     "skipped",
-                    `Embedded ${outcome.embedded} compartments; ${outcome.remaining} could not be embedded (the provider returned no result). Run /ctx-embed start again to retry them.`,
+                    formatEmbedFailureSummary(outcome.embedded, outcome.remaining, outcome.failure),
                 );
             default:
                 return terminal(
@@ -699,7 +746,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
-            let completedDrainWithWork = false;
+            // Latch discipline: early exits (no identity, provider off, nothing to
+            // embed yet) release the latch so a young session gets its drain once
+            // real work exists — those paths are silent and cost one coverage
+            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
+            // success), the latch holds for the process lifetime: busy means the
+            // project-level passive backfill owns the backlog, and re-attempting
+            // per pass is the announce/busy livelock this shape replaced.
+            let drainReachedTerminal = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -719,48 +773,33 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
                 if (remaining <= 0) return;
-                const notifyParams = getLiveNotificationParams(
-                    sessionId,
-                    liveModelBySession,
-                    variantBySession,
-                    agentBySession,
-                );
-                if (!isTuiConnected(sessionId)) {
-                    const startMsg = `Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`;
-                    await sendIgnoredMessage(deps.client, sessionId, startMsg, {
-                        ...notifyParams,
-                    });
-                }
-                const summary = await executeEmbedHistory(sessionId);
-                const completedCoverage = getEmbeddingCoverageStatus(
-                    db,
-                    sessionProjectIdentity,
-                    sessionId,
-                );
-                completedDrainWithWork =
-                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
-                if (!isTuiConnected(sessionId)) {
-                    await sendIgnoredMessage(deps.client, sessionId, summary, {
-                        ...notifyParams,
-                    });
-                }
+                // The auto lane is a silent bootstrap trigger: no pre-announce, no
+                // busy/zero-work chatter, and the once-per-process latch never
+                // resets. Announce-then-drain looped every turn on large backlogs —
+                // the project-level passive backfill holds the drain lock for the
+                // whole (bounded, deferred-span) catch-up, so this drain returned
+                // "busy"/zero-work each pass, reset its own latch, and re-announced
+                // the same count forever. Retries belong to the passive backfill;
+                // progress lives in /ctx-embed status and the sidebar.
+                await executeEmbedHistory(sessionId, { silent: true });
+                drainReachedTerminal = true;
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
             } finally {
-                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
+                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };
 
-    const sidekickRunnable = isSidekickRunnable(deps.config);
-    const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-            const transport = new SubcModuleTransport();
+            const transport = new SubcModuleTransport(
+                deps.config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+            );
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
@@ -772,6 +811,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
+                mirrorMemory: (args) => transport.mirrorMemory(args),
+                memoryIdentityAck: (args) => transport.memoryIdentityAck(args),
                 getCompartmentsAfter: async (sessionId, afterSequence) => {
                     const response = await transport.call({
                         sessionId,
@@ -797,37 +838,86 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         "max_sequence" in record && typeof record.max_sequence === "number"
                             ? record.max_sequence
                             : afterSequence;
-                    return { max_sequence: maxSequence, compartments };
+                    const compartmentCount =
+                        "compartment_count" in record &&
+                        typeof record.compartment_count === "number"
+                            ? record.compartment_count
+                            : undefined;
+                    const revertEpoch =
+                        "revert_epoch" in record && typeof record.revert_epoch === "number"
+                            ? record.revert_epoch
+                            : undefined;
+                    return {
+                        max_sequence: maxSequence,
+                        compartments,
+                        ...(compartmentCount !== undefined
+                            ? { compartment_count: compartmentCount }
+                            : {}),
+                        ...(revertEpoch !== undefined ? { revert_epoch: revertEpoch } : {}),
+                        ...("set_changed" in record && record.set_changed === true
+                            ? { set_changed: true }
+                            : {}),
+                    };
                 },
             };
             return client;
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
+    const rustRefusalRecovery = rustModeModuleClient
+        ? createRustRefusalRecovery({
+              moduleClient: rustModeModuleClient,
+              client: deps.client,
+          })
+        : undefined;
+    const syncModuleDomain = async (
+        domain: "memories" | "notes",
+        pageBudget?: number,
+    ): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
-        for (;;) {
-            const cursor = getMirrorCursor(db, domain);
-            const response = await rustModeModuleClient.mirrorPull({
-                domain,
-                cursor,
-                limit: 1000,
-            });
-            const next = applyMirrorPage({ db, page: response.page });
-            if (!response.page.has_more || next === cursor) break;
-        }
+        await drainMirrorPages({
+            db,
+            module: rustModeModuleClient,
+            domain,
+            limit: 1000,
+            pageBudget,
+        });
     };
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
-    const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
+    const syncModuleMemoryIdentity = async (
+        moduleProject: string,
+        moduleRowId: number,
+        projectRoot: string,
+    ): Promise<void> => {
+        if (!rustModeModuleClient?.mirrorMemory) return;
+        const { row } = await rustModeModuleClient.mirrorMemory({
+            module_row_id: moduleRowId,
+            projectRoot,
+        });
+        if (!row) return;
+        const identity = applyTargetedMemoryMirrorRow({ db, row });
+        if (!identity || !rustModeModuleClient.memoryIdentityAck) return;
+        await rustModeModuleClient.memoryIdentityAck({
+            project: moduleProject,
+            projectRoot,
+            rows: [
+                {
+                    module_row_id: moduleRowId,
+                    context_row_id: identity.contextRowId,
+                },
+            ],
+        });
+    };
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
-                  authorityState: async ({ projectPath, projectRoot, domain }) => {
+                  authorityState: async ({ projectPath, projectRoot, sessionId, domain }) => {
                       if (!rustModeModuleClient.authorityStatus) return null;
                       const result = await rustModeModuleClient.authorityStatus({
                           context_store_uuid: ensureContextStoreUuid(db),
                           project: projectPath,
                           projectRoot,
+                          sessionId,
                           domain,
                       });
                       return result.authority?.state ?? null;
@@ -860,7 +950,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       filter,
                       limit,
                       offset,
-                      noteId,
+                      noteIds,
                   }) => {
                       const response = await rustModeModuleClient.call({
                           sessionId,
@@ -874,10 +964,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   content,
                                   memory_project: memoryProject,
                                   surface_condition: surfaceCondition,
+                                  compiled_provider: compiledProvider,
+                                  compiled_config: compiledConfig,
+                                  compiled_at: compiledAt,
+                                  compile_status: compileStatus,
                                   filter,
                                   limit,
                                   offset,
-                                  note_id: noteId,
+                                  note_ids: noteIds,
                               },
                           },
                       });
@@ -886,7 +980,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       await syncModuleNotes();
                       if (compileStatus && !moduleNoteResponseIsError(response)) {
                           const moduleRowId =
-                              action === "write" ? moduleNoteRowId(response) : (noteId ?? null);
+                              action === "write"
+                                  ? moduleNoteRowId(response)
+                                  : (noteIds?.[0] ?? null);
                           if (
                               moduleRowId === null ||
                               !applyMirroredNoteCompileFields({
@@ -918,7 +1014,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       category,
                       ids,
                       reason,
+                      limit,
                   }) => {
+                      const hostIds = ids ?? [];
+                      const translatedIds = translateHostMemoryIds(db, hostIds);
+                      if ("error" in translatedIds) return translatedIds.error;
+                      const moduleIds = translatedIds.moduleIds;
                       const response = await rustModeModuleClient.call({
                           sessionId,
                           projectRoot,
@@ -930,16 +1031,66 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   action,
                                   content,
                                   category,
-                                  ids,
+                                  ids: moduleIds,
+                                  host_ids: hostIds,
+                                  memory_id_lane: "host",
                                   reason,
+                                  limit,
                                   memory_project: memoryProject,
                               },
                           },
                       });
-                      // Auto-search and local RPC/dashboard reads consume the mirror,
-                      // so publish the module mutation to that read model before return.
-                      await syncModuleMemories();
-                      return response;
+                      // A fresh canonical row can sit behind a large cursor backlog. Pull that
+                      // one row first so the agent reply has a bounded path to its host id. The
+                      // ordinary memory drain remains on the transform-pass cadence.
+                      const operation = moduleMemoryOperation(response);
+                      const newModuleRowId =
+                          operation?.action === "write"
+                              ? operation.module_id
+                              : operation?.action === "merge"
+                                ? operation.canonical_module_id
+                                : undefined;
+                      try {
+                          if (newModuleRowId !== undefined) {
+                              await syncModuleMemoryIdentity(
+                                  memoryProject,
+                                  newModuleRowId,
+                                  projectRoot,
+                              );
+                          }
+                      } catch (error) {
+                          log("[magic-context] targeted memory mirror sync failed:", error);
+                      }
+                      if (
+                          !moduleNoteResponseIsError(response) &&
+                          (action === "write" || action === "update" || action === "merge")
+                      ) {
+                          // TypeScript memory writes queue embedding work immediately.
+                          // The Rust path must do the same after publishing its memory.
+                          void (async () => {
+                              await ensureProjectRegisteredFromOpenCodeDirectory(projectRoot, db);
+                              const embedded = await embedUnembeddedMemoriesForProject(
+                                  db,
+                                  memoryProject,
+                              );
+                              if (embedded > 0) {
+                                  log(
+                                      `[magic-context] proactively embedded ${embedded} mirrored ${embedded === 1 ? "memory" : "memories"} for project ${memoryProject}`,
+                                  );
+                              }
+                          })().catch((error) => {
+                              log("[magic-context] mirrored memory embedding failed:", error);
+                          });
+                      }
+                      return (
+                          translateModuleMemoryMutationReply({
+                              db,
+                              moduleProject: memoryProject,
+                              response,
+                              requestedHostIds: hostIds,
+                              requestedCategory: category,
+                          }) ?? response
+                      );
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
@@ -1019,6 +1170,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             );
     };
 
+    // Durable LKG replay: register the db-backed backend so slot drops clear the
+    // persisted row and in-memory misses (notably the first pass after a
+    // process restart) hydrate the snapshot captured by the last applied pass.
+    // Re-registration on a healed storage reopen replaces the stale handle.
+    registerLkgPersistence(createDbLkgPersistence(db));
+
     const transform = createTransform({
         tagger: deps.tagger,
         scheduler: deps.scheduler,
@@ -1026,7 +1183,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         channel1StateBySession,
         channel2DirectiveTextBySession,
-        protectedTags: deps.config.protected_tags,
+        protectedTokens: deps.config.protected_tokens,
+        protectedTokenTierOverrides: deps.config.protectedTokenTierOverrides,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
@@ -1034,6 +1192,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deferredHistoryRefreshSessions,
         pendingMaterializationSessions,
         deferredMaterializationSessions,
+        variantBySession,
         lastHeuristicsTurnId,
         commitSeenLastPass,
         internalChildSessions,
@@ -1056,6 +1215,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdPercentage: deps.config.execute_threshold_percentage,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+        historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -1068,6 +1230,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         getModelKey: (sessionId) => {
             const model = liveModelBySession.get(sessionId);
             return resolveModelKey(model?.providerID, model?.modelID);
+        },
+        getToolSetHash: (sessionId) => {
+            const model = liveModelBySession.get(sessionId);
+            if (!model) return "";
+            return getCurrentToolSetHash(
+                model.providerID,
+                model.modelID,
+                agentBySession.get(sessionId),
+            );
         },
         getFallbackModelId: (sessionId) => {
             const model = liveModelBySession.get(sessionId);
@@ -1082,15 +1253,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
-        autoSearch: deps.config.memory?.auto_search?.enabled
-            ? {
-                  enabled: true,
-                  scoreThreshold: deps.config.memory?.auto_search.score_threshold,
-                  minPromptChars: deps.config.memory?.auto_search.min_prompt_chars,
-                  directory: deps.directory,
-                  ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-              }
-            : undefined,
+        // Keep the resolved controls available to both renderers. Rust mode must receive
+        // an explicit false here rather than falling back to the module default.
+        autoSearch: {
+            enabled: deps.config.memory?.auto_search?.enabled ?? true,
+            scoreThreshold: deps.config.memory?.auto_search?.score_threshold ?? 0.6,
+            minPromptChars: deps.config.memory?.auto_search?.min_prompt_chars ?? 20,
+            directory: deps.directory,
+            ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        },
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
         // by the parent and they have no ctx_expand recovery path.
@@ -1106,17 +1277,20 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         promptSurface: deps.config.prompt_surface,
+        promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
+        onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,
         compactionOff,
+        thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
         db,
         client: deps.client,
@@ -1139,32 +1313,32 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustWireInvalidated: (sessionId: string) => {
             transform.invalidateRustWireState(sessionId);
         },
-        // Clean up per-session state the system-prompt handler maintains so
-        // these module/closure-scope maps don't accumulate entries over the
-        // plugin's lifetime (Finding #3).
-        onSessionDeleted: (sessionId: string) => {
+        rustSessionCleanup: rustModeModuleClient !== undefined,
+        // Remove module-owned state before the context database drops the durable
+        // session→project binding needed to retry a failed module deletion.
+        onSessionDeleted: async (sessionId: string) => {
+            rustRefusalRecovery?.forget(sessionId);
             dropSlot(sessionId, "session-deleted");
-            transform.clearRustSession(sessionId);
-            systemPromptHash.clearSession(sessionId);
-            // Prune every per-session map this hook closure owns. These
-            // accumulate one entry per session for the plugin process lifetime
-            // (which can span days/weeks across many sessions and subagents);
-            // without this, a long-lived process leaks memory steadily. Some
-            // maps are shared via liveSessionState — clearing on the terminal
-            // session.deleted event is correct since the session is gone.
-            lastHeuristicsTurnId.delete(sessionId);
-            clearToolPermissionDenied(sessionId);
-            commitSeenLastPass.delete(sessionId);
-            variantBySession.delete(sessionId);
-            liveModelBySession.delete(sessionId);
-            agentBySession.delete(sessionId);
-            sessionDirectoryBySession.delete(sessionId);
-            recompProgressBySession.delete(sessionId);
-            internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
-            channel1StateBySession.delete(sessionId);
-            channel2DirectiveTextBySession.delete(sessionId);
-            clearEmbedSessionState(sessionId);
+            try {
+                await transform.clearRustSession(sessionId);
+            } finally {
+                systemPromptHash.clearSession(sessionId);
+                // Prune every per-session map this hook closure owns. These maps
+                // otherwise accumulate for the lifetime of a long-running plugin process.
+                lastHeuristicsTurnId.delete(sessionId);
+                clearToolPermissionDenied(sessionId);
+                commitSeenLastPass.delete(sessionId);
+                variantBySession.delete(sessionId);
+                liveModelBySession.delete(sessionId);
+                agentBySession.delete(sessionId);
+                sessionDirectoryBySession.delete(sessionId);
+                recompProgressBySession.delete(sessionId);
+                internalChildSessions.delete(sessionId);
+                rustMemorySyncRequestedSessions.delete(sessionId);
+                channel1StateBySession.delete(sessionId);
+                channel2DirectiveTextBySession.delete(sessionId);
+                clearEmbedSessionState(sessionId);
+            }
         },
     });
 
@@ -1193,7 +1367,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Dreamer v2: the per-task scheduler owns due-evaluation + keyed leases.
         // This message-event-driven path is a secondary trigger to the process
         // timer; both call the same idempotent scheduler (leases prevent overlap).
-        const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreaming, deps.config.language);
+        const runtimeConfigs = buildDreamTaskRuntimeConfigs(
+            dreaming,
+            "opencode",
+            deps.config.language,
+            deps.config.mural?.model,
+        );
         const executor = createDreamTaskExecutor({
             client: deps.client,
             // Run in the directory this hook instance owns, not a stale sibling
@@ -1235,7 +1414,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const commandHandler = createMagicContextCommandHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
@@ -1245,6 +1423,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustModeModuleClient,
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
+        cacheTtlConfig: deps.config.cache_ttl,
+        cacheTtlConfigured: deps.config.cacheTtlConfigured === true,
+        configParseFailures: deps.config.configParseFailures ?? [],
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific
             // threshold even before the first transform pass has populated
@@ -1253,7 +1434,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
+        getStatusDetail: (sessionId, moduleStatus) => {
+            const model = resolveLiveModel(sessionId);
+            return buildStatusDetail(
+                db,
+                sessionId,
+                sessionDirectoryBySession.get(sessionId) ?? deps.directory,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                deps.config as unknown as Record<string, unknown>,
+                deps.liveSessionState,
+                deps.config.memory?.injection_budget_tokens,
+                moduleStatus,
+                !compactionOff,
+            );
+        },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
+        getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),
         getContextLimit: (sessionId) => {
             // Same DB fallback as getLiveModelKey — /ctx-status's "Resolved
             // context limit" and history-budget math depend on the live model.
@@ -1304,15 +1500,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 ...params,
             });
         },
-        sidekick: sidekickConfig
-            ? {
-                  config: sidekickConfig,
-                  projectPath,
-                  sessionDirectory: deps.directory,
-                  client: deps.client,
-                  language: deps.config.language,
-              }
-            : undefined,
         dreamer: dreamerConfig
             ? {
                   config: dreamerConfig,
@@ -1324,7 +1511,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       runManualDream({
                           db,
                           projectIdentity: projectPath,
-                          tasks: buildDreamTaskRuntimeConfigs(dreamerConfig, deps.config.language),
+                          tasks: buildDreamTaskRuntimeConfigs(
+                              dreamerConfig,
+                              "opencode",
+                              deps.config.language,
+                              deps.config.mural?.model,
+                          ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
                               sessionDirectory: deps.directory,
@@ -1365,7 +1557,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const systemPromptHash = createSystemPromptHashHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         dreamerEnabled: dreamerRunnable,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
@@ -1403,6 +1594,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         liveModelBySession,
+        latestAssistantMessageIdBySession,
         variantBySession,
         agentBySession,
         sessionDirectoryBySession,
@@ -1414,7 +1606,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         lastHeuristicsTurnId,
         commitSeenLastPass,
         client: deps.client,
-        protectedTags: deps.config.protected_tags,
     });
 
     const hooks = {
@@ -1430,6 +1621,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
+            commandHandler,
+            cacheTtlConfig: deps.config.cache_ttl,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable
@@ -1438,7 +1631,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           {
                               client: deps.client,
                               db,
-                              sendIgnoredMessage,
+                              sendStatusNotification,
                               getNotificationParams: (sid) =>
                                   getLiveNotificationParams(
                                       sid,
@@ -1473,6 +1666,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             }
         },
         "command.execute.before": createCommandExecuteBeforeHook(commandHandler),
+        "tool.execute.before": createDroppedInputToolExecuteBeforeHook(),
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
@@ -1498,10 +1692,29 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const hooksWithBackends = hooks as typeof hooks & {
         rustToolBackends?: RustToolBackends;
+        getDebugMemoryHolders?: () => {
+            taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
+            wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
+        };
     };
-    Object.defineProperty(hooksWithBackends, "rustToolBackends", {
-        value: rustToolBackends,
-        enumerable: false,
+    Object.defineProperties(hooksWithBackends, {
+        rustToolBackends: {
+            value: rustToolBackends,
+            enumerable: false,
+        },
+        getDebugMemoryHolders: {
+            value: () => ({
+                taggerCache: deps.tagger.getHeapStats?.() ?? {
+                    sessionCount: 0,
+                    assignmentEntries: 0,
+                    toolAccountingEntries: 0,
+                    loadSignatureEntries: 0,
+                    sessions: [],
+                },
+                wireCache: transform.getRustWireCacheHeapStats(),
+            }),
+            enumerable: false,
+        },
     });
     return hooksWithBackends;
 }
@@ -1516,7 +1729,7 @@ export async function createMagicContextHookAsync(
     let database: Database | null;
     try {
         clearHookInitFailure();
-        database = await openDatabaseAsync();
+        database = await openDatabaseAsync({ onBootTimings: deps.onStorageBootTimings });
     } catch (error) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);

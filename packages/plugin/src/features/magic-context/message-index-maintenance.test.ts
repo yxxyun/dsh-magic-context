@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
+import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
 const tempDirectories: string[] = [];
@@ -26,17 +28,47 @@ function createOpenCodeDb(liveSessionIds: string[]): string {
     return path;
 }
 
+function createStoreDb(): Database {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    runMigrations(db);
+    return db;
+}
+
 function seedIndexedSession(db: Database, sessionId: string, updatedAt: number): void {
     db.prepare(
         `INSERT INTO message_history_index
             (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
          VALUES (?, 1, 0, ?, 'opencode')`,
     ).run(sessionId, updatedAt);
+    const result = db
+        .prepare(
+            `INSERT INTO message_history_fts
+                (session_id, message_ordinal, message_id, role, content)
+             VALUES (?, 1, ?, 'user', ?)`,
+        )
+        .run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, 1, result.lastInsertRowid);
+}
+
+function seedSessionScopedRows(db: Database, sessionId: string, updatedAt: number): void {
+    seedIndexedSession(db, sessionId, updatedAt);
     db.prepare(
-        `INSERT INTO message_history_fts
-            (session_id, message_ordinal, message_id, role, content)
-         VALUES (?, 1, ?, 'user', ?)`,
-    ).run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`);
+        "INSERT INTO session_meta (session_id, harness, last_response_time) VALUES (?, 'opencode', ?)",
+    ).run(sessionId, updatedAt);
+    db.prepare("INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')").run(
+        sessionId,
+    );
+    db.prepare(
+        `INSERT INTO session_facts
+            (session_id, category, content, created_at, updated_at, harness)
+         VALUES (?, 'fact', 'content', ?, ?, 'opencode')`,
+    ).run(sessionId, updatedAt, updatedAt);
+    db.prepare(
+        "INSERT INTO tool_owner_backfill_state (session_id, status) VALUES (?, 'completed')",
+    ).run(sessionId);
 }
 
 function countRows(db: Database, table: string, sessionId: string): number {
@@ -54,14 +86,16 @@ afterEach(() => {
 });
 
 describe("message history orphan maintenance", () => {
-    test("sweeps old orphans while retaining live and young sessions", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+    test("sweeps every old orphan row while retaining live, young, and Pi rows", () => {
+        const db = createStoreDb();
         const now = 2_000_000_000_000;
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
-        seedIndexedSession(db, "ses-live", old);
-        seedIndexedSession(db, "ses-orphan", old);
-        seedIndexedSession(db, "ses-young", now - 1_000);
+        seedSessionScopedRows(db, "ses-live", old);
+        seedSessionScopedRows(db, "ses-orphan", old);
+        seedSessionScopedRows(db, "ses-young", now - 1_000);
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES ('ses-orphan', 2, 'pi')",
+        ).run();
         const openCodePath = createOpenCodeDb(["ses-live"]);
 
         try {
@@ -72,20 +106,102 @@ describe("message history orphan maintenance", () => {
             );
 
             expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
-            expect(countRows(db, "message_history_fts", "ses-orphan")).toBe(0);
-            expect(countRows(db, "message_history_index", "ses-orphan")).toBe(0);
-            expect(countRows(db, "message_history_fts", "ses-live")).toBe(1);
-            expect(countRows(db, "message_history_index", "ses-live")).toBe(1);
-            expect(countRows(db, "message_history_fts", "ses-young")).toBe(1);
-            expect(countRows(db, "message_history_index", "ses-young")).toBe(1);
+            for (const table of [
+                "message_history_fts",
+                "message_history_index",
+                "session_meta",
+                "session_facts",
+                "tool_owner_backfill_state",
+            ]) {
+                expect(countRows(db, table, "ses-orphan"), `${table} retained an orphan`).toBe(0);
+                expect(countRows(db, table, "ses-live"), `${table} removed a live session`).toBe(1);
+                expect(countRows(db, table, "ses-young"), `${table} removed a young session`).toBe(
+                    1,
+                );
+            }
+            expect(
+                db
+                    .prepare("SELECT harness FROM tags WHERE session_id = ? ORDER BY harness")
+                    .all("ses-orphan"),
+            ).toEqual([{ harness: "pi" }]);
+            expect(countRows(db, "tags", "ses-live")).toBe(1);
+            expect(countRows(db, "tags", "ses-young")).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("preserves every host row and coordinate for an orphan with pending Rust cleanup", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        const sessionId = "ses-rust-cleanup-orphan";
+        seedSessionScopedRows(db, sessionId, old);
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', 'git:rust-cleanup-orphan', ?)",
+        ).run(sessionId, old);
+        db.prepare(
+            "INSERT INTO pending_session_cleanup (session_id, harness, requested_at) VALUES (?, 'opencode:rust', ?)",
+        ).run(sessionId, old);
+        const openCodePath = createOpenCodeDb([]);
+
+        try {
+            const result = sweepOrphanedOpenCodeMessageIndexes(
+                db,
+                () => new Database(openCodePath, { readonly: true }),
+                { now },
+            );
+
+            expect(result).toMatchObject({ status: "swept", scanned: 1, deleted: 0 });
+            for (const table of [
+                "message_history_fts",
+                "message_history_index",
+                "session_meta",
+                "session_projects",
+                "pending_session_cleanup",
+                "tags",
+                "session_facts",
+                "tool_owner_backfill_state",
+            ]) {
+                expect(countRows(db, table, sessionId), `${table} lost Rust cleanup state`).toBe(1);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("discovers an orphan whose index rows were already purged", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const orphanSessionId = "ses-indexless-orphan";
+        const liveSessionId = "ses-indexless-live";
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(orphanSessionId);
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(liveSessionId);
+        const openCodePath = createOpenCodeDb([liveSessionId]);
+
+        try {
+            expect(countRows(db, "message_history_index", orphanSessionId)).toBe(0);
+
+            const result = sweepOrphanedOpenCodeMessageIndexes(
+                db,
+                () => new Database(openCodePath, { readonly: true }),
+                { now },
+            );
+
+            expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+            expect(countRows(db, "tags", orphanSessionId)).toBe(0);
+            expect(countRows(db, "tags", liveSessionId)).toBe(1);
         } finally {
             closeQuietly(db);
         }
     });
 
     test("persists a keyset cursor and resumes within the configured batch bound", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createStoreDb();
         const now = 2_000_000_000_000;
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
         for (const sessionId of ["ses-a", "ses-b", "ses-c"]) {
@@ -126,8 +242,7 @@ describe("message history orphan maintenance", () => {
     });
 
     test("parks cleanly when a Pi-only install has no OpenCode database", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createStoreDb();
         const now = 2_000_000_000_000;
         seedIndexedSession(db, "pi-do-not-delete", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
         let openAttempts = 0;

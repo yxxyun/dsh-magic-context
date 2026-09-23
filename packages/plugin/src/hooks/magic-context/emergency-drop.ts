@@ -7,16 +7,17 @@
 // plan (drop primitive + `updateTagStatus(...,"dropped")` + watermark persist),
 // so OpenCode and Pi run identical selection logic.
 //
-// CACHE CONTRACT (see .alfonso/plans/ctx-reduce-phase2-v3.md):
+// CACHE CONTRACT (see ARCHITECTURE.md, tiered emergency drop and reclaim episodes):
 //   - The caller MUST invoke this only on the ≥derived force-materialize pass (a
 //     cache-busting pass, never a defer pass).
-//   - Each tag is dropped AT MOST ONCE: candidates are gated on
-//     `tagNumber > priorWatermark` AND `status==="active"`, and the watermark
-//     advances past every dropped tag. So the number of drop-induced cache
-//     busts over a session is bounded by the tool-tag count — no oscillation.
+//   - Each tag is dropped AT MOST ONCE because dropped tags leave the active set.
+//   - A continuous stay in the force band gets one non-empty emergency batch.
+//     Leaving that band or another provider-visible mutation rearms selection,
+//     so accumulated candidates share one rewrite instead of trickling.
 //   - All accounting is in TOKENS. Tags store BYTES, so we convert with the one
 //     canonical estimator (`TOKENS_PER_BYTE`, shared with the Phase 1 nudge).
 
+import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { TOKENS_PER_BYTE } from "./ctx-reduce-nudge";
 
 /** Reclaim target = fixedFloor + TARGET_FRACTION × (ceiling − fixedFloor). */
@@ -101,7 +102,7 @@ export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): numbe
 
 /**
  * Plan a tiered target-headroom emergency drop. Pure: returns the ordered set of
- * tool tag numbers to drop plus the new watermark; the caller applies them.
+ * tool tag numbers to drop, a token target, and a reason; the caller applies them.
  *
  * fixedFloor is derived as `currentTotalInputTokens − Σ(active floor-tag tokens)`.
  * Tags cover exactly the live-tail content (messages, tool outputs, files,
@@ -129,28 +130,31 @@ export function planEmergencyDrop(input: {
      */
     floorTags: readonly EmergencyDropTag[];
     maxTag: number;
-    protectedTags: number;
+    /**
+     * Union projection form: exact tag-number cutoff directly.
+     * Coordinate space: tag-number space (number | null).
+     * Empty-window behavior: branches on absent cutoff (null), applying no tag-number threshold.
+     */
+    protectedCutoff: number | null;
+    /** Provider-proven or estimated pressure; at 95% only open arcs and exemplars survive. */
+    usagePercentage?: number;
     currentTotalInputTokens: number;
     /** ceiling = contextLimit × executeThreshold%. */
     ceilingTokens: number;
     /**
-     * last_emergency_input_sample — the `currentTotalInputTokens` reading at the
-     * previous emergency drop (0 if never dropped). The SOLE idempotence latch:
-     * see the same-sample no-op below. (There is deliberately no tag-number
-     * watermark — a scalar "dropped-through" cursor wrongly excludes still-active
-     * lower-numbered tags after a non-contiguous tier-ordered drop. Dropped tags
-     * leave the `status='active'` set, so they're never re-selected; the sample
-     * latch is what prevents over-dropping the rest of the tail on a stale pass.)
+     * `last_emergency_input_sample` is retained as the pressure-episode latch:
+     * zero means armed, non-zero means this force-band episode already had its
+     * originating batch. The caller rearms on pressure exit or an independent
+     * bust. There is deliberately no tag-number watermark because a scalar
+     * cursor would exclude still-active lower-numbered tags after tiered drops.
      */
     priorInputSample: number;
-    /** True once any emergency drop has happened (drives the latch + log). */
+    /** True while the persisted pressure-episode latch is non-zero. */
     hasPriorDrop: boolean;
 }): EmergencyDropPlan {
     const {
         tags,
         floorTags,
-        maxTag,
-        protectedTags,
         currentTotalInputTokens,
         ceilingTokens,
         priorInputSample,
@@ -173,15 +177,16 @@ export function planEmergencyDrop(input: {
         return noop("unknown-usage");
     }
 
-    // Idempotence latch. After a drop the wire is reduced, but the provider
-    // hasn't re-measured it — `currentTotalInputTokens` stays at the pre-drop
-    // value until the next assistant response. A second pass at the derived force band
-    // using that same stale reading would recompute the floor from the now-smaller active tail
-    // and over-drop the rest of the tail (busting the cache again). So once we
-    // have dropped at a given usage sample, no-op until a FRESH sample arrives
-    // (the reading changes). New measured pressure ⇒ different sample ⇒ release.
-    if (hasPriorDrop && currentTotalInputTokens === priorInputSample) {
-        return noop("same-input-sample (awaiting fresh usage after prior drop)");
+    // A force-band LEVEL is not a new application EDGE. Once an emergency batch
+    // has acted in this pressure episode, fresh provider samples must not release
+    // one newly-unprotected tag per execute pass. The caller clears the persisted
+    // latch only after pressure exits or when another mutation has already priced
+    // the pass, allowing the whole accumulated set to ride that independent bust.
+    const absoluteEmergency = (input.usagePercentage ?? 0) >= 95;
+    if (hasPriorDrop && !absoluteEmergency) {
+        return noop(
+            `pressure-episode-latched (prior sample ${priorInputSample}; awaiting exit or independent bust)`,
+        );
     }
 
     // fixedFloor from the FULL active live-window content (floorTags — see the
@@ -204,10 +209,15 @@ export function planEmergencyDrop(input: {
         return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})`);
     }
 
-    const protectedCutoff = maxTag - protectedTags;
+    // Union projection form: exact tag-number cutoff directly.
+    // Coordinate space: tag-number space (number | null).
+    // Empty-window behavior: branches on absent cutoff (null), applying no tag-number threshold.
+    // At >=95%, the token window and newest-3 minimum yield (parity with #423).
+    const cutoff = input.protectedCutoff;
+    const windowYields = absoluteEmergency;
 
-    // Per-tier recency reserve (T1, T2 only): the newest ceil(20%) active tool
-    // tags of each tier are continuation context and never evictable.
+    // Below 95%, reserve the newest ceil(20%) of T1/T2 as continuation context.
+    // At absolute emergency pressure, only open arcs and ctx_reduce exemplars remain protected.
     const tierActive: Record<1 | 2, number[]> = { 1: [], 2: [] };
     for (const tag of tags) {
         if (tag.status !== "active" || tag.type !== "tool") continue;
@@ -219,11 +229,19 @@ export function planEmergencyDrop(input: {
         const nums = tierActive[tier];
         if (nums.length === 0) continue;
         nums.sort((a, b) => b - a); // newest first
-        const reserveCount = Math.ceil(TIER_RECENCY_RESERVE * nums.length);
+        const reserveCount = absoluteEmergency ? 0 : Math.ceil(TIER_RECENCY_RESERVE * nums.length);
         for (let i = 0; i < reserveCount && i < nums.length; i++) {
             reserved.add(nums[i]);
         }
     }
+
+    // Protect the same newest ctx_reduce exemplars even though resolveToolTier
+    // classifies them as T3. This is safe without changing the target math:
+    // fixedFloor above derives from every active floor tag, so removing candidates
+    // changes neither the floor nor the target (panel-verified emergency interaction).
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
+        floorTags.filter((tag) => tag.status === "active" && tag.type === "tool"),
+    );
 
     // Build evictable candidates per tier. Only active tags are eligible, so a
     // tag dropped on a prior pass (now status!=='active') is never re-selected —
@@ -231,7 +249,21 @@ export function planEmergencyDrop(input: {
     const byTier: Record<Tier, EmergencyDropTag[]> = { 1: [], 2: [], 3: [] };
     for (const tag of tags) {
         if (tag.status !== "active" || tag.type !== "tool") continue;
-        if (tag.tagNumber > protectedCutoff) continue; // global protected tail
+
+        // Window protection check:
+        // When window yields (>=95%), window does not protect tags.
+        // Below 95%:
+        // If cutoff is present (non-null), tool tags with tag_number >= cutoff are protected.
+        // If cutoff is ABSENT (null), branch explicitly on absence and apply NO tag-number threshold!
+        if (!windowYields) {
+            if (cutoff !== null) {
+                if (tag.tagNumber >= cutoff) continue;
+            } else {
+                // Branch: cutoff is absent (empty window) -> apply no tag-number threshold
+            }
+        }
+
+        if (protectedCtxReduceTags.has(tag.tagNumber)) continue;
         const tier = resolveToolTier(tag.toolName);
         if ((tier === 1 || tier === 2) && reserved.has(tag.tagNumber)) continue;
         byTier[tier].push(tag);
@@ -253,8 +285,8 @@ export function planEmergencyDrop(input: {
     }
 
     if (selected.length === 0) {
-        // Nothing left to drop (all active candidates reserved/protected). No
-        // cache bust — wait for the 95% block to fire.
+        // No cache rewrite occurred; the caller leaves the episode armed so
+        // later completed outputs can form a batch.
         return noop("no-candidates");
     }
 

@@ -16,6 +16,12 @@
  * their exported functions remain distinct deliberately. A future OMP catalog
  * rename must not silently change plain-Pi behavior (or vice versa).
  *
+ * The OpenCode Zen gateway is the one place the two harnesses diverge: OpenCode
+ * and plain Pi both name it `opencode`, while OMP exposes the same gateway as
+ * `opencode-zen`. Only the OMP map carries that pair; plain Pi keeps `opencode`
+ * as an identity. `opencode-go` is a distinct gateway (the "go" variant at
+ * opencode.ai/zen/go) and stays unmapped on both harnesses.
+ *
  * The mapping is intentionally not a one-to-one provider identity. Both
  * harnesses also expose plain `openai` and `google` providers for direct API
  * keys, while the canonical prefix does not record whether a subscription or
@@ -43,11 +49,17 @@ const PI_TO_CANONICAL_PROVIDER: Readonly<Record<string, string>> = {
 const CANONICAL_TO_OMP_PROVIDER: Readonly<Record<string, string>> = {
     openai: "openai-codex",
     google: "google-antigravity",
+    opencode: "opencode-zen",
 };
 
 const OMP_TO_CANONICAL_PROVIDER: Readonly<Record<string, string>> = {
     "openai-codex": "openai",
     "google-antigravity": "google",
+    "opencode-zen": "opencode",
+};
+
+const CANONICAL_MODEL_IDENTITY_ALIASES: Readonly<Record<string, string>> = {
+    "github-copilot/gpt-6-astra": "openai/gpt-6-astra",
 };
 
 /** Remap only the provider prefix (text before the first "/"), preserving the
@@ -64,6 +76,17 @@ function remapProviderPrefix(ref: string, map: Readonly<Record<string, string>>)
     return `${map[provider]}${ref.slice(slash)}`;
 }
 
+/**
+ * Canonicalize only for identity comparisons and cache policy; callers must not
+ * use the result as a provider spawn route. Provider-wide Pi/OMP aliases are
+ * normalized first; model-specific aliases stay explicit because GitHub Copilot
+ * also serves non-OpenAI model families.
+ */
+export function canonicalModelIdentity(ref: string): string {
+    const harnessCanonical = piModelRefToCanonical(ompModelRefToCanonical(ref));
+    return CANONICAL_MODEL_IDENTITY_ALIASES[harnessCanonical.toLowerCase()] ?? harnessCanonical;
+}
+
 /** Pi-native `provider/model` -> canonical (OpenCode). Identity when unmapped.
  *  Used by the Pi setup wizard so configs it writes stay OpenCode-readable. */
 export function piModelRefToCanonical(ref: string): string {
@@ -75,6 +98,25 @@ export function piModelRefToCanonical(ref: string): string {
  *  is safe on a config that already holds Pi-form ids (hand-edited or pre-fix). */
 export function resolveModelRefForPi(ref: string): string {
     return remapProviderPrefix(piModelRefToCanonical(ref), CANONICAL_TO_PI_PROVIDER);
+}
+
+/**
+ * Return every known spelling of a model reference with the canonical shared
+ * form first. The raw input remains the first fallback, so a single config file
+ * works on every harness: canonical wins when both spellings are present, while
+ * Pi/OMP-native provider ids are still accepted at the read edge. Unknown
+ * providers pass through unchanged and therefore produce one candidate.
+ */
+export function modelRefLookupOrder(ref: string): string[] {
+    const canonical = piModelRefToCanonical(ompModelRefToCanonical(ref));
+    return [
+        ...new Set([
+            canonical,
+            ref,
+            resolveModelRefForPi(canonical),
+            resolveModelRefForOmp(canonical),
+        ]),
+    ];
 }
 
 /** OMP-native selector -> canonical shared-config model reference. */

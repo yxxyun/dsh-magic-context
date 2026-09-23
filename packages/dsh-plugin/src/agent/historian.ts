@@ -68,10 +68,12 @@ import {
   type ProtectedTailBoundarySnapshot,
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import {
+  getRawSessionTagKeysThrough,
   readRawSessionMessageOrdinalById,
   readSessionChunk,
   withRawMessageProvider,
   type RawMessageProvider,
+  type RawSessionTagKeys,
   type SessionChunk,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { describeError } from "@magic-context/core/shared/error-message";
@@ -461,6 +463,13 @@ interface PublishArgs {
   readonly chunk: SessionChunk;
   readonly newCompartments: CandidateCompartment[];
   readonly lastNewEnd: number;
+  /**
+   * Raw-session tag keys observed through `lastNewEnd`, collected by the caller
+   * BEFORE the write transaction. v0.42.6 moved the drop queue's paged reads out
+   * of the transaction (its 3-arg form returns a Promise), so an in-transaction
+   * publisher must pass these in.
+   */
+  readonly observedKeys: RawSessionTagKeys;
   readonly validated: ValidatedOkPass;
   readonly log: (message: string) => void;
 }
@@ -520,7 +529,7 @@ function publishHistorianResult(args: PublishArgs): PublishResult {
         args.log(`[magic-context] failed to store compartment events: ${describeError(error).brief}`);
       }
     }
-    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd);
+    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd, args.observedKeys);
     recordProtectedTailPublicationFloor(db, sessionId, args.lastNewEnd + 1);
     if (lastNewEndMessageId) {
       stageDshCompactionMarker(db, sessionId, {
@@ -637,17 +646,43 @@ export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
         return;
       }
 
-      const publish = publishHistorianResult({
-        db,
-        sessionId,
-        directory: deps.directory,
-        leaseHolderId: holderId,
-        chunk: result.chunk!,
-        newCompartments: result.newCompartments!,
-        lastNewEnd: result.lastNewEnd!,
-        validated: result.validated!,
-        log,
-      });
+      // v0.42.6 moved the drop queue's paged raw-session reads OUT of the write
+      // transaction (its 3-arg form returns a Promise, so the drops would never
+      // commit and the rejection would go unhandled). Collect the observed tag
+      // keys here, asynchronously and before BEGIN.
+      let observedKeys: RawSessionTagKeys;
+      try {
+        observedKeys = await getRawSessionTagKeysThrough(sessionId, result.lastNewEnd!, { db });
+      } catch (error) {
+        log(`[magic-context] historian drop-key read failed: ${describeError(error).brief}`);
+        telemetry.failureReason = "publish failed (drop-key read error)";
+        return;
+      }
+
+      let publish: ReturnType<typeof publishHistorianResult>;
+      try {
+        publish = publishHistorianResult({
+          db,
+          sessionId,
+          directory: deps.directory,
+          leaseHolderId: holderId,
+          chunk: result.chunk!,
+          newCompartments: result.newCompartments!,
+          lastNewEnd: result.lastNewEnd!,
+          observedKeys,
+          validated: result.validated!,
+          log,
+        });
+      } catch (error) {
+        // v0.42.6's drop queue reads the raw session INSIDE the publish
+        // transaction (getRawSessionTagKeysThrough → readRawSessionMessagePage),
+        // so a provider read failure now surfaces here. publishHistorianResult
+        // has already rolled back; fail soft like every other historian failure
+        // path rather than throwing into the pre-step chain.
+        log(`[magic-context] historian publish failed: ${describeError(error).brief}`);
+        telemetry.failureReason = "publish failed (transaction error)";
+        return;
+      }
       if (!publish.ok) {
         telemetry.failureReason = "publish failed (lease lost or transaction error)";
         return;
@@ -848,6 +883,13 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
               `magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`,
             );
           }
+          // See publishHistorianResult's observedKeys note: the drop queue's
+          // paged raw-session reads must complete BEFORE the write transaction.
+          const observedKeys = await getRawSessionTagKeysThrough(
+            sessionId,
+            result.lastNewEnd!,
+            { db: deps.db },
+          );
           const publish = publishHistorianResult({
             db: deps.db,
             sessionId,
@@ -856,6 +898,7 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
             chunk: result.chunk!,
             newCompartments: result.newCompartments!,
             lastNewEnd: result.lastNewEnd!,
+            observedKeys,
             validated: result.validated!,
             log,
           });

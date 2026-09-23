@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
+    canonicalModelIdentity,
+    modelRefLookupOrder,
     ompModelRefToCanonical,
     piModelRefToCanonical,
     resolveModelRefForOmp,
@@ -7,6 +9,21 @@ import {
 } from "./harness-provider-map";
 
 describe("harness-provider-map", () => {
+    describe("canonicalModelIdentity", () => {
+        it("collapses Astra route aliases without changing unrelated Copilot models", () => {
+            for (const ref of [
+                "openai/gpt-6-astra",
+                "openai-codex/gpt-6-astra",
+                "github-copilot/gpt-6-astra",
+            ]) {
+                expect(canonicalModelIdentity(ref)).toBe("openai/gpt-6-astra");
+            }
+            expect(canonicalModelIdentity("github-copilot/claude-opus-5")).toBe(
+                "github-copilot/claude-opus-5",
+            );
+        });
+    });
+
     describe("resolveModelRefForPi (canonical -> Pi, used when spawning)", () => {
         it("maps the diverging auth-plugin providers, preserving the model id", () => {
             expect(resolveModelRefForPi("openai/gpt-5.5")).toBe("openai-codex/gpt-5.5");
@@ -64,6 +81,25 @@ describe("harness-provider-map", () => {
             const piForm = "openai-codex/gpt-5.5";
             expect(resolveModelRefForPi(piModelRefToCanonical(piForm))).toBe(piForm);
         });
+
+        describe("modelRefLookupOrder (config read edge)", () => {
+            it("tries canonical before the Pi-native spelling", () => {
+                expect(modelRefLookupOrder("openai-codex/gpt-5.6-sol")).toEqual([
+                    "openai/gpt-5.6-sol",
+                    "openai-codex/gpt-5.6-sol",
+                ]);
+                expect(modelRefLookupOrder("openai/gpt-5.6-sol")).toEqual([
+                    "openai/gpt-5.6-sol",
+                    "openai-codex/gpt-5.6-sol",
+                ]);
+            });
+
+            it("keeps unknown provider prefixes as a single passthrough key", () => {
+                expect(modelRefLookupOrder("custom-provider/model")).toEqual([
+                    "custom-provider/model",
+                ]);
+            });
+        });
     });
 });
 
@@ -86,6 +122,42 @@ describe("OMP provider boundary", () => {
         const selector = "openai-codex/team/nested/gpt-5.5";
         expect(resolveModelRefForOmp(selector)).toBe(selector);
         expect(resolveModelRefForOmp(ompModelRefToCanonical(selector))).toBe(selector);
+    });
+
+    it("translates the OpenCode Zen gateway (opencode) to OMP's opencode-zen spelling", () => {
+        expect(resolveModelRefForOmp("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode-zen/deepseek-v4-flash-free",
+        );
+        expect(ompModelRefToCanonical("opencode-zen/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+    });
+
+    it("resolves an opencode/ shared ref on OMP via modelRefLookupOrder", () => {
+        expect(modelRefLookupOrder("opencode/deepseek-v4-flash-free")).toEqual([
+            "opencode/deepseek-v4-flash-free",
+            "opencode-zen/deepseek-v4-flash-free",
+        ]);
+        expect(modelRefLookupOrder("opencode-zen/deepseek-v4-flash-free")).toEqual([
+            "opencode/deepseek-v4-flash-free",
+            "opencode-zen/deepseek-v4-flash-free",
+        ]);
+    });
+
+    it("leaves the OpenCode Zen gateway unchanged on plain Pi (Pi uses opencode)", () => {
+        expect(resolveModelRefForPi("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+        expect(piModelRefToCanonical("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+    });
+
+    it("keeps opencode-go unmapped on both harnesses (distinct gateway)", () => {
+        expect(resolveModelRefForOmp("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(ompModelRefToCanonical("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(resolveModelRefForPi("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(piModelRefToCanonical("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
     });
 
     it("passes through provider ids that collide with Object.prototype members", () => {

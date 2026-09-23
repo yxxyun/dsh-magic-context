@@ -1,8 +1,8 @@
 // Channel 2 delivery: the synthetic-user-message ceiling nudge.
 //
-// The transform records a one-shot `pending` intent in `session_meta`
-// (`channel2_nudge_state`) when pressure is near the execute threshold and a
-// large pile of reclaimable tool output remains. This module DELIVERS that
+// The transform records a cycle-capped `pending` intent in `session_meta`
+// (`channel2_nudge_state`) when its persisted rendered-tail predicate holds.
+// This module DELIVERS that
 // intent from the event handler (`message.updated`, both mid-turn
 // "tool-calls" and final "stop" events), because `promptAsync` must run on an
 // event boundary, not mid-transform. Primary sessions keep both delivery
@@ -15,8 +15,8 @@
 // Lease state machine (cross-process CAS): pending -> claimed(token) -> delivered.
 //   - claim `pending -> claimed` with a per-claim token before send (so two
 //     processes can't both send from the same pending row)
-//   - on confirmed success: token-CAS `claimed -> delivered` (cap consumed,
-//     terminal)
+//   - on confirmed success: token-CAS `claimed -> delivered` (current tail-reset
+//     cycle consumed)
 //   - on send failure: revert `claimed -> pending` (don't burn the one ceiling
 //     nudge on a transient transport error)
 //   - after a successful send: never revert to pending, even if confirmation
@@ -49,10 +49,14 @@ import { resolvePromptContext } from "../../shared/prompt-context";
 import type { Database } from "../../shared/sqlite";
 import {
     buildChannel2Reminder,
-    shouldTriggerChannel2,
+    type Channel1State,
+    type Channel2PredicateBaseline,
+    evaluateChannel2,
+    formatChannel2Evaluation,
+    reclaimableToolOutputCount,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
-import { isMidTurn } from "./read-session-db";
+import { assistantAwaitingTools } from "./read-session-db";
 
 export interface Channel2DeliveryDeps {
     db: Database;
@@ -62,14 +66,8 @@ export interface Channel2DeliveryDeps {
      * No-op when absent (e.g. a context with no client wired).
      */
     client?: unknown;
-    /** Reclaimable tool-output tokens for the wording + stale-intent revalidation. */
-    reclaimableTokens?: number;
-    /**
-     * The usable working range measured at the same Channel-1 baseline refresh
-     * (see Channel1State.usableTokens). Required to re-run the FULL trigger
-     * predicate at delivery time.
-     */
-    usableTokens?: number;
+    /** Persisted reclaimable/total tail tokens, typed deltas, and generation validity. */
+    baseline?: Channel2PredicateBaseline & Partial<Pick<Channel1State, "baselineParts">>;
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
     /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
     directiveText?: string;
@@ -89,7 +87,7 @@ function subagentRunIsActive(deps: Channel2DeliveryDeps, sessionId: string): boo
     try {
         const meta = getOrCreateSessionMeta(deps.db, sessionId);
         if (!meta.isSubagent) return true;
-        return isMidTurn(deps, sessionId);
+        return assistantAwaitingTools(deps, sessionId);
     } catch (error) {
         sessionLog(
             sessionId,
@@ -131,6 +129,47 @@ function releaseClaimWithoutDelivery(db: Database, sessionId: string, claimToken
     }
 }
 
+export interface SyntheticUserDeliveryDeps {
+    client: unknown;
+    text: string;
+    /** Re-check lease ownership immediately before the host call. */
+    beforeSend?: () => boolean;
+}
+
+/** Deliver an agent-directed synthetic user message through OpenCode's live run loop. */
+export async function deliverSyntheticUserMessage(
+    sessionId: string,
+    deps: SyntheticUserDeliveryDeps,
+): Promise<boolean> {
+    const promptContext = await resolvePromptContext(deps.client, sessionId);
+    const body: Record<string, unknown> = {
+        noReply: false,
+        // A synthetic part reaches the model without rendering as an operator message.
+        // `ignored` must remain absent because OpenCode removes ignored text from the model call.
+        parts: [{ type: "text", text: deps.text, synthetic: true }],
+    };
+    if (promptContext?.agent) body.agent = promptContext.agent;
+    if (promptContext?.model) {
+        body.model = {
+            providerID: promptContext.model.providerID,
+            modelID: promptContext.model.modelID,
+        };
+    }
+    if (promptContext?.variant) body.variant = promptContext.variant;
+    if (deps.beforeSend && !deps.beforeSend()) return false;
+
+    const session = (
+        deps.client as {
+            session?: { promptAsync?: (input: unknown) => Promise<unknown> };
+        }
+    ).session;
+    if (typeof session?.promptAsync !== "function") {
+        throw new Error("client has no session.promptAsync");
+    }
+    await session.promptAsync({ path: { id: sessionId }, body });
+    return true;
+}
+
 /**
  * Attempt to deliver a pending Channel 2 ceiling nudge for `sessionId`. Safe to
  * call on every step-boundary `message.updated`: it no-ops unless a `pending`
@@ -157,48 +196,34 @@ export async function maybeDeliverChannel2(
         return false;
     }
 
-    // Revalidate before delivering. The `pending` intent was recorded at high
-    // pressure during a transform pass; between then and this terminal
-    // message.updated the agent may have run ctx_reduce (or a later turn shrank
-    // the reclaimable tail), so the ceiling condition may no longer hold. A
-    // module directive has already been validated against the module's durable
-    // pressure state, so its lease still uses this function but skips a second
-    // predicate evaluation that could discard the authoritative text.
-    // Firing the synthetic nudge anyway would inject a stale "you have N tokens
-    // to drop" message AND consume the one-per-session cap for nothing.
+    // Revalidate before delivering. Between arming and this step boundary the
+    // agent may have reduced or appended enough typed mass to change the saved
+    // predicate. A module directive is already validated by the module, so its
+    // lease skips this TypeScript baseline check and preserves its text.
     //
-    // Two rules, both cap-preserving:
-    // - UNKNOWN baseline (no fresh measurement at this event) → do NOT deliver
-    //   and do NOT touch the lease: leave `pending` for a later final-stop that
-    //   has a real measurement. Never substitute a default and burn the cap on
-    //   an unvalidated condition.
-    // - KNOWN baseline → re-run the FULL trigger predicate (floor AND the
-    //   reclaimable ≥ usable/3 ratio — the same one that armed the intent),
-    //   not just the floor. Predicate false → cancel to '' (re-armable).
-    if (
-        deps.directiveText === undefined &&
-        (deps.reclaimableTokens === undefined || deps.usableTokens === undefined)
-    ) {
+    // An unavailable or generation-invalidated baseline holds `pending`; a known
+    // false predicate cancels it to the re-armable empty state.
+    const evaluation = evaluateChannel2(deps.baseline);
+    sessionLog(
+        sessionId,
+        formatChannel2Evaluation(evaluation, { leaseBefore: "pending", leaseAfter: "pending" }),
+    );
+    if (deps.directiveText === undefined && !evaluation.evaluable) {
         return false;
     }
-    if (
-        deps.directiveText === undefined &&
-        !shouldTriggerChannel2({
-            reclaimableTokens: deps.reclaimableTokens as number,
-            usableTokens: deps.usableTokens as number,
-        })
-    ) {
+    if (deps.directiveText === undefined && !evaluation.shouldTrigger) {
         try {
             casChannel2NudgeState(deps.db, sessionId, "pending", "");
             sessionLog(
                 sessionId,
-                `channel2 intent cleared pre-delivery (reclaimable ${deps.reclaimableTokens}, usable ${deps.usableTokens} — trigger no longer holds; re-armable)`,
+                `channel2 intent cleared pre-delivery (U ${evaluation.reclaimableTokens}, T ${evaluation.tailTokens} — trigger no longer holds; re-armable)`,
             );
         } catch {
             // best-effort; if the CAS fails the next pass re-evaluates.
         }
         return false;
     }
+    const effectiveU = evaluation.reclaimableTokens;
 
     const client = deps.client;
     if (!client) return false;
@@ -219,56 +244,37 @@ export async function maybeDeliverChannel2(
     }
 
     try {
-        const promptContext = await resolvePromptContext(client, sessionId);
         // Module directives carry their own validated wording; host-triggered
         // reminders use the measured reclaimable tail after the predicate above.
         const reminder =
             deps.directiveText ??
-            buildChannel2Reminder(deps.reclaimableTokens as number, deps.oldestReclaimableToolTags);
-
-        const body: Record<string, unknown> = {
-            noReply: false,
-            // synthetic: true — this is an agent-directed nudge, not a real user
-            // turn. It still drives the run loop and reaches the model (OpenCode
-            // serializes on !ignored && text!=="", and MessageV2.latest/the run
-            // loop ignore `synthetic`), but it (a) skips OpenCode's queued-message
-            // `<system-reminder>…Please address…` wrapper — which would otherwise
-            // double-wrap our reminder AND flip wrapped↔unwrapped as lastFinished
-            // advances, busting the prefix cache (issue #129 class) — and (b)
-            // drops out of the TUI user-message render. MUST NOT be paired with
-            // `ignored: true` (that would strip it from the model call).
-            parts: [{ type: "text", text: reminder, synthetic: true }],
-        };
-        if (promptContext?.agent) body.agent = promptContext.agent;
-        if (promptContext?.model) {
-            body.model = {
-                providerID: promptContext.model.providerID,
-                modelID: promptContext.model.modelID,
-            };
-        }
-        if (promptContext?.variant) body.variant = promptContext.variant;
-
-        const session = (client as { session?: { promptAsync?: (i: unknown) => Promise<unknown> } })
-            .session;
-        if (typeof session?.promptAsync !== "function") {
-            throw new Error("client has no session.promptAsync");
-        }
-        const claim = getChannel2NudgeClaim(deps.db, sessionId);
-        if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
-            sessionLog(
-                sessionId,
-                `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
+            buildChannel2Reminder(
+                effectiveU,
+                reclaimableToolOutputCount(deps.baseline?.baselineParts ?? []),
+                deps.oldestReclaimableToolTags,
             );
-            return false;
-        }
-        // resolvePromptContext yielded to the host. Re-check immediately before
-        // promptAsync: a child that completed while the claim was queued must
-        // leave its report as the last message, not start a follow-up turn.
-        if (!subagentRunIsActive(deps, sessionId)) {
-            releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
-            return false;
-        }
-        await session.promptAsync({ path: { id: sessionId }, body });
+        const sent = await deliverSyntheticUserMessage(sessionId, {
+            client,
+            text: reminder,
+            beforeSend: () => {
+                const claim = getChannel2NudgeClaim(deps.db, sessionId);
+                if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
+                    sessionLog(
+                        sessionId,
+                        `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
+                    );
+                    return false;
+                }
+                // Context lookup yielded to the host. A child that completed while
+                // the claim was queued must leave its report as the final message.
+                if (!subagentRunIsActive(deps, sessionId)) {
+                    releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
+                    return false;
+                }
+                return true;
+            },
+        });
+        if (!sent) return false;
     } catch (error) {
         // Revert only when the send itself failed. Once promptAsync returns, the
         // synthetic user message may already exist; re-arming can duplicate it.
@@ -298,7 +304,7 @@ export async function maybeDeliverChannel2(
     }
 
     try {
-        // Confirmed: consume the one-shot cap (terminal). The CAS result is
+        // Confirmed: consume the current tail-reset cycle. The CAS result is
         // authoritative; a stolen/expired claim must not be treated as delivered.
         const confirmed = casChannel2NudgeClaim(deps.db, sessionId, "delivered", claimToken);
         if (confirmed) {

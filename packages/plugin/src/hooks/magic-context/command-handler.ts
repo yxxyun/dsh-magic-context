@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
-import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
+import type { DreamerConfig, MagicContextConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
+import type { MagicContextBuiltinCommandName } from "../../features/builtin-commands/commands";
 import { getDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
@@ -10,22 +11,38 @@ import {
     isCanonicalDreamTask,
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
-import { runSidekick } from "../../features/magic-context/sidekick/agent";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
-import type { PluginContext } from "../../plugin/types";
+import type { RustSessionStatus } from "../../plugin/rpc-handlers";
 import { sessionLog } from "../../shared";
+import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
+import type { StatusDetail } from "../../shared/rpc-types";
 import type { Database } from "../../shared/sqlite";
+import {
+    formatStatusDetailMarkdown,
+    formatStatusDiagnosticsMarkdown,
+} from "../../shared/status-detail-text";
+import {
+    resolveTailHygieneStatus,
+    type WireTailHygieneBaseline,
+} from "../../shared/tail-hygiene-status";
+import {
+    capabilityRefusalCode,
+    renderCapabilityRefusal,
+    renderUserFacingFailure,
+    userFacingFailureCode,
+} from "../../shared/user-facing-codes";
 import {
     type PartialRecompRange,
     snapRangeToCompartments,
 } from "./compartment-runner-partial-recomp";
+import { resolveContextWindowGeometry } from "./event-resolvers";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
+import { RUST_PARTIAL_RECOMP_REFUSAL, RUST_SESSION_UPGRADE_REFUSAL } from "./maintenance-authority";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
-import { sendUserPrompt } from "./send-session-notification";
 
 /**
  * Track per-session recomp confirmation for Desktop (no dialog available).
@@ -125,6 +142,38 @@ export function parseWrapupArgs(
     return { ok: true, messagesToKeep };
 }
 
+const commandArgumentValidators: Record<MagicContextBuiltinCommandName, (raw: string) => boolean> =
+    {
+        "ctx-status": (raw) => {
+            const mode = raw.trim().toLowerCase();
+            return mode === "" || mode === "diagnostics";
+        },
+        "ctx-recomp": (raw) => parseRecompArgs(raw).kind !== "error",
+        "ctx-wrapup": (raw) => parseWrapupArgs(raw).ok,
+        "ctx-session-upgrade": (raw) => raw.trim() === "",
+        "ctx-flush": (raw) => raw.trim() === "",
+        "ctx-dream": (raw) => {
+            const requested = raw.trim();
+            return requested === "" || isCanonicalDreamTask(requested);
+        },
+        "ctx-embed": (raw) => {
+            const subcommand = raw.trim().toLowerCase();
+            return subcommand === "" || subcommand === "start" || subcommand === "pause";
+        },
+    };
+
+/**
+ * Conservative pre-dispatch gate for Desktop prompts that lost their slash.
+ * The actual command handler still parses the accepted text, so intercepted and
+ * native slash commands share one execution path and one argument interpretation.
+ */
+export function acceptsMagicContextCommandArguments(
+    command: MagicContextBuiltinCommandName,
+    raw: string,
+): boolean {
+    return commandArgumentValidators[command](raw);
+}
+
 export interface CommandExecuteInput {
     command: string;
     sessionID: string;
@@ -222,19 +271,25 @@ function formatRustOperationMessage(
                 return `## Magic Wrapup\n\n${summary || "Nothing to compact."}`;
             case "already_in_progress":
                 return `## Magic Wrapup — Skipped\n\n/ctx-wrapup is already running for this session${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"} complete)` : ""}. Wait for it to finish, then run /ctx-wrapup again if more history remains.`;
+            case "retryable":
+                // The module's nonterminal disposition: progress was made but the
+                // drain stopped short of the keep watermark for a retryable reason.
+                // The TypeScript orchestrator presents the same shape as a Partial
+                // with the prescribed continuation, not a terminal failure.
+                return `## Magic Wrapup — Partial\n\n${renderCapabilityRefusal("history_compression")}`;
             default:
-                return `## Magic Wrapup — Failed\n\n${summary || "Wrapup failed; try /ctx-wrapup again."}${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
+                return `## Magic Wrapup — Failed\n\n${renderCapabilityRefusal("history_compression")}`;
         }
     }
     switch (disposition) {
         case "started":
-            return "## Magic Recomp\n\nHistorian recomp started. Rebuilding compartments from raw session history now.";
+            return "## Magic Recomp\n\nRecomp started. Rebuilding the compressed history from raw session history now; saved memories are kept as they are.";
         case "already_in_progress":
-            return "## Magic Recomp — Skipped\n\nHistorian recomp is already running for this session. Wait for it to finish, then try /ctx-recomp again.";
+            return "## Magic Recomp — Skipped\n\nHistory compression is already running for this session. Wait for it to finish, then try /ctx-recomp again.";
         case "nothing_to_do":
             return "## Magic Recomp\n\nNothing to rebuild: this session has no published compartments.";
         default:
-            return `## Magic Recomp — Failed\n\n${summary || "Historian recomp failed; try /ctx-recomp again."}`;
+            return `## Magic Recomp — Failed\n\n${renderCapabilityRefusal("history_compression")}`;
     }
 }
 
@@ -305,84 +360,6 @@ async function executeSessionUpgrade(
     return deps.runUpgrade(sessionId);
 }
 
-/**
- * Execute /ctx-aug: run sidekick to augment the user's prompt with relevant memories,
- * then send the augmented prompt as a real user message.
- */
-async function executeAugmentation(
-    deps: {
-        db: Database;
-        sendNotification: (
-            sessionId: string,
-            text: string,
-            params: NotificationParams,
-        ) => Promise<void>;
-        sidekick?: {
-            config: SidekickConfig;
-            projectPath: string;
-            sessionDirectory?: string;
-            client: PluginContext["client"];
-            language?: string;
-        };
-    },
-    sessionId: string,
-    userPrompt: string,
-): Promise<never> {
-    if (!deps.sidekick?.config) {
-        await deps.sendNotification(
-            sessionId,
-            "## /ctx-aug\n\nSidekick is not configured. Add sidekick settings to `magic-context.jsonc` to use /ctx-aug.",
-            {},
-        );
-        throwSentinel("CTX-AUG");
-    }
-
-    const prompt = userPrompt.trim();
-    if (prompt.length === 0) {
-        await deps.sendNotification(
-            sessionId,
-            "## /ctx-aug\n\nUsage: `/ctx-aug <your prompt>`\n\nProvide a prompt to augment with project memory context.",
-            {},
-        );
-        throwSentinel("CTX-AUG");
-    }
-
-    // Step 1: Show "preparing" notification (hidden from LLM)
-    await deps.sendNotification(
-        sessionId,
-        "🔍 Preparing augmentation… this may take 2-10s depending on your sidekick provider.",
-        {},
-    );
-
-    // Step 2: Run sidekick
-    sessionLog(sessionId, "/ctx-aug: running sidekick");
-    const sidekickResult = await runSidekick({
-        client: deps.sidekick.client,
-        sessionId,
-        projectPath: deps.sidekick.projectPath,
-        sessionDirectory: deps.sidekick.sessionDirectory,
-        userMessage: prompt,
-        config: deps.sidekick.config,
-        language: deps.sidekick.language,
-    });
-
-    // Step 3: Build augmented prompt
-    let augmentedPrompt: string;
-    if (sidekickResult) {
-        augmentedPrompt = `${prompt}\n\n<sidekick-augmentation>\n${sidekickResult}\n</sidekick-augmentation>`;
-        sessionLog(sessionId, `/ctx-aug: sidekick returned ${sidekickResult.length} chars`);
-    } else {
-        // Sidekick returned nothing — send the prompt as-is with a note
-        augmentedPrompt = prompt;
-        sessionLog(sessionId, "/ctx-aug: sidekick returned no result, sending prompt as-is");
-    }
-
-    // Step 4: Send as a real user prompt (will be processed by the model)
-    await sendUserPrompt(deps.sidekick.client, sessionId, augmentedPrompt);
-
-    throwSentinel("CTX-AUG");
-}
-
 export type ManualDreamSummary = ManualRunResult;
 
 function readDreamTaskBacklogsSafely(
@@ -401,6 +378,9 @@ function readDreamTaskBacklogsSafely(
 function summarizeManualDream(s: ManualDreamSummary): string {
     const lines: string[] = ["## /ctx-dream", ""];
     if (s.ran.length > 0) lines.push(`Ran: ${s.ran.join(", ")}`);
+    if ((s.details?.length ?? 0) > 0) {
+        lines.push("Details:", ...(s.details ?? []).map((detail) => `- ${detail}`));
+    }
     if (s.failed.length > 0) lines.push(`Failed: ${s.failed.join(", ")}`);
     if ((s.failureDetails?.length ?? 0) > 0) {
         lines.push("Failure details:", ...(s.failureDetails ?? []).map((detail) => `- ${detail}`));
@@ -497,15 +477,30 @@ async function executeDreaming(
         dreamNotificationParams,
     );
 
-    const summary = await deps.dreamer.runManual(task);
-
-    await deps.sendNotification(sessionId, summarizeManualDream(summary), dreamNotificationParams);
+    try {
+        const summary = await deps.dreamer.runManual(task);
+        await deps.sendNotification(
+            sessionId,
+            summarizeManualDream(summary),
+            dreamNotificationParams,
+        );
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            `ctx-dream failed code=${userFacingFailureCode("dream_unknown")}`,
+            error,
+        );
+        await deps.sendNotification(
+            sessionId,
+            `## /ctx-dream\n\n${renderUserFacingFailure("dream_unknown")}`,
+            dreamNotificationParams,
+        );
+    }
     throwSentinel("CTX-DREAM");
 }
 
 export function createMagicContextCommandHandler(deps: {
     db: Database;
-    protectedTags: number;
     /** Boot-resolved mode; command paths must not re-read configuration. */
     compactionOff?: boolean;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
@@ -513,11 +508,18 @@ export function createMagicContextCommandHandler(deps: {
     historyBudgetPercentage?: number;
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     getLiveModelKey?: (sessionId: string) => string | undefined;
+    cacheTtlConfig?: MagicContextConfig["cache_ttl"];
+    cacheTtlConfigured?: boolean;
+    configParseFailures?: ConfigParseFailure[];
+    /** Builds the status payload shared with the TUI dialog for a chat-only fallback. */
+    getStatusDetail?: (sessionId: string, moduleStatus?: RustSessionStatus) => StatusDetail;
     /** Optional live context limit resolver — used for tokens-based threshold display. */
     getContextLimit?: (sessionId: string) => number | undefined;
     getDreamerProgress?: () =>
         | import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
         | null;
+    /** Cached U/T token measurement of the final rendered conversation tail, shared by both nudge mechanisms. */
+    getTailHygiene?: (sessionId: string) => import("./ctx-reduce-nudge").Channel1State | undefined;
     onFlush?: (sessionId: string) => void;
     /** Runs /ctx-recomp. When `range` is provided, runs partial recomp over
      *  that range (snapped to enclosing compartment boundaries). When omitted,
@@ -549,13 +551,6 @@ export function createMagicContextCommandHandler(deps: {
     transformMode?: ResolvedTransformMode;
     rustModeModuleClient?: RustModeModuleClient;
     projectRoot?: string;
-    sidekick?: {
-        config: SidekickConfig;
-        projectPath: string;
-        sessionDirectory?: string;
-        client: PluginContext["client"];
-        language?: string;
-    };
     dreamer?: {
         config: DreamerConfig;
         projectPath: string;
@@ -571,7 +566,7 @@ export function createMagicContextCommandHandler(deps: {
     // throwSentinel and the raw command would be forwarded to the model (and a
     // real error logged). Wrap it once so a delivery failure is logged and
     // swallowed, never preempting the sentinel. Reassigning the deps method
-    // covers the handler AND the standalone executeAugmentation/executeDreaming,
+    // covers the handler and the standalone executeDreaming helper,
     // which receive this same deps reference.
     const rawSendNotification = deps.sendNotification;
     deps.sendNotification = async (sessionId, text, params) => {
@@ -589,7 +584,6 @@ export function createMagicContextCommandHandler(deps: {
     const isFlushCommand = (command: string): boolean => command === "ctx-flush";
     const isRecompCommand = (command: string): boolean => command === "ctx-recomp";
     const isWrapupCommand = (command: string): boolean => command === "ctx-wrapup";
-    const isAugCommand = (command: string): boolean => command === "ctx-aug";
     const isDreamCommand = (command: string): boolean => command === "ctx-dream";
     const isSessionUpgradeCommand = (command: string): boolean => command === "ctx-session-upgrade";
     const isEmbedCommand = (command: string): boolean => command === "ctx-embed";
@@ -621,7 +615,6 @@ export function createMagicContextCommandHandler(deps: {
             const isFlush = isFlushCommand(input.command);
             const isRecomp = isRecompCommand(input.command);
             const isWrapup = isWrapupCommand(input.command);
-            const isAug = isAugCommand(input.command);
             const isDream = isDreamCommand(input.command);
             const isSessionUpgrade = isSessionUpgradeCommand(input.command);
             const isEmbed = isEmbedCommand(input.command);
@@ -631,7 +624,6 @@ export function createMagicContextCommandHandler(deps: {
                 !isFlush &&
                 !isRecomp &&
                 !isWrapup &&
-                !isAug &&
                 !isDream &&
                 !isSessionUpgrade &&
                 !isEmbed
@@ -650,11 +642,6 @@ export function createMagicContextCommandHandler(deps: {
                     {},
                 );
                 throwSentinel(input.command);
-            }
-
-            if (isAug) {
-                await executeAugmentation(deps, sessionId, input.arguments);
-                return; // executeAugmentation throws sentinel internally
             }
 
             if (isDream) {
@@ -727,7 +714,12 @@ export function createMagicContextCommandHandler(deps: {
                                 ? "No pending operations to flush."
                                 : "Flushed: Changes take effect on next message.";
                     } catch (error) {
-                        result = `Error: Failed to flush context operations. ${error instanceof Error ? error.message : String(error)}`;
+                        sessionLog(
+                            sessionId,
+                            `ctx-flush failed code=${capabilityRefusalCode("context_cleanup")}`,
+                            error,
+                        );
+                        result = renderCapabilityRefusal("context_cleanup");
                     }
                 } else {
                     result = executeFlush(deps.db, sessionId);
@@ -745,6 +737,7 @@ export function createMagicContextCommandHandler(deps: {
             }
 
             if (isStatus) {
+                const statusDiagnostics = input.arguments.trim().toLowerCase() === "diagnostics";
                 let rustStatus: Record<string, unknown> | undefined;
                 if (rustMode) {
                     try {
@@ -759,38 +752,101 @@ export function createMagicContextCommandHandler(deps: {
                 }
                 if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a native dialog
-                    pushNotification("action", { action: "show-status-dialog" }, sessionId);
+                    pushNotification(
+                        "action",
+                        { action: "show-status-dialog", diagnostics: statusDiagnostics },
+                        sessionId,
+                    );
                     sessionLog(sessionId, "command ctx-status: pushed show-status-dialog to TUI");
                     throwSentinel(input.command);
                 }
-                const liveModelKey = deps.getLiveModelKey?.(sessionId);
-                const liveContextLimit = deps.getContextLimit?.(sessionId);
-                const statusOutput = executeStatus(
-                    deps.db,
-                    sessionId,
-                    deps.protectedTags,
-                    deps.executeThresholdPercentage,
-                    liveModelKey,
-                    deps.historyBudgetPercentage,
-                    deps.commitClusterTrigger,
-                    deps.executeThresholdTokens,
-                    liveContextLimit,
-                    deps.dreamer
-                        ? {
-                              backlog: readDreamTaskBacklogsSafely(
-                                  deps.db,
-                                  deps.dreamer.projectPath,
-                                  CANONICAL_DREAM_TASKS,
-                              ),
-                              progress: deps.getDreamerProgress?.() ?? null,
-                          }
-                        : undefined,
-                );
-                const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
-                const modeStatus = deps.compactionOff
-                    ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
-                    : "";
-                const combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
+                let combinedStatus: string;
+                try {
+                    const detail =
+                        rustMode && !rustStatus
+                            ? undefined
+                            : deps.getStatusDetail?.(
+                                  sessionId,
+                                  rustStatus as RustSessionStatus | undefined,
+                              );
+                    if (rustMode && !rustStatus) {
+                        combinedStatus = `## Magic Status — Unavailable\n\n${renderUserFacingFailure("status_unavailable")}`;
+                    } else if (detail) {
+                        combinedStatus = statusDiagnostics
+                            ? formatStatusDiagnosticsMarkdown(detail)
+                            : formatStatusDetailMarkdown(detail);
+                    } else {
+                        // Compatibility for isolated handler consumers that have not yet
+                        // supplied the shared TUI status builder.
+                        const liveModelKey = deps.getLiveModelKey?.(sessionId);
+                        const liveContextLimit = deps.getContextLimit?.(sessionId);
+                        const modelSlash = liveModelKey?.indexOf("/") ?? -1;
+                        const windowGeometry =
+                            liveModelKey && modelSlash > 0
+                                ? resolveContextWindowGeometry(
+                                      liveModelKey.slice(0, modelSlash),
+                                      liveModelKey.slice(modelSlash + 1),
+                                      { db: deps.db, sessionID: sessionId },
+                                  )
+                                : undefined;
+                        const rustTailHygiene = rustStatus?.tail_hygiene;
+                        const tailHygiene = resolveTailHygieneStatus(
+                            deps.getTailHygiene?.(sessionId),
+                            rustTailHygiene && typeof rustTailHygiene === "object"
+                                ? (rustTailHygiene as WireTailHygieneBaseline)
+                                : undefined,
+                        );
+                        const statusOutput = executeStatus(
+                            deps.db,
+                            sessionId,
+                            deps.executeThresholdPercentage,
+                            liveModelKey,
+                            deps.historyBudgetPercentage,
+                            deps.commitClusterTrigger,
+                            deps.executeThresholdTokens,
+                            liveContextLimit,
+                            deps.dreamer
+                                ? {
+                                      backlog: readDreamTaskBacklogsSafely(
+                                          deps.db,
+                                          deps.dreamer.projectPath,
+                                          CANONICAL_DREAM_TASKS,
+                                      ),
+                                      progress: deps.getDreamerProgress?.() ?? null,
+                                  }
+                                : undefined,
+                            windowGeometry,
+                            tailHygiene,
+                            undefined,
+                            Boolean(rustMode),
+                            {
+                                cacheTtlConfig: deps.cacheTtlConfig ?? "5m",
+                                cacheTtlConfigured: deps.cacheTtlConfigured === true,
+                                configParseFailures: deps.configParseFailures ?? [],
+                                diagnostics: statusDiagnostics,
+                                compactionEnabled: !deps.compactionOff,
+                            },
+                        );
+                        const moduleStatus =
+                            rustStatus && statusDiagnostics
+                                ? `\n\n${formatRustStatusText(rustStatus)}`
+                                : "";
+                        const modeStatus =
+                            deps.compactionOff && statusDiagnostics
+                                ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
+                                : "";
+                        combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
+                    }
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "shared ctx-status detail failed; using compatibility text:",
+                        error,
+                    );
+                    combinedStatus = rustMode
+                        ? `## Magic Status — Unavailable\n\n${renderUserFacingFailure("status_unavailable")}`
+                        : executeStatus(deps.db, sessionId);
+                }
                 result += result ? `\n\n${combinedStatus}` : combinedStatus;
             }
 
@@ -802,7 +858,10 @@ export function createMagicContextCommandHandler(deps: {
                 } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
                 } else if (rustMode) {
-                    const keep = Math.min(100, Math.max(5, parsed.messagesToKeep));
+                    // The requested keep watermark is forwarded unchanged: it counts raw
+                    // messages and the module honors it as given (the TypeScript
+                    // orchestrator imposes no 5/100 clamp, only a floor of 1).
+                    const keep = parsed.messagesToKeep;
                     await deps.sendNotification(
                         sessionId,
                         "## Magic Wrapup\n\nStarting wrapup…",
@@ -822,7 +881,12 @@ export function createMagicContextCommandHandler(deps: {
                         );
                         result = formatRustOperationMessage("wrapup", value);
                     } catch (error) {
-                        result = `## Magic Wrapup — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
+                        sessionLog(
+                            sessionId,
+                            `ctx-wrapup failed code=${capabilityRefusalCode("history_compression")}`,
+                            error,
+                        );
+                        result = `## Magic Wrapup — Failed\n\n${renderCapabilityRefusal("history_compression")}`;
                     }
                 } else if (!deps.executeWrapup) {
                     result =
@@ -840,6 +904,8 @@ export function createMagicContextCommandHandler(deps: {
                     result = `## Magic Recomp — Invalid Arguments\n\n${parsedArgs.message}`;
                 } else if (parsedArgs.kind === "upgrade") {
                     result = executeRecompUpgradeStub(deps.db, sessionId);
+                } else if (rustMode && parsedArgs.kind === "partial") {
+                    result = `## Magic Recomp — Unavailable\n\n${RUST_PARTIAL_RECOMP_REFUSAL}`;
                 } else if (rustMode) {
                     try {
                         const value = await callRust("session.recomp", {
@@ -850,7 +916,12 @@ export function createMagicContextCommandHandler(deps: {
                         });
                         result = formatRustOperationMessage("recomp", value);
                     } catch (error) {
-                        result = `## Magic Recomp — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
+                        sessionLog(
+                            sessionId,
+                            `ctx-recomp failed code=${capabilityRefusalCode("history_compression")}`,
+                            error,
+                        );
+                        result = `## Magic Recomp — Failed\n\n${renderCapabilityRefusal("history_compression")}`;
                     }
                 } else if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a confirmation dialog.
@@ -890,7 +961,7 @@ export function createMagicContextCommandHandler(deps: {
                         } else {
                             await deps.sendNotification(
                                 sessionId,
-                                "## Magic Recomp\n\nHistorian recomp started. Rebuilding compartments and facts from raw session history now.",
+                                "## Magic Recomp\n\nRecomp started. Rebuilding the compressed history from raw session history now; saved memories are kept as they are.",
                                 {},
                             );
                             result = await deps.executeRecomp(sessionId);
@@ -939,7 +1010,7 @@ export function createMagicContextCommandHandler(deps: {
                                 "## ⚠️ Recomp Confirmation Required",
                                 "",
                                 `You currently have **${compartmentCount}** compartments.`,
-                                "Running /ctx-recomp will **regenerate all compartments and facts** from raw session history.",
+                                "Running /ctx-recomp will **rebuild the compressed history** from raw session history. Saved memories are not changed.",
                                 "",
                                 "This operation:",
                                 "- May take a long time (minutes to hours for long sessions)",
@@ -963,6 +1034,8 @@ export function createMagicContextCommandHandler(deps: {
                 if (!sessionId) {
                     result =
                         "## Session Upgrade\n\nThis prompt is not attached to a session yet — send a message first, then run `/ctx-session-upgrade`.";
+                } else if (rustMode) {
+                    result = `## Session Upgrade — Unavailable\n\n${RUST_SESSION_UPGRADE_REFUSAL}`;
                 } else {
                     result = await executeSessionUpgrade(deps, sessionId);
                 }

@@ -76,6 +76,10 @@ interface PassResult {
     m1: string;
     rematerialized: boolean;
     reason: string | null;
+    systemHashPrev: string | null;
+    systemHashNew: string | null;
+    m0ModelKeyPrev: string | null;
+    m0ModelKeyNew: string | null;
 }
 
 function pass(opts: {
@@ -101,6 +105,10 @@ function pass(opts: {
         m1: result.m1Text ?? "",
         rematerialized: result.m0RematerializedThisPass,
         reason: result.decision.reason,
+        systemHashPrev: result.decision.systemHashPrev ?? null,
+        systemHashNew: result.decision.systemHashNew ?? null,
+        m0ModelKeyPrev: result.decision.m0ModelKeyPrev ?? null,
+        m0ModelKeyNew: result.decision.m0ModelKeyNew ?? null,
     };
 }
 
@@ -167,6 +175,10 @@ describe("m[0]/m[1] materialization taxonomy", () => {
             hard: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
         });
         expect(hard.reason).toBe("model_change");
+        expect(hard.m0ModelKeyPrev).toBe("anthropic/opus");
+        expect(hard.m0ModelKeyNew).toBe("anthropic/sonnet");
+        expect(hard.systemHashPrev).toBeNull();
+        expect(hard.systemHashNew).toBeNull();
         expect(hard.rematerialized).toBe(true);
         // B is now folded into the m[0] baseline; m[1] resets to placeholder.
         expect(hard.m0).toContain("Bravo delta");
@@ -185,6 +197,10 @@ describe("m[0]/m[1] materialization taxonomy", () => {
             hard: { ...BASE_HARD, systemHash: "sys-v2" },
         });
         expect(hard.reason).toBe("system_hash");
+        expect(hard.systemHashPrev).toBe("sys-v1");
+        expect(hard.systemHashNew).toBe("sys-v2");
+        expect(hard.m0ModelKeyPrev).toBeNull();
+        expect(hard.m0ModelKeyNew).toBeNull();
         expect(hard.rematerialized).toBe(true);
     });
 
@@ -324,5 +340,82 @@ describe("m[0]/m[1] materialization taxonomy", () => {
 
         const noFold = pass({ projectDirectory, isCacheBustingPass: true, hard: BASE_HARD });
         expect(noFold.rematerialized).toBe(false);
+    });
+    it("does not hard-fold when the current model switches from canonical to Pi alias spelling", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const canonical = { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" };
+        pass({ projectDirectory, isCacheBustingPass: true, hard: canonical });
+
+        const aliasOnly = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        expect(aliasOnly.rematerialized).toBe(false);
+        expect(aliasOnly.reason).toBeNull();
+    });
+
+    it("persists a Pi-native baseline canonically, then accepts the reverse spelling flip", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        expect(getOrCreateSessionMeta(db, SESSION_ID).cachedM0ModelKey).toBe("openai/gpt-5.6-sol");
+        const aliasOnly = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+
+        expect(aliasOnly.rematerialized).toBe(false);
+        expect(aliasOnly.reason).toBeNull();
+    });
+
+    it("does not hard-fold when an existing cached baseline stores a native alias", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+        db.prepare("UPDATE session_meta SET cached_m0_model_key = ? WHERE session_id = ?").run(
+            "openai-codex/gpt-5.6-sol",
+            SESSION_ID,
+        );
+
+        const upgraded = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+
+        expect(upgraded.rematerialized).toBe(false);
+        expect(upgraded.reason).toBeNull();
+    });
+
+    it("still hard-folds for different models in the same alias family", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        const realSwitch = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-codex" },
+        });
+
+        expect(realSwitch.rematerialized).toBe(true);
+        expect(realSwitch.reason).toBe("model_change");
     });
 });

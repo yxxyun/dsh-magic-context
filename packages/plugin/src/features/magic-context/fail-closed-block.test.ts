@@ -25,9 +25,9 @@ const migrationReason: FailClosedReason = {
     persistedVersion: 73,
     supportedVersion: 74,
     blockingProcesses: [
-        { harness: "OpenCode server", pid: 5736 },
-        { harness: "OpenCode server", pid: 5736 },
-        { harness: "OpenCode server", pid: 5737 },
+        { kind: "OpenCode server", pid: 5736 },
+        { kind: "OpenCode server", pid: 5736 },
+        { kind: "OpenCode instance (TUI/CLI)", pid: 5737 },
     ],
 };
 
@@ -50,12 +50,14 @@ describe("formatFailClosedBlockingMessage", () => {
     it("names the blocking processes and gives ordered recovery actions", () => {
         const message = formatFailClosedBlockingMessage(migrationReason);
         expect(message).toContain("OpenCode server (PID 5736)");
-        expect(message).toContain("OpenCode server (PID 5737)");
+        expect(message).toContain("OpenCode instance (TUI/CLI) (PID 5737)");
         expect(message).toContain("an older Magic Context build");
         expect(message).toContain("would fail against the migrated database");
+        expect(message).toContain("one database serves every project on this machine");
         expect(message).toContain(
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
+            "Restart the blocking process — even one from a different project — and it will pick up the new build and migrate on start; or shut it down and retry.",
         );
+        expect(message).not.toContain("OpenCode server (PID 5737)");
         expect(message).not.toContain("fence");
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
@@ -73,6 +75,8 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message).toContain(file);
         expect(message).toContain("io arm");
         expect(message).toContain("safe to delete");
+        expect(message).toContain("If none of these processes are running");
+        expect(message).not.toContain("If no OpenCode server is running");
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
 
@@ -94,16 +98,54 @@ describe("formatFailClosedBlockingMessage", () => {
     it("deduplicates and bounds the process list", () => {
         const processes = [
             ...Array.from({ length: 10 }, (_, index) => ({
-                harness: "OpenCode server",
+                kind: "OpenCode server" as const,
                 pid: index + 1,
             })),
-            { harness: "OpenCode server", pid: 1 },
+            { kind: "OpenCode server" as const, pid: 1 },
         ];
         const message = formatFailClosedBlockingProcesses(processes);
         expect(message).toContain("OpenCode server (PID 1)");
         expect(message).not.toContain("OpenCode server (PID 9)");
         expect(message).toContain("2 more blocking process(es)");
         expect(message.match(/OpenCode server \(PID 1\)/g)).toHaveLength(1);
+    });
+
+    it("renders probe evidence for every blocker and redacts command lines", () => {
+        const token = `sk-${"a".repeat(40)}`;
+        const message = formatFailClosedBlockingMessage({
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [
+                {
+                    kind: "OpenCode instance (TUI/CLI)",
+                    pid: 76165,
+                    startTime: Date.parse("2026-08-22T09:14:00Z"),
+                    commandLine: `opencode --directory /home/alice/proj --token=${token}`,
+                },
+                { kind: "Pi", pid: 76166, startTime: null, commandLine: null },
+            ],
+        });
+
+        expect(message).toContain("- PID 76165: OpenCode instance (TUI/CLI), started ");
+        expect(message).toContain("/home/<USER>/proj");
+        expect(message).toContain("token=<REDACTED:token>");
+        expect(message).not.toContain(token);
+        expect(message).toContain("- PID 76166: Pi, started unverified, cmd: unverified");
+    });
+
+    it("does not throw when all probe fields are unavailable", () => {
+        const reason: FailClosedReason = {
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [{ pid: 76167, startTime: null, commandLine: null }],
+        };
+
+        const error = createFailClosedBlockingError(reason);
+        expect(error.message).toContain(
+            "- PID 76167: process, started unverified, cmd: unverified",
+        );
     });
 
     it("includes the storage cause and recovery command", () => {
@@ -120,7 +162,6 @@ describe("shouldBypassFailClosedBlock", () => {
         expect(shouldBypassFailClosedBlock({ agent: "compaction" })).toBe(true);
         expect(shouldBypassFailClosedBlock({ agent: "historian" })).toBe(true);
         expect(shouldBypassFailClosedBlock({ agent: "dreamer-docs" })).toBe(true);
-        expect(shouldBypassFailClosedBlock({ agent: "sidekick" })).toBe(true);
         expect(shouldBypassFailClosedBlock({ isInternalChildSession: true })).toBe(true);
         expect(shouldBypassFailClosedBlock({ isPiSubagentEnv: true })).toBe(true);
     });

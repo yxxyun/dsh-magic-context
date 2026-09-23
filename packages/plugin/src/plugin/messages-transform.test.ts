@@ -1,13 +1,25 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import {
     createFailClosedController,
     FAIL_CLOSED_DOCTOR_COMMAND,
     isFailClosedBlockingError,
 } from "../features/magic-context/fail-closed-block";
+import { initializeDatabase } from "../features/magic-context/storage-db";
+import {
+    recordOverflowDetected,
+    resetEmergencyRecoveryRegistryForTest,
+} from "../features/magic-context/storage-meta-persisted";
+import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
+import { Database } from "../shared/sqlite";
 import { createMessagesTransformHandler } from "./messages-transform";
+
+afterEach(() => {
+    resetEmergencyRecoveryRegistryForTest();
+});
 
 // Minimal fake message shape — just needs info + parts.
 function makeOutput(overrides?: { agent?: string; sessionID?: string }): any {
@@ -49,6 +61,29 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         // Messages are left untouched when transform fails.
         expect(output.messages).toHaveLength(1);
         expect(output.messages[0].info.id).toBe("m1");
+    });
+
+    it("fails closed instead of serving raw when emergency recovery meets SQLITE_BUSY", async () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        recordOverflowDetected(db, "ses_test", 100_000, "anthropic/fable-5-1");
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    const err = new Error("database is locked") as Error & { code: string };
+                    err.code = "SQLITE_BUSY";
+                    throw err;
+                },
+            },
+        });
+
+        try {
+            await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
+                EmergencyFailClosedError,
+            );
+        } finally {
+            db.close();
+        }
     });
 
     it("swallows unexpected non-SQLITE errors too", async () => {
@@ -322,5 +357,148 @@ describe("createMessagesTransformHandler — compaction-off fail-closed inertnes
             thrown = error;
         }
         expect(isFailClosedBlockingError(thrown)).toBe(true);
+    });
+});
+
+describe("createMessagesTransformHandler — issue #327 wire tail", () => {
+    it("keeps a user-ended input user-terminated when a pending blank assistant appears mid-pass", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    await Promise.resolve();
+                    (out.messages as any).push({
+                        info: {
+                            id: "assistant-pending",
+                            role: "assistant",
+                            sessionID: "ses_test",
+                        },
+                        parts: [],
+                    });
+                    finalizeMessageRepresentation(out.messages as any, "anthropic", {
+                        trailingBlankDecisions: new Map([["assistant-pending", "keep"]]),
+                    });
+                },
+            },
+        });
+        const output = makeOutput();
+
+        await handler({}, output);
+
+        expect(output.messages.map((message: any) => message.info.role)).toEqual([
+            "assistant",
+            "user",
+        ]);
+        expect(output.messages.at(-1)?.info.id).toBe("m1");
+        // Re-anchoring preserves the pending shell without letting `keep`
+        // manufacture content that was absent from the harness object.
+        expect(output.messages[0].parts).toEqual([]);
+    });
+
+    it("re-anchors a persisted error-only assistant shell without deleting it", async () => {
+        let called = false;
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    called = true;
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.push({
+            info: {
+                id: "assistant-error-shell",
+                role: "assistant",
+                sessionID: "ses_test",
+                error: { name: "APIError" },
+            },
+            parts: [{ type: "text", text: " \n\t" }],
+        });
+
+        await handler({}, output);
+
+        expect(called).toBe(true);
+        expect(output.messages.map((message: any) => message.info.id)).toEqual([
+            "assistant-error-shell",
+            "m1",
+        ]);
+    });
+
+    it("rejects a completed assistant-terminal retry instead of reordering its prompt", async () => {
+        let called = false;
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    called = true;
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.push({
+            info: { id: "assistant-completed", role: "assistant", sessionID: "ses_test" },
+            parts: [
+                { type: "reasoning", text: "completed thought", signature: "sig" },
+                {
+                    type: "tool",
+                    tool: "bash",
+                    state: { status: "completed", input: {}, output: "done" },
+                },
+            ],
+        });
+
+        // Mid-turn continuation shape: the streaming assistant (with completed
+        // tool parts) legitimately terminates the array. The wrapper must pass it
+        // through untouched and still run the inner transform.
+        await handler({}, output);
+        expect(called).toBe(true);
+        expect(output.messages.at(-1)?.info.id).toBe("assistant-completed");
+    });
+
+    it("rejects real content appended after the input user during an asynchronous pass", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    await Promise.resolve();
+                    (out.messages as any).push({
+                        info: {
+                            id: "assistant-completed-late",
+                            role: "assistant",
+                            sessionID: "ses_test",
+                        },
+                        parts: [{ type: "text", text: "completed answer" }],
+                    });
+                },
+            },
+        });
+
+        const output = makeOutput();
+        await handler({}, output);
+        // Completed content appended mid-transform stays exactly where OpenCode
+        // put it — never reordered below its prompt, never refused.
+        expect(output.messages.at(-1)?.info.id).toBe("assistant-completed-late");
+    });
+});
+
+describe("createMessagesTransformHandler — user-tail removal defense", () => {
+    it("restores the input user after an inner transform removes it behind an assistant", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    out.messages.pop();
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.unshift({
+            info: { id: "assistant-before", role: "assistant", sessionID: "ses_test" },
+            parts: [{ type: "text", text: "previous answer" }],
+        });
+
+        await handler({}, output);
+
+        expect(output.messages.map((message: any) => message.info.role)).toEqual([
+            "assistant",
+            "user",
+        ]);
+        expect(output.messages.at(-1)?.info.id).toBe("m1");
     });
 });

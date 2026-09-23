@@ -13,16 +13,17 @@ export function getDataDir(): string {
  * Layout:
  *   - OpenCode: `${os.tmpdir()}/opencode/magic-context/`
  *   - Pi:       `${os.tmpdir()}/pi/magic-context/`
+ *   - OMP:      `${os.tmpdir()}/omp/magic-context/`
  *
  * Why a per-harness subtree of `os.tmpdir()`:
  *   1. OpenCode Desktop runs as an Electron app with a permission sandbox.
  *      Writing to arbitrary tmp paths can trigger user-visible permission
  *      prompts; the `${tmpdir}/opencode/` subtree is allow-listed by
  *      OpenCode, so anything we put under it never asks for permission.
- *   2. Splitting OpenCode from Pi keeps their logs and historian dump
- *      directories cleanly separated. `doctor --issue` for each harness
- *      reports diagnostics from the matching subtree, so an OpenCode
- *      issue report never includes Pi log noise (and vice versa).
+ *   2. Splitting harnesses keeps their logs and historian dump directories
+ *      cleanly separated. `doctor --issue` for each harness reports diagnostics
+ *      from the matching subtree, so issue reports do not include another
+ *      harness's log noise.
  *   3. Pi has no permission sandbox, so the path choice is purely
  *      cosmetic for Pi — it just keeps the layout symmetric.
  *
@@ -37,13 +38,13 @@ export function getMagicContextTempDir(harness: HarnessId = getHarness()): strin
 }
 
 /**
- * Standard log file path the plugin writes to. Pi and OpenCode write to
- * SEPARATE logs under their respective harness subtrees so a single
- * machine running both harnesses doesn't interleave session traces.
+ * Standard log file path the plugin writes to. Each harness writes to a
+ * separate log under its own subtree so a machine running multiple harnesses
+ * does not interleave session traces.
  *
  * The plugin's buffered logger calls this on every flush rather than
- * caching, so `setHarness("pi")` taking effect after module load is
- * reflected in the next flush.
+ * caching, so the boot-time `setHarness()` call is reflected in the next
+ * flush.
  */
 export function getMagicContextLogPath(harness: HarnessId = getHarness()): string {
     // An explicit override wins over the harness temp-dir default, so users on
@@ -166,7 +167,9 @@ export function getOpenCodeStorageDir(): string {
  *   - Shared Dreamer runs (one per project per machine)
  *   - Future cross-harness session migration
  *
- * Layout: <XDG_DATA_HOME>/cortexkit/magic-context/
+ * Resolution precedence: test isolation, MAGIC_CONTEXT_STORAGE_DIR, XDG data
+ * home, then the platform default. The explicit override is a complete storage
+ * directory and must be absolute so every process on a host selects one store.
  *
  * TEST-ISOLATION GUARD. `openDatabase()` has been guarded in
  * `resolveDatabasePath()` since the 2026-06-01 (v26) and 2026-06-19 (v41)
@@ -192,20 +195,61 @@ export function getOpenCodeStorageDir(): string {
  * `PRAGMA integrity_check`, announcements, the models.dev cache) are covered
  * too — they never go through the DB resolver.
  *
- * XDG_DATA_HOME still wins over both: a test that manages its own data home is
- * already controlled, and production has no test dir set at all.
+ * In production, MAGIC_CONTEXT_STORAGE_DIR takes precedence over XDG_DATA_HOME.
+ * Test isolation remains authoritative so an ambient override cannot redirect
+ * a test into a user's real shared database.
  */
-export function getMagicContextStorageDir(): string {
-    if (!process.env.XDG_DATA_HOME) {
-        const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
-        if (testDataDir) {
-            return path.join(testDataDir, "cortexkit", "magic-context");
+export type MagicContextStorageSource =
+    | "test isolation"
+    | "environment override"
+    | "XDG_DATA_HOME"
+    | "platform default";
+
+export interface MagicContextStorageResolution {
+    path: string;
+    source: MagicContextStorageSource;
+}
+
+export function getMagicContextStorageResolution(): MagicContextStorageResolution {
+    const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim();
+    if (testDataDir) {
+        const perTestDataHome = process.env.XDG_DATA_HOME?.trim();
+        if (perTestDataHome && path.resolve(perTestDataHome) !== path.resolve(testDataDir)) {
+            return {
+                path: path.join(perTestDataHome, "cortexkit", "magic-context"),
+                source: "test isolation",
+            };
         }
-        if (process.env.NODE_ENV === "test") {
-            return getTestBackstopStorageDir();
-        }
+        return {
+            path: path.join(testDataDir, "cortexkit", "magic-context"),
+            source: "test isolation",
+        };
     }
-    return path.join(getDataDir(), "cortexkit", "magic-context");
+    if (process.env.NODE_ENV === "test") {
+        return { path: getTestBackstopStorageDir(), source: "test isolation" };
+    }
+    const explicitStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR?.trim();
+    if (explicitStorageDir) {
+        if (!path.isAbsolute(explicitStorageDir)) {
+            throw new Error("MAGIC_CONTEXT_STORAGE_DIR must be an absolute path");
+        }
+        return { path: explicitStorageDir, source: "environment override" };
+    }
+    const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+    if (xdgDataHome) {
+        return {
+            path: path.join(xdgDataHome, "cortexkit", "magic-context"),
+            source: "XDG_DATA_HOME",
+        };
+    }
+    return {
+        path: path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
+        source: "platform default",
+    };
+}
+
+export function getMagicContextStorageDir(): string {
+    return getMagicContextStorageResolution().path;
 }
 
 let testBackstopStorageDir: string | null = null;

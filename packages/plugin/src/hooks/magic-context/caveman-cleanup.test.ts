@@ -92,13 +92,14 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, new Map(), [], {
             enabled: false,
             minChars: 500,
-            protectedTags: 10,
+            protectedCutoff: 0,
         });
         expect(result).toEqual({
             compressedToLite: 0,
             compressedToFull: 0,
             compressedToUltra: 0,
             mutatedTextTags: 0,
+            textReductions: [],
         });
     });
 
@@ -110,7 +111,7 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, new Map(), tags, {
             enabled: true,
             minChars: 100,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
         expect(result.compressedToLite + result.compressedToFull + result.compressedToUltra).toBe(
             0,
@@ -138,7 +139,7 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, targets, tags, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
 
         expect(result.compressedToUltra).toBe(2); // positions 0,1 -> ultra (20% of 10)
@@ -171,7 +172,7 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, targets, tags, {
             enabled: true,
             minChars: 100,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
 
         // Only tag 2 is eligible (length > 100); positioned at index 0 of 1-item
@@ -193,11 +194,11 @@ describe("applyCavemanCleanup", () => {
             targets.set(tag.tagNumber, mockTarget(longText).target);
         }
 
-        // protectedTags = 3 → tags 3,4,5 are protected; only 1,2 eligible
+        // Cutoff 3 protects tags 3,4,5; only 1,2 are eligible
         const result = applyCavemanCleanup(SESSION, db, targets, tags, {
             enabled: true,
             minChars: 50,
-            protectedTags: 3,
+            protectedCutoff: 3,
         });
 
         // 2 eligible tags: positions 0,1 -> ultra (both), since 20% of 2 = 0 tags,
@@ -221,7 +222,7 @@ describe("applyCavemanCleanup", () => {
         applyCavemanCleanup(SESSION, db, targets, tags, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
         const afterUltra = getContent();
         expect(afterUltra).not.toBe(longText);
@@ -233,7 +234,7 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, targets, afterPass1Tags, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
         expect(result.compressedToLite + result.compressedToFull + result.compressedToUltra).toBe(
             0,
@@ -253,7 +254,7 @@ describe("applyCavemanCleanup", () => {
         const result = applyCavemanCleanup(SESSION, db, targets, tags, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
 
         expect(result.compressedToLite + result.compressedToFull + result.compressedToUltra).toBe(
@@ -296,7 +297,7 @@ describe("applyCavemanCleanup", () => {
         applyCavemanCleanup(SESSION, db, targets, tags5, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
 
         // Tag 3 (position 2/5 = 0.4 < 0.6 → lite, depth 1)
@@ -327,7 +328,7 @@ describe("applyCavemanCleanup", () => {
         applyCavemanCleanup(SESSION, db, targets, tags25, {
             enabled: true,
             minChars: 50,
-            protectedTags: 0,
+            protectedCutoff: null,
         });
 
         // Now tag 3 should be ultra. The visible content must match
