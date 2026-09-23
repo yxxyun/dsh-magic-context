@@ -309,7 +309,7 @@ function previewTagPayloadMessages(
         source?: { kind?: unknown };
       };
       const sourceKind = msg.source?.kind;
-      if (sourceKind === "plugin" || sourceKind === "skill-catalog") {
+      if (isMagicSource(msg.source) || sourceKind === "skill-catalog") {
         out.push(raw);
         continue;
       }
@@ -446,7 +446,7 @@ export async function runContextPlaneStep(
           if (event === null || typeof event !== "object") return false;
           const e = event as { data?: { source?: { plugin?: unknown; messageId?: unknown } } };
           const source = e.data?.source;
-          return source?.plugin === "magic-context" && source?.messageId === noteMarker;
+          return isMagicSource(source) && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
           const { magicUserMessage } = await import("../compat/dsh-0.1/session");

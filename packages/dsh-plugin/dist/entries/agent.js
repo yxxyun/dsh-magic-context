@@ -284,6 +284,7 @@ import {
   deriveEventMessage2,
   MAGIC_SOURCE_KIND2,
   magicSource2,
+  isMagicSource2,
   magicUserMessage2,
   sessionEvents2
 } from "./agent-nkqrsrrf.js";
@@ -2838,7 +2839,7 @@ function isMagicWatermarkOnSurface(session, watermark) {
     if (!event || event.type !== "user/message")
       continue;
     const source = event.data?.source;
-    if (source && source.kind === "plugin" && source.plugin === "magic-context" && source.messageId === watermark) {
+    if (source && isMagicSource2(source) && source.messageId === watermark) {
       return true;
     }
   }
@@ -3420,7 +3421,7 @@ function injectNudge(agent, sessionId, kind, text) {
       return false;
     const e = event;
     const source = e.data?.source;
-    return source?.plugin === "magic-context" && source?.messageId === marker;
+    return isMagicSource2(source) && source?.messageId === marker;
   })) {
     return;
   }
@@ -4644,7 +4645,7 @@ function previewTagPayloadMessages(db, sessionId, messages, log) {
     for (const raw of messages) {
       const msg = raw;
       const sourceKind = msg.source?.kind;
-      if (sourceKind === "plugin" || sourceKind === "skill-catalog") {
+      if (isMagicSource2(msg.source) || sourceKind === "skill-catalog") {
         out.push(raw);
         continue;
       }
@@ -4734,7 +4735,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
             return false;
           const e = event;
           const source = e.data?.source;
-          return source?.plugin === "magic-context" && source?.messageId === noteMarker;
+          return isMagicSource2(source) && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
           const { magicUserMessage } = await import("./session-c5n90p3w.js");

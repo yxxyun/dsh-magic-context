@@ -310,8 +310,7 @@ export function isMagicWatermarkOnSurface(
     const source = event.data?.source;
     if (
       source &&
-      source.kind === "plugin" &&
-      (source as MagicMessageSource).plugin === "magic-context" &&
+      isMagicSource(source) &&
       (source as MagicMessageSource).messageId === watermark
     ) {
       return true;
