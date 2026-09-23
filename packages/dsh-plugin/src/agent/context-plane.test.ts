@@ -10,6 +10,7 @@ import {
 import type { PreStepDecision } from "../compat/dsh-0.1/prestep";
 import { createTestDb } from "../test-utils";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { getTagsBySession } from "@magic-context/core/features/magic-context/storage";
 import {
   createContextPlaneState,
   runContextPlaneStep,
@@ -58,7 +59,7 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
 }
 
 describe("context plane (pre-step wiring of transcript + coordinator)", () => {
-  it("reconciles the outbox and applies the derived plan on the first step", async () => {
+  it("tags the first pass without rewriting the surface, and passes the step through", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
     try {
       const db = await createTestDb(join(dir, "context.db"));
@@ -90,12 +91,18 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
       );
       expect(result).toBe(decision);
       expect(downstream).toBe(1);
-      // The first pass tagged the messages: ops applied to the surface.
-      expect(session.surface.replaceGeneration).toBeGreaterThan(0);
-      // The saga records committed.
+      // The first pass TAGGED the messages. Assert the tag rows themselves, not
+      // a surface side effect: this plane deliberately runs with
+      // skipPrefixInjection, so tagging must NOT rewrite the surface (doing so
+      // is what wedged real sessions).
+      const tags = getTagsBySession(db, "dsh:a1b2c3d4:sess-plane");
+      expect(tags.length).toBeGreaterThan(0);
+      expect(session.surface.replaceGeneration).toBe(0);
+      // With prefix injection suppressed this fixture needs no surface mutation
+      // at all (no pending drops, no temporal gaps, no cleanup config), so the
+      // saga must stay empty. Records only exist for surface ops.
       const records = listOutboxBySession(db, "dsh:a1b2c3d4:sess-plane");
-      expect(records.length).toBeGreaterThan(0);
-      expect(records.every((r) => r.status === "committed")).toBe(true);
+      expect(records.length).toBe(0);
       db.close();
     } finally {
       await cleanupDir(dir);
@@ -234,3 +241,4 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
     }
   });
 });
+
