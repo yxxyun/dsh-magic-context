@@ -20,6 +20,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { setDshHarness } from "dsh-magic-context-adapter";
 import { loadPluginConfig, type MagicContextPluginConfig } from "@magic-context/core/config";
+import { log as coreLog } from "@magic-context/core/shared/logger";
 import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@magic-context/core/config/agent-disable";
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
@@ -271,7 +272,16 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   if (!host) {
     throw new Error("magic-context-agent: magicContextHost service unavailable");
   }
-  const log = (message: string) => ctx.logger?.info?.(message);
+  // `ctx.logger.info` is NOT persisted anywhere an operator can read on DSH
+  // (there is no DSH log file), so the whole agent plane — historian, dreamer,
+  // knowledge gate, seam wiring — was effectively silent: the first real
+  // compaction run would have been undiagnosable. Mirror every line into the
+  // core logger (magic-context.log), which is the sink that actually gets read,
+  // and keep the ctx logger for whatever the host does with it.
+  const log = (message: string) => {
+    coreLog(message);
+    ctx.logger?.info?.(message);
+  };
   const directory = config.directory ?? process.cwd();
 
   registerSystemGuidance(ctx, { config: config.guidance, log });

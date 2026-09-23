@@ -397,16 +397,24 @@ export async function runContextPlaneStep(
         skipPrefixInjection: true,
       } satisfies PlanContext);
 
-      // Health guard. An empty transcript WHILE the session has events is the
-      // exact silent failure this pipeline hit: events were read from a
-      // `session.events` property that does not exist at runtime, so the view
-      // came back empty, tagging produced nothing, and every caller looked
+      // Health guard. An empty transcript WHILE the surface already carries
+      // nodes is the exact silent failure this pipeline hit: events were read
+      // from a `session.events` property that does not exist at runtime, so the
+      // view came back empty, tagging produced nothing, and every caller looked
       // fine. Surface it loudly rather than regressing to silence.
+      //
+      // The guard must NOT fire on an EMPTY surface. DSH appends the turn's
+      // user/message AFTER preStep runs, so a session's first pre-step sees a
+      // legitimately empty surface — "tagging is producing nothing" was pure
+      // noise there (it fired on every fresh session) and would mask the real
+      // failure it exists to catch. That first-step content is tagged on the
+      // next pass.
       const sessionEventCount = sessionEvents(agent.session).length;
-      if (view.messages.length === 0 && sessionEventCount > 0) {
+      const surfaceNodeCount = agent.session.surface?.nodes?.length ?? 0;
+      if (view.messages.length === 0 && surfaceNodeCount > 0) {
         coreLog(
           `[magic-context] empty transcript despite ${sessionEventCount} session events` +
-            ` (surfaceNodes=${agent.session.surface?.nodes?.length ?? "n/a"}) — tagging is producing nothing.`,
+            ` (surfaceNodes=${surfaceNodeCount}) — tagging is producing nothing.`,
         );
       }
 

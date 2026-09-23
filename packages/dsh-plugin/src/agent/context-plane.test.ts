@@ -1,8 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import * as loggerModule from "@magic-context/core/shared/logger";
 import {
   createAssistantMessage,
   createUserMessage,
@@ -237,6 +238,71 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
       expect(fired).toBe(0);
       db.close();
     } finally {
+      await cleanupDir(dir);
+    }
+  });
+
+  it("warns about an empty transcript only when the surface actually had nodes", async () => {
+    // DSH appends the turn's user/message AFTER preStep runs, so a session's
+    // FIRST pre-step sees session events but ZERO surface nodes. The health
+    // guard used to call that "tagging is producing nothing" on every fresh
+    // session — log spam that also masked the real failure it exists to catch.
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
+    const spy = spyOn(loggerModule, "log").mockImplementation(() => {});
+    const warnings = () =>
+      spy.mock.calls.filter((call) => String(call[0]).includes("empty transcript"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const depsFor = (): ContextPlaneDeps => ({
+        host: {
+          ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
+          canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
+        },
+        config: { protectedTags: 0 },
+        log: () => {},
+      });
+
+      // (a) Fresh session: an event exists, but nothing is on the surface yet.
+      const fresh = Session.create(SessionId("sess-fresh"));
+      fresh.append("session/title", { title: "fresh" } as never);
+      expect(fresh.surface.nodes.length).toBe(0);
+      await runContextPlaneStep(
+        createContextPlaneState(),
+        depsFor(),
+        { agent: { id: fresh.id, session: fresh } as never },
+        async () => ({ reject: false, messages: [] }),
+      );
+      expect(warnings()).toHaveLength(0);
+
+      // (b) True positive: the surface carries a node, yet the walk derives no
+      // messages from it — exactly the silent failure the guard must surface.
+      // `system/message` is surface-eligible but skipped by the transcript walk,
+      // so it reproduces "surface has content, transcript came back empty".
+      // (This also proves the spy really intercepts the guard's log sink, so
+      // case (a) cannot pass vacuously.)
+      const broken = Session.create(SessionId("sess-broken"));
+      broken.append(
+        "system/message",
+        {
+          turn: 1,
+          step: 1,
+          message: { role: "system", content: [{ type: "text", text: "boot" }] },
+        } as never,
+        { surfaceOp: "append" },
+      );
+      expect(broken.surface.nodes.length).toBeGreaterThan(0);
+      await runContextPlaneStep(
+        createContextPlaneState(),
+        depsFor(),
+        { agent: { id: broken.id, session: broken } as never },
+        async () => ({ reject: false, messages: [] }),
+      );
+      expect(warnings()).toHaveLength(1);
+      expect(String(warnings()[0]?.[0])).toContain("surfaceNodes=1");
+
+      db.close();
+    } finally {
+      spy.mockRestore();
       await cleanupDir(dir);
     }
   });
