@@ -4724,8 +4724,9 @@ async function runContextPlaneStep(state, deps, payload, next) {
         skipPrefixInjection: true
       });
       const sessionEventCount = sessionEvents2(agent.session).length;
-      if (view.messages.length === 0 && sessionEventCount > 0) {
-        log(`[magic-context] empty transcript despite ${sessionEventCount} session events` + ` (surfaceNodes=${agent.session.surface?.nodes?.length ?? "n/a"}) — tagging is producing nothing.`);
+      const surfaceNodeCount = agent.session.surface?.nodes?.length ?? 0;
+      if (view.messages.length === 0 && surfaceNodeCount > 0) {
+        log(`[magic-context] empty transcript despite ${sessionEventCount} session events` + ` (surfaceNodes=${surfaceNodeCount}) — tagging is producing nothing.`);
       }
       if (plan !== null) {
         const hostView = {
@@ -16354,14 +16355,17 @@ function apply(ctx, config = {}) {
   if (!host) {
     throw new Error("magic-context-agent: magicContextHost service unavailable");
   }
-  const log = (message) => ctx.logger?.info?.(message);
+  const log2 = (message) => {
+    log(message);
+    ctx.logger?.info?.(message);
+  };
   const directory = config.directory ?? process.cwd();
-  registerSystemGuidance(ctx, { config: config.guidance, log });
+  registerSystemGuidance(ctx, { config: config.guidance, log: log2 });
   registerSessionProjectTracking(ctx, {
     host,
     directory,
     config: config.sessionTracking,
-    log
+    log: log2
   });
   registerContextPlane(ctx, {
     host,
@@ -16383,25 +16387,25 @@ function apply(ctx, config = {}) {
             signalDshDeferredHistoryRefresh(sessionId);
             signalDshDeferredMaterialization(sessionId);
           },
-          log
+          log: log2
         }).catch((error) => {
-          log(`[magic-context] historian pass failed (background): ${error instanceof Error ? error.message : String(error)}`);
+          log2(`[magic-context] historian pass failed (background): ${error instanceof Error ? error.message : String(error)}`);
         });
       }
     },
-    log
+    log: log2
   });
   registerMagicHistorianPlane(ctx, {
     host,
     directory,
-    log
+    log: log2
   });
   registerDshDreamer(ctx, {
     host,
     directory,
     config: config.dreamer,
     coreConfig: dreamerCoreConfigOf(config),
-    log
+    log: log2
   });
   registerKnowledgeGate(ctx, {
     host,
@@ -16409,12 +16413,12 @@ function apply(ctx, config = {}) {
     autoSearch: config.autoSearch ?? {},
     mural: createMuralWiring(ctx, config.knowledge?.muralEnabled === true),
     now: config.now,
-    log
+    log: log2
   });
   const runtime = {
     canonicalKey: (dshSessionId) => host.canonicalKey(dshSessionId),
     resolveProjectIdentity: undefined,
-    log
+    log: log2
   };
   registerCtxTools(ctx, { ...runtime, ...config.tools ?? {} });
   const seams = new Map;
@@ -16423,10 +16427,10 @@ function apply(ctx, config = {}) {
       return;
     seams.set("dreamer", dshDreamSeams(ctx, {
       db: bootstrap.db,
-      log,
+      log: log2,
       compactionOff: config.commands?.compactionOff === true
     }));
-    seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log }));
+    seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log: log2 }));
   });
   registerCtxCommands(ctx, {
     ...runtime,
@@ -16445,11 +16449,11 @@ function apply(ctx, config = {}) {
     },
     runSidekick: createSidekickSeam(ctx, {
       canonicalKey: (dshSessionId) => host.canonicalKey(dshSessionId),
-      log
+      log: log2
     }),
-    runEmbedDrain: createEmbedSeam({ log })
+    runEmbedDrain: createEmbedSeam({ log: log2 })
   });
-  log(`[magic-context] agent plane ready: knowledge=${config.knowledge?.enabled !== false} ` + `guidance=${config.guidance?.enabled !== false} autoSearch=${config.autoSearch?.enabled !== false} ` + `sessionTracking=${config.sessionTracking?.enabled !== false} directory=${directory}`);
+  log2(`[magic-context] agent plane ready: knowledge=${config.knowledge?.enabled !== false} ` + `guidance=${config.guidance?.enabled !== false} autoSearch=${config.autoSearch?.enabled !== false} ` + `sessionTracking=${config.sessionTracking?.enabled !== false} directory=${directory}`);
 }
 
 // src/entries/agent.ts
