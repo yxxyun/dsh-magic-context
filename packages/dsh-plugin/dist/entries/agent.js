@@ -2845,6 +2845,22 @@ function isMagicWatermarkOnSurface(session, watermark) {
   }
   return false;
 }
+function dropAlreadySurfacedMagicMessages(agent, messages) {
+  let removed = 0;
+  for (let index = messages.length - 1;index >= 0; index -= 1) {
+    const source = messages[index]?.source;
+    if (!source || !isMagicSource2(source))
+      continue;
+    const watermark = source.messageId;
+    if (typeof watermark !== "string" || watermark.length === 0)
+      continue;
+    if (!isMagicWatermarkOnSurface(agent.session, watermark))
+      continue;
+    messages.splice(index, 1);
+    removed += 1;
+  }
+  return removed;
+}
 async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, forceMaterialize = false) {
   if (deps.config.enabled === false)
     return;
@@ -2933,6 +2949,7 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
     if (isMagicChildSession(agent)) {
       return await next();
     }
+    dropAlreadySurfacedMagicMessages(agent, payload.messages);
     const bootstrap = await deps.host.ready;
     if (bootstrap.kind === "ok") {
       const db = bootstrap.db;

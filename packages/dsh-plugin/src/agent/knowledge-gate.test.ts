@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { canonicalSessionKey } from "dsh-magic-context-adapter";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import { MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
-import { isMagicSource } from "../compat/dsh-0.1/session";
+import { isMagicSource, magicUserMessage } from "../compat/dsh-0.1/session";
 import { createTestDb } from "../test-utils";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
@@ -266,6 +266,62 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const resumedState = createKnowledgeGateState();
       await runKnowledgeGateStep(resumedState, deps, { agent: harness.agent, messages: [userMessage("post-restart message")] }, passThroughNext());
       expect(harness.injected.length).toBe(2);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("drops a queued Magic message the live surface already carries (duplicate-id guard)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const identity = resolveKnowledgeProjectPath(dir);
+      insertMemory(db, {
+        projectPath: identity as string,
+        category: "PROJECT_RULES",
+        content: "duplicate surface id guard content",
+        sourceType: "user",
+      });
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+      // Mirror the runtime: the pre-step decision's `messages` array is what
+      // gets appended to the surface, so `next` returns it verbatim.
+      const runtimeNext = (payload: { messages: readonly UserMessage[] }) =>
+        async (): Promise<PreStepDecision> => ({
+          kind: "enter",
+          messages: payload.messages as UserMessage[],
+        });
+
+      // Step 1 — the gate delivers the baseline through the pre-step decision
+      // (and, in production, also queues the same objects for the next step).
+      const firstPayload = { agent: harness.agent, messages: [userMessage("first message")] };
+      await runKnowledgeGateStep(state, deps, firstPayload, runtimeNext(firstPayload));
+      expect(harness.injected.length).toBe(2);
+      const m0Watermark = (harness.injected[0].source as { messageId?: string }).messageId as string;
+      expect(isMagicWatermarkOnSurface(harness.agent.session, m0Watermark)).toBe(true);
+
+      // Step 2 — the runtime claims the queued copies (same objects, same ids)
+      // into `messages`. They must not be appended again: a duplicate surface id
+      // makes the DSH client fail to render the whole conversation (#411).
+      const turn = userMessage("second turn message");
+      const secondPayload = { agent: harness.agent, messages: [...harness.injected, turn] };
+      const decision = await runKnowledgeGateStep(state, deps, secondPayload, runtimeNext(secondPayload));
+      expect(decision.kind).toBe("enter");
+      // Only the genuine user turn survives; both queued baseline copies are gone.
+      expect(secondPayload.messages).toEqual([turn]);
+      expect(harness.injected.length).toBe(2);
+
+      // A Magic message whose watermark is NOT on the surface is never dropped —
+      // that queued copy is the fallback delivery for a prepend that never landed.
+      const unseen = magicUserMessage("unseen baseline", {
+        kind: MAGIC_SOURCE_KIND,
+        messageId: "mc-kb:0:0123456789abcdef",
+      });
+      const thirdPayload = { agent: harness.agent, messages: [unseen] };
+      await runKnowledgeGateStep(state, deps, thirdPayload, runtimeNext(thirdPayload));
+      expect(thirdPayload.messages).toEqual([unseen]);
     } finally {
       await cleanupDir(dir, db);
     }

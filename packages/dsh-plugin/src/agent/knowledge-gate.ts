@@ -19,11 +19,27 @@
  *      (fire-and-forget, see auto-search.ts);
  *   5. passes the pre-step decision through untouched (`await next()`).
  *
- * Injection timing: DSH `agent.inject()` queues model-facing context for the
- * NEXT pre-step batch (the current batch was already claimed when the waterfall
- * ran), so the knowledge baseline becomes model-visible on the following
- * request of the session. This matches the PLAN §4.1 "inject, do not rewrite"
- * contract — the adapter never mutates existing message arrays.
+ * Injection timing (verified against the 0.1.7-alpha.2 runtime): the baseline
+ * rides BOTH delivery channels, and the pair is de-duplicated on the way in:
+ *
+ *   - `payload.messages.unshift(...)` — the pre-step decision's `messages`
+ *     array is exactly what the runtime appends to the surface, so this is the
+ *     path that makes the baseline visible to THIS step's request (Pi transform
+ *     unshift semantics; the runtime delivers its own runtime-context the same
+ *     way). It is NOT side-effect free: the prepended messages become surface
+ *     nodes.
+ *   - `agent.inject(...)` — the durable next-step inbox
+ *     (`ReactLoopAgent.inject` → `inbox.splice("next-step", …)`), claimed and
+ *     appended by the FOLLOWING step. It is the fallback for a pass whose
+ *     prepend never landed.
+ *
+ * Both channels materialize the SAME message objects, so the queued copy would
+ * be appended a second time with an unchanged id. The DSH client keys
+ * conversation nodes by message id, so a duplicated id breaks the entire
+ * conversation view (memory #411). dropAlreadySurfacedMagicMessages() removes
+ * from the incoming batch any Magic message that is already a live surface
+ * node: the queued copy is redundant once the prepended one landed, and it is
+ * still appended when the prepend did not land.
  *
  * Knowledge-mode preview: `compactionOff: true` by default — the zero-
  * compartment path where m[0] carries memory/docs/user-profile only and
@@ -56,7 +72,7 @@ import {
   type PreStepDecision,
   type PreStepPayload,
 } from "../compat/dsh-0.1/prestep";
-import type { DshStorageBootstrap } from "../host/bootstrap";
+import type { DshStorageBootstrap } from "../host/bootstrap";
 import { trackSessionProjectOnce, sessionProjectPath } from "./session-track";
 import { maybeRunAutoSearchHint, type AutoSearchConfig } from "./auto-search";
 import { isMagicChildSession } from "./worker";
@@ -319,6 +335,39 @@ export function isMagicWatermarkOnSurface(
   return false;
 }
 
+/**
+ * Remove from the incoming pre-step batch every Magic message whose watermark is
+ * already a LIVE surface node, and return how many were removed.
+ *
+ * This is the invariant that makes the inject()+prepend pair safe: DSH appends
+ * the pre-step decision's `messages` to the surface, and `agent.inject()` queues
+ * the same objects for the next step — without this guard the next step claims
+ * them and appends a second node carrying an unchanged message id. The client
+ * keys conversation nodes by that id, so the duplicate silently breaks the
+ * conversation view (memory #411).
+ *
+ * Shadowed (replaced/compacted) nodes do not count — a new surface generation
+ * legitimately re-delivers the same watermark — and messages without a
+ * watermark (user turns, runtime context) are never touched.
+ */
+export function dropAlreadySurfacedMagicMessages(
+  agent: KnowledgeAgentView,
+  messages: unknown[],
+): number {
+  let removed = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const source = (messages[index] as { source?: MagicMessageSource | { kind?: string } } | undefined)
+      ?.source;
+    if (!source || !isMagicSource(source)) continue;
+    const watermark = (source as MagicMessageSource).messageId;
+    if (typeof watermark !== "string" || watermark.length === 0) continue;
+    if (!isMagicWatermarkOnSurface(agent.session, watermark)) continue;
+    messages.splice(index, 1);
+    removed += 1;
+  }
+  return removed;
+}
+
 /** Inject the knowledge baseline once per (session, surface generation). */
 export async function maybeInjectKnowledge(
   state: KnowledgeGateState,
@@ -461,6 +510,10 @@ export async function runKnowledgeGateStep(
     if (isMagicChildSession(agent as unknown as import("@deepseek-ai/dsh-agent").Agent)) {
       return await next();
     }
+    // Never append a Magic message the live surface already carries: this is
+    // what keeps the inject()+prepend pair from creating duplicate surface ids
+    // (see the module header and dropAlreadySurfacedMagicMessages).
+    dropAlreadySurfacedMagicMessages(agent, payload.messages as unknown[]);
     const bootstrap = await deps.host.ready;
     if (bootstrap.kind === "ok") {
       const db = bootstrap.db;
@@ -477,8 +530,9 @@ export async function runKnowledgeGateStep(
       // Knowledge baseline (once per surface generation; forced after publish).
       await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization);
       // Pi transform 语义：首轮注入的消息前置到本次调用的消息列表（立即可见）。
-      // agent.inject 排队到下一批 pre-step；前置只影响本次调用，不写 surface，
-      // 因此不会与下一批 surface 中的基线重复（watermark/状态去重）。
+      // 前置即写入 surface（运行时把 decision.messages 追加为表面节点），而
+      // agent.inject 又把这些同一批对象排进下一步的 inbox —— 下一步的
+      // dropAlreadySurfacedMagicMessages 会丢弃这份冗余副本，避免重复 id。
       if (state.lastInjectedMessages.length > 0) {
         const injected = state.lastInjectedMessages;
         state.lastInjectedMessages = [];
