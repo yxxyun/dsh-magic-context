@@ -13,6 +13,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { DshStorageBootstrap } from "../host/bootstrap";
+import { sessionEvents } from "../compat/dsh-0.1/session";
 import {
   registerPreStepGate,
   type PreStepDecision,
@@ -43,6 +44,7 @@ import { isMagicChildSession } from "./worker";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { log as coreLog } from "@magic-context/core/shared/logger";
 
 /** The host-service slice the context plane needs (structural view). */
 export interface ContextPlaneHostView {
@@ -130,7 +132,11 @@ function sessionLogView(
   agent: Agent,
   canonicalSessionId: string,
 ): { hasSeq(seq: number): boolean; generation: number } {
-  const events = agent.session.events;
+  // Events come from the runtime's `snapshotEvents()` method, not the
+  // `session.events` property the type stubs advertise — see sessionEvents().
+  // Reading the property was what threw "events is not iterable" on every
+  // session's first pre-step and silently killed the whole context plane.
+  const events = sessionEvents(agent.session);
   const seqSet = new Set<number>();
   for (const event of events) {
     if (event !== null && typeof event === "object") {
@@ -140,7 +146,8 @@ function sessionLogView(
   }
   return {
     hasSeq: (seq: number) => seqSet.has(seq),
-    generation: agent.session.surface.replaceGeneration,
+    generation:
+      (agent.session as { surface?: { replaceGeneration?: number } }).surface?.replaceGeneration ?? 0,
   };
 }
 
@@ -369,7 +376,7 @@ export async function runContextPlaneStep(
       previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
         session: {
-          events: agent.session.events,
+          events: sessionEvents(agent.session),
           surface: agent.session.surface,
           header: {},
         },
@@ -380,6 +387,20 @@ export async function runContextPlaneStep(
         protectedTags: deps.config?.protectedTags ?? 20,
         heuristicCleanup: deps.heuristicCleanup,
       } satisfies PlanContext);
+
+      // Health guard. An empty transcript WHILE the session has events is the
+      // exact silent failure this pipeline hit: events were read from a
+      // `session.events` property that does not exist at runtime, so the view
+      // came back empty, tagging produced nothing, and every caller looked
+      // fine. Surface it loudly rather than regressing to silence.
+      const sessionEventCount = sessionEvents(agent.session).length;
+      if (view.messages.length === 0 && sessionEventCount > 0) {
+        coreLog(
+          `[magic-context] empty transcript despite ${sessionEventCount} session events` +
+            ` (surfaceNodes=${agent.session.surface?.nodes?.length ?? "n/a"}) — tagging is producing nothing.`,
+        );
+      }
+
       if (plan !== null) {
         const hostView: CoordinatorHostView = {
           db,
@@ -439,7 +460,15 @@ export async function runContextPlaneStep(
     if (historian !== undefined && historian.config?.enabled !== false) {
       maybeFireHistorian(historian, db, canonicalSessionId, agent, deps.directory);
     }
-  } catch (error) {    deps.log?.(
+  } catch (error) {
+    // Fail-open must still be DIAGNOSABLE. `deps.log` routes through
+    // ctx.logger.info, which DSH does not persist anywhere the operator can
+    // read — so routing this failure there made a broken context plane look
+    // perfectly healthy (the log stayed empty while no tags were ever written).
+    // Send it to the shared core logger, which writes magic-context.log.
+    const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+    coreLog(`[magic-context] context plane failed (fail-open): ${detail}`);
+    deps.log?.(
       `[magic-context] context plane failed (fail-open): ${error instanceof Error ? error.message : String(error)}`,
     );
   }

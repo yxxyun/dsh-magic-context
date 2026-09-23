@@ -1,0 +1,25097 @@
+import {
+  shouldEnforcePrivateStoragePermissions,
+  V2_MEMORY_CATEGORIES,
+  PROMOTABLE_CATEGORIES,
+  getMemoryCategoryOrder,
+  CATEGORY_DEFAULT_TTL,
+  Database,
+  withPrivilegedWriter,
+  OMO_INTERNAL_INITIATOR_MARKER,
+  removeSystemReminders,
+  hasMeaningfulUserText,
+  extractTexts,
+  extractToolCallSummaries,
+  estimateTokens,
+  normalizeText,
+  compactRole,
+  formatBlock,
+  compactTextForSummary,
+  mergeCommitHashes,
+  isUserHomeDirectory,
+  resolveProjectIdentityForSession,
+  normalizeStoredProjectPath,
+  storedPathBelongsToIdentity,
+  closeQuietly,
+  stableStringify,
+  resolveWorkspaceShareCategories,
+  resolveWorkspaceIdentitySet,
+  expandWorkspaceIdentitySetWithAliases,
+  resolveStoredPathWorkspaceIdentity,
+  sourceNameForMemory,
+  computeWorkspaceEpochFingerprint,
+  getErrorMessage
+} from "./agent-8w60yqpt.js";
+import {
+  setHarness,
+  getHarness,
+  getDataDir,
+  getMagicContextStorageDir,
+  log,
+  sessionLog
+} from "./agent-nb38pbc0.js";
+import {
+  deriveEventMessage2,
+  textBlock2,
+  sessionEvents2
+} from "./agent-md57b5ck.js";
+
+// src/agent/tools.ts
+import {
+  defineTool as defineTool2
+} from "@deepseek-ai/dsh-tools";
+
+// ../adapter-api/src/harness.ts
+var DSH_HARNESS = "dsh";
+function setDshHarness() {
+  setHarness(DSH_HARNESS);
+}
+var DSH_SESSION_KEY_PREFIX = "dsh";
+var SEP = ":";
+function canonicalSessionKey(homeHash, dshSessionId) {
+  if (homeHash.length === 0)
+    throw new Error("canonicalSessionKey: homeHash must be non-empty");
+  if (dshSessionId.length === 0)
+    throw new Error("canonicalSessionKey: dshSessionId must be non-empty");
+  if (dshSessionId.includes(SEP)) {
+    throw new Error(`canonicalSessionKey: dshSessionId must not contain "${SEP}"`);
+  }
+  return `${DSH_SESSION_KEY_PREFIX}${SEP}${homeHash}${SEP}${dshSessionId}`;
+}
+// ../adapter-api/src/model-map.ts
+var CANONICAL_DEEPSEEK_PROVIDER = "deepseek";
+var DSH_DEEPSEEK_PROVIDER = "deepseek-official";
+var DSH_TO_CANONICAL_PROVIDER = {
+  [DSH_DEEPSEEK_PROVIDER]: CANONICAL_DEEPSEEK_PROVIDER
+};
+var CANONICAL_TO_DSH_PROVIDER = {
+  [CANONICAL_DEEPSEEK_PROVIDER]: DSH_DEEPSEEK_PROVIDER
+};
+function remapProviderPrefix(ref, map) {
+  if (typeof ref !== "string")
+    return ref;
+  const slash = ref.indexOf("/");
+  if (slash <= 0)
+    return ref;
+  const provider = ref.slice(0, slash);
+  if (!Object.hasOwn(map, provider))
+    return ref;
+  return `${map[provider]}${ref.slice(slash)}`;
+}
+function dshModelRefToCanonical(ref) {
+  return remapProviderPrefix(ref, DSH_TO_CANONICAL_PROVIDER);
+}
+// ../plugin/src/features/magic-context/compartment-lease.ts
+var COMPARTMENT_LEASE_TTL_MS = 5 * 60 * 1000;
+var COMPARTMENT_LEASE_RENEWAL_MS = 60 * 1000;
+function acquireCompartmentLease(db, sessionId, holderId) {
+  const acquiredAt = Date.now();
+  const expiresAt = acquiredAt + COMPARTMENT_LEASE_TTL_MS;
+  const result = db.prepare(`INSERT INTO compartment_state_lease (session_id, holder_id, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET
+                holder_id = excluded.holder_id,
+                acquired_at = excluded.acquired_at,
+                expires_at = excluded.expires_at
+             WHERE compartment_state_lease.holder_id = excluded.holder_id
+                OR compartment_state_lease.expires_at <= ?`).run(sessionId, holderId, acquiredAt, expiresAt, acquiredAt);
+  if (result.changes !== 1) {
+    return null;
+  }
+  return { sessionId, holderId, acquiredAt, expiresAt };
+}
+function renewCompartmentLease(db, sessionId, holderId) {
+  const now = Date.now();
+  const expiresAt = now + COMPARTMENT_LEASE_TTL_MS;
+  const result = db.prepare(`UPDATE compartment_state_lease
+             SET expires_at = ?, acquired_at = ?
+             WHERE session_id = ? AND holder_id = ? AND expires_at > ?`).run(expiresAt, now, sessionId, holderId, now);
+  return result.changes === 1;
+}
+function releaseCompartmentLease(db, sessionId, holderId) {
+  db.prepare("DELETE FROM compartment_state_lease WHERE session_id = ? AND holder_id = ?").run(sessionId, holderId);
+}
+function isCompartmentLeaseHeld(db, sessionId, holderId) {
+  const row = db.prepare("SELECT 1 FROM compartment_state_lease WHERE session_id = ? AND holder_id = ? AND expires_at > ?").get(sessionId, holderId, Date.now());
+  return row != null;
+}
+
+// ../plugin/src/features/magic-context/compression-depth-storage.ts
+var incrementDepthStatements = new WeakMap;
+var totalDepthStatements = new WeakMap;
+var maxDepthStatements = new WeakMap;
+var clearDepthStatements = new WeakMap;
+function getClearDepthStatement(db) {
+  let stmt = clearDepthStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM compression_depth WHERE session_id = ?");
+    clearDepthStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function clearCompressionDepth(db, sessionId) {
+  getClearDepthStatement(db).run(sessionId);
+}
+function clearCompressionDepthRange(db, sessionId, startOrdinal, endOrdinal) {
+  if (endOrdinal < startOrdinal) {
+    return;
+  }
+  db.prepare("DELETE FROM compression_depth WHERE session_id = ? AND message_ordinal BETWEEN ? AND ?").run(sessionId, startOrdinal, endOrdinal);
+}
+
+// ../plugin/src/features/magic-context/storage-meta-shared.ts
+import { Buffer as Buffer2 } from "node:buffer";
+var SESSION_META_SELECT_COLUMNS = [
+  "session_id",
+  "last_response_time",
+  "cache_ttl",
+  "counter",
+  "last_nudge_tokens",
+  "last_nudge_band",
+  "last_transform_error",
+  "is_subagent",
+  "last_context_percentage",
+  "last_input_tokens",
+  "observed_safe_input_tokens",
+  "cache_alert_sent",
+  "times_execute_threshold_reached",
+  "compartment_in_progress",
+  "system_prompt_hash",
+  "system_prompt_tokens",
+  "conversation_tokens",
+  "tool_call_tokens",
+  "cleared_reasoning_through_tag",
+  "tool_reclaim_watermark",
+  "last_todo_state",
+  "cached_m0_bytes",
+  "cached_m0_mural_data_url",
+  "cached_m0_mural_hash",
+  "cached_m1_bytes",
+  "cached_m0_project_memory_epoch",
+  "cached_m0_workspace_fingerprint",
+  "cached_m0_project_user_profile_version",
+  "cached_m0_max_compartment_seq",
+  "cached_m0_max_memory_id",
+  "cached_m0_max_mutation_id",
+  "cached_m0_max_memory_mutation_id",
+  "cached_m0_project_docs_hash",
+  "cached_m0_materialized_at",
+  "cached_m0_session_facts_version",
+  "cached_m0_upgrade_state",
+  "cached_m0_system_hash",
+  "cached_m0_tool_set_hash",
+  "cached_m0_model_key",
+  "cached_m0_project_identity",
+  "last_observed_model_key",
+  "last_usage_context_limit",
+  "prior_boundary_ordinal",
+  "protected_tail_policy_version",
+  "protected_tail_drain_window_started_at",
+  "protected_tail_drain_tokens",
+  "recovery_no_eligible_head_count",
+  "force_emergency_bypass_window_start",
+  "force_emergency_bypass_used",
+  "emergency_drain_active",
+  "historian_drain_failure_at",
+  "upgrade_reminded_at",
+  "upgrade_reminder_last_sent_at",
+  "upgrade_reminder_count",
+  "pi_stable_id_scheme"
+];
+var META_COLUMNS = {
+  lastResponseTime: "last_response_time",
+  cacheTtl: "cache_ttl",
+  counter: "counter",
+  lastNudgeTokens: "last_nudge_tokens",
+  lastNudgeBand: "last_nudge_band",
+  lastTransformError: "last_transform_error",
+  isSubagent: "is_subagent",
+  lastContextPercentage: "last_context_percentage",
+  lastInputTokens: "last_input_tokens",
+  observedSafeInputTokens: "observed_safe_input_tokens",
+  cacheAlertSent: "cache_alert_sent",
+  timesExecuteThresholdReached: "times_execute_threshold_reached",
+  compartmentInProgress: "compartment_in_progress",
+  systemPromptHash: "system_prompt_hash",
+  systemPromptTokens: "system_prompt_tokens",
+  conversationTokens: "conversation_tokens",
+  toolCallTokens: "tool_call_tokens",
+  clearedReasoningThroughTag: "cleared_reasoning_through_tag",
+  toolReclaimWatermark: "tool_reclaim_watermark",
+  lastTodoState: "last_todo_state",
+  cachedM0Bytes: "cached_m0_bytes",
+  cachedM0MuralDataUrl: "cached_m0_mural_data_url",
+  cachedM0MuralHash: "cached_m0_mural_hash",
+  cachedM1Bytes: "cached_m1_bytes",
+  cachedM0ProjectMemoryEpoch: "cached_m0_project_memory_epoch",
+  cachedM0WorkspaceFingerprint: "cached_m0_workspace_fingerprint",
+  cachedM0ProjectUserProfileVersion: "cached_m0_project_user_profile_version",
+  cachedM0MaxCompartmentSeq: "cached_m0_max_compartment_seq",
+  cachedM0MaxMemoryId: "cached_m0_max_memory_id",
+  cachedM0MaxMutationId: "cached_m0_max_mutation_id",
+  cachedM0MaxMemoryMutationId: "cached_m0_max_memory_mutation_id",
+  cachedM0ProjectDocsHash: "cached_m0_project_docs_hash",
+  cachedM0MaterializedAt: "cached_m0_materialized_at",
+  cachedM0SessionFactsVersion: "cached_m0_session_facts_version",
+  cachedM0UpgradeState: "cached_m0_upgrade_state",
+  cachedM0SystemHash: "cached_m0_system_hash",
+  cachedM0ToolSetHash: "cached_m0_tool_set_hash",
+  cachedM0ModelKey: "cached_m0_model_key",
+  cachedM0ProjectIdentity: "cached_m0_project_identity",
+  lastObservedModelKey: "last_observed_model_key",
+  lastUsageContextLimit: "last_usage_context_limit",
+  priorBoundaryOrdinal: "prior_boundary_ordinal",
+  protectedTailPolicyVersion: "protected_tail_policy_version",
+  protectedTailDrainWindowStartedAt: "protected_tail_drain_window_started_at",
+  protectedTailDrainTokens: "protected_tail_drain_tokens",
+  recoveryNoEligibleHeadCount: "recovery_no_eligible_head_count",
+  forceEmergencyBypassWindowStart: "force_emergency_bypass_window_start",
+  forceEmergencyBypassUsed: "force_emergency_bypass_used",
+  emergencyDrainActive: "emergency_drain_active",
+  historianDrainFailureAt: "historian_drain_failure_at",
+  upgradeRemindedAt: "upgrade_reminded_at",
+  upgradeReminderLastSentAt: "upgrade_reminder_last_sent_at",
+  upgradeReminderCount: "upgrade_reminder_count",
+  piStableIdScheme: "pi_stable_id_scheme"
+};
+var BOOLEAN_META_KEYS = new Set(["isSubagent", "compartmentInProgress", "cacheAlertSent"]);
+var NULL_BIND_META_KEYS = new Set([
+  "cachedM0Bytes",
+  "cachedM0MuralDataUrl",
+  "cachedM0MuralHash",
+  "cachedM1Bytes",
+  "cachedM0ProjectMemoryEpoch",
+  "cachedM0WorkspaceFingerprint",
+  "cachedM0ProjectUserProfileVersion",
+  "cachedM0MaxCompartmentSeq",
+  "cachedM0MaxMemoryId",
+  "cachedM0MaxMutationId",
+  "cachedM0MaxMemoryMutationId",
+  "cachedM0ProjectDocsHash",
+  "cachedM0MaterializedAt",
+  "cachedM0SessionFactsVersion",
+  "cachedM0UpgradeState",
+  "cachedM0ProjectIdentity",
+  "lastObservedModelKey",
+  "upgradeRemindedAt",
+  "upgradeReminderLastSentAt",
+  "piStableIdScheme"
+]);
+function isStringOrNull(value) {
+  return value === null || typeof value === "string";
+}
+function isNumberOrNull(value) {
+  return value === null || typeof value === "number";
+}
+function isBlobOrNull(value) {
+  return value === null || Buffer2.isBuffer(value) || value instanceof Uint8Array;
+}
+function toBufferOrNull(value) {
+  if (value === null)
+    return null;
+  if (Buffer2.isBuffer(value))
+    return value;
+  return Buffer2.from(value.buffer, value.byteOffset, value.byteLength);
+}
+function isSessionMetaRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.session_id === "string" && typeof r.last_response_time === "number" && isStringOrNull(r.cache_ttl) && typeof r.counter === "number" && typeof r.last_nudge_tokens === "number" && isStringOrNull(r.last_nudge_band) && isStringOrNull(r.last_transform_error) && typeof r.is_subagent === "number" && typeof r.last_context_percentage === "number" && typeof r.last_input_tokens === "number" && isNumberOrNull(r.observed_safe_input_tokens) && isNumberOrNull(r.cache_alert_sent) && isNumberOrNull(r.times_execute_threshold_reached) && isNumberOrNull(r.compartment_in_progress) && (r.system_prompt_hash === null || typeof r.system_prompt_hash === "string" || typeof r.system_prompt_hash === "number") && isNumberOrNull(r.system_prompt_tokens) && isNumberOrNull(r.conversation_tokens) && isNumberOrNull(r.tool_call_tokens) && isNumberOrNull(r.cleared_reasoning_through_tag) && isStringOrNull(r.last_todo_state) && isBlobOrNull(r.cached_m0_bytes) && isStringOrNull(r.cached_m0_mural_data_url) && isStringOrNull(r.cached_m0_mural_hash) && isBlobOrNull(r.cached_m1_bytes) && isNumberOrNull(r.cached_m0_project_memory_epoch) && isStringOrNull(r.cached_m0_workspace_fingerprint) && isNumberOrNull(r.cached_m0_project_user_profile_version) && isNumberOrNull(r.cached_m0_max_compartment_seq) && isNumberOrNull(r.cached_m0_max_memory_id) && isNumberOrNull(r.cached_m0_max_mutation_id) && isNumberOrNull(r.cached_m0_max_memory_mutation_id) && isStringOrNull(r.cached_m0_project_docs_hash) && isNumberOrNull(r.cached_m0_materialized_at) && isNumberOrNull(r.cached_m0_session_facts_version) && isStringOrNull(r.cached_m0_upgrade_state) && isStringOrNull(r.cached_m0_system_hash) && isStringOrNull(r.cached_m0_tool_set_hash) && isStringOrNull(r.cached_m0_model_key) && isStringOrNull(r.cached_m0_project_identity) && isStringOrNull(r.last_observed_model_key) && isNumberOrNull(r.last_usage_context_limit) && isNumberOrNull(r.prior_boundary_ordinal) && isNumberOrNull(r.protected_tail_policy_version) && isNumberOrNull(r.protected_tail_drain_window_started_at) && isNumberOrNull(r.protected_tail_drain_tokens) && isNumberOrNull(r.recovery_no_eligible_head_count) && isNumberOrNull(r.force_emergency_bypass_window_start) && isNumberOrNull(r.force_emergency_bypass_used) && isNumberOrNull(r.upgrade_reminded_at) && isNumberOrNull(r.upgrade_reminder_last_sent_at) && isNumberOrNull(r.upgrade_reminder_count) && isNumberOrNull(r.pi_stable_id_scheme) && isNumberOrNull(r.tool_reclaim_watermark);
+}
+function getDefaultSessionMeta(sessionId) {
+  return {
+    sessionId,
+    lastResponseTime: 0,
+    cacheTtl: "5m",
+    counter: 0,
+    lastNudgeTokens: 0,
+    lastNudgeBand: null,
+    lastTransformError: null,
+    isSubagent: false,
+    lastContextPercentage: 0,
+    lastInputTokens: 0,
+    observedSafeInputTokens: 0,
+    cacheAlertSent: false,
+    timesExecuteThresholdReached: 0,
+    compartmentInProgress: false,
+    systemPromptHash: "",
+    systemPromptTokens: 0,
+    conversationTokens: 0,
+    toolCallTokens: 0,
+    clearedReasoningThroughTag: 0,
+    toolReclaimWatermark: 0,
+    lastTodoState: "",
+    cachedM0Bytes: null,
+    cachedM0MuralDataUrl: null,
+    cachedM0MuralHash: null,
+    cachedM1Bytes: null,
+    cachedM0ProjectMemoryEpoch: null,
+    cachedM0WorkspaceFingerprint: null,
+    cachedM0ProjectUserProfileVersion: null,
+    cachedM0MaxCompartmentSeq: null,
+    cachedM0MaxMemoryId: null,
+    cachedM0MaxMutationId: null,
+    cachedM0MaxMemoryMutationId: null,
+    cachedM0ProjectDocsHash: null,
+    cachedM0MaterializedAt: null,
+    cachedM0SessionFactsVersion: null,
+    cachedM0UpgradeState: null,
+    cachedM0SystemHash: null,
+    cachedM0ToolSetHash: null,
+    cachedM0ModelKey: null,
+    cachedM0ProjectIdentity: null,
+    lastObservedModelKey: null,
+    lastUsageContextLimit: 0,
+    priorBoundaryOrdinal: 1,
+    protectedTailPolicyVersion: 0,
+    protectedTailDrainWindowStartedAt: 0,
+    protectedTailDrainTokens: 0,
+    recoveryNoEligibleHeadCount: 0,
+    forceEmergencyBypassWindowStart: 0,
+    forceEmergencyBypassUsed: 0,
+    upgradeRemindedAt: null,
+    upgradeReminderLastSentAt: null,
+    upgradeReminderCount: 0,
+    piStableIdScheme: null
+  };
+}
+function ensureSessionMetaRow(db, sessionId) {
+  const defaults = getDefaultSessionMeta(sessionId);
+  db.prepare("INSERT OR IGNORE INTO session_meta (session_id, harness, last_response_time, cache_ttl, counter, last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent, last_context_percentage, last_input_tokens, observed_safe_input_tokens, cache_alert_sent, times_execute_threshold_reached, compartment_in_progress, system_prompt_hash, cleared_reasoning_through_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(sessionId, getHarness(), defaults.lastResponseTime, defaults.cacheTtl, defaults.counter, defaults.lastNudgeTokens, defaults.lastNudgeBand ?? "", defaults.lastTransformError ?? "", defaults.isSubagent ? 1 : 0, defaults.lastContextPercentage, defaults.lastInputTokens, defaults.observedSafeInputTokens, defaults.cacheAlertSent ? 1 : 0, defaults.timesExecuteThresholdReached, defaults.compartmentInProgress ? 1 : 0, defaults.systemPromptHash ?? "", defaults.clearedReasoningThroughTag);
+}
+function toSessionMeta(row) {
+  const nudgeBandRaw = typeof row.last_nudge_band === "string" ? row.last_nudge_band : "";
+  const transformErrorRaw = typeof row.last_transform_error === "string" ? row.last_transform_error : "";
+  const cacheTtlRaw = typeof row.cache_ttl === "string" && row.cache_ttl.length > 0 ? row.cache_ttl : "5m";
+  const systemPromptHashRaw = row.system_prompt_hash == null ? "" : row.system_prompt_hash;
+  const lastTodoStateRaw = typeof row.last_todo_state === "string" ? row.last_todo_state : "";
+  const numOrZero = (value) => typeof value === "number" ? value : 0;
+  const numOrNull = (value) => typeof value === "number" ? value : null;
+  const stringOrNull = (value) => typeof value === "string" ? value : null;
+  return {
+    sessionId: row.session_id,
+    lastResponseTime: row.last_response_time,
+    cacheTtl: cacheTtlRaw,
+    counter: row.counter,
+    lastNudgeTokens: row.last_nudge_tokens,
+    lastNudgeBand: nudgeBandRaw.length > 0 ? nudgeBandRaw : null,
+    lastTransformError: transformErrorRaw.length > 0 ? transformErrorRaw : null,
+    isSubagent: row.is_subagent === 1,
+    lastContextPercentage: row.last_context_percentage,
+    lastInputTokens: row.last_input_tokens,
+    observedSafeInputTokens: numOrZero(row.observed_safe_input_tokens),
+    cacheAlertSent: numOrZero(row.cache_alert_sent) === 1,
+    timesExecuteThresholdReached: numOrZero(row.times_execute_threshold_reached),
+    compartmentInProgress: row.compartment_in_progress === 1,
+    systemPromptHash: String(systemPromptHashRaw),
+    systemPromptTokens: numOrZero(row.system_prompt_tokens),
+    conversationTokens: numOrZero(row.conversation_tokens),
+    toolCallTokens: numOrZero(row.tool_call_tokens),
+    clearedReasoningThroughTag: numOrZero(row.cleared_reasoning_through_tag),
+    toolReclaimWatermark: numOrZero(row.tool_reclaim_watermark),
+    lastTodoState: lastTodoStateRaw,
+    cachedM0Bytes: toBufferOrNull(row.cached_m0_bytes),
+    cachedM0MuralDataUrl: stringOrNull(row.cached_m0_mural_data_url),
+    cachedM0MuralHash: stringOrNull(row.cached_m0_mural_hash),
+    cachedM1Bytes: toBufferOrNull(row.cached_m1_bytes),
+    cachedM0ProjectMemoryEpoch: numOrNull(row.cached_m0_project_memory_epoch),
+    cachedM0WorkspaceFingerprint: stringOrNull(row.cached_m0_workspace_fingerprint),
+    cachedM0ProjectUserProfileVersion: numOrNull(row.cached_m0_project_user_profile_version),
+    cachedM0MaxCompartmentSeq: numOrNull(row.cached_m0_max_compartment_seq),
+    cachedM0MaxMemoryId: numOrNull(row.cached_m0_max_memory_id),
+    cachedM0MaxMutationId: numOrNull(row.cached_m0_max_mutation_id),
+    cachedM0MaxMemoryMutationId: numOrNull(row.cached_m0_max_memory_mutation_id),
+    cachedM0ProjectDocsHash: stringOrNull(row.cached_m0_project_docs_hash),
+    cachedM0MaterializedAt: numOrNull(row.cached_m0_materialized_at),
+    cachedM0SessionFactsVersion: numOrNull(row.cached_m0_session_facts_version),
+    cachedM0UpgradeState: stringOrNull(row.cached_m0_upgrade_state),
+    cachedM0SystemHash: stringOrNull(row.cached_m0_system_hash),
+    cachedM0ToolSetHash: stringOrNull(row.cached_m0_tool_set_hash),
+    cachedM0ModelKey: stringOrNull(row.cached_m0_model_key),
+    cachedM0ProjectIdentity: stringOrNull(row.cached_m0_project_identity),
+    lastObservedModelKey: stringOrNull(row.last_observed_model_key),
+    lastUsageContextLimit: numOrZero(row.last_usage_context_limit),
+    priorBoundaryOrdinal: Math.max(1, numOrZero(row.prior_boundary_ordinal) || 1),
+    protectedTailPolicyVersion: numOrZero(row.protected_tail_policy_version),
+    protectedTailDrainWindowStartedAt: numOrZero(row.protected_tail_drain_window_started_at),
+    protectedTailDrainTokens: numOrZero(row.protected_tail_drain_tokens),
+    recoveryNoEligibleHeadCount: numOrZero(row.recovery_no_eligible_head_count),
+    forceEmergencyBypassWindowStart: numOrZero(row.force_emergency_bypass_window_start),
+    forceEmergencyBypassUsed: numOrZero(row.force_emergency_bypass_used),
+    upgradeRemindedAt: numOrNull(row.upgrade_reminded_at),
+    upgradeReminderLastSentAt: numOrNull(row.upgrade_reminder_last_sent_at),
+    upgradeReminderCount: numOrZero(row.upgrade_reminder_count),
+    piStableIdScheme: numOrNull(row.pi_stable_id_scheme)
+  };
+}
+function persistCachedM0(db, sessionId, payload) {
+  ensureSessionMetaRow(db, sessionId);
+  db.prepare(`UPDATE session_meta SET
+            cached_m0_bytes = ?,
+            cached_m0_mural_data_url = ?,
+            cached_m0_mural_hash = ?,
+            cached_m0_project_memory_epoch = ?,
+            cached_m0_workspace_fingerprint = ?,
+            cached_m0_project_user_profile_version = ?,
+            cached_m0_max_compartment_seq = ?,
+            cached_m0_max_memory_id = ?,
+            cached_m0_max_mutation_id = ?,
+            cached_m0_max_memory_mutation_id = ?,
+            cached_m1_bytes = ?,
+            cached_m0_project_docs_hash = ?,
+            cached_m0_materialized_at = ?,
+            cached_m0_session_facts_version = ?,
+            cached_m0_upgrade_state = ?,
+            cached_m0_system_hash = ?,
+            cached_m0_model_key = ?,
+            cached_m0_project_identity = ?
+         WHERE session_id = ?`).run(Buffer2.from(payload.m0Bytes), payload.muralDataUrl ?? null, payload.muralHash ?? null, payload.projectMemoryEpoch, payload.workspaceFingerprint ?? null, payload.projectUserProfileVersion, payload.maxCompartmentSeq, payload.maxMemoryId, payload.maxMutationId, payload.maxMemoryMutationId ?? null, payload.m1Bytes ? Buffer2.from(payload.m1Bytes) : null, payload.projectDocsHash, payload.materializedAt, payload.sessionFactsVersion, payload.upgradeState, payload.systemHash ?? "", payload.modelKey ?? "", payload.projectIdentity ?? null, sessionId);
+}
+function clearCachedM0M1(db, sessionId) {
+  ensureSessionMetaRow(db, sessionId);
+  const existingColumns = new Set(db.prepare("PRAGMA table_info(session_meta)").all().map((column) => column.name));
+  const clears = [
+    ["cached_m0_bytes", null],
+    ["cached_m0_mural_data_url", null],
+    ["cached_m0_mural_hash", null],
+    ["cached_m1_bytes", null],
+    ["cached_m0_project_memory_epoch", null],
+    ["cached_m0_workspace_fingerprint", null],
+    ["cached_m0_project_user_profile_version", null],
+    ["cached_m0_max_compartment_seq", null],
+    ["cached_m0_max_memory_id", null],
+    ["cached_m0_max_mutation_id", null],
+    ["cached_m0_max_memory_mutation_id", null],
+    ["cached_m0_project_docs_hash", null],
+    ["cached_m0_materialized_at", null],
+    ["cached_m0_session_facts_version", null],
+    ["cached_m0_upgrade_state", null],
+    ["cached_m0_system_hash", null],
+    ["cached_m0_tool_set_hash", null],
+    ["cached_m0_model_key", null],
+    ["cached_m0_project_identity", null],
+    ["cached_m0_last_baseline_end_message_id", null],
+    ["memory_block_cache", ""],
+    ["memory_block_count", 0],
+    ["memory_block_ids", ""]
+  ];
+  const setClauses = [];
+  const values = [];
+  for (const [column, value] of clears) {
+    if (!existingColumns.has(column))
+      continue;
+    setClauses.push(`${column} = ?`);
+    values.push(value);
+  }
+  if (setClauses.length === 0)
+    return;
+  db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(...values, sessionId);
+}
+
+// ../plugin/src/features/magic-context/compartment-storage.ts
+var insertCompartmentStatements = new WeakMap;
+var insertFactStatements = new WeakMap;
+function getInsertCompartmentStatement(db) {
+  let stmt = insertCompartmentStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    insertCompartmentStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function isStringOrNullish(v) {
+  return v === null || v === undefined || typeof v === "string";
+}
+function isNumberOrNullish(v) {
+  return v === null || v === undefined || typeof v === "number";
+}
+function isCompartmentRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.session_id === "string" && typeof candidate.sequence === "number" && typeof candidate.start_message === "number" && typeof candidate.end_message === "number" && typeof candidate.start_message_id === "string" && typeof candidate.end_message_id === "string" && typeof candidate.title === "string" && typeof candidate.content === "string" && isStringOrNullish(candidate.p1) && isStringOrNullish(candidate.p2) && isStringOrNullish(candidate.p3) && isStringOrNullish(candidate.p4) && isNumberOrNullish(candidate.importance) && isStringOrNullish(candidate.episode_type) && isNumberOrNullish(candidate.legacy) && typeof candidate.created_at === "number";
+}
+function isSessionFactRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.session_id === "string" && typeof candidate.category === "string" && typeof candidate.content === "string" && typeof candidate.created_at === "number" && typeof candidate.updated_at === "number";
+}
+function insertCompartmentRows(db, sessionId, compartments, now) {
+  const stmt = getInsertCompartmentStatement(db);
+  for (const compartment of compartments) {
+    const hasTiers = typeof compartment.p1 === "string" && compartment.p1.length > 0;
+    stmt.run(sessionId, compartment.sequence, compartment.startMessage, compartment.endMessage, compartment.startMessageId, compartment.endMessageId, compartment.title, compartment.content, compartment.p1 ?? null, compartment.p2 ?? null, compartment.p3 ?? null, compartment.p4 ?? null, typeof compartment.importance === "number" ? compartment.importance : 50, compartment.episodeType ?? null, hasTiers ? 0 : 1, now, getHarness());
+  }
+}
+function toCompartment(row) {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    sequence: row.sequence,
+    startMessage: row.start_message,
+    endMessage: row.end_message,
+    startMessageId: row.start_message_id,
+    endMessageId: row.end_message_id,
+    title: row.title,
+    content: row.content,
+    p1: row.p1 ?? null,
+    p2: row.p2 ?? null,
+    p3: row.p3 ?? null,
+    p4: row.p4 ?? null,
+    importance: typeof row.importance === "number" ? row.importance : 50,
+    episodeType: row.episode_type ?? null,
+    legacy: typeof row.legacy === "number" ? row.legacy : 0,
+    createdAt: row.created_at
+  };
+}
+function toSessionFact(row) {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    category: row.category,
+    content: row.content,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function getCompartments(db, sessionId) {
+  const rows = db.prepare("SELECT * FROM compartments WHERE session_id = ? ORDER BY sequence ASC").all(sessionId).filter(isCompartmentRow);
+  return rows.map(toCompartment);
+}
+function getLastCompartmentEndMessage(db, sessionId) {
+  const row = db.prepare("SELECT MAX(end_message) as max_end FROM compartments WHERE session_id = ?").get(sessionId);
+  return row?.max_end ?? -1;
+}
+function appendCompartments(db, sessionId, compartments) {
+  if (compartments.length === 0)
+    return;
+  const now = Date.now();
+  db.transaction(() => {
+    insertCompartmentRows(db, sessionId, compartments, now);
+  })();
+}
+function getSessionFacts(db, sessionId) {
+  const rows = db.prepare("SELECT * FROM session_facts WHERE session_id = ? ORDER BY category ASC, id ASC").all(sessionId).filter(isSessionFactRow);
+  return rows.map(toSessionFact);
+}
+function buildCompartmentBlock(compartments, facts, memoryBlock, dateRanges) {
+  const lines = [];
+  if (memoryBlock) {
+    lines.push(memoryBlock);
+    lines.push("");
+  }
+  for (const c of compartments) {
+    const dates = dateRanges?.byId.get(c.id);
+    const dateAttr = dates ? ` start-date="${dates.start}" end-date="${dates.end}"` : "";
+    lines.push(`<compartment start="${c.startMessage}" end="${c.endMessage}"${dateAttr} title="${escapeXmlAttr(c.title)}">`);
+    lines.push(escapeXmlContent(c.content));
+    lines.push("</compartment>");
+    lines.push("");
+  }
+  const factsByCategory = new Map;
+  for (const f of facts) {
+    const existing = factsByCategory.get(f.category) ?? [];
+    existing.push(f.content);
+    factsByCategory.set(f.category, existing);
+  }
+  for (const [category, items] of factsByCategory) {
+    lines.push(`${category}:`);
+    for (const item of items) {
+      lines.push(`* ${escapeXmlContent(item)}`);
+    }
+    lines.push("");
+  }
+  return lines.join(`
+`).trimEnd();
+}
+function saveRecompStagingPass(db, sessionId, passNumber, compartments, facts) {
+  const now = Date.now();
+  db.transaction(() => {
+    db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+    const compartmentStmt = db.prepare("INSERT OR REPLACE INTO recomp_compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, pass_number, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const c of compartments) {
+      compartmentStmt.run(sessionId, c.sequence, c.startMessage, c.endMessage, c.startMessageId, c.endMessageId, c.title, c.content, c.p1 ?? null, c.p2 ?? null, c.p3 ?? null, c.p4 ?? null, typeof c.importance === "number" ? c.importance : 50, c.episodeType ?? null, passNumber, now, getHarness());
+    }
+    const factStmt = db.prepare("INSERT INTO recomp_facts (session_id, category, content, pass_number, created_at, harness) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const f of facts) {
+      factStmt.run(sessionId, f.category, f.content, passNumber, now, getHarness());
+    }
+  })();
+}
+function getRecompStaging(db, sessionId) {
+  const compartmentRows = db.prepare("SELECT * FROM recomp_compartments WHERE session_id = ? ORDER BY sequence ASC").all(sessionId).filter(isRecompCompartmentRow);
+  if (compartmentRows.length === 0)
+    return null;
+  const compartments = compartmentRows.map((row) => ({
+    sequence: row.sequence,
+    startMessage: row.start_message,
+    endMessage: row.end_message,
+    startMessageId: row.start_message_id,
+    endMessageId: row.end_message_id,
+    title: row.title,
+    content: row.content,
+    p1: row.p1 ?? null,
+    p2: row.p2 ?? null,
+    p3: row.p3 ?? null,
+    p4: row.p4 ?? null,
+    importance: typeof row.importance === "number" ? row.importance : 50,
+    episodeType: row.episode_type ?? null
+  }));
+  const factRows = db.prepare("SELECT category, content FROM recomp_facts WHERE session_id = ?").all(sessionId).filter(isRecompFactRow);
+  const maxPass = compartmentRows.reduce((m, r) => Math.max(m, r.pass_number), 0);
+  const lastEnd = compartmentRows[compartmentRows.length - 1]?.end_message ?? 0;
+  return {
+    compartments,
+    facts: factRows,
+    passCount: maxPass,
+    lastEndMessage: lastEnd
+  };
+}
+function clearRecompStaging(db, sessionId) {
+  db.transaction(() => {
+    db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
+    db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+    try {
+      db.prepare("UPDATE session_meta SET recomp_partial_range_start = 0, recomp_partial_range_end = 0 WHERE session_id = ?").run(sessionId);
+    } catch {}
+  })();
+}
+function getRecompPartialRange(db, sessionId) {
+  try {
+    const row = db.prepare("SELECT recomp_partial_range_start AS start, recomp_partial_range_end AS end FROM session_meta WHERE session_id = ?").get(sessionId);
+    const start = typeof row?.start === "number" ? row.start : 0;
+    const end = typeof row?.end === "number" ? row.end : 0;
+    if (start <= 0 || end <= 0)
+      return null;
+    return { start, end };
+  } catch {
+    return null;
+  }
+}
+function setRecompPartialRange(db, sessionId, range) {
+  const start = range ? range.start : 0;
+  const end = range ? range.end : 0;
+  db.prepare("INSERT OR IGNORE INTO session_meta (session_id) VALUES (?)").run(sessionId);
+  db.prepare("UPDATE session_meta SET recomp_partial_range_start = ?, recomp_partial_range_end = ? WHERE session_id = ?").run(start, end, sessionId);
+}
+function isRecompCompartmentRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.session_id === "string" && typeof candidate.sequence === "number" && typeof candidate.start_message === "number" && typeof candidate.end_message === "number" && typeof candidate.start_message_id === "string" && typeof candidate.end_message_id === "string" && typeof candidate.title === "string" && typeof candidate.content === "string" && isStringOrNullish(candidate.p1) && isStringOrNullish(candidate.p2) && isStringOrNullish(candidate.p3) && isStringOrNullish(candidate.p4) && isNumberOrNullish(candidate.importance) && isStringOrNullish(candidate.episode_type) && typeof candidate.pass_number === "number" && typeof candidate.created_at === "number";
+}
+function isRecompFactRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.category === "string" && typeof candidate.content === "string";
+}
+function escapeXmlAttr(s) {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escapeXmlContent(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+// ../plugin/src/config/schema/magic-context.ts
+import { homedir } from "node:os";
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/util.js
+function getEnumValues(entries) {
+  const numericValues = Object.values(entries).filter((v) => typeof v === "number");
+  const values = Object.entries(entries).filter(([k, _]) => numericValues.indexOf(+k) === -1).map(([_, v]) => v);
+  return values;
+}
+function joinValues(array, separator = "|") {
+  return array.map((val) => stringifyPrimitive(val)).join(separator);
+}
+function jsonStringifyReplacer(_, value) {
+  if (typeof value === "bigint")
+    return value.toString();
+  return value;
+}
+
+class Cached {
+  constructor(getter) {
+    this._getter = getter;
+    this._value = undefined;
+  }
+  get value() {
+    const getter = this._getter;
+    if (getter !== undefined) {
+      this._value = getter();
+      this._getter = undefined;
+    }
+    return this._value;
+  }
+}
+function cached(getter) {
+  return new Cached(getter);
+}
+function nullish(input) {
+  return input === null || input === undefined;
+}
+function cleanRegex(source) {
+  const start = source.startsWith("^") ? 1 : 0;
+  const end = source.endsWith("$") ? source.length - 1 : source.length;
+  return source.slice(start, end);
+}
+function floatSafeRemainder(val, step) {
+  const ratio = val / step;
+  const roundedRatio = Math.round(ratio);
+  const tolerance = 4 * Number.EPSILON * Math.max(Math.abs(ratio), 1);
+  if (Math.abs(ratio - roundedRatio) < tolerance)
+    return 0;
+  return ratio - roundedRatio;
+}
+function assignProp(target, prop, value) {
+  Object.defineProperty(target, prop, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true
+  });
+}
+function rawShape(def) {
+  const desc = Object.getOwnPropertyDescriptor(def, "shape");
+  return desc?.get ? desc.get.raw : desc?.value;
+}
+function sourceShape(schema) {
+  return rawShape(schema._zod.def) ?? schema._zod.def.shape;
+}
+function deferProp(target, key, getter) {
+  Object.defineProperty(target, key, {
+    get() {
+      const value = getter();
+      assignProp(this, key, value);
+      return value;
+    },
+    enumerable: true,
+    configurable: true
+  });
+}
+function putProp(target, key, value) {
+  if (key in target)
+    assignProp(target, key, value);
+  else
+    target[key] = value;
+}
+function mirrorShape(target, source, keys, wrap) {
+  const raw = sourceShape(source);
+  for (const key of keys) {
+    const desc = Object.getOwnPropertyDescriptor(raw, key);
+    if (!desc.enumerable)
+      continue;
+    if (desc.get) {
+      deferProp(target, key, () => {
+        const value = source._zod.def.shape[key];
+        return wrap ? wrap(value, key) : value;
+      });
+    } else
+      putProp(target, key, wrap ? wrap(desc.value, key) : desc.value);
+  }
+}
+function mirrorProps(target, source) {
+  for (const key of Reflect.ownKeys(source)) {
+    const desc = Object.getOwnPropertyDescriptor(source, key);
+    if (!desc.enumerable)
+      continue;
+    if (desc.get)
+      deferProp(target, key, () => source[key]);
+    else
+      putProp(target, key, desc.value);
+  }
+}
+function mergeDefs(...defs) {
+  const mergedDescriptors = {};
+  for (const def of defs) {
+    const descriptors = Object.getOwnPropertyDescriptors(def);
+    Object.assign(mergedDescriptors, descriptors);
+  }
+  return Object.defineProperties({}, mergedDescriptors);
+}
+function esc(str) {
+  return JSON.stringify(str);
+}
+function slugify(input) {
+  return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+var captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
+function isObject(data) {
+  return typeof data === "object" && data !== null && !Array.isArray(data);
+}
+var allowsEval = /* @__PURE__ */ cached(() => {
+  if (globalConfig.jitless) {
+    return false;
+  }
+  if (typeof navigator !== "undefined" && navigator?.userAgent?.includes("Cloudflare")) {
+    return false;
+  }
+  try {
+    const F = Function;
+    new F("");
+    return true;
+  } catch (_) {
+    return false;
+  }
+});
+function isPlainObject(o) {
+  if (isObject(o) === false)
+    return false;
+  const ctor = o.constructor;
+  if (ctor === undefined)
+    return true;
+  if (typeof ctor !== "function")
+    return true;
+  const prot = ctor.prototype;
+  if (isObject(prot) === false)
+    return false;
+  if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) {
+    return false;
+  }
+  return true;
+}
+function shallowClone(o) {
+  if (isPlainObject(o))
+    return { ...o };
+  if (Array.isArray(o))
+    return [...o];
+  if (o instanceof Map)
+    return new Map(o);
+  if (o instanceof Set)
+    return new Set(o);
+  return o;
+}
+var propertyKeyTypes = /* @__PURE__ */ new Set(["string", "number", "symbol"]);
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function clone(inst, def, params) {
+  const cl = new inst._zod.constr(def ?? inst._zod.def);
+  if (!def || params?.parent)
+    cl._zod.parent = inst;
+  return cl;
+}
+function normalizeParams(_params) {
+  const params = _params;
+  if (!params)
+    return {};
+  if (typeof params === "string")
+    return { error: () => params };
+  if (params?.message !== undefined) {
+    if (params?.error !== undefined)
+      throw new Error("Cannot specify both `message` and `error` params");
+    params.error = params.message;
+  }
+  delete params.message;
+  if (typeof params.error === "string")
+    return { ...params, error: () => params.error };
+  return params;
+}
+function stringifyPrimitive(value) {
+  if (typeof value === "bigint")
+    return value.toString() + "n";
+  if (typeof value === "string")
+    return `"${value}"`;
+  return `${value}`;
+}
+function optionalKeys(shape) {
+  return Object.keys(shape).filter((k) => {
+    return shape[k]._zod.optin !== undefined && shape[k]._zod.optout === "optional";
+  });
+}
+var NUMBER_FORMAT_RANGES = /* @__PURE__ */ (() => ({
+  safeint: [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+  int32: [-2147483648, 2147483647],
+  uint32: [0, 4294967295],
+  float32: [-340282346638528860000000000000000000000, 340282346638528860000000000000000000000],
+  float64: [-Number.MAX_VALUE, Number.MAX_VALUE]
+}))();
+var BIGINT_FORMAT_RANGES = {
+  int64: [/* @__PURE__ */ BigInt("-9223372036854775808"), /* @__PURE__ */ BigInt("9223372036854775807")],
+  uint64: [/* @__PURE__ */ BigInt(0), /* @__PURE__ */ BigInt("18446744073709551615")]
+};
+function pick(schema, mask) {
+  const currDef = schema._zod.def;
+  const checks = currDef.checks;
+  const hasChecks = checks && checks.length > 0;
+  if (hasChecks) {
+    throw new Error(".pick() cannot be used on object schemas containing refinements");
+  }
+  const newShape = {};
+  mirrorShape(newShape, schema, maskedKeys(schema, mask));
+  return clone(schema, mergeDefs(currDef, { shape: newShape, checks: [] }));
+}
+function maskedKeys(schema, mask) {
+  const raw = sourceShape(schema);
+  const keys = [];
+  for (const key of Reflect.ownKeys(mask)) {
+    if (!Object.getOwnPropertyDescriptor(raw, key)?.enumerable) {
+      throw new Error(`Unrecognized key: "${String(key)}"`);
+    }
+    if (mask[key])
+      keys.push(key);
+  }
+  return keys;
+}
+function omit(schema, mask) {
+  const currDef = schema._zod.def;
+  const checks = currDef.checks;
+  const hasChecks = checks && checks.length > 0;
+  if (hasChecks) {
+    throw new Error(".omit() cannot be used on object schemas containing refinements");
+  }
+  const omitted = new Set(maskedKeys(schema, mask));
+  const newShape = {};
+  mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)).filter((key) => !omitted.has(key)));
+  return clone(schema, mergeDefs(currDef, { shape: newShape, checks: [] }));
+}
+function extend(schema, shape) {
+  if (!isPlainObject(shape)) {
+    throw new Error("Invalid input to extend: expected a plain object");
+  }
+  const checks = schema._zod.def.checks;
+  const hasChecks = checks && checks.length > 0;
+  if (hasChecks) {
+    const existingShape = sourceShape(schema);
+    for (const key of Reflect.ownKeys(shape)) {
+      if (Object.getOwnPropertyDescriptor(existingShape, key) !== undefined) {
+        throw new Error("Cannot overwrite keys on object schemas containing refinements. Use `.safeExtend()` instead.");
+      }
+    }
+  }
+  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
+}
+function extended(schema, shape) {
+  const newShape = {};
+  mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)));
+  mirrorProps(newShape, shape);
+  return newShape;
+}
+function safeExtend(schema, shape) {
+  if (!isPlainObject(shape)) {
+    throw new Error("Invalid input to safeExtend: expected a plain object");
+  }
+  return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
+}
+function merge(a, b) {
+  if (!b?._zod?.def) {
+    throw new Error("Invalid input to merge: expected an object schema. To merge a plain shape, use `.extend()`.");
+  }
+  if (a._zod.def.checks?.length) {
+    throw new Error(".merge() cannot be used on object schemas containing refinements. Use .safeExtend() instead.");
+  }
+  const newShape = {};
+  mirrorShape(newShape, a, Reflect.ownKeys(sourceShape(a)));
+  mirrorShape(newShape, b, Reflect.ownKeys(sourceShape(b)));
+  const def = mergeDefs(a._zod.def, {
+    shape: newShape,
+    get catchall() {
+      return b._zod.def.catchall;
+    },
+    checks: b._zod.def.checks ?? []
+  });
+  return clone(a, def);
+}
+function partial(Class, schema, mask, name = "partial") {
+  const currDef = schema._zod.def;
+  const checks = currDef.checks;
+  const hasChecks = checks && checks.length > 0;
+  if (hasChecks) {
+    throw new Error(`.${name}() cannot be used on object schemas containing refinements`);
+  }
+  const selected = mask ? new Set(maskedKeys(schema, mask)) : undefined;
+  const newShape = {};
+  mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)), Class && ((value, key) => selected && !selected.has(key) ? value : new Class({ type: "optional", innerType: value })));
+  return clone(schema, mergeDefs(schema._zod.def, { shape: newShape, checks: [] }));
+}
+function required(Class, schema, mask) {
+  const selected = mask ? new Set(maskedKeys(schema, mask)) : undefined;
+  const newShape = {};
+  mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)), (value, key) => selected && !selected.has(key) ? value : new Class({ type: "nonoptional", innerType: value }));
+  return clone(schema, mergeDefs(schema._zod.def, { shape: newShape }));
+}
+function aborted(x, startIndex = 0) {
+  if (x.aborted === true)
+    return true;
+  for (let i = startIndex;i < x.issues.length; i++) {
+    if (x.issues[i]?.continue !== true) {
+      return true;
+    }
+  }
+  return false;
+}
+function explicitlyAborted(x, startIndex = 0) {
+  if (x.aborted === true)
+    return true;
+  for (let i = startIndex;i < x.issues.length; i++) {
+    if (x.issues[i]?.continue === false) {
+      return true;
+    }
+  }
+  return false;
+}
+function prefixIssues(path, issues) {
+  return issues.map((iss) => {
+    var _a;
+    (_a = iss).path ?? (_a.path = []);
+    iss.path.unshift(path);
+    return iss;
+  });
+}
+function unwrapMessage(message) {
+  return typeof message === "string" ? message : message?.message;
+}
+function attachSchema(issues, start, inst) {
+  var _a;
+  for (let i = start;i < issues.length; i++) {
+    (_a = issues[i]).schema ?? (_a.schema = inst);
+  }
+}
+function finalizeIssue(iss, ctx, config) {
+  var _a;
+  const traits = iss.inst?._zod?.traits;
+  if (traits?.has("$ZodType")) {
+    if (traits.has("$ZodCheck"))
+      (_a = iss).schema ?? (_a.schema = iss.inst);
+    else
+      iss.schema = iss.inst;
+  }
+  const schemaError = iss.schema !== iss.inst ? iss.schema?._zod.def?.error : undefined;
+  const message = iss.message ? iss.message : unwrapMessage(iss.inst?._zod.def?.error?.(iss)) ?? unwrapMessage(schemaError?.(iss)) ?? unwrapMessage(ctx?.error?.(iss)) ?? unwrapMessage(config.customError?.(iss)) ?? unwrapMessage(config.localeError?.(iss)) ?? "Invalid input";
+  const full = {};
+  for (const k of Object.keys(iss)) {
+    if (k === "inst" || k === "schema" || k === "continue" || k === "input" || k === "__proto__")
+      continue;
+    full[k] = iss[k];
+  }
+  full.path ?? (full.path = []);
+  full.message = message;
+  if (ctx?.reportInput) {
+    full.input = iss.input;
+  }
+  return full;
+}
+var highSurrogate = /[\uD800-\uDBFF]/;
+function codePointLength(str) {
+  const units = str.length;
+  if (!highSurrogate.test(str))
+    return units;
+  let count = units;
+  for (let i = 0;i < units - 1; i++) {
+    if ((str.charCodeAt(i) & 64512) === 55296 && (str.charCodeAt(i + 1) & 64512) === 56320) {
+      count--;
+      i++;
+    }
+  }
+  return count;
+}
+function getLengthableOrigin(input) {
+  if (Array.isArray(input))
+    return "array";
+  if (typeof input === "string")
+    return "string";
+  return "unknown";
+}
+function parsedType(data) {
+  const t = typeof data;
+  switch (t) {
+    case "number": {
+      return Number.isNaN(data) ? "nan" : "number";
+    }
+    case "object": {
+      if (data === null) {
+        return "null";
+      }
+      if (Array.isArray(data)) {
+        return "array";
+      }
+      const obj = data;
+      if (obj && Object.getPrototypeOf(obj) !== Object.prototype && "constructor" in obj && obj.constructor) {
+        return obj.constructor.name;
+      }
+    }
+  }
+  return t;
+}
+function issue(...args) {
+  const [iss, input, inst] = args;
+  if (typeof iss === "string") {
+    return {
+      message: iss,
+      code: "custom",
+      input,
+      inst
+    };
+  }
+  return { ...iss };
+}
+function members(proto, table) {
+  for (const key in table) {
+    const desc = Object.getOwnPropertyDescriptor(table, key);
+    if (desc.get)
+      Object.defineProperty(proto, key, { ...desc, enumerable: false });
+    else
+      defineBound(proto, key, desc.value);
+  }
+}
+function own(inst, key, value, enumerable = true) {
+  Object.defineProperty(inst, key, { configurable: true, writable: true, enumerable, value });
+  return value;
+}
+function hide(inst, key, value) {
+  return own(inst, key, value, false);
+}
+function derived(computes, table) {
+  for (const key in computes) {
+    const compute = computes[key];
+    Object.defineProperty(table, key, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return own(this, key, compute(this));
+      },
+      set(value) {
+        own(this, key, value);
+      }
+    });
+  }
+  return table;
+}
+function defineBound(proto, key, fn) {
+  Object.defineProperty(proto, key, {
+    configurable: true,
+    get() {
+      return this == null ? fn : own(this, key, fn.bind(this));
+    },
+    set(value) {
+      own(this, key, value);
+    }
+  });
+}
+function claim(inst, sentinel) {
+  const proto = Object.getPrototypeOf(inst);
+  return sentinel in proto ? undefined : proto;
+}
+var installing;
+var broke = false;
+var breaker = {
+  configurable: true,
+  get() {
+    broke = true;
+    return;
+  }
+};
+function defineLazyInternal(inst, key, compute) {
+  const proto = Object.getPrototypeOf(inst._zod);
+  if (key in proto && installing !== inst._zod) {
+    installing = undefined;
+    return;
+  }
+  installing = inst._zod;
+  Object.defineProperty(proto, key, {
+    configurable: true,
+    get() {
+      Object.defineProperty(this, key, breaker);
+      const outer = broke;
+      broke = false;
+      try {
+        const value = compute(this);
+        if (broke)
+          delete this[key];
+        else
+          Object.defineProperty(this, key, { configurable: true, writable: true, value });
+        broke = broke || outer;
+        return value;
+      } catch (err) {
+        delete this[key];
+        broke = broke || outer;
+        throw err;
+      }
+    },
+    set(value) {
+      Object.defineProperty(this, key, { configurable: true, writable: true, value });
+    }
+  });
+}
+function installLazyProp(inst, key, make, enumerable) {
+  const proto = claim(inst, key);
+  if (!proto)
+    return;
+  Object.defineProperty(proto, key, {
+    configurable: true,
+    get() {
+      const desc = { configurable: true, writable: true, enumerable, value: undefined };
+      Object.defineProperty(this, key, desc);
+      desc.value = make(this);
+      Object.defineProperty(this, key, desc);
+      return desc.value;
+    },
+    set(value) {
+      Object.defineProperty(this, key, { configurable: true, writable: true, enumerable, value });
+    }
+  });
+}
+var CONSTANT_CATCH = "~constantCatch";
+function constantCatch(value) {
+  const fn = () => value;
+  fn[CONSTANT_CATCH] = true;
+  return fn;
+}
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/core.js
+var _a;
+var _zodDesc = { value: undefined, enumerable: false };
+var _E = "captureStackTrace" in Error ? Error : null;
+function newError(Definition) {
+  const E = _E;
+  if (E) {
+    const saved = E.stackTraceLimit;
+    if (typeof saved === "number") {
+      try {
+        E.stackTraceLimit = 0;
+      } catch {
+        _E = null;
+        return new Definition;
+      }
+      try {
+        return new Definition;
+      } finally {
+        E.stackTraceLimit = saved;
+      }
+    }
+  }
+  return new Definition;
+}
+function $constructor(name, initializer, proto, params) {
+  const zodProto = {};
+  function Internals(def) {
+    this.def = def;
+    this.constr = _;
+    this.traits = new Set;
+  }
+  Internals.prototype = zodProto;
+  const protoMembers = proto;
+  const initialized = protoMembers && new WeakSet;
+  function init(inst, def) {
+    if (!inst._zod) {
+      _zodDesc.value = new Internals(def);
+      try {
+        Object.defineProperty(inst, "_zod", _zodDesc);
+      } finally {
+        _zodDesc.value = undefined;
+      }
+    } else if (inst._zod.traits.has(name)) {
+      return;
+    }
+    inst._zod.traits.add(name);
+    initializer(inst, def);
+    if (initialized) {
+      const own = Object.getPrototypeOf(inst);
+      const ctorProto = inst._zod.constr.prototype;
+      let up = own;
+      while (up && up !== ctorProto)
+        up = Object.getPrototypeOf(up);
+      const target = up ?? own;
+      if (!initialized.has(target)) {
+        initialized.add(target);
+        members(target, protoMembers);
+      }
+    }
+    const proto = _.prototype;
+    for (const k in proto) {
+      if (!Object.prototype.hasOwnProperty.call(proto, k))
+        continue;
+      if (!(k in inst)) {
+        inst[k] = proto[k].bind(inst);
+      }
+    }
+  }
+  const Parent = params?.Parent ?? Object;
+
+  class Definition extends Parent {
+  }
+  Object.defineProperty(Definition, "name", { value: name });
+  function _(def) {
+    const inst = params?.Parent ? newError(Definition) : this;
+    init(inst, def);
+    const deferred = inst._zod.deferred;
+    if (deferred) {
+      for (const fn of deferred) {
+        fn();
+      }
+      inst._zod.deferred = undefined;
+    }
+    const pp = globalThis.__zod_globalConfig?.postProcessor;
+    if (pp)
+      pp(inst);
+    return inst;
+  }
+  Object.defineProperty(_, "init", { value: init });
+  Object.defineProperty(_, Symbol.hasInstance, {
+    value: (inst) => {
+      if (params?.Parent && inst instanceof params.Parent)
+        return true;
+      return inst?._zod?.traits?.has(name);
+    }
+  });
+  Object.defineProperty(_, "name", { value: name });
+  return _;
+}
+class $ZodAsyncError extends Error {
+  constructor() {
+    super(`Encountered Promise during synchronous parse. Use .parseAsync() instead.`);
+  }
+}
+
+class $ZodEncodeError extends Error {
+  constructor(name) {
+    super(`Encountered unidirectional transform during encode: ${name}`);
+    this.name = "ZodEncodeError";
+  }
+}
+(_a = globalThis).__zod_globalConfig ?? (_a.__zod_globalConfig = {});
+var globalConfig = globalThis.__zod_globalConfig;
+function config(newConfig) {
+  if (newConfig)
+    Object.assign(globalConfig, newConfig);
+  return globalConfig;
+}
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/errors.js
+function _getMessage() {
+  const internals = this._zod;
+  internals.message ?? (internals.message = JSON.stringify(internals.def, jsonStringifyReplacer, 2));
+  return internals.message;
+}
+function _setMessage(value) {
+  this._zod.message = value;
+}
+var _messageDesc = {
+  get: _getMessage,
+  set: _setMessage,
+  enumerable: true,
+  configurable: true
+};
+var _issuesDesc = { value: undefined, enumerable: false };
+var _installedToString = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
+var initializer = (inst, def) => {
+  inst.name = "$ZodError";
+  _issuesDesc.value = def;
+  Object.defineProperty(inst, "issues", _issuesDesc);
+  _issuesDesc.value = undefined;
+  Object.defineProperty(inst, "message", _messageDesc);
+  const proto = Object.getPrototypeOf(inst);
+  if (!_installedToString.has(proto)) {
+    _installedToString.add(proto);
+    Object.defineProperty(proto, "toString", {
+      configurable: true,
+      enumerable: false,
+      get() {
+        const value = () => this.message;
+        Object.defineProperty(this, "toString", { value, configurable: true, writable: true });
+        return value;
+      },
+      set(value) {
+        Object.defineProperty(this, "toString", { value, configurable: true, writable: true });
+      }
+    });
+  }
+};
+var $ZodError = $constructor("$ZodError", initializer);
+var $ZodRealError = $constructor("$ZodError", initializer, undefined, {
+  Parent: Error
+});
+function node(obj, key, make) {
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+    if (key === "__proto__") {
+      Object.defineProperty(obj, key, { value: make(), writable: true, enumerable: true, configurable: true });
+    } else {
+      obj[key] = make();
+    }
+  }
+  return obj[key];
+}
+function flattenError(error, mapper = (issue) => issue.message) {
+  const fieldErrors = {};
+  const formErrors = [];
+  for (const sub of error.issues) {
+    if (sub.path.length > 0) {
+      node(fieldErrors, sub.path[0], () => []).push(mapper(sub));
+    } else {
+      formErrors.push(mapper(sub));
+    }
+  }
+  return { formErrors, fieldErrors };
+}
+function formatError(error, mapper = (issue) => issue.message) {
+  const fieldErrors = { _errors: [] };
+  const processError = (error, path = []) => {
+    for (const issue of error.issues) {
+      if (issue.code === "invalid_union" && issue.errors.length) {
+        issue.errors.map((issues) => processError({ issues }, [...path, ...issue.path]));
+      } else if (issue.code === "invalid_key") {
+        processError({ issues: issue.issues }, [...path, ...issue.path]);
+      } else if (issue.code === "invalid_element") {
+        processError({ issues: issue.issues }, [...path, ...issue.path]);
+      } else {
+        const fullpath = [...path, ...issue.path];
+        if (fullpath.length === 0) {
+          fieldErrors._errors.push(mapper(issue));
+        } else {
+          let curr = fieldErrors;
+          let i = 0;
+          while (i < fullpath.length) {
+            const el = fullpath[i];
+            const terminal = i === fullpath.length - 1;
+            if (el === "_errors") {
+              if (terminal)
+                curr._errors.push(mapper(issue));
+              i++;
+              continue;
+            }
+            if (!Object.prototype.hasOwnProperty.call(curr, el)) {
+              Object.defineProperty(curr, el, {
+                value: { _errors: [] },
+                enumerable: true,
+                writable: true,
+                configurable: true
+              });
+            }
+            const node = curr[el];
+            if (terminal) {
+              node._errors.push(mapper(issue));
+            }
+            curr = node;
+            i++;
+          }
+        }
+      }
+    }
+  };
+  processError(error);
+  return fieldErrors;
+}
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/parse.js
+function finalizeParams(callee, params) {
+  return { callee: params?.callee ?? callee, Err: params?.Err };
+}
+var _parse = (_Err) => {
+  const fn = (schema, value, _ctx, _params) => {
+    const ctx = _ctx ? { ..._ctx, async: false } : { async: false };
+    const result = schema._zod.run({ value, issues: [] }, ctx);
+    if (result instanceof Promise) {
+      throw new $ZodAsyncError;
+    }
+    if (result.issues.length) {
+      const e = new (_params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
+      captureStackTrace(e, _params?.callee ?? fn);
+      throw e;
+    }
+    return result.value;
+  };
+  return fn;
+};
+var _parseAsync = (_Err) => {
+  const fn = async (schema, value, _ctx, params) => {
+    const ctx = _ctx ? { ..._ctx, async: true } : { async: true };
+    let result = schema._zod.run({ value, issues: [] }, ctx);
+    if (result instanceof Promise)
+      result = await result;
+    if (result.issues.length) {
+      const e = new (params?.Err ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
+      captureStackTrace(e, params?.callee ?? fn);
+      throw e;
+    }
+    return result.value;
+  };
+  return fn;
+};
+var _safeParse = (_Err) => (schema, value, _ctx) => {
+  const ctx = _ctx ? { ..._ctx, async: false } : { async: false };
+  const result = schema._zod.run({ value, issues: [] }, ctx);
+  if (result instanceof Promise) {
+    throw new $ZodAsyncError;
+  }
+  return result.issues.length ? failure(_Err, result.issues, ctx) : { success: true, data: result.value };
+};
+function failure(Err, issues, ctx) {
+  let error;
+  return {
+    success: false,
+    get error() {
+      if (!error) {
+        error = new Err(issues.map((iss) => finalizeIssue(iss, ctx, config())));
+        issues = undefined;
+        ctx = undefined;
+      }
+      return error;
+    },
+    set error(e) {
+      error = e;
+      issues = undefined;
+      ctx = undefined;
+    }
+  };
+}
+var _safeParseAsync = (_Err) => async (schema, value, _ctx) => {
+  const ctx = _ctx ? { ..._ctx, async: true } : { async: true };
+  let result = schema._zod.run({ value, issues: [] }, ctx);
+  if (result instanceof Promise)
+    result = await result;
+  return result.issues.length ? failure(_Err, result.issues, ctx) : { success: true, data: result.value };
+};
+var COMPILE_INVALID = /* @__PURE__ */ Symbol.for("zod.compile.invalid");
+var COMPILE_FALLBACK = /* @__PURE__ */ Symbol.for("zod.compile.fallback");
+var validate = (schema, value, _ctx) => {
+  const validator = schema._zod.bag.validator;
+  if (validator !== undefined) {
+    if (validator(value) !== COMPILE_INVALID)
+      return true;
+    if (validator.definite === true && _ctx === undefined)
+      return false;
+  }
+  return validateFallback(schema, value, _ctx);
+};
+function validateFallback(schema, value, _ctx) {
+  const ctx = _ctx ? { ..._ctx, async: false, abortEarly: true } : { async: false, abortEarly: true };
+  const fallbackRun = schema._zod.bag.fallbackRun;
+  let result;
+  if (fallbackRun) {
+    ctx[COMPILE_FALLBACK] = true;
+    result = fallbackRun({ value, issues: [] }, ctx);
+  } else {
+    result = schema._zod.run({ value, issues: [] }, ctx);
+  }
+  if (result instanceof Promise) {
+    throw new $ZodAsyncError;
+  }
+  return result.issues.length === 0;
+}
+var validateAsync = async (schema, value, _ctx) => {
+  const ctx = _ctx ? { ..._ctx, async: true, abortEarly: true } : { async: true, abortEarly: true };
+  let result = schema._zod.run({ value, issues: [] }, ctx);
+  if (result instanceof Promise)
+    result = await result;
+  return result.issues.length === 0;
+};
+var _encode = (_Err) => {
+  const parse = _parse(_Err);
+  const fn = (schema, value, _ctx, _params) => {
+    const ctx = _ctx ? { ..._ctx, direction: "backward" } : { direction: "backward" };
+    return parse(schema, value, ctx, finalizeParams(fn, _params));
+  };
+  return fn;
+};
+var _decode = (_Err) => {
+  const parse = _parse(_Err);
+  const fn = (schema, value, _ctx, _params) => {
+    return parse(schema, value, _ctx, finalizeParams(fn, _params));
+  };
+  return fn;
+};
+var _encodeAsync = (_Err) => {
+  const parseAsync = _parseAsync(_Err);
+  const fn = async (schema, value, _ctx, _params) => {
+    const ctx = _ctx ? { ..._ctx, direction: "backward" } : { direction: "backward" };
+    return await parseAsync(schema, value, ctx, finalizeParams(fn, _params));
+  };
+  return fn;
+};
+var _decodeAsync = (_Err) => {
+  const parseAsync = _parseAsync(_Err);
+  const fn = async (schema, value, _ctx, _params) => {
+    return await parseAsync(schema, value, _ctx, finalizeParams(fn, _params));
+  };
+  return fn;
+};
+var _safeEncode = (_Err) => (schema, value, _ctx) => {
+  const ctx = _ctx ? { ..._ctx, direction: "backward" } : { direction: "backward" };
+  return _safeParse(_Err)(schema, value, ctx);
+};
+var _safeDecode = (_Err) => (schema, value, _ctx) => {
+  return _safeParse(_Err)(schema, value, _ctx);
+};
+var _safeEncodeAsync = (_Err) => async (schema, value, _ctx) => {
+  const ctx = _ctx ? { ..._ctx, direction: "backward" } : { direction: "backward" };
+  return _safeParseAsync(_Err)(schema, value, ctx);
+};
+var _safeDecodeAsync = (_Err) => async (schema, value, _ctx) => {
+  return _safeParseAsync(_Err)(schema, value, _ctx);
+};
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/regexes.js
+var cuid = /^[cC][0-9a-z]{6,}$/;
+var cuid2 = /^[0-9a-z]+$/;
+var ulid = /^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$/;
+var xid = /^[0-9a-vA-V]{20}$/;
+var ksuid = /^[A-Za-z0-9]{27}$/;
+var nanoid = /^[a-zA-Z0-9_-]{21}$/;
+function nanoidOfLength(length) {
+  return new RegExp(`^[a-zA-Z0-9_-]{${length}}$`);
+}
+var duration = /^P(?:(\d+W)|(?!.*W)(?=\d|T\d)(\d+Y)?(\d+M)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+([.,]\d+)?S)?)?)$/;
+var guid = /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+var uuid = (version) => {
+  if (!version)
+    return /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/;
+  return new RegExp(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-${version}[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$`);
+};
+var email = /^(?:[A-Za-z0-9_'+\-]+\.)*[A-Za-z0-9_'+\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
+var _emoji = `^(?=[\\s\\S]*[\\p{Extended_Pictographic}\\p{Regional_Indicator}\\u20E3])[\\p{Extended_Pictographic}\\p{Emoji_Component}]+$`;
+function emoji() {
+  return new RegExp(_emoji, "u");
+}
+var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
+var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
+var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
+var cidrv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$/;
+var base64 = /^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$/;
+var base64url = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$/;
+var httpProtocol = /^https?$/;
+var e164 = /^\+[1-9]\d{6,14}$/;
+var dateSource = `(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))`;
+function anchor(source) {
+  return new RegExp(`^${source}$`);
+}
+var date = /* @__PURE__ */ anchor(dateSource);
+function timeSource(args) {
+  const hhmm = `(?:[01]\\d|2[0-3]):[0-5]\\d`;
+  const regex = typeof args.precision === "number" ? args.precision === -1 ? `${hhmm}` : args.precision === 0 ? `${hhmm}:[0-5]\\d` : `${hhmm}:[0-5]\\d\\.\\d{${args.precision}}` : args.seconds ? `${hhmm}:[0-5]\\d(?:\\.\\d+)?` : `${hhmm}(?::[0-5]\\d(?:\\.\\d+)?)?`;
+  return regex;
+}
+function time(args) {
+  return new RegExp(`^${timeSource(args)}$`);
+}
+function datetime(args) {
+  const opts = ["Z"];
+  if (args.offset)
+    opts.push(`([+-](?:[01]\\d|2[0-3]):[0-5]\\d)`);
+  const qualified = `${timeSource({ precision: args.precision, seconds: true })}(?:${opts.join("|")})`;
+  const timeRegex = args.local ? `${qualified}|${timeSource({ precision: args.precision })}` : qualified;
+  return new RegExp(`^${dateSource}T(?:${timeRegex})$`);
+}
+var anyString = /^[\s\S]{0,}$/;
+var integer = /^-?\d+$/;
+var number = /^-?\d+(?:\.\d+)?$/;
+var boolean = /^(?:true|false)$/i;
+var lowercase = /^[^A-Z]*$/;
+var uppercase = /^[^a-z]*$/;
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/checks.js
+var $ZodCheck = /* @__PURE__ */ $constructor("$ZodCheck", (inst, def) => {
+  var _a;
+  inst._zod ?? (inst._zod = {});
+  inst._zod.def = def;
+  (_a = inst._zod).onattach ?? (_a.onattach = []);
+});
+var _whenHasLength = (payload) => {
+  const val = payload.value;
+  return !nullish(val) && val.length !== undefined;
+};
+var numericOriginMap = {
+  number: "number",
+  bigint: "bigint",
+  object: "date"
+};
+var $ZodCheckLessThan = /* @__PURE__ */ $constructor("$ZodCheckLessThan", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  const origin = numericOriginMap[typeof def.value];
+  inst._zod.check = (payload) => {
+    if (def.inclusive ? payload.value <= def.value : payload.value < def.value) {
+      return;
+    }
+    payload.issues.push({
+      origin: numericOriginMap[typeof payload.value] ?? origin,
+      code: "too_big",
+      maximum: typeof def.value === "object" ? def.value.getTime() : def.value,
+      input: payload.value,
+      inclusive: def.inclusive,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckGreaterThan = /* @__PURE__ */ $constructor("$ZodCheckGreaterThan", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  const origin = numericOriginMap[typeof def.value];
+  inst._zod.check = (payload) => {
+    if (def.inclusive ? payload.value >= def.value : payload.value > def.value) {
+      return;
+    }
+    payload.issues.push({
+      origin: numericOriginMap[typeof payload.value] ?? origin,
+      code: "too_small",
+      minimum: typeof def.value === "object" ? def.value.getTime() : def.value,
+      input: payload.value,
+      inclusive: def.inclusive,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckMultipleOf = /* @__PURE__ */ $constructor("$ZodCheckMultipleOf", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (typeof payload.value !== typeof def.value)
+      throw new Error("Cannot mix number and bigint in multiple_of check.");
+    const isMultiple = typeof payload.value === "bigint" ? def.value !== BigInt(0) && payload.value % def.value === BigInt(0) : floatSafeRemainder(payload.value, def.value) === 0;
+    if (isMultiple)
+      return;
+    payload.issues.push({
+      origin: typeof payload.value,
+      code: "not_multiple_of",
+      divisor: def.value,
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckNumberFormat = /* @__PURE__ */ $constructor("$ZodCheckNumberFormat", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  def.format = def.format || "float64";
+  const isInt = def.format?.includes("int");
+  const origin = isInt ? "int" : "number";
+  const [minimum, maximum] = NUMBER_FORMAT_RANGES[def.format];
+  inst._zod.check = (payload) => {
+    const input = payload.value;
+    if (isInt) {
+      if (!Number.isInteger(input)) {
+        payload.issues.push({
+          expected: origin,
+          format: def.format,
+          code: "invalid_type",
+          continue: false,
+          input,
+          inst
+        });
+        return;
+      }
+      if (!Number.isSafeInteger(input)) {
+        if (input > 0) {
+          payload.issues.push({
+            input,
+            code: "too_big",
+            maximum: Number.MAX_SAFE_INTEGER,
+            note: "Integers must be within the safe integer range.",
+            inst,
+            origin,
+            inclusive: true,
+            continue: !def.abort
+          });
+        } else {
+          payload.issues.push({
+            input,
+            code: "too_small",
+            minimum: Number.MIN_SAFE_INTEGER,
+            note: "Integers must be within the safe integer range.",
+            inst,
+            origin,
+            inclusive: true,
+            continue: !def.abort
+          });
+        }
+        return;
+      }
+    }
+    if (input < minimum) {
+      payload.issues.push({
+        origin: "number",
+        input,
+        code: "too_small",
+        minimum,
+        inclusive: true,
+        inst,
+        continue: !def.abort
+      });
+    }
+    if (input > maximum) {
+      payload.issues.push({
+        origin: "number",
+        input,
+        code: "too_big",
+        maximum,
+        inclusive: true,
+        inst,
+        continue: !def.abort
+      });
+    }
+  };
+});
+var $ZodCheckMaxLength = /* @__PURE__ */ $constructor("$ZodCheckMaxLength", (inst, def) => {
+  var _a;
+  $ZodCheck.init(inst, def);
+  (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
+  inst._zod.check = (payload) => {
+    const input = payload.value;
+    const units = input.length;
+    const length = typeof input === "string" && units > def.maximum ? codePointLength(input) : units;
+    if (length <= def.maximum)
+      return;
+    const origin = getLengthableOrigin(input);
+    payload.issues.push({
+      origin,
+      code: "too_big",
+      maximum: def.maximum,
+      inclusive: true,
+      input,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckMinLength = /* @__PURE__ */ $constructor("$ZodCheckMinLength", (inst, def) => {
+  var _a;
+  $ZodCheck.init(inst, def);
+  (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
+  inst._zod.check = (payload) => {
+    const input = payload.value;
+    const units = input.length;
+    const length = typeof input === "string" && units >= def.minimum && units < def.minimum * 2 ? codePointLength(input) : units;
+    if (length >= def.minimum)
+      return;
+    const origin = getLengthableOrigin(input);
+    payload.issues.push({
+      origin,
+      code: "too_small",
+      minimum: def.minimum,
+      inclusive: true,
+      input,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckLengthEquals = /* @__PURE__ */ $constructor("$ZodCheckLengthEquals", (inst, def) => {
+  var _a;
+  $ZodCheck.init(inst, def);
+  (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
+  inst._zod.check = (payload) => {
+    const input = payload.value;
+    const units = input.length;
+    const length = typeof input === "string" && units >= def.length && units <= def.length * 2 ? codePointLength(input) : units;
+    if (length === def.length)
+      return;
+    const origin = getLengthableOrigin(input);
+    const tooBig = length > def.length;
+    payload.issues.push({
+      origin,
+      ...tooBig ? { code: "too_big", maximum: def.length } : { code: "too_small", minimum: def.length },
+      inclusive: true,
+      exact: true,
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckStringFormat = /* @__PURE__ */ $constructor("$ZodCheckStringFormat", (inst, def) => {
+  var _a, _b;
+  $ZodCheck.init(inst, def);
+  if (def.pattern)
+    (_a = inst._zod).check ?? (_a.check = (payload) => {
+      def.pattern.lastIndex = 0;
+      if (def.pattern.test(payload.value))
+        return;
+      payload.issues.push({
+        origin: "string",
+        code: "invalid_format",
+        format: def.format,
+        input: payload.value,
+        ...def.pattern ? { pattern: def.pattern.toString() } : {},
+        inst,
+        continue: !def.abort
+      });
+    });
+  else
+    (_b = inst._zod).check ?? (_b.check = () => {});
+});
+var $ZodCheckRegex = /* @__PURE__ */ $constructor("$ZodCheckRegex", (inst, def) => {
+  $ZodCheckStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    def.pattern.lastIndex = 0;
+    if (def.pattern.test(payload.value))
+      return;
+    payload.issues.push({
+      origin: "string",
+      code: "invalid_format",
+      format: "regex",
+      input: payload.value,
+      pattern: def.pattern.toString(),
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckLowerCase = /* @__PURE__ */ $constructor("$ZodCheckLowerCase", (inst, def) => {
+  def.pattern ?? (def.pattern = lowercase);
+  $ZodCheckStringFormat.init(inst, def);
+});
+var $ZodCheckUpperCase = /* @__PURE__ */ $constructor("$ZodCheckUpperCase", (inst, def) => {
+  def.pattern ?? (def.pattern = uppercase);
+  $ZodCheckStringFormat.init(inst, def);
+});
+var $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  const escapedRegex = escapeRegex(def.includes);
+  const pattern = new RegExp(typeof def.position === "number" ? `^.{${def.position},}${escapedRegex}` : escapedRegex);
+  def.pattern = pattern;
+  inst._zod.check = (payload) => {
+    if (payload.value.includes(def.includes, def.position))
+      return;
+    payload.issues.push({
+      origin: "string",
+      code: "invalid_format",
+      format: "includes",
+      includes: def.includes,
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  const pattern = new RegExp(`^${escapeRegex(def.prefix)}.*`);
+  def.pattern ?? (def.pattern = pattern);
+  inst._zod.check = (payload) => {
+    if (payload.value.startsWith(def.prefix))
+      return;
+    payload.issues.push({
+      origin: "string",
+      code: "invalid_format",
+      format: "starts_with",
+      prefix: def.prefix,
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckEndsWith = /* @__PURE__ */ $constructor("$ZodCheckEndsWith", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  const pattern = new RegExp(`.*${escapeRegex(def.suffix)}$`);
+  def.pattern ?? (def.pattern = pattern);
+  inst._zod.check = (payload) => {
+    if (payload.value.endsWith(def.suffix))
+      return;
+    payload.issues.push({
+      origin: "string",
+      code: "invalid_format",
+      format: "ends_with",
+      suffix: def.suffix,
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodCheckOverwrite = /* @__PURE__ */ $constructor("$ZodCheckOverwrite", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  inst._zod.check = (payload) => {
+    payload.value = def.tx(payload.value);
+  };
+});
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/doc.js
+class Doc {
+  constructor(args = [], closed = {}) {
+    this.content = [];
+    this.indent = 0;
+    this.args = args;
+    this.closed = closed;
+  }
+  indented(fn) {
+    this.indent += 1;
+    try {
+      fn(this);
+    } finally {
+      this.indent -= 1;
+    }
+  }
+  write(arg) {
+    if (typeof arg === "function") {
+      arg(this, { execution: "sync" });
+      arg(this, { execution: "async" });
+      return;
+    }
+    const content = arg;
+    const lines = content.split(`
+`).filter((x) => x);
+    const minIndent = Math.min(...lines.map((x) => x.length - x.trimStart().length));
+    const dedented = lines.map((x) => x.slice(minIndent)).map((x) => " ".repeat(this.indent * 2) + x);
+    for (const line of dedented) {
+      this.content.push(line);
+    }
+  }
+  compile() {
+    const F = Function;
+    const content = this?.content ?? [``];
+    const factory = new F(...Object.keys(this.closed), `return function (${this.args.join(", ")}) {
+${content.join(`
+`)}
+};`);
+    return factory(...Object.values(this.closed));
+  }
+}
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/versions.js
+var version = {
+  major: 4,
+  minor: 6,
+  patch: 5
+};
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/schemas.js
+var $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
+  var _a;
+  inst ?? (inst = {});
+  inst._zod.def = def;
+  inst._zod.bag = inst._zod.bag || {};
+  inst._zod.version = version;
+  const defChecks = inst._zod.def.checks;
+  const checks = inst._zod.traits.has("$ZodCheck") ? [inst, ...defChecks ?? []] : defChecks?.length ? [...defChecks] : [];
+  for (const ch of checks) {
+    for (const fn of ch._zod.onattach) {
+      fn(inst);
+    }
+  }
+  if (checks.length === 0) {
+    (_a = inst._zod).deferred ?? (_a.deferred = []);
+    inst._zod.deferred?.push(() => {
+      inst._zod.run = inst._zod.parse;
+    });
+  } else {
+    const runChecks = (payload, checks, ctx) => {
+      if (payload.memo)
+        return payload;
+      let isAborted = aborted(payload);
+      let asyncResult;
+      for (const ch of checks) {
+        if (ch._zod.def.when) {
+          if (explicitlyAborted(payload))
+            continue;
+          const shouldRun = ch._zod.def.when(payload);
+          if (!shouldRun)
+            continue;
+        } else if (isAborted) {
+          continue;
+        }
+        const currLen = payload.issues.length;
+        const _ = ch._zod.check(payload);
+        if (_ instanceof Promise && ctx?.async === false) {
+          throw new $ZodAsyncError;
+        }
+        if (asyncResult || _ instanceof Promise) {
+          asyncResult = (asyncResult ?? Promise.resolve()).then(async () => {
+            await _;
+            const nextLen = payload.issues.length;
+            if (nextLen === currLen)
+              return;
+            attachSchema(payload.issues, currLen, inst);
+            if (!isAborted)
+              isAborted = aborted(payload, currLen);
+          });
+        } else {
+          const nextLen = payload.issues.length;
+          if (nextLen === currLen)
+            continue;
+          attachSchema(payload.issues, currLen, inst);
+          if (!isAborted)
+            isAborted = aborted(payload, currLen);
+        }
+      }
+      if (asyncResult) {
+        return asyncResult.then(() => {
+          return payload;
+        });
+      }
+      return payload;
+    };
+    const handleCanaryResult = (canary, payload, ctx) => {
+      if (aborted(canary)) {
+        canary.aborted = true;
+        return canary;
+      }
+      const checkResult = runChecks(payload, checks, ctx);
+      if (checkResult instanceof Promise) {
+        if (ctx.async === false)
+          throw new $ZodAsyncError;
+        return checkResult.then((checkResult) => inst._zod.parse(checkResult, ctx));
+      }
+      return inst._zod.parse(checkResult, ctx);
+    };
+    inst._zod.run = (payload, ctx) => {
+      if (ctx.skipChecks) {
+        return inst._zod.parse(payload, ctx);
+      }
+      if (ctx.direction === "backward") {
+        const canary = inst._zod.parse({ value: payload.value, issues: [] }, { ...ctx, skipChecks: true });
+        if (canary instanceof Promise) {
+          return canary.then((canary) => {
+            return handleCanaryResult(canary, payload, ctx);
+          });
+        }
+        return handleCanaryResult(canary, payload, ctx);
+      }
+      const result = inst._zod.parse(payload, ctx);
+      if (result instanceof Promise) {
+        if (ctx.async === false)
+          throw new $ZodAsyncError;
+        return result.then((result) => runChecks(result, checks, ctx));
+      }
+      return runChecks(result, checks, ctx);
+    };
+  }
+}, {
+  get "~standard"() {
+    return hide(this, "~standard", standardProps(this));
+  },
+  set "~standard"(value) {
+    own(this, "~standard", value);
+  }
+});
+var toStandardResult = (r, ctx) => r.issues.length ? { issues: r.issues.map((iss) => finalizeIssue(iss, ctx, config())) } : { value: r.value };
+async function validateAsync2(inst, value) {
+  const ctx = { async: true };
+  return toStandardResult(await inst._zod.run({ value, issues: [] }, ctx), ctx);
+}
+function standardProps(inst) {
+  return {
+    validate: (value) => {
+      const ctx = { async: false };
+      try {
+        const r = inst._zod.run({ value, issues: [] }, ctx);
+        if (!(r instanceof Promise))
+          return toStandardResult(r, ctx);
+      } catch (_) {}
+      return validateAsync2(inst, value);
+    },
+    vendor: "zod",
+    version: 1
+  };
+}
+var $ZodString = /* @__PURE__ */ $constructor("$ZodString", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.pattern = def.pattern ?? anyString;
+  inst._zod.parse = (payload, _) => {
+    if (def.coerce)
+      try {
+        payload.value = String(payload.value);
+      } catch (_) {}
+    if (typeof payload.value === "string")
+      return payload;
+    payload.issues.push({
+      expected: "string",
+      code: "invalid_type",
+      input: payload.value,
+      inst
+    });
+    return payload;
+  };
+});
+var $ZodStringFormat = /* @__PURE__ */ $constructor("$ZodStringFormat", (inst, def) => {
+  $ZodCheckStringFormat.init(inst, def);
+  $ZodString.init(inst, def);
+});
+var $ZodGUID = /* @__PURE__ */ $constructor("$ZodGUID", (inst, def) => {
+  def.pattern ?? (def.pattern = guid);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodUUID = /* @__PURE__ */ $constructor("$ZodUUID", (inst, def) => {
+  if (def.version) {
+    const versionMap = {
+      v1: 1,
+      v2: 2,
+      v3: 3,
+      v4: 4,
+      v5: 5,
+      v6: 6,
+      v7: 7,
+      v8: 8
+    };
+    const v = versionMap[def.version];
+    if (v === undefined)
+      throw new Error(`Invalid UUID version: "${def.version}"`);
+    def.pattern ?? (def.pattern = uuid(v));
+  } else
+    def.pattern ?? (def.pattern = uuid());
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodEmail = /* @__PURE__ */ $constructor("$ZodEmail", (inst, def) => {
+  def.pattern ?? (def.pattern = email);
+  $ZodStringFormat.init(inst, def);
+});
+var URL_BAD_FORMAT = 1;
+var URL_UNPARSEABLE = 2;
+function canParseURL(input) {
+  try {
+    if (typeof URL !== "undefined" && typeof URL.canParse === "function")
+      return URL.canParse(input);
+    new URL(input);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function validateURL(trimmed, def) {
+  if (!("normalize" in def) && !("hostname" in def) && !("protocol" in def)) {
+    return canParseURL(trimmed) || URL_UNPARSEABLE;
+  }
+  return parseURLObject(trimmed, def);
+}
+function parseURLObject(trimmed, def) {
+  if (!def.normalize && def.protocol?.source === httpProtocol.source && !/^https?:\/\//i.test(trimmed)) {
+    return URL_BAD_FORMAT;
+  }
+  try {
+    if (typeof URL !== "undefined") {
+      const URLStatic = URL;
+      if (typeof URLStatic.parse === "function")
+        return URLStatic.parse(trimmed) ?? URL_UNPARSEABLE;
+    }
+    return new URL(trimmed);
+  } catch {
+    return URL_UNPARSEABLE;
+  }
+}
+var asciiTabOrNewline = /[\t\n\r]/g;
+function stripTabAndNewline(value) {
+  return value.replace(asciiTabOrNewline, "");
+}
+function urlHostnameOk(url, hostname) {
+  hostname.lastIndex = 0;
+  return hostname.test(url.hostname);
+}
+function urlProtocolOk(url, protocol) {
+  protocol.lastIndex = 0;
+  return protocol.test(url.protocol.endsWith(":") ? url.protocol.slice(0, -1) : url.protocol);
+}
+var $ZodURL = /* @__PURE__ */ $constructor("$ZodURL", (inst, def) => {
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    try {
+      const trimmed = payload.value.trim();
+      const url = validateURL(trimmed, def);
+      if (url === URL_BAD_FORMAT) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid URL format",
+          input: payload.value,
+          inst,
+          continue: !def.abort
+        });
+        return;
+      }
+      if (url === URL_UNPARSEABLE) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          input: payload.value,
+          inst,
+          continue: !def.abort
+        });
+        return;
+      }
+      if (url === true) {
+        payload.value = stripTabAndNewline(trimmed);
+        return;
+      }
+      if (def.hostname && !urlHostnameOk(url, def.hostname)) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid hostname",
+          pattern: def.hostname.source,
+          input: payload.value,
+          inst,
+          continue: !def.abort
+        });
+      }
+      if (def.protocol && !urlProtocolOk(url, def.protocol)) {
+        payload.issues.push({
+          code: "invalid_format",
+          format: "url",
+          note: "Invalid protocol",
+          pattern: def.protocol.source,
+          input: payload.value,
+          inst,
+          continue: !def.abort
+        });
+      }
+      payload.value = def.normalize ? url.href : stripTabAndNewline(trimmed);
+      return;
+    } catch (_) {
+      payload.issues.push({
+        code: "invalid_format",
+        format: "url",
+        input: payload.value,
+        inst,
+        continue: !def.abort
+      });
+    }
+  };
+});
+var $ZodEmoji = /* @__PURE__ */ $constructor("$ZodEmoji", (inst, def) => {
+  def.pattern ?? (def.pattern = emoji());
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodNanoID = /* @__PURE__ */ $constructor("$ZodNanoID", (inst, def) => {
+  if (def.length !== undefined && (!Number.isInteger(def.length) || def.length < 1))
+    throw new Error(`Invalid nanoid length: ${def.length}`);
+  def.pattern ?? (def.pattern = def.length === undefined ? nanoid : nanoidOfLength(def.length));
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodCUID = /* @__PURE__ */ $constructor("$ZodCUID", (inst, def) => {
+  def.pattern ?? (def.pattern = cuid);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodCUID2 = /* @__PURE__ */ $constructor("$ZodCUID2", (inst, def) => {
+  def.pattern ?? (def.pattern = cuid2);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodULID = /* @__PURE__ */ $constructor("$ZodULID", (inst, def) => {
+  def.pattern ?? (def.pattern = ulid);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodXID = /* @__PURE__ */ $constructor("$ZodXID", (inst, def) => {
+  def.pattern ?? (def.pattern = xid);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodKSUID = /* @__PURE__ */ $constructor("$ZodKSUID", (inst, def) => {
+  def.pattern ?? (def.pattern = ksuid);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodISODateTime = /* @__PURE__ */ $constructor("$ZodISODateTime", (inst, def) => {
+  def.pattern ?? (def.pattern = datetime(def));
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodISODate = /* @__PURE__ */ $constructor("$ZodISODate", (inst, def) => {
+  def.pattern ?? (def.pattern = date);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodISOTime = /* @__PURE__ */ $constructor("$ZodISOTime", (inst, def) => {
+  def.pattern ?? (def.pattern = time(def));
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodISODuration = /* @__PURE__ */ $constructor("$ZodISODuration", (inst, def) => {
+  def.pattern ?? (def.pattern = duration);
+  $ZodStringFormat.init(inst, def);
+});
+var $ZodIPv4 = /* @__PURE__ */ $constructor("$ZodIPv4", (inst, def) => {
+  def.pattern ?? (def.pattern = ipv4);
+  $ZodStringFormat.init(inst, def);
+});
+var ipv6Alphabet = /^[0-9a-fA-F:.]+$/;
+function isValidIPv6(value) {
+  if (!ipv6Alphabet.test(value))
+    return false;
+  return canParseURL(`http://[${value}]`);
+}
+var $ZodIPv6 = /* @__PURE__ */ $constructor("$ZodIPv6", (inst, def) => {
+  def.pattern ?? (def.pattern = ipv6);
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (!isValidIPv6(payload.value)) {
+      payload.issues.push({
+        code: "invalid_format",
+        format: "ipv6",
+        input: payload.value,
+        inst,
+        continue: !def.abort
+      });
+    }
+  };
+});
+var $ZodCIDRv4 = /* @__PURE__ */ $constructor("$ZodCIDRv4", (inst, def) => {
+  def.pattern ?? (def.pattern = cidrv4);
+  $ZodStringFormat.init(inst, def);
+});
+function isValidCIDRv6(value) {
+  const parts = value.split("/");
+  if (parts.length !== 2)
+    return false;
+  const [address, prefix] = parts;
+  if (!prefix)
+    return false;
+  const prefixNum = Number(prefix);
+  if (`${prefixNum}` !== prefix)
+    return false;
+  if (prefixNum < 0 || prefixNum > 128)
+    return false;
+  return isValidIPv6(address);
+}
+var $ZodCIDRv6 = /* @__PURE__ */ $constructor("$ZodCIDRv6", (inst, def) => {
+  def.pattern ?? (def.pattern = cidrv6);
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (!isValidCIDRv6(payload.value)) {
+      payload.issues.push({
+        code: "invalid_format",
+        format: "cidrv6",
+        input: payload.value,
+        inst,
+        continue: !def.abort
+      });
+    }
+  };
+});
+function isValidBase64(data) {
+  if (data === "")
+    return true;
+  if (/\s/.test(data))
+    return false;
+  if (data.length % 4 !== 0)
+    return false;
+  try {
+    atob(data);
+    return true;
+  } catch {
+    return false;
+  }
+}
+var base64Charset = /^[0-9a-zA-Z+/]*={0,2}$/;
+var $ZodBase64 = /* @__PURE__ */ $constructor("$ZodBase64", (inst, def) => {
+  def.pattern ?? (def.pattern = base64Charset);
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (isValidBase64(payload.value))
+      return;
+    payload.issues.push({
+      code: "invalid_format",
+      format: "base64",
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var base64urlCharset = /^[A-Za-z0-9_-]*$/;
+function isValidBase64URL(data) {
+  if (!base64urlCharset.test(data))
+    return false;
+  const base64 = data.replace(/[-_]/g, (c) => c === "-" ? "+" : "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  return isValidBase64(padded);
+}
+var $ZodBase64URL = /* @__PURE__ */ $constructor("$ZodBase64URL", (inst, def) => {
+  def.pattern ?? (def.pattern = base64urlCharset);
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (isValidBase64URL(payload.value))
+      return;
+    payload.issues.push({
+      code: "invalid_format",
+      format: "base64url",
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodE164 = /* @__PURE__ */ $constructor("$ZodE164", (inst, def) => {
+  def.pattern ?? (def.pattern = e164);
+  $ZodStringFormat.init(inst, def);
+});
+function isValidJWT(token, algorithm = null) {
+  try {
+    const tokensParts = token.split(".");
+    if (tokensParts.length !== 3)
+      return false;
+    const [header] = tokensParts;
+    if (!header)
+      return false;
+    const parsedHeader = JSON.parse(atob(header));
+    if ("typ" in parsedHeader && parsedHeader?.typ !== "JWT")
+      return false;
+    if (!parsedHeader.alg)
+      return false;
+    if (algorithm && (!("alg" in parsedHeader) || parsedHeader.alg !== algorithm))
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+var $ZodJWT = /* @__PURE__ */ $constructor("$ZodJWT", (inst, def) => {
+  $ZodStringFormat.init(inst, def);
+  inst._zod.check = (payload) => {
+    if (isValidJWT(payload.value, def.alg))
+      return;
+    payload.issues.push({
+      code: "invalid_format",
+      format: "jwt",
+      input: payload.value,
+      inst,
+      continue: !def.abort
+    });
+  };
+});
+var $ZodNumber = /* @__PURE__ */ $constructor("$ZodNumber", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.pattern = number;
+  inst._zod.parse = (payload, _ctx) => {
+    if (def.coerce)
+      try {
+        payload.value = Number(payload.value);
+      } catch (_) {}
+    const input = payload.value;
+    if (typeof input === "number" && !Number.isNaN(input) && Number.isFinite(input)) {
+      return payload;
+    }
+    const received = typeof input === "number" ? Number.isNaN(input) ? "NaN" : !Number.isFinite(input) ? String(input) : undefined : undefined;
+    payload.issues.push({
+      expected: "number",
+      code: "invalid_type",
+      input,
+      inst,
+      ...received ? { received } : {}
+    });
+    return payload;
+  };
+});
+var $ZodNumberFormat = /* @__PURE__ */ $constructor("$ZodNumberFormat", (inst, def) => {
+  $ZodCheckNumberFormat.init(inst, def);
+  $ZodNumber.init(inst, def);
+});
+var $ZodBoolean = /* @__PURE__ */ $constructor("$ZodBoolean", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.pattern = boolean;
+  inst._zod.parse = (payload, _ctx) => {
+    if (def.coerce)
+      try {
+        payload.value = Boolean(payload.value);
+      } catch (_) {}
+    const input = payload.value;
+    if (typeof input === "boolean")
+      return payload;
+    payload.issues.push({
+      expected: "boolean",
+      code: "invalid_type",
+      input,
+      inst
+    });
+    return payload;
+  };
+});
+var $ZodUnknown = /* @__PURE__ */ $constructor("$ZodUnknown", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.parse = (payload) => payload;
+});
+var $ZodNever = /* @__PURE__ */ $constructor("$ZodNever", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.parse = (payload, _ctx) => {
+    payload.issues.push({
+      expected: "never",
+      code: "invalid_type",
+      input: payload.value,
+      inst
+    });
+    return payload;
+  };
+});
+function handleArrayResult(result, final, index) {
+  if (result.issues.length) {
+    final.issues.push(...prefixIssues(index, result.issues));
+  }
+  final.value[index] = result.value;
+}
+var $ZodArray = /* @__PURE__ */ $constructor("$ZodArray", (inst, def) => {
+  $ZodType.init(inst, def);
+  const memo = globalConfig.memoizer;
+  memo?.attach(inst);
+  inst._zod.parse = (payload, ctx) => {
+    const input = payload.value;
+    if (!Array.isArray(input)) {
+      payload.issues.push({
+        expected: "array",
+        code: "invalid_type",
+        input,
+        inst
+      });
+      return payload;
+    }
+    payload.value = memo ? memo.alloc(inst, payload, Array(input.length), ctx) : Array(input.length);
+    const proms = [];
+    const abortEarly = ctx?.abortEarly;
+    for (let i = 0;i < input.length; i++) {
+      const item = input[i];
+      const result = def.element._zod.run({
+        value: item,
+        issues: []
+      }, ctx);
+      if (result instanceof Promise) {
+        proms.push(result.then((result) => handleArrayResult(result, payload, i)));
+      } else {
+        handleArrayResult(result, payload, i);
+        if (abortEarly && result.issues.length !== 0 && aborted(result))
+          break;
+      }
+    }
+    if (proms.length) {
+      return Promise.all(proms).then(() => payload);
+    }
+    return payload;
+  };
+});
+function handlePropertyResult(result, final, key, input, optin, optout) {
+  const isPresent = key in input;
+  const isOptionalOut = optout === "optional";
+  if (!isPresent && isOptionalOut && optin === "optional") {
+    return;
+  }
+  if (result.issues.length) {
+    if (optin !== undefined && isOptionalOut && !isPresent) {
+      return;
+    }
+    final.issues.push(...prefixIssues(key, result.issues));
+  }
+  if (!isPresent && optin === undefined) {
+    if (!result.issues.length) {
+      final.issues.push({
+        code: "invalid_type",
+        expected: "nonoptional",
+        input: undefined,
+        path: [key]
+      });
+    }
+    return;
+  }
+  if (result.value === undefined) {
+    if (isPresent || optin === "defaulted" && !isOptionalOut) {
+      final.value[key] = undefined;
+    }
+  } else {
+    final.value[key] = result.value;
+  }
+}
+var NO_SYMBOL_KEYS = [];
+function normalizeDef(def) {
+  const keys = Object.keys(def.shape);
+  const ownSymbols = Object.getOwnPropertySymbols(def.shape);
+  const symbolKeys = ownSymbols.length ? ownSymbols : NO_SYMBOL_KEYS;
+  const allKeys = symbolKeys.length ? [...keys, ...symbolKeys] : keys;
+  for (const k of allKeys) {
+    if (!def.shape?.[k]?._zod?.traits?.has("$ZodType")) {
+      throw new Error(`Invalid element at key "${String(k)}": expected a Zod schema`);
+    }
+  }
+  const okeys = optionalKeys(def.shape);
+  return {
+    ...def,
+    allKeys,
+    symbolKeys,
+    keySet: new Set(keys),
+    numKeys: keys.length,
+    optionalKeys: new Set(okeys)
+  };
+}
+function handleCatchall(proms, input, payload, ctx, def, inst, abortEarly) {
+  const unrecognized = [];
+  const keySet = def.keySet;
+  const _catchall = def.catchall._zod;
+  const t = _catchall.def.type;
+  const optin = _catchall.optin;
+  const optout = _catchall.optout;
+  let seen = 0;
+  for (const key in input) {
+    if (abortEarly && payload.issues.length !== seen) {
+      if (aborted(payload, seen))
+        break;
+      seen = payload.issues.length;
+    }
+    if (keySet.has(key))
+      continue;
+    if (key === "__proto__") {
+      if (t === "never")
+        unrecognized.push(key);
+      continue;
+    }
+    if (t === "never") {
+      unrecognized.push(key);
+      continue;
+    }
+    const r = _catchall.run({ value: input[key], issues: [] }, ctx);
+    if (r instanceof Promise) {
+      proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, optin, optout)));
+    } else {
+      handlePropertyResult(r, payload, key, input, optin, optout);
+    }
+  }
+  if (unrecognized.length) {
+    payload.issues.push({
+      code: "unrecognized_keys",
+      keys: unrecognized,
+      input,
+      inst,
+      continue: true
+    });
+  }
+  if (!proms.length)
+    return payload;
+  return Promise.all(proms).then(() => {
+    return payload;
+  });
+}
+var $ZodObject = /* @__PURE__ */ $constructor("$ZodObject", (inst, def) => {
+  $ZodType.init(inst, def);
+  const desc = Object.getOwnPropertyDescriptor(def, "shape");
+  const sh = desc?.get ? desc.get.raw : def.shape ?? {};
+  if (sh) {
+    const get = () => {
+      const newSh = { ...sh };
+      Object.defineProperty(def, "shape", { value: newSh });
+      get.raw = newSh;
+      return newSh;
+    };
+    get.raw = sh;
+    Object.defineProperty(def, "shape", { get });
+  }
+  const _normalized = cached(() => normalizeDef(def));
+  defineLazyInternal(inst, "propValues", (zod) => {
+    const shape = zod.def.shape;
+    const propValues = {};
+    for (const key in shape) {
+      const field = shape[key]._zod;
+      if (field.values) {
+        if (!Object.prototype.hasOwnProperty.call(propValues, key)) {
+          assignProp(propValues, key, new Set);
+        }
+        for (const v of field.values)
+          propValues[key].add(v);
+        if (field.optin !== undefined)
+          propValues[key].add(undefined);
+      }
+    }
+    return propValues;
+  });
+  const isObject2 = isObject;
+  const catchall = def.catchall;
+  let value;
+  const memo = globalConfig.memoizer;
+  memo?.attach(inst);
+  inst._zod.parse = (payload, ctx) => {
+    value ?? (value = _normalized.value);
+    const input = payload.value;
+    if (!isObject2(input)) {
+      payload.issues.push({
+        expected: "object",
+        code: "invalid_type",
+        input,
+        inst
+      });
+      return payload;
+    }
+    payload.value = memo ? memo.alloc(inst, payload, {}, ctx) : {};
+    const proms = [];
+    const shape = value.shape;
+    const abortEarly = ctx?.abortEarly;
+    let seen = payload.issues.length;
+    for (const key of value.allKeys) {
+      if (abortEarly && payload.issues.length !== seen) {
+        if (aborted(payload, seen))
+          break;
+        seen = payload.issues.length;
+      }
+      if (key === "__proto__")
+        continue;
+      const el = shape[key];
+      const optin = el._zod.optin;
+      const optout = el._zod.optout;
+      const r = el._zod.run({ value: input[key], issues: [] }, ctx);
+      if (r instanceof Promise) {
+        proms.push(r.then((r) => handlePropertyResult(r, payload, key, input, optin, optout)));
+      } else {
+        handlePropertyResult(r, payload, key, input, optin, optout);
+      }
+    }
+    if (!catchall) {
+      return proms.length ? Promise.all(proms).then(() => payload) : payload;
+    }
+    return handleCatchall(proms, input, payload, ctx, _normalized.value, inst, abortEarly === true);
+  };
+});
+var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) => {
+  $ZodObject.init(inst, def);
+  const superParse = inst._zod.parse;
+  const _normalized = cached(() => normalizeDef(def));
+  const memo = globalConfig.memoizer;
+  const generateFastpass = (shape) => {
+    const normalized = _normalized.value;
+    const syms = normalized.symbolKeys;
+    const doc = new Doc(["payload", "ctx"], { shape, inst, memo, syms });
+    const parseStr = (k) => `shape[${k}]._zod.run({ value: input[${k}], issues: [] }, ctx)`;
+    const prefixStr = (id, k) => `
+          let ${id}_ab = false;
+          for (let i = 0; i < ${id}.issues.length; i++) {
+            const iss = ${id}.issues[i];
+            iss.path = iss.path ? [${k}, ...iss.path] : [${k}];
+            payload.issues.push(iss);
+            if (iss.continue !== true) ${id}_ab = true;
+          }
+          if (${id}_ab && ctx && ctx.abortEarly) {
+            payload.value = newResult;
+            return payload;
+          }`;
+    doc.write(`const input = payload.value;`);
+    const ids = Object.create(null);
+    let counter = 0;
+    for (const key of normalized.allKeys) {
+      ids[key] = `key_${counter++}`;
+    }
+    doc.write(memo ? `const newResult = memo.alloc(inst, payload, {}, ctx);` : `const newResult = {};`);
+    for (const key of normalized.allKeys) {
+      if (key === "__proto__")
+        continue;
+      const id = ids[key];
+      const k = typeof key === "symbol" ? `syms[${syms.indexOf(key)}]` : esc(key);
+      const isPresent = `${k} in input`;
+      const schema = shape[key];
+      const optin = schema?._zod?.optin;
+      const isOptionalIn = optin !== undefined;
+      const isOptionalOut = schema?._zod?.optout === "optional";
+      doc.write(`const ${id} = ${parseStr(k)};`);
+      if (isOptionalIn && isOptionalOut) {
+        const assign = optin === "optional" ? `${id}_present` : `${id}.value !== undefined || ${id}_present`;
+        doc.write(`
+        const ${id}_present = ${isPresent};
+        if (!${id}.issues.length || ${id}_present) {
+          if (${id}.issues.length) {${prefixStr(id, k)}
+          }
+
+          if (${assign}) {
+            newResult[${k}] = ${id}.value;
+          }
+        }
+
+      `);
+      } else if (!isOptionalIn) {
+        doc.write(`
+        const ${id}_present = ${isPresent};
+        if (${id}.issues.length) {${prefixStr(id, k)}
+        }
+        if (!${id}_present && !${id}.issues.length) {
+          payload.issues.push({
+            code: "invalid_type",
+            expected: "nonoptional",
+            input: undefined,
+            path: [${k}]
+          });
+          if (ctx && ctx.abortEarly) {
+            payload.value = newResult;
+            return payload;
+          }
+        }
+
+        if (${id}_present) {
+          newResult[${k}] = ${id}.value;
+        }
+
+      `);
+      } else {
+        doc.write(`
+        if (${id}.issues.length) {${prefixStr(id, k)}
+        }
+      `);
+        if (optin === "defaulted") {
+          doc.write(`newResult[${k}] = ${id}.value;`);
+        } else {
+          doc.write(`
+        if (${id}.value !== undefined || ${isPresent}) {
+          newResult[${k}] = ${id}.value;
+        }
+      `);
+        }
+      }
+    }
+    doc.write(`payload.value = newResult;`);
+    doc.write(`return payload;`);
+    return doc.compile();
+  };
+  let fastpass;
+  const isObject2 = isObject;
+  const jit = !globalConfig.jitless;
+  const allowsEval2 = allowsEval;
+  const fastEnabled = jit && allowsEval2.value;
+  const catchall = def.catchall;
+  let value;
+  inst._zod.parse = (payload, ctx) => {
+    value ?? (value = _normalized.value);
+    const input = payload.value;
+    if (!isObject2(input)) {
+      payload.issues.push({
+        expected: "object",
+        code: "invalid_type",
+        input,
+        inst
+      });
+      return payload;
+    }
+    if (jit && fastEnabled && ctx?.async === false && ctx.jitless !== true) {
+      if (!fastpass)
+        fastpass = generateFastpass(def.shape);
+      payload = fastpass(payload, ctx);
+      if (!catchall)
+        return payload;
+      return handleCatchall([], input, payload, ctx, value, inst, ctx?.abortEarly === true);
+    }
+    return superParse(payload, ctx);
+  };
+});
+function handleUnionResults(results, final, inst, ctx) {
+  for (const result of results) {
+    if (result.issues.length === 0) {
+      final.value = result.value;
+      return final;
+    }
+  }
+  const nonaborted = results.filter((r) => !aborted(r));
+  if (nonaborted.length === 1) {
+    final.value = nonaborted[0].value;
+    return nonaborted[0];
+  }
+  final.issues.push({
+    code: "invalid_union",
+    input: final.value,
+    inst,
+    errors: results.map((result) => result.issues.map((iss) => finalizeIssue(iss, ctx, config())))
+  });
+  return final;
+}
+var $ZodUnion = /* @__PURE__ */ $constructor("$ZodUnion", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.options.some((o) => o._zod.optin === "defaulted") ? "defaulted" : zod.def.options.some((o) => o._zod.optin !== undefined) ? "optional" : undefined);
+  defineLazyInternal(inst, "optout", (zod) => zod.def.options.some((o) => o._zod.optout === "optional") ? "optional" : undefined);
+  defineLazyInternal(inst, "values", (zod) => {
+    if (zod.def.options.every((o) => o._zod.values)) {
+      return new Set(zod.def.options.flatMap((option) => Array.from(option._zod.values)));
+    }
+    return;
+  });
+  defineLazyInternal(inst, "pattern", (zod) => {
+    if (zod.def.options.every((o) => o._zod.pattern)) {
+      const patterns = zod.def.options.map((o) => o._zod.pattern);
+      return new RegExp(`^(${patterns.map((p) => cleanRegex(p.source)).join("|")})$`);
+    }
+    return;
+  });
+  const first = def.options.length === 1 ? def.options[0]._zod.run : null;
+  inst._zod.parse = (payload, ctx) => {
+    if (first) {
+      return first(payload, ctx);
+    }
+    let async = false;
+    const results = [];
+    for (const option of def.options) {
+      const result = option._zod.run({
+        value: payload.value,
+        issues: []
+      }, ctx);
+      if (result instanceof Promise) {
+        results.push(result);
+        async = true;
+      } else {
+        if (result.issues.length === 0)
+          return result;
+        results.push(result);
+      }
+    }
+    if (!async)
+      return handleUnionResults(results, payload, inst, ctx);
+    return Promise.all(results).then((results) => {
+      return handleUnionResults(results, payload, inst, ctx);
+    });
+  };
+});
+var $ZodIntersection = /* @__PURE__ */ $constructor("$ZodIntersection", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.parse = (payload, ctx) => {
+    const input = payload.value;
+    const left = def.left._zod.run({ value: input, issues: [] }, ctx);
+    const right = def.right._zod.run({ value: input, issues: [] }, ctx);
+    const async = left instanceof Promise || right instanceof Promise;
+    if (async) {
+      return Promise.all([left, right]).then(([left, right]) => {
+        return handleIntersectionResults(payload, left, right);
+      });
+    }
+    return handleIntersectionResults(payload, left, right);
+  };
+});
+function mergeValues(a, b) {
+  if (a === b) {
+    return { valid: true, data: a };
+  }
+  if (a instanceof Date && b instanceof Date && +a === +b) {
+    return { valid: true, data: a };
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const bKeys = Object.keys(b);
+    const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
+    const newObj = { ...a, ...b };
+    if (Object.prototype.hasOwnProperty.call(newObj, "__proto__"))
+      delete newObj.__proto__;
+    for (const key of sharedKeys) {
+      if (key === "__proto__")
+        continue;
+      const sharedValue = mergeValues(a[key], b[key]);
+      if (!sharedValue.valid) {
+        return {
+          valid: false,
+          mergeErrorPath: [key, ...sharedValue.mergeErrorPath]
+        };
+      }
+      newObj[key] = sharedValue.data;
+    }
+    return { valid: true, data: newObj };
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) {
+      return { valid: false, mergeErrorPath: [] };
+    }
+    const newArray = [];
+    for (let index = 0;index < a.length; index++) {
+      const itemA = a[index];
+      const itemB = b[index];
+      const sharedValue = mergeValues(itemA, itemB);
+      if (!sharedValue.valid) {
+        return {
+          valid: false,
+          mergeErrorPath: [index, ...sharedValue.mergeErrorPath]
+        };
+      }
+      newArray.push(sharedValue.data);
+    }
+    return { valid: true, data: newArray };
+  }
+  return { valid: false, mergeErrorPath: [] };
+}
+function handleIntersectionResults(result, left, right) {
+  const unrecKeys = new Map;
+  let unrecIssue;
+  const keyIssues = new Map;
+  const collect = (iss, side) => {
+    let keys;
+    if (iss.code === "unrecognized_keys" && !iss.path?.length) {
+      unrecIssue ?? (unrecIssue = iss);
+      keys = iss.keys;
+    } else if (iss.code === "invalid_key" && iss.origin === "record" && iss.path?.length === 1) {
+      const k = String(iss.path[0]);
+      if (!keyIssues.has(k))
+        keyIssues.set(k, iss);
+      keys = [k];
+    } else {
+      return false;
+    }
+    for (const k of keys) {
+      if (!unrecKeys.has(k))
+        unrecKeys.set(k, {});
+      unrecKeys.get(k)[side] = true;
+    }
+    return true;
+  };
+  for (const iss of left.issues) {
+    if (!collect(iss, "l"))
+      result.issues.push(iss);
+  }
+  for (const iss of right.issues) {
+    if (!collect(iss, "r"))
+      result.issues.push(iss);
+  }
+  const bothKeys = [...unrecKeys].filter(([, f]) => f.l && f.r).map(([k]) => k);
+  if (bothKeys.length) {
+    const aggregated = unrecIssue ? bothKeys.filter((k) => unrecIssue.keys.includes(k)) : [];
+    if (aggregated.length)
+      result.issues.push({ ...unrecIssue, keys: aggregated });
+    for (const k of bothKeys) {
+      if (!aggregated.includes(k) && keyIssues.has(k))
+        result.issues.push(keyIssues.get(k));
+    }
+  }
+  const merged = mergeValues(left.value, right.value);
+  if (!merged.valid) {
+    if (aborted(result))
+      return result;
+    throw new Error(`Unmergable intersection. Error path: ` + `${JSON.stringify(merged.mergeErrorPath)}`);
+  }
+  result.value = merged.data;
+  return result;
+}
+var $ZodRecord = /* @__PURE__ */ $constructor("$ZodRecord", (inst, def) => {
+  $ZodType.init(inst, def);
+  const memo = globalConfig.memoizer;
+  memo?.attach(inst);
+  inst._zod.parse = (payload, ctx) => {
+    const input = payload.value;
+    if (!isPlainObject(input)) {
+      payload.issues.push({
+        expected: "record",
+        code: "invalid_type",
+        input,
+        inst
+      });
+      return payload;
+    }
+    const proms = [];
+    const values = def.keyType._zod.values;
+    if (values && !def.partial) {
+      payload.value = memo ? memo.alloc(inst, payload, {}, ctx) : {};
+      const recordKeys = new Set;
+      for (const key of values) {
+        if (typeof key === "string" || typeof key === "number" || typeof key === "symbol") {
+          recordKeys.add(typeof key === "number" ? key.toString() : key);
+          if (key === "__proto__")
+            continue;
+          const keyResult = def.keyType._zod.run({ value: key, issues: [] }, ctx);
+          if (keyResult instanceof Promise) {
+            throw new Error("Async schemas not supported in object keys currently");
+          }
+          if (keyResult.issues.length) {
+            payload.issues.push({
+              code: "invalid_key",
+              origin: "record",
+              issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
+              input: key,
+              path: [key],
+              inst
+            });
+            continue;
+          }
+          const outKey = keyResult.value;
+          if (outKey === "__proto__")
+            continue;
+          const result = def.valueType._zod.run({ value: input[key], issues: [] }, ctx);
+          if (result instanceof Promise) {
+            proms.push(result.then((result) => {
+              if (result.issues.length) {
+                payload.issues.push(...prefixIssues(key, result.issues));
+              }
+              payload.value[outKey] = result.value;
+            }));
+          } else {
+            if (result.issues.length) {
+              payload.issues.push(...prefixIssues(key, result.issues));
+            }
+            payload.value[outKey] = result.value;
+          }
+        }
+      }
+      let unrecognized;
+      for (const key in input) {
+        if (!recordKeys.has(key)) {
+          if (def.mode === "loose") {
+            if (key === "__proto__")
+              continue;
+            payload.value[key] = input[key];
+          } else {
+            unrecognized = unrecognized ?? [];
+            unrecognized.push(key);
+          }
+        }
+      }
+      if (unrecognized && unrecognized.length > 0) {
+        payload.issues.push({
+          code: "unrecognized_keys",
+          input,
+          inst,
+          keys: unrecognized,
+          continue: true
+        });
+      }
+    } else {
+      payload.value = memo ? memo.alloc(inst, payload, {}, ctx) : {};
+      let unrecognized;
+      for (const key of Reflect.ownKeys(input)) {
+        if (key === "__proto__")
+          continue;
+        if (!Object.prototype.propertyIsEnumerable.call(input, key))
+          continue;
+        let keyResult = def.keyType._zod.run({ value: key, issues: [] }, ctx);
+        if (keyResult instanceof Promise) {
+          throw new Error("Async schemas not supported in object keys currently");
+        }
+        const checkNumericKey = typeof key === "string" && number.test(key) && keyResult.issues.length;
+        if (checkNumericKey) {
+          const retryResult = def.keyType._zod.run({ value: Number(key), issues: [] }, ctx);
+          if (retryResult instanceof Promise) {
+            throw new Error("Async schemas not supported in object keys currently");
+          }
+          if (retryResult.issues.length === 0) {
+            keyResult = retryResult;
+          }
+        }
+        if (keyResult.issues.length) {
+          if (def.mode === "loose") {
+            payload.value[key] = input[key];
+          } else if (values) {
+            unrecognized = unrecognized ?? [];
+            unrecognized.push(key);
+          } else {
+            payload.issues.push({
+              code: "invalid_key",
+              origin: "record",
+              issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
+              input: key,
+              path: [key],
+              inst
+            });
+          }
+          continue;
+        }
+        const outKey = keyResult.value;
+        if (outKey === "__proto__")
+          continue;
+        const result = def.valueType._zod.run({ value: input[key], issues: [] }, ctx);
+        if (result instanceof Promise) {
+          proms.push(result.then((result) => {
+            if (result.issues.length) {
+              payload.issues.push(...prefixIssues(key, result.issues));
+            }
+            payload.value[outKey] = result.value;
+          }));
+        } else {
+          if (result.issues.length) {
+            payload.issues.push(...prefixIssues(key, result.issues));
+          }
+          payload.value[outKey] = result.value;
+        }
+      }
+      if (unrecognized && unrecognized.length > 0) {
+        payload.issues.push({
+          code: "unrecognized_keys",
+          input,
+          inst,
+          keys: unrecognized,
+          continue: true
+        });
+      }
+    }
+    if (proms.length) {
+      return Promise.all(proms).then(() => payload);
+    }
+    return payload;
+  };
+});
+var $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
+  $ZodType.init(inst, def);
+  const values = getEnumValues(def.entries);
+  const valuesSet = new Set(values);
+  inst._zod.values = valuesSet;
+  defineLazyInternal(inst, "pattern", (zod) => {
+    const patternValues = getEnumValues(zod.def.entries).filter((k) => propertyKeyTypes.has(typeof k));
+    return new RegExp(patternValues.length ? `^(${patternValues.map((o) => escapeRegex(o.toString())).join("|")})$` : "^[^\\s\\S]$");
+  });
+  inst._zod.parse = (payload, _ctx) => {
+    const input = payload.value;
+    if (valuesSet.has(input)) {
+      return payload;
+    }
+    payload.issues.push({
+      code: "invalid_value",
+      values,
+      input,
+      inst
+    });
+    return payload;
+  };
+});
+var $ZodTransform = /* @__PURE__ */ $constructor("$ZodTransform", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.optin = "optional";
+  globalConfig.memoizer?.guard(inst);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      throw new $ZodEncodeError(inst.constructor.name);
+    }
+    const _out = def.transform(payload.value, payload);
+    if (ctx.async) {
+      const output = _out instanceof Promise ? _out : Promise.resolve(_out);
+      return output.then((output) => {
+        payload.value = output;
+        return payload;
+      });
+    }
+    if (_out instanceof Promise) {
+      throw new $ZodAsyncError;
+    }
+    payload.value = _out;
+    return payload;
+  };
+});
+function handleOptionalResult(payload, result) {
+  payload.value = result.issues.length ? undefined : result.value;
+  return payload;
+}
+var $ZodOptional = /* @__PURE__ */ $constructor("$ZodOptional", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.innerType._zod.optin === "defaulted" ? "defaulted" : "optional");
+  inst._zod.optout = "optional";
+  defineLazyInternal(inst, "values", (zod) => {
+    const values = zod.def.innerType._zod.values;
+    return values ? new Set([...values, undefined]) : undefined;
+  });
+  defineLazyInternal(inst, "pattern", (zod) => {
+    const pattern = zod.def.innerType._zod.pattern;
+    return pattern ? new RegExp(`^(${cleanRegex(pattern.source)})?$`) : undefined;
+  });
+  inst._zod.parse = (payload, ctx) => {
+    if (payload.value === undefined) {
+      if (def.innerType._zod.optin !== "defaulted")
+        return payload;
+      const result = def.innerType._zod.run({ value: payload.value, issues: [] }, ctx);
+      if (result instanceof Promise)
+        return result.then((result) => handleOptionalResult(payload, result));
+      return handleOptionalResult(payload, result);
+    }
+    return def.innerType._zod.run(payload, ctx);
+  };
+});
+var $ZodExactOptional = /* @__PURE__ */ $constructor("$ZodExactOptional", (inst, def) => {
+  $ZodOptional.init(inst, def);
+  defineLazyInternal(inst, "values", (zod) => zod.def.innerType._zod.values);
+  defineLazyInternal(inst, "pattern", (zod) => zod.def.innerType._zod.pattern);
+  inst._zod.parse = (payload, ctx) => {
+    return def.innerType._zod.run(payload, ctx);
+  };
+});
+var $ZodNullable = /* @__PURE__ */ $constructor("$ZodNullable", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.innerType._zod.optin);
+  defineLazyInternal(inst, "optout", (zod) => zod.def.innerType._zod.optout);
+  defineLazyInternal(inst, "pattern", (zod) => {
+    const pattern = zod.def.innerType._zod.pattern;
+    return pattern ? new RegExp(`^(${cleanRegex(pattern.source)}|null)$`) : undefined;
+  });
+  defineLazyInternal(inst, "values", (zod) => {
+    return zod.def.innerType._zod.values ? new Set([...zod.def.innerType._zod.values, null]) : undefined;
+  });
+  inst._zod.parse = (payload, ctx) => {
+    if (payload.value === null)
+      return payload;
+    return def.innerType._zod.run(payload, ctx);
+  };
+});
+var $ZodDefault = /* @__PURE__ */ $constructor("$ZodDefault", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.optin = "defaulted";
+  defineLazyInternal(inst, "values", (zod) => zod.def.innerType._zod.values);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      return def.innerType._zod.run(payload, ctx);
+    }
+    if (payload.value === undefined) {
+      payload.value = def.defaultValue;
+      return payload;
+    }
+    const result = def.innerType._zod.run(payload, ctx);
+    if (result instanceof Promise) {
+      return result.then((result) => handleDefaultResult(result, def));
+    }
+    return handleDefaultResult(result, def);
+  };
+});
+function handleDefaultResult(payload, def) {
+  if (payload.value === undefined) {
+    payload.value = def.defaultValue;
+  }
+  return payload;
+}
+var $ZodPrefault = /* @__PURE__ */ $constructor("$ZodPrefault", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.optin = "defaulted";
+  defineLazyInternal(inst, "values", (zod) => zod.def.innerType._zod.values);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      return def.innerType._zod.run(payload, ctx);
+    }
+    if (payload.value === undefined) {
+      payload.value = def.defaultValue;
+    }
+    return def.innerType._zod.run(payload, ctx);
+  };
+});
+var $ZodNonOptional = /* @__PURE__ */ $constructor("$ZodNonOptional", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "values", (zod) => {
+    const v = zod.def.innerType._zod.values;
+    return v ? new Set([...v].filter((x) => x !== undefined)) : undefined;
+  });
+  inst._zod.parse = (payload, ctx) => {
+    const result = def.innerType._zod.run(payload, ctx);
+    if (result instanceof Promise) {
+      return result.then((result) => handleNonOptionalResult(result, inst));
+    }
+    return handleNonOptionalResult(result, inst);
+  };
+});
+function handleNonOptionalResult(payload, inst) {
+  if (!payload.issues.length && payload.value === undefined) {
+    payload.issues.push({
+      code: "invalid_type",
+      expected: "nonoptional",
+      input: payload.value,
+      inst
+    });
+  }
+  return payload;
+}
+function handleCatchResult(payload, result, def, ctx) {
+  if (!result.issues.length) {
+    payload.value = result.value;
+    if (result.memo)
+      payload.memo = true;
+    return payload;
+  }
+  payload.value = def.catchValue({
+    ...result,
+    value: payload.value,
+    error: {
+      issues: result.issues.map((iss) => finalizeIssue(iss, ctx, config()))
+    },
+    input: payload.value
+  });
+  return payload;
+}
+var $ZodCatch = /* @__PURE__ */ $constructor("$ZodCatch", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.innerType._zod.optin === "defaulted" ? "defaulted" : "optional");
+  defineLazyInternal(inst, "optout", (zod) => zod.def.innerType._zod.optout);
+  defineLazyInternal(inst, "values", (zod) => zod.def.innerType._zod.values);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      return def.innerType._zod.run(payload, ctx);
+    }
+    const result = def.innerType._zod.run({ value: payload.value, issues: [] }, ctx);
+    if (result instanceof Promise) {
+      return result.then((result) => handleCatchResult(payload, result, def, ctx));
+    }
+    return handleCatchResult(payload, result, def, ctx);
+  };
+});
+var $ZodPipe = /* @__PURE__ */ $constructor("$ZodPipe", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "values", (zod) => zod.def.in._zod.values);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.in._zod.optin);
+  defineLazyInternal(inst, "optout", (zod) => zod.def.out._zod.optout);
+  defineLazyInternal(inst, "propValues", (zod) => zod.def.in._zod.propValues);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      const right = def.out._zod.run(payload, ctx);
+      if (right instanceof Promise) {
+        return right.then((right) => handlePipeResult(right, def.in, ctx));
+      }
+      return handlePipeResult(right, def.in, ctx);
+    }
+    const left = def.in._zod.run(payload, ctx);
+    if (left instanceof Promise) {
+      return left.then((left) => handlePipeResult(left, def.out, ctx));
+    }
+    return handlePipeResult(left, def.out, ctx);
+  };
+});
+function handlePipeResult(left, next, ctx) {
+  if (left.issues.some((iss) => iss.code !== "unrecognized_keys")) {
+    left.aborted = true;
+    return left;
+  }
+  return next._zod.run({ value: left.value, issues: left.issues }, ctx);
+}
+var $ZodReadonly = /* @__PURE__ */ $constructor("$ZodReadonly", (inst, def) => {
+  $ZodType.init(inst, def);
+  defineLazyInternal(inst, "propValues", (zod) => zod.def.innerType._zod.propValues);
+  defineLazyInternal(inst, "values", (zod) => zod.def.innerType._zod.values);
+  defineLazyInternal(inst, "optin", (zod) => zod.def.innerType?._zod?.optin);
+  defineLazyInternal(inst, "optout", (zod) => zod.def.innerType?._zod?.optout);
+  inst._zod.parse = (payload, ctx) => {
+    if (ctx.direction === "backward") {
+      return def.innerType._zod.run(payload, ctx);
+    }
+    const result = def.innerType._zod.run(payload, ctx);
+    if (result instanceof Promise) {
+      return result.then(handleReadonlyResult);
+    }
+    return handleReadonlyResult(result);
+  };
+});
+function handleReadonlyResult(payload) {
+  if (!payload.memo)
+    payload.value = Object.freeze(payload.value);
+  return payload;
+}
+var $ZodCustom = /* @__PURE__ */ $constructor("$ZodCustom", (inst, def) => {
+  $ZodCheck.init(inst, def);
+  $ZodType.init(inst, def);
+  inst._zod.parse = (payload, _) => {
+    return payload;
+  };
+  inst._zod.check = (payload) => {
+    const input = payload.value;
+    const r = def.fn(input);
+    if (r instanceof Promise) {
+      return r.then((r) => handleRefineResult(r, payload, input, inst));
+    }
+    handleRefineResult(r, payload, input, inst);
+    return;
+  };
+});
+function handleRefineResult(result, payload, input, inst) {
+  if (!result) {
+    const _iss = {
+      code: "custom",
+      input,
+      inst,
+      path: [...inst._zod.def.path ?? []],
+      continue: !inst._zod.def.abort
+    };
+    if (inst._zod.def.params)
+      _iss.params = inst._zod.def.params;
+    payload.issues.push(issue(_iss));
+  }
+}
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/memoizer.js
+class $ZodCyclicError extends Error {
+  constructor() {
+    super(`Cannot parse a reference cycle that closes through a transform`);
+    this.name = "ZodCyclicError";
+  }
+}
+var STATE = "~memo";
+var NO_ISSUES = [];
+function isRef(value) {
+  return value !== null && typeof value === "object";
+}
+function cloneIssues(issues) {
+  return issues.map((iss) => iss.path ? { ...iss, path: iss.path.slice() } : { ...iss });
+}
+var recursive = /* @__PURE__ */ new WeakMap;
+var NONE = 0;
+var ASSUMED = 1;
+var PROVEN = 2;
+function isRecursive(inst, stack, resolve) {
+  const cached = recursive.get(inst);
+  if (cached !== undefined)
+    return cached ? PROVEN : NONE;
+  if (stack.has(inst))
+    return PROVEN;
+  stack.add(inst);
+  let result = NONE;
+  const check = (child) => {
+    if (result !== PROVEN && child?._zod) {
+      const answer = isRecursive(child, stack, resolve);
+      if (answer > result)
+        result = answer;
+    }
+  };
+  const shape = (sh, spread) => {
+    let answer = NONE;
+    for (const key of Reflect.ownKeys(sh)) {
+      const desc = Object.getOwnPropertyDescriptor(sh, key);
+      if (spread && !desc.enumerable)
+        continue;
+      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve) : NONE;
+      if (child > answer)
+        answer = child;
+    }
+    return answer;
+  };
+  const merge = (answer) => {
+    if (answer > result)
+      result = answer;
+  };
+  const def = inst._zod.def;
+  const kind = def.type;
+  switch (kind) {
+    case "object": {
+      const raw = rawShape(def);
+      merge(raw ? shape(raw, true) : ASSUMED);
+      check(def.catchall);
+      break;
+    }
+    case "array":
+      check(def.element);
+      break;
+    case "tuple":
+      for (const el of def.items)
+        check(el);
+      check(def.rest);
+      break;
+    case "record":
+    case "map":
+      check(def.keyType);
+      check(def.valueType);
+      break;
+    case "set":
+      check(def.valueType);
+      break;
+    case "union":
+      for (const el of def.options)
+        check(el);
+      break;
+    case "intersection":
+      check(def.left);
+      check(def.right);
+      break;
+    case "optional":
+    case "nullable":
+    case "default":
+    case "prefault":
+    case "catch":
+    case "readonly":
+    case "nonoptional":
+    case "promise":
+    case "success":
+      check(def.innerType);
+      break;
+    case "pipe":
+      check(def.in);
+      check(def.out);
+      break;
+    case "function":
+      check(def.input);
+      check(def.output);
+      break;
+    case "lazy": {
+      const inner = def._cachedInner ?? (resolve ? inst._zod.innerType : undefined);
+      merge(inner ? isRecursive(inner, stack, false) : ASSUMED);
+      break;
+    }
+    case "template_literal":
+    case "string":
+    case "number":
+    case "int":
+    case "boolean":
+    case "bigint":
+    case "symbol":
+    case "undefined":
+    case "null":
+    case "void":
+    case "never":
+    case "any":
+    case "unknown":
+    case "date":
+    case "nan":
+    case "enum":
+    case "literal":
+    case "file":
+    case "transform":
+    case "custom":
+      break;
+    default: {
+      for (const key in def) {
+        const desc = Object.getOwnPropertyDescriptor(def, key);
+        if (!desc || desc.get)
+          continue;
+        const value = desc.value;
+        if (!value || typeof value !== "object")
+          continue;
+        if (value._zod)
+          check(value);
+        else if (Array.isArray(value))
+          for (const el of value)
+            check(el);
+      }
+    }
+  }
+  stack.delete(inst);
+  return settle(inst, result);
+}
+function settle(inst, answer) {
+  if (answer !== ASSUMED)
+    recursive.set(inst, answer === PROVEN);
+  return answer;
+}
+function bucketFor(state, inst) {
+  let bucket = state.buckets.get(inst);
+  if (!bucket) {
+    bucket = new WeakMap;
+    state.buckets.set(inst, bucket);
+  }
+  return bucket;
+}
+var handoff;
+var open = [];
+var memo = {
+  alloc(_inst, payload, empty) {
+    const bucket = handoff;
+    if (!bucket)
+      return empty;
+    handoff = undefined;
+    const entry = { value: empty, issues: null };
+    bucket.set(payload.value, entry);
+    open.push(entry);
+    return empty;
+  },
+  guard(inst) {
+    var _a;
+    (_a = inst._zod).deferred ?? (_a.deferred = []);
+    inst._zod.deferred.push(() => {
+      const base = inst._zod.parse;
+      const wrapped = (payload, ctx) => {
+        if (ctx.direction !== "backward" && isBackEdge(ctx, payload.value))
+          throw new $ZodCyclicError;
+        return base(payload, ctx);
+      };
+      inst._zod.parse = wrapped;
+      if (inst._zod.run === base)
+        inst._zod.run = wrapped;
+    });
+  },
+  attach(inst) {
+    var _a;
+    let isRecursiveInst;
+    let rechecked = false;
+    let lastCtx;
+    let lastBucket;
+    (_a = inst._zod).deferred ?? (_a.deferred = []);
+    inst._zod.deferred.push(() => {
+      const base = inst._zod.parse;
+      const wrapped = (payload, ctx) => {
+        if (isRecursiveInst === undefined) {
+          const walked = isRecursive(inst, new Set, false);
+          if (walked === NONE) {
+            inst._zod.parse = base;
+            if (inst._zod.run === wrapped)
+              inst._zod.run = base;
+            return base(payload, ctx);
+          }
+          if (walked === PROVEN || rechecked)
+            isRecursiveInst = true;
+          else
+            rechecked = true;
+        }
+        const input = payload.value;
+        if (!isRef(input))
+          return base(payload, ctx);
+        let state = ctx[STATE];
+        if (!state) {
+          state = { buckets: new WeakMap, backEdges: undefined };
+          ctx[STATE] = state;
+        }
+        let bucket;
+        if (lastCtx === ctx) {
+          bucket = lastBucket;
+        } else {
+          bucket = bucketFor(state, inst);
+          lastCtx = ctx;
+          lastBucket = bucket;
+        }
+        const hit = bucket.get(input);
+        if (hit) {
+          payload.value = hit.value;
+          if (hit.issues) {
+            if (hit.issues.length)
+              payload.issues.push(...cloneIssues(hit.issues));
+          } else {
+            payload.memo = true;
+            state.backEdges ?? (state.backEdges = new WeakSet);
+            state.backEdges.add(hit.value);
+          }
+          return payload;
+        }
+        handoff = bucket;
+        const depth = open.length;
+        const result = base(payload, ctx);
+        handoff = undefined;
+        const entry = open.length > depth ? open.pop() : undefined;
+        if (result instanceof Promise) {
+          return result.then((r) => {
+            if (entry)
+              entry.issues = r.issues.length ? cloneIssues(r.issues) : NO_ISSUES;
+            return r;
+          });
+        }
+        if (entry)
+          entry.issues = result.issues.length ? cloneIssues(result.issues) : NO_ISSUES;
+        return result;
+      };
+      inst._zod.parse = wrapped;
+      if (inst._zod.run === base)
+        inst._zod.run = wrapped;
+    });
+  }
+};
+function memoizer() {
+  return memo;
+}
+function isBackEdge(ctx, value) {
+  const backEdges = ctx[STATE]?.backEdges;
+  return backEdges !== undefined && isRef(value) && backEdges.has(value);
+}
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/locales/en.js
+var error = () => {
+  const Sizable = {
+    string: { unit: "characters", verb: "to have" },
+    file: { unit: "bytes", verb: "to have" },
+    array: { unit: "items", verb: "to have" },
+    set: { unit: "items", verb: "to have" },
+    map: { unit: "entries", verb: "to have" }
+  };
+  function getSizing(origin) {
+    return Sizable[origin] ?? null;
+  }
+  const FormatDictionary = {
+    regex: "input",
+    email: "email address",
+    url: "URL",
+    emoji: "emoji",
+    uuid: "UUID",
+    uuidv4: "UUIDv4",
+    uuidv6: "UUIDv6",
+    nanoid: "nanoid",
+    guid: "GUID",
+    cuid: "cuid",
+    cuid2: "cuid2",
+    ulid: "ULID",
+    xid: "XID",
+    ksuid: "KSUID",
+    datetime: "ISO datetime",
+    date: "ISO date",
+    time: "ISO time",
+    duration: "ISO duration",
+    ipv4: "IPv4 address",
+    ipv6: "IPv6 address",
+    mac: "MAC address",
+    cidrv4: "IPv4 range",
+    cidrv6: "IPv6 range",
+    base64: "base64-encoded string",
+    base64url: "base64url-encoded string",
+    json_string: "JSON string",
+    e164: "E.164 number",
+    currency_code: "currency code",
+    credit_card: "credit card number",
+    iban: "IBAN",
+    jwt: "JWT",
+    template_literal: "input"
+  };
+  const TypeDictionary = {
+    nan: "NaN"
+  };
+  function getTypeName(type, input) {
+    if (type === "number" && typeof input === "number" && !Number.isFinite(input)) {
+      return String(input);
+    }
+    return TypeDictionary[type] ?? type;
+  }
+  return (issue) => {
+    switch (issue.code) {
+      case "invalid_type": {
+        const expected = getTypeName(issue.expected);
+        const receivedType = parsedType(issue.input);
+        const received = getTypeName(receivedType, issue.input);
+        return `Invalid input: expected ${expected}, received ${received}`;
+      }
+      case "invalid_value":
+        if (issue.values.length === 1)
+          return `Invalid input: expected ${stringifyPrimitive(issue.values[0])}`;
+        return `Invalid option: expected one of ${joinValues(issue.values, "|")}`;
+      case "too_big": {
+        const adj = issue.exact ? "exactly " : issue.inclusive ? "<=" : "<";
+        const sizing = getSizing(issue.origin);
+        if (sizing)
+          return `Too big: expected ${issue.origin ?? "value"} to have ${adj}${issue.maximum.toString()} ${sizing.unit ?? "elements"}`;
+        return `Too big: expected ${issue.origin ?? "value"} to be ${adj}${issue.maximum.toString()}`;
+      }
+      case "too_small": {
+        const adj = issue.exact ? "exactly " : issue.inclusive ? ">=" : ">";
+        const sizing = getSizing(issue.origin);
+        if (sizing) {
+          return `Too small: expected ${issue.origin} to have ${adj}${issue.minimum.toString()} ${sizing.unit}`;
+        }
+        return `Too small: expected ${issue.origin} to be ${adj}${issue.minimum.toString()}`;
+      }
+      case "invalid_format": {
+        const _issue = issue;
+        if (_issue.format === "starts_with") {
+          return `Invalid string: must start with "${_issue.prefix}"`;
+        }
+        if (_issue.format === "ends_with")
+          return `Invalid string: must end with "${_issue.suffix}"`;
+        if (_issue.format === "includes")
+          return `Invalid string: must include "${_issue.includes}"`;
+        if (_issue.format === "regex")
+          return `Invalid string: must match pattern ${_issue.pattern}`;
+        return `Invalid ${FormatDictionary[_issue.format] ?? issue.format}`;
+      }
+      case "not_multiple_of":
+        return `Invalid number: must be a multiple of ${issue.divisor}`;
+      case "unrecognized_keys":
+        return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${joinValues(issue.keys, ", ")}`;
+      case "invalid_key":
+        return `Invalid key in ${issue.origin}`;
+      case "invalid_union":
+        if (issue.options && Array.isArray(issue.options) && issue.options.length > 0) {
+          const opts = issue.options.map((o) => `'${o}'`).join(" | ");
+          return `Invalid discriminator value. Expected ${opts}`;
+        }
+        if (issue.inclusive === false) {
+          return "Invalid input: more than one option matched";
+        }
+        return "Invalid input";
+      case "invalid_element":
+        return `Invalid value in ${issue.origin}`;
+      default:
+        return `Invalid input`;
+    }
+  };
+};
+function en_default() {
+  return {
+    localeError: error()
+  };
+}
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/registries.js
+var _a2;
+class $ZodRegistry {
+  constructor() {
+    this._map = new WeakMap;
+    this._idmap = new Map;
+  }
+  add(schema, ..._meta) {
+    const meta = _meta[0];
+    this._map.set(schema, meta);
+    if (meta && typeof meta === "object" && "id" in meta) {
+      this._idmap.set(meta.id, schema);
+    }
+    return this;
+  }
+  clear() {
+    this._map = new WeakMap;
+    this._idmap = new Map;
+    return this;
+  }
+  remove(schema) {
+    const meta = this._map.get(schema);
+    if (meta && typeof meta === "object" && "id" in meta) {
+      this._idmap.delete(meta.id);
+    }
+    this._map.delete(schema);
+    return this;
+  }
+  get(schema) {
+    const p = schema._zod.parent;
+    if (p) {
+      const pm = { ...this.get(p) ?? {} };
+      delete pm.id;
+      const f = { ...pm, ...this._map.get(schema) };
+      return Object.keys(f).length ? f : undefined;
+    }
+    return this._map.get(schema);
+  }
+  has(schema) {
+    return this._map.has(schema);
+  }
+}
+function registry() {
+  return new $ZodRegistry;
+}
+(_a2 = globalThis).__zod_globalRegistry ?? (_a2.__zod_globalRegistry = registry());
+var globalRegistry = globalThis.__zod_globalRegistry;
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/api.js
+function snapshotChecks(def) {
+  if (def.checks)
+    def.checks = [...def.checks];
+  return def;
+}
+function _string(Class, params) {
+  return new Class(snapshotChecks({ type: "string", ...normalizeParams(params) }));
+}
+function _email(Class, params) {
+  return new Class({
+    type: "string",
+    format: "email",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _guid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "guid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _uuid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "uuid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _uuidv4(Class, params) {
+  return new Class({
+    type: "string",
+    format: "uuid",
+    check: "string_format",
+    abort: false,
+    version: "v4",
+    ...normalizeParams(params)
+  });
+}
+function _uuidv6(Class, params) {
+  return new Class({
+    type: "string",
+    format: "uuid",
+    check: "string_format",
+    abort: false,
+    version: "v6",
+    ...normalizeParams(params)
+  });
+}
+function _uuidv7(Class, params) {
+  return new Class({
+    type: "string",
+    format: "uuid",
+    check: "string_format",
+    abort: false,
+    version: "v7",
+    ...normalizeParams(params)
+  });
+}
+function _url(Class, params) {
+  return new Class({
+    type: "string",
+    format: "url",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _emoji2(Class, params) {
+  return new Class({
+    type: "string",
+    format: "emoji",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _nanoid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "nanoid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _cuid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "cuid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _cuid2(Class, params) {
+  return new Class({
+    type: "string",
+    format: "cuid2",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _ulid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "ulid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _xid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "xid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _ksuid(Class, params) {
+  return new Class({
+    type: "string",
+    format: "ksuid",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _ipv4(Class, params) {
+  return new Class({
+    type: "string",
+    format: "ipv4",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _ipv6(Class, params) {
+  return new Class({
+    type: "string",
+    format: "ipv6",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _cidrv4(Class, params) {
+  return new Class({
+    type: "string",
+    format: "cidrv4",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _cidrv6(Class, params) {
+  return new Class({
+    type: "string",
+    format: "cidrv6",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _base64(Class, params) {
+  return new Class({
+    type: "string",
+    format: "base64",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _base64url(Class, params) {
+  return new Class({
+    type: "string",
+    format: "base64url",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _e164(Class, params) {
+  return new Class({
+    type: "string",
+    format: "e164",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _jwt(Class, params) {
+  return new Class({
+    type: "string",
+    format: "jwt",
+    check: "string_format",
+    abort: false,
+    ...normalizeParams(params)
+  });
+}
+function _isoDateTime(Class, params) {
+  return new Class({
+    type: "string",
+    format: "datetime",
+    check: "string_format",
+    offset: false,
+    local: false,
+    precision: null,
+    ...normalizeParams(params)
+  });
+}
+function _isoDate(Class, params) {
+  return new Class({
+    type: "string",
+    format: "date",
+    check: "string_format",
+    ...normalizeParams(params)
+  });
+}
+function _isoTime(Class, params) {
+  return new Class({
+    type: "string",
+    format: "time",
+    check: "string_format",
+    precision: null,
+    ...normalizeParams(params)
+  });
+}
+function _isoDuration(Class, params) {
+  return new Class({
+    type: "string",
+    format: "duration",
+    check: "string_format",
+    ...normalizeParams(params)
+  });
+}
+function _number(Class, params) {
+  return new Class(snapshotChecks({ type: "number", checks: [], ...normalizeParams(params) }));
+}
+function _int(Class, params) {
+  return new Class({
+    type: "number",
+    check: "number_format",
+    abort: false,
+    format: "safeint",
+    ...normalizeParams(params)
+  });
+}
+function _boolean(Class, params) {
+  return new Class({
+    type: "boolean",
+    ...normalizeParams(params)
+  });
+}
+function _unknown(Class) {
+  return new Class({
+    type: "unknown"
+  });
+}
+function _never(Class, params) {
+  return new Class({
+    type: "never",
+    ...normalizeParams(params)
+  });
+}
+function _lt(value, params) {
+  return new $ZodCheckLessThan({
+    check: "less_than",
+    ...normalizeParams(params),
+    value,
+    inclusive: false
+  });
+}
+function _lte(value, params) {
+  return new $ZodCheckLessThan({
+    check: "less_than",
+    ...normalizeParams(params),
+    value,
+    inclusive: true
+  });
+}
+function _gt(value, params) {
+  return new $ZodCheckGreaterThan({
+    check: "greater_than",
+    ...normalizeParams(params),
+    value,
+    inclusive: false
+  });
+}
+function _gte(value, params) {
+  return new $ZodCheckGreaterThan({
+    check: "greater_than",
+    ...normalizeParams(params),
+    value,
+    inclusive: true
+  });
+}
+function _multipleOf(value, params) {
+  return new $ZodCheckMultipleOf({
+    check: "multiple_of",
+    ...normalizeParams(params),
+    value
+  });
+}
+function _maxLength(maximum, params) {
+  const ch = new $ZodCheckMaxLength({
+    check: "max_length",
+    ...normalizeParams(params),
+    maximum
+  });
+  return ch;
+}
+function _minLength(minimum, params) {
+  return new $ZodCheckMinLength({
+    check: "min_length",
+    ...normalizeParams(params),
+    minimum
+  });
+}
+function _length(length, params) {
+  return new $ZodCheckLengthEquals({
+    check: "length_equals",
+    ...normalizeParams(params),
+    length
+  });
+}
+function _regex(pattern, params) {
+  return new $ZodCheckRegex({
+    check: "string_format",
+    format: "regex",
+    ...normalizeParams(params),
+    pattern
+  });
+}
+function _lowercase(params) {
+  return new $ZodCheckLowerCase({
+    check: "string_format",
+    format: "lowercase",
+    ...normalizeParams(params)
+  });
+}
+function _uppercase(params) {
+  return new $ZodCheckUpperCase({
+    check: "string_format",
+    format: "uppercase",
+    ...normalizeParams(params)
+  });
+}
+function _includes(includes, params) {
+  return new $ZodCheckIncludes({
+    check: "string_format",
+    format: "includes",
+    ...normalizeParams(params),
+    includes
+  });
+}
+function _startsWith(prefix, params) {
+  return new $ZodCheckStartsWith({
+    check: "string_format",
+    format: "starts_with",
+    ...normalizeParams(params),
+    prefix
+  });
+}
+function _endsWith(suffix, params) {
+  return new $ZodCheckEndsWith({
+    check: "string_format",
+    format: "ends_with",
+    ...normalizeParams(params),
+    suffix
+  });
+}
+function _overwrite(tx) {
+  return new $ZodCheckOverwrite({
+    check: "overwrite",
+    tx
+  });
+}
+function _normalize(form) {
+  return _overwrite((input) => input.normalize(form));
+}
+function _trim() {
+  return _overwrite((input) => input.trim());
+}
+function _toLowerCase() {
+  return _overwrite((input) => input.toLowerCase());
+}
+function _toUpperCase() {
+  return _overwrite((input) => input.toUpperCase());
+}
+function _slugify() {
+  return _overwrite((input) => slugify(input));
+}
+function _array(Class, element, params) {
+  return new Class({
+    type: "array",
+    element,
+    ...normalizeParams(params)
+  });
+}
+function _refine(Class, fn, _params) {
+  const schema = new Class({
+    type: "custom",
+    check: "custom",
+    fn,
+    ...normalizeParams(_params)
+  });
+  return schema;
+}
+function _superRefine(fn, params) {
+  const ch = _check((payload) => {
+    payload.addIssue = (issue2) => {
+      if (typeof issue2 === "string") {
+        payload.issues.push(issue(issue2, payload.value, ch._zod.def));
+      } else {
+        const _issue = issue2;
+        if (_issue.fatal)
+          _issue.continue = false;
+        _issue.code ?? (_issue.code = "custom");
+        if (!("input" in _issue))
+          _issue.input = payload.value;
+        _issue.inst ?? (_issue.inst = ch);
+        _issue.continue ?? (_issue.continue = !ch._zod.def.abort);
+        payload.issues.push(issue(_issue));
+      }
+    };
+    return fn(payload.value, payload);
+  }, params);
+  return ch;
+}
+function _check(fn, params) {
+  const ch = new $ZodCheck({
+    check: "custom",
+    ...normalizeParams(params)
+  });
+  ch._zod.check = fn;
+  return ch;
+}
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/to-json-schema.js
+function assignProps(target, ...sources) {
+  for (const source of sources) {
+    for (const key of Reflect.ownKeys(source)) {
+      if (Object.prototype.propertyIsEnumerable.call(source, key)) {
+        assignProp(target, key, source[key]);
+      }
+    }
+  }
+  return target;
+}
+function initializeContext(params) {
+  let target = params?.target ?? "draft-2020-12";
+  if (target === "draft-4")
+    target = "draft-04";
+  if (target === "draft-7")
+    target = "draft-07";
+  return {
+    processors: params.processors ?? {},
+    metadataRegistry: params?.metadata ?? globalRegistry,
+    target,
+    unrepresentable: params?.unrepresentable ?? "throw",
+    override: params?.override ?? (() => {}),
+    io: params?.io ?? "output",
+    counter: 0,
+    seen: new Map,
+    sharedDefsExtractedFor: undefined,
+    sharedEmitDoneFor: undefined,
+    cycles: params?.cycles ?? "ref",
+    reused: params?.reused ?? "inline",
+    intersections: [],
+    deferred: [],
+    external: params?.external ?? undefined
+  };
+}
+function handleUnrepresentable(schema, ctx, json, params, message) {
+  const result = typeof ctx.unrepresentable === "function" ? ctx.unrepresentable({ zodSchema: schema, path: params.path, message }) : ctx.unrepresentable;
+  if (result === "any")
+    return false;
+  if (result === undefined || result === "throw")
+    throw new Error(message);
+  Object.assign(json, result);
+  return true;
+}
+function processSchema(schema, ctx, _params = { path: [], schemaPath: [] }) {
+  var _a;
+  const def = schema._zod.def;
+  const seen = ctx.seen.get(schema);
+  if (seen) {
+    seen.count++;
+    const isCycle = _params.schemaPath.includes(schema);
+    if (isCycle) {
+      seen.cycle = _params.path;
+    }
+    return seen.schema;
+  }
+  const result = { schema: {}, count: 1, cycle: undefined, path: _params.path };
+  ctx.seen.set(schema, result);
+  ctx.sharedDefsExtractedFor = undefined;
+  ctx.sharedEmitDoneFor = undefined;
+  const overrideSchema = schema._zod.toJSONSchema?.();
+  if (overrideSchema) {
+    result.schema = overrideSchema;
+  } else {
+    const params = {
+      ..._params,
+      schemaPath: [..._params.schemaPath, schema],
+      path: _params.path
+    };
+    if (schema._zod.processJSONSchema) {
+      schema._zod.processJSONSchema(ctx, result.schema, params);
+    } else {
+      const _json = result.schema;
+      const processor = ctx.processors[def.type];
+      if (!processor) {
+        throw new Error(`[toJSONSchema]: Non-representable type encountered: ${def.type}`);
+      }
+      processor(schema, ctx, _json, params);
+    }
+    const parent = schema._zod.parent;
+    if (parent) {
+      if (!result.ref)
+        result.ref = parent;
+      processSchema(parent, ctx, params);
+      ctx.seen.get(parent).isParent = true;
+    }
+  }
+  const meta = ctx.metadataRegistry.get(schema);
+  if (meta)
+    assignProps(result.schema, meta);
+  if (ctx.io === "input" && isTransforming(schema)) {
+    delete result.schema.examples;
+    delete result.schema.default;
+  }
+  if (ctx.io === "input" && "_prefault" in result.schema)
+    (_a = result.schema).default ?? (_a.default = result.schema._prefault);
+  delete result.schema._prefault;
+  const _result = ctx.seen.get(schema);
+  return _result.schema;
+}
+function encodeJSONPointerSegment(segment) {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+function extractDefs(ctx, schema) {
+  const root = ctx.seen.get(schema);
+  if (!root)
+    throw new Error("Unprocessed schema. This is a bug in Zod.");
+  if (ctx.external && ctx.sharedDefsExtractedFor === ctx.external)
+    return;
+  const idToSchema = new Map;
+  for (const entry of ctx.seen.entries()) {
+    const id = ctx.metadataRegistry.get(entry[0])?.id;
+    if (id) {
+      const existing = idToSchema.get(id);
+      if (existing && existing !== entry[0]) {
+        throw new Error(`Duplicate schema id "${id}" detected during JSON Schema conversion. Two different schemas cannot share the same id when converted together.`);
+      }
+      idToSchema.set(id, entry[0]);
+    }
+  }
+  const makeURI = (entry) => {
+    const defsSegment = ctx.target === "draft-2020-12" ? "$defs" : "definitions";
+    if (ctx.external) {
+      const externalId = ctx.external.registry.get(entry[0])?.id;
+      const uriGenerator = ctx.external.uri ?? ((id) => id);
+      if (externalId) {
+        return { ref: uriGenerator(externalId) };
+      }
+      const id = entry[1].defId ?? entry[1].schema.id ?? `schema${ctx.counter++}`;
+      entry[1].defId = id;
+      return { defId: id, ref: `${uriGenerator("__shared")}#/${defsSegment}/${encodeJSONPointerSegment(id)}` };
+    }
+    const uriPrefix = `#`;
+    const defUriPrefix = `${uriPrefix}/${defsSegment}/`;
+    if (entry[1] === root && !entry[1].schema.id) {
+      return { ref: uriPrefix };
+    }
+    const defId = entry[1].schema.id ?? `__schema${ctx.counter++}`;
+    return { defId, ref: defUriPrefix + encodeJSONPointerSegment(defId) };
+  };
+  const extractToDef = (entry) => {
+    if (entry[1].schema.$ref) {
+      return;
+    }
+    const seen = entry[1];
+    const { ref, defId } = makeURI(entry);
+    seen.def = { ...seen.schema };
+    if (defId)
+      seen.defId = defId;
+    const schema = seen.schema;
+    for (const key in schema) {
+      delete schema[key];
+    }
+    schema.$ref = ref;
+  };
+  if (ctx.cycles === "throw") {
+    for (const entry of ctx.seen.entries()) {
+      const seen = entry[1];
+      if (seen.cycle) {
+        throw new Error("Cycle detected: " + `#/${seen.cycle?.join("/")}/<root>` + '\n\nSet the `cycles` parameter to `"ref"` to resolve cyclical schemas with defs.');
+      }
+    }
+  }
+  for (const entry of ctx.seen.entries()) {
+    const seen = entry[1];
+    if (schema === entry[0]) {
+      extractToDef(entry);
+      continue;
+    }
+    if (ctx.external) {
+      const ext = ctx.external.registry.get(entry[0])?.id;
+      if (schema !== entry[0] && ext) {
+        extractToDef(entry);
+        continue;
+      }
+    }
+    const id = ctx.metadataRegistry.get(entry[0])?.id;
+    if (id) {
+      extractToDef(entry);
+      continue;
+    }
+    if (seen.cycle) {
+      extractToDef(entry);
+      continue;
+    }
+    if (seen.count > 1) {
+      if (ctx.reused === "ref") {
+        extractToDef(entry);
+      }
+    }
+  }
+  if (ctx.external)
+    ctx.sharedDefsExtractedFor = ctx.external;
+}
+function compactTypeUnion(schema) {
+  const options = schema.anyOf;
+  if (!Array.isArray(options) || options.length === 0 || schema.type !== undefined)
+    return;
+  const types = [];
+  for (const option of options) {
+    if (!option || typeof option !== "object")
+      return;
+    compactTypeUnion(option);
+    const keys = Object.keys(option);
+    if (keys.length !== 1 || keys[0] !== "type")
+      return;
+    const type = option.type;
+    for (const member of Array.isArray(type) ? type : [type]) {
+      if (typeof member !== "string")
+        return;
+      if (!types.includes(member))
+        types.push(member);
+    }
+  }
+  delete schema.anyOf;
+  schema.type = types.length === 1 ? types[0] : types;
+}
+var FOLDABLE_KEYS = new Set(["type", "properties", "required", "additionalProperties"]);
+var UNION_KEYS = ["oneOf", "anyOf"];
+function undeclaredConstraint(member) {
+  const extra = member.additionalProperties;
+  if (extra === undefined || extra === false || typeof extra !== "object" || extra === null)
+    return null;
+  return Object.keys(extra).length ? extra : null;
+}
+function foldObjects(members) {
+  const objects = [];
+  for (const member of members) {
+    if (typeof member !== "object" || member.type !== "object")
+      return null;
+    for (const key in member) {
+      if (!FOLDABLE_KEYS.has(key))
+        return null;
+    }
+    objects.push(member);
+  }
+  const properties = {};
+  const required = new Set;
+  for (const object of objects) {
+    for (const key in object.properties) {
+      if (Object.prototype.hasOwnProperty.call(properties, key))
+        continue;
+      const parts = [];
+      for (const other of objects) {
+        const part = other.properties?.[key] ?? undeclaredConstraint(other);
+        if (part === null || part === undefined)
+          continue;
+        if (!parts.some((seen) => JSON.stringify(seen) === JSON.stringify(part)))
+          parts.push(part);
+      }
+      const merged = parts.length === 1 ? parts[0] : foldObjects(parts) ?? { allOf: parts };
+      assignProp(properties, key, merged);
+    }
+    for (const key of object.required ?? [])
+      required.add(key);
+  }
+  const folded = { type: "object", properties };
+  if (required.size)
+    folded.required = [...required];
+  if (objects.every((object) => object.additionalProperties === false)) {
+    folded.additionalProperties = false;
+  } else {
+    const constraints = [];
+    for (const object of objects) {
+      const constraint = undeclaredConstraint(object);
+      if (constraint && !constraints.some((seen) => JSON.stringify(seen) === JSON.stringify(constraint)))
+        constraints.push(constraint);
+    }
+    if (constraints.length === 1)
+      folded.additionalProperties = constraints[0];
+    else if (constraints.length > 1)
+      folded.additionalProperties = { allOf: constraints };
+  }
+  return folded;
+}
+function foldIntersection(json) {
+  const allOf = json.allOf;
+  if (!Array.isArray(allOf) || allOf.length < 2)
+    return;
+  for (const key of FOLDABLE_KEYS)
+    if (key in json)
+      return;
+  const unions = allOf.filter((m) => UNION_KEYS.some((k) => Array.isArray(m[k])));
+  let folded = null;
+  if (!unions.length) {
+    folded = foldObjects(allOf);
+  } else {
+    const union = unions[0];
+    const keyword = UNION_KEYS.find((k) => Array.isArray(union[k]));
+    if (Object.keys(union).length !== 1)
+      return;
+    const rest = allOf.filter((m) => m !== union);
+    const branches = union[keyword].map((branch) => foldObjects([...rest, branch]));
+    if (branches.some((b) => !b))
+      return;
+    folded = { [keyword]: branches };
+  }
+  if (!folded)
+    return;
+  delete json.allOf;
+  assignProps(json, folded);
+}
+function finalize(ctx, schema) {
+  const root = ctx.seen.get(schema);
+  if (!root)
+    throw new Error("Unprocessed schema. This is a bug in Zod.");
+  const flattenRef = (zodSchema) => {
+    const seen = ctx.seen.get(zodSchema);
+    if (seen.ref === null)
+      return;
+    const schema = seen.def ?? seen.schema;
+    const _cached = { ...schema };
+    const ref = seen.ref;
+    seen.ref = null;
+    if (ref) {
+      flattenRef(ref);
+      const refSeen = ctx.seen.get(ref);
+      const refSchema = refSeen.schema;
+      if (refSchema.$ref && (ctx.target === "draft-07" || ctx.target === "draft-04" || ctx.target === "openapi-3.0")) {
+        schema.allOf = schema.allOf ?? [];
+        schema.allOf.push(refSchema);
+      } else {
+        assignProps(schema, refSchema);
+      }
+      assignProps(schema, _cached);
+      const isParentRef = zodSchema._zod.parent === ref;
+      if (isParentRef) {
+        for (const key in schema) {
+          if (key === "$ref" || key === "allOf")
+            continue;
+          if (!(key in _cached)) {
+            delete schema[key];
+          }
+        }
+      }
+      if (refSchema.$ref && refSeen.def) {
+        for (const key in schema) {
+          if (key === "$ref" || key === "allOf")
+            continue;
+          if (key in refSeen.def && JSON.stringify(schema[key]) === JSON.stringify(refSeen.def[key])) {
+            delete schema[key];
+          }
+        }
+      }
+    }
+    const parent = zodSchema._zod.parent;
+    if (parent && parent !== ref) {
+      flattenRef(parent);
+      const parentSeen = ctx.seen.get(parent);
+      if (parentSeen?.schema.$ref) {
+        schema.$ref = parentSeen.schema.$ref;
+        if (parentSeen.def) {
+          for (const key in schema) {
+            if (key === "$ref" || key === "allOf")
+              continue;
+            if (key in parentSeen.def && JSON.stringify(schema[key]) === JSON.stringify(parentSeen.def[key])) {
+              delete schema[key];
+            }
+          }
+        }
+      }
+    }
+    ctx.override({
+      zodSchema,
+      jsonSchema: schema,
+      path: seen.path ?? []
+    });
+  };
+  if (!ctx.external || ctx.sharedEmitDoneFor !== ctx.external) {
+    for (const entry of [...ctx.seen.entries()].reverse()) {
+      flattenRef(entry[0]);
+    }
+    if (ctx.target !== "openapi-3.0") {
+      for (const entry of ctx.seen.entries()) {
+        compactTypeUnion(entry[1].def ?? entry[1].schema);
+      }
+    }
+    for (const rewrite of ctx.deferred)
+      rewrite();
+    if (ctx.intersections.length) {
+      const carriers = new Map;
+      for (const seen of ctx.seen.values()) {
+        for (const json of [seen.schema, seen.def]) {
+          const allOf = json?.allOf;
+          if (!Array.isArray(allOf))
+            continue;
+          const existing = carriers.get(allOf);
+          if (existing)
+            existing.push(json);
+          else
+            carriers.set(allOf, [json]);
+        }
+      }
+      for (const allOf of ctx.intersections) {
+        for (const json of carriers.get(allOf) ?? [])
+          foldIntersection(json);
+      }
+    }
+  }
+  const result = {};
+  if (ctx.target === "draft-2020-12") {
+    result.$schema = "https://json-schema.org/draft/2020-12/schema";
+  } else if (ctx.target === "draft-07") {
+    result.$schema = "http://json-schema.org/draft-07/schema#";
+  } else if (ctx.target === "draft-04") {
+    result.$schema = "http://json-schema.org/draft-04/schema#";
+  } else if (ctx.target === "openapi-3.0") {}
+  if (ctx.external?.uri) {
+    const id = ctx.external.registry.get(schema)?.id;
+    if (!id)
+      throw new Error("Schema is missing an `id` property");
+    result.$id = ctx.external.uri(id);
+  }
+  assignProps(result, root.defId ? root.schema : root.def ?? root.schema);
+  const rootMetaId = ctx.metadataRegistry.get(schema)?.id;
+  if (rootMetaId !== undefined && result.id === rootMetaId)
+    delete result.id;
+  const defs = ctx.external?.defs ?? {};
+  if (!ctx.external || ctx.sharedEmitDoneFor !== ctx.external) {
+    for (const entry of ctx.seen.entries()) {
+      const seen = entry[1];
+      if (seen.def && seen.defId) {
+        if (seen.def.id === seen.defId)
+          delete seen.def.id;
+        assignProp(defs, seen.defId, seen.def);
+      }
+    }
+  }
+  if (ctx.external)
+    ctx.sharedEmitDoneFor = ctx.external;
+  if (ctx.external) {} else {
+    if (Object.keys(defs).length > 0) {
+      if (ctx.target === "draft-2020-12") {
+        result.$defs = defs;
+      } else {
+        result.definitions = defs;
+      }
+    }
+  }
+  try {
+    const finalized = JSON.parse(JSON.stringify(result));
+    Object.defineProperty(finalized, "~standard", {
+      value: {
+        ...schema["~standard"],
+        jsonSchema: {
+          input: createStandardJSONSchemaMethod(schema, "input", ctx.processors),
+          output: createStandardJSONSchemaMethod(schema, "output", ctx.processors)
+        }
+      },
+      enumerable: false,
+      writable: false
+    });
+    return finalized;
+  } catch (_err) {
+    throw new Error("Error converting schema to JSON.");
+  }
+}
+function isTransforming(_schema, _ctx) {
+  const ctx = _ctx ?? { seen: new Set };
+  if (ctx.seen.has(_schema))
+    return false;
+  ctx.seen.add(_schema);
+  const def = _schema._zod.def;
+  if (def.type === "transform")
+    return true;
+  if (def.type === "array")
+    return isTransforming(def.element, ctx);
+  if (def.type === "set")
+    return isTransforming(def.valueType, ctx);
+  if (def.type === "lazy")
+    return isTransforming(def.getter(), ctx);
+  if (def.type === "promise" || def.type === "optional" || def.type === "nonoptional" || def.type === "nullable" || def.type === "readonly" || def.type === "default" || def.type === "prefault" || def.type === "catch") {
+    return isTransforming(def.innerType, ctx);
+  }
+  if (def.type === "intersection") {
+    return isTransforming(def.left, ctx) || isTransforming(def.right, ctx);
+  }
+  if (def.type === "record" || def.type === "map") {
+    return isTransforming(def.keyType, ctx) || isTransforming(def.valueType, ctx);
+  }
+  if (def.type === "pipe") {
+    if (_schema._zod.traits.has("$ZodCodec"))
+      return true;
+    return isTransforming(def.in, ctx) || isTransforming(def.out, ctx);
+  }
+  if (def.type === "object") {
+    for (const key in def.shape) {
+      if (isTransforming(def.shape[key], ctx))
+        return true;
+    }
+    return false;
+  }
+  if (def.type === "union") {
+    for (const option of def.options) {
+      if (isTransforming(option, ctx))
+        return true;
+    }
+    return false;
+  }
+  if (def.type === "tuple") {
+    for (const item of def.items) {
+      if (isTransforming(item, ctx))
+        return true;
+    }
+    if (def.rest && isTransforming(def.rest, ctx))
+      return true;
+    return false;
+  }
+  return false;
+}
+var createToJSONSchemaMethod = (schema, processors = {}) => (params) => {
+  const ctx = initializeContext({ ...params, processors });
+  processSchema(schema, ctx);
+  extractDefs(ctx, schema);
+  return finalize(ctx, schema);
+};
+var createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params) => {
+  const { libraryOptions, target } = params ?? {};
+  const ctx = initializeContext({ ...libraryOptions ?? {}, target, io, processors });
+  processSchema(schema, ctx);
+  extractDefs(ctx, schema);
+  return finalize(ctx, schema);
+};
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/json-schema-processors.js
+var narrowMin = (agg, key, value) => {
+  if (agg[key] === undefined || value > agg[key])
+    agg[key] = value;
+};
+var narrowMax = (agg, key, value) => {
+  if (agg[key] === undefined || value < agg[key])
+    agg[key] = value;
+};
+var narrowBoth = (agg, value) => {
+  narrowMin(agg, "minimum", value);
+  narrowMax(agg, "maximum", value);
+};
+var addDivisor = (agg, value) => {
+  agg.multipleOf ?? (agg.multipleOf = []);
+  if (!agg.multipleOf.includes(value))
+    agg.multipleOf.push(value);
+};
+var addPattern = (agg, pattern) => {
+  agg.patterns ?? (agg.patterns = new Set);
+  agg.patterns.add(pattern);
+};
+var intersectMime = (agg, mime) => {
+  agg.mime = agg.mime ? agg.mime.filter((m) => mime.includes(m)) : [...mime];
+};
+var setFormat = (agg, format) => {
+  agg.format = format;
+  if (format.includes("int"))
+    agg.isInt = true;
+};
+var minContributor = (agg, def) => narrowMin(agg, "minimum", def.minimum);
+var maxContributor = (agg, def) => narrowMax(agg, "maximum", def.maximum);
+var formatContributor = (ranges) => (agg, def) => {
+  setFormat(agg, def.format);
+  const [minimum, maximum] = ranges[def.format];
+  narrowMin(agg, "minimum", minimum);
+  narrowMax(agg, "maximum", maximum);
+};
+var contributors = {
+  greater_than: (agg, def) => narrowMin(agg, def.inclusive ? "minimum" : "exclusiveMinimum", def.value),
+  less_than: (agg, def) => narrowMax(agg, def.inclusive ? "maximum" : "exclusiveMaximum", def.value),
+  multiple_of: (agg, def) => addDivisor(agg, def.value),
+  number_format: formatContributor(NUMBER_FORMAT_RANGES),
+  bigint_format: formatContributor(BIGINT_FORMAT_RANGES),
+  min_length: minContributor,
+  max_length: maxContributor,
+  length_equals: (agg, def) => narrowBoth(agg, def.length),
+  min_size: minContributor,
+  max_size: maxContributor,
+  size_equals: (agg, def) => narrowBoth(agg, def.size),
+  string_format: (agg, def) => {
+    setFormat(agg, def.format);
+    if (def.pattern)
+      addPattern(agg, def.pattern);
+    if (def.format === "base64" || def.format === "base64url")
+      agg.contentEncoding = def.format;
+    if (def.local || def.precision === -1)
+      agg.laxFormat = true;
+  },
+  mime_type: (agg, def) => intersectMime(agg, def.mime)
+};
+function aggregateChecks(schema) {
+  const agg = {};
+  const def = schema._zod.def;
+  const list = schema._zod.traits.has("$ZodCheck") ? [schema, ...def.checks ?? []] : def.checks ?? [];
+  for (const ch of list)
+    contributors[ch._zod.def.check]?.(agg, ch._zod.def);
+  const bag = schema._zod.bag;
+  if (bag.minimum !== undefined)
+    narrowMin(agg, "minimum", bag.minimum);
+  if (bag.exclusiveMinimum !== undefined)
+    narrowMin(agg, "exclusiveMinimum", bag.exclusiveMinimum);
+  if (bag.maximum !== undefined)
+    narrowMax(agg, "maximum", bag.maximum);
+  if (bag.exclusiveMaximum !== undefined)
+    narrowMax(agg, "exclusiveMaximum", bag.exclusiveMaximum);
+  if (bag.multipleOf !== undefined)
+    addDivisor(agg, bag.multipleOf);
+  if (bag.format !== undefined) {
+    agg.format ?? (agg.format = bag.format);
+    if (bag.format.includes("int"))
+      agg.isInt = true;
+  }
+  if (bag.mime)
+    intersectMime(agg, bag.mime);
+  for (const pattern of bag.patterns ?? [])
+    addPattern(agg, pattern);
+  return agg;
+}
+var formatMap = {
+  guid: "uuid",
+  url: "uri",
+  datetime: "date-time",
+  json_string: "json-string",
+  regex: ""
+};
+var exactPatterns = new Map([
+  [base64Charset, base64],
+  [base64urlCharset, base64url]
+]);
+var exactPattern = (p) => exactPatterns.get(p) ?? p;
+var stringProcessor = (schema, ctx, _json, _params) => {
+  const json = _json;
+  json.type = "string";
+  const { minimum, maximum, format, patterns, contentEncoding, laxFormat } = aggregateChecks(schema);
+  if (typeof minimum === "number")
+    json.minLength = minimum;
+  if (typeof maximum === "number")
+    json.maxLength = maximum;
+  if (format) {
+    json.format = formatMap[format] ?? format;
+    if (json.format === "")
+      delete json.format;
+    if (format === "time" || laxFormat) {
+      delete json.format;
+    }
+  }
+  if (contentEncoding)
+    json.contentEncoding = contentEncoding;
+  if (patterns && patterns.size > 0) {
+    const patternList = [...patterns].map(exactPattern);
+    if (patternList.length === 1)
+      json.pattern = patternList[0].source;
+    else if (patternList.length > 1) {
+      json.allOf = [
+        ...patternList.map((regex) => ({
+          ...ctx.target === "draft-07" || ctx.target === "draft-04" || ctx.target === "openapi-3.0" ? { type: "string" } : {},
+          pattern: regex.source
+        }))
+      ];
+    }
+  }
+};
+var numberProcessor = (schema, ctx, _json, params) => {
+  const json = _json;
+  const { minimum, maximum, multipleOf, exclusiveMaximum, exclusiveMinimum, isInt } = aggregateChecks(schema);
+  json.type = isInt ? "integer" : "number";
+  const exMin = typeof exclusiveMinimum === "number" && exclusiveMinimum >= (minimum ?? Number.NEGATIVE_INFINITY);
+  const exMax = typeof exclusiveMaximum === "number" && exclusiveMaximum <= (maximum ?? Number.POSITIVE_INFINITY);
+  const legacy = ctx.target === "draft-04" || ctx.target === "openapi-3.0";
+  if (exMin) {
+    if (legacy) {
+      json.minimum = exclusiveMinimum;
+      json.exclusiveMinimum = true;
+    } else {
+      json.exclusiveMinimum = exclusiveMinimum;
+    }
+  } else if (typeof minimum === "number") {
+    json.minimum = minimum;
+  }
+  if (exMax) {
+    if (legacy) {
+      json.maximum = exclusiveMaximum;
+      json.exclusiveMaximum = true;
+    } else {
+      json.exclusiveMaximum = exclusiveMaximum;
+    }
+  } else if (typeof maximum === "number") {
+    json.maximum = maximum;
+  }
+  if (multipleOf) {
+    const divisors = new Set;
+    for (const divisor of multipleOf) {
+      if (Number.isFinite(divisor) && divisor !== 0)
+        divisors.add(Math.abs(divisor));
+      else
+        handleUnrepresentable(schema, ctx, json, params, `A multipleOf divisor of ${divisor} cannot be represented in JSON Schema`);
+    }
+    const [first, ...rest] = divisors;
+    if (first !== undefined)
+      json.multipleOf = first;
+    if (rest.length)
+      json.allOf = [...json.allOf ?? [], ...rest.map((m) => ({ multipleOf: m }))];
+  }
+};
+var booleanProcessor = (_schema, _ctx, json, _params) => {
+  json.type = "boolean";
+};
+var neverProcessor = (_schema, _ctx, json, _params) => {
+  json.not = {};
+};
+var unknownProcessor = (_schema, _ctx, _json, _params) => {};
+var enumProcessor = (schema, _ctx, json, _params) => {
+  const def = schema._zod.def;
+  const values = getEnumValues(def.entries);
+  if (values.length === 0) {
+    json.not = {};
+    return;
+  }
+  if (values.every((v) => typeof v === "number"))
+    json.type = "number";
+  if (values.every((v) => typeof v === "string"))
+    json.type = "string";
+  json.enum = values;
+};
+var customProcessor = (schema, ctx, json, params) => {
+  handleUnrepresentable(schema, ctx, json, params, "Custom types cannot be represented in JSON Schema");
+};
+var transformProcessor = (schema, ctx, json, params) => {
+  handleUnrepresentable(schema, ctx, json, params, "Transforms cannot be represented in JSON Schema");
+};
+var arrayProcessor = (schema, ctx, _json, params) => {
+  const json = _json;
+  const def = schema._zod.def;
+  const { minimum, maximum } = aggregateChecks(schema);
+  if (typeof minimum === "number")
+    json.minItems = minimum;
+  if (typeof maximum === "number")
+    json.maxItems = maximum;
+  json.type = "array";
+  json.items = processSchema(def.element, ctx, {
+    ...params,
+    path: [...params.path, "items"]
+  });
+};
+function inputOptin(schema) {
+  const def = schema._zod.def;
+  if (def.type === "pipe" && def.in._zod.traits.has("$ZodTransform")) {
+    return inputOptin(def.out);
+  }
+  if (def.type === "catch") {
+    return inputOptin(def.innerType);
+  }
+  return schema._zod.optin;
+}
+var objectProcessor = (schema, ctx, _json, params) => {
+  const json = _json;
+  const def = schema._zod.def;
+  const shape = def.shape;
+  const symbolKeys = Object.getOwnPropertySymbols(shape);
+  if (symbolKeys.length && handleUnrepresentable(schema, ctx, json, params, "Symbol keys cannot be represented in JSON Schema")) {
+    return;
+  }
+  json.type = "object";
+  json.properties = {};
+  for (const key in shape) {
+    assignProp(json.properties, key, processSchema(shape[key], ctx, {
+      ...params,
+      path: [...params.path, "properties", key]
+    }));
+  }
+  const requiredKeys = [];
+  for (const key of Object.keys(shape)) {
+    const field = def.shape[key];
+    if (ctx.io === "input" ? inputOptin(field) === undefined : field._zod.optout === undefined) {
+      requiredKeys.push(key);
+    }
+  }
+  if (requiredKeys.length > 0) {
+    json.required = requiredKeys;
+  }
+  if (def.catchall?._zod.def.type === "never") {
+    json.additionalProperties = false;
+  } else if (!def.catchall) {
+    if (ctx.io === "output")
+      json.additionalProperties = false;
+  } else if (def.catchall) {
+    json.additionalProperties = processSchema(def.catchall, ctx, {
+      ...params,
+      path: [...params.path, "additionalProperties"]
+    });
+  }
+};
+var unionProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  const isExclusive = def.inclusive === false;
+  const options = def.options.map((x, i) => processSchema(x, ctx, {
+    ...params,
+    path: [...params.path, isExclusive ? "oneOf" : "anyOf", i]
+  }));
+  if (isExclusive) {
+    json.oneOf = options;
+  } else {
+    json.anyOf = options;
+  }
+};
+var intersectionProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  const a = processSchema(def.left, ctx, {
+    ...params,
+    path: [...params.path, "allOf", 0]
+  });
+  const b = processSchema(def.right, ctx, {
+    ...params,
+    path: [...params.path, "allOf", 1]
+  });
+  const isSimpleIntersection = (val) => ("allOf" in val) && Object.keys(val).length === 1;
+  const allOf = [
+    ...isSimpleIntersection(a) ? a.allOf : [a],
+    ...isSimpleIntersection(b) ? b.allOf : [b]
+  ];
+  json.allOf = allOf;
+  ctx.intersections.push(allOf);
+};
+function stringifyKeyNames(bySchema, json, visited) {
+  if (json.$ref) {
+    if (visited.has(json))
+      return json;
+    visited.add(json);
+    const def = bySchema.get(json)?.def;
+    if (!def)
+      return json;
+    const inlined = stringifyKeyNames(bySchema, def, visited);
+    return inlined === def ? json : inlined;
+  }
+  for (const keyword of ["anyOf", "oneOf"]) {
+    const branches = json[keyword];
+    if (!Array.isArray(branches))
+      continue;
+    const mapped = branches.map((branch) => stringifyKeyNames(bySchema, branch, visited));
+    if (mapped.some((branch, i) => branch !== branches[i]))
+      json = { ...json, [keyword]: mapped };
+  }
+  const types = Array.isArray(json.type) ? json.type : [json.type];
+  const numericType = !types.includes("string") && types.some((t) => t === "number" || t === "integer");
+  const values = json.enum ?? (json.const !== undefined ? [json.const] : undefined);
+  if (!numericType && !values?.some((v) => typeof v === "number"))
+    return json;
+  const { minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf, format, id, ...rest } = json;
+  if (rest.enum)
+    rest.enum = rest.enum.map((v) => typeof v === "number" ? String(v) : v);
+  else if (typeof rest.const === "number")
+    rest.const = String(rest.const);
+  if (!numericType)
+    return rest;
+  rest.type = "string";
+  if (!values)
+    rest.pattern = (types.includes("number") ? number : integer).source;
+  return rest;
+}
+var pendingRecords = new WeakMap;
+function rewriteKeyNames(ctx) {
+  const bySchema = new Map;
+  for (const entry of ctx.seen.values()) {
+    if (entry.def && !bySchema.has(entry.schema))
+      bySchema.set(entry.schema, entry);
+  }
+  const rewrites = new Map;
+  for (const record of pendingRecords.get(ctx) ?? []) {
+    const seen = ctx.seen.get(record);
+    const names = (seen?.def ?? seen?.schema)?.propertyNames;
+    if (!names || names === true || rewrites.has(names))
+      continue;
+    const rewritten = stringifyKeyNames(bySchema, names, new Set);
+    if (rewritten !== names)
+      rewrites.set(names, rewritten);
+  }
+  if (!rewrites.size)
+    return;
+  for (const entry of ctx.seen.values()) {
+    for (const carrier of [entry.schema, entry.def]) {
+      const rewritten = carrier && rewrites.get(carrier.propertyNames);
+      if (rewritten)
+        carrier.propertyNames = rewritten;
+    }
+  }
+}
+var recordProcessor = (schema, ctx, _json, params) => {
+  const json = _json;
+  const def = schema._zod.def;
+  json.type = "object";
+  const keyType = def.keyType;
+  const patterns = aggregateChecks(keyType).patterns;
+  if (def.mode === "loose" && patterns && patterns.size > 0) {
+    const valueSchema = processSchema(def.valueType, ctx, {
+      ...params,
+      path: [...params.path, "patternProperties", "*"]
+    });
+    json.patternProperties = {};
+    for (const pattern of patterns) {
+      assignProp(json.patternProperties, exactPattern(pattern).source, valueSchema);
+    }
+  } else {
+    if (ctx.target === "draft-07" || ctx.target === "draft-2020-12") {
+      json.propertyNames = processSchema(def.keyType, ctx, {
+        ...params,
+        path: [...params.path, "propertyNames"]
+      });
+      let pending = pendingRecords.get(ctx);
+      if (!pending) {
+        pending = [];
+        pendingRecords.set(ctx, pending);
+        ctx.deferred.push(() => rewriteKeyNames(ctx));
+      }
+      pending.push(schema);
+    }
+    json.additionalProperties = processSchema(def.valueType, ctx, {
+      ...params,
+      path: [...params.path, "additionalProperties"]
+    });
+  }
+  const keyValues = keyType._zod.values;
+  const omittableOnInput = ctx.io === "input" && inputOptin(def.valueType) !== undefined;
+  if (keyValues && !def.partial && !omittableOnInput) {
+    const validKeyValues = [...keyValues].filter((v) => typeof v === "string" || typeof v === "number");
+    if (validKeyValues.length > 0) {
+      json.required = validKeyValues.map(String);
+    }
+  }
+};
+var nullableProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  const inner = processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  if (ctx.target === "openapi-3.0") {
+    seen.ref = def.innerType;
+    json.nullable = true;
+  } else {
+    json.anyOf = [inner, { type: "null" }];
+  }
+};
+var nonoptionalProcessor = (schema, ctx, _json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+};
+var UNREPRESENTABLE_DEFAULT = Symbol();
+function serializeDefaultValue(value, schema, ctx, json, params) {
+  let unrepresentable = false;
+  const serialized = JSON.stringify(value, (_, val) => {
+    if (typeof val !== "bigint")
+      return val;
+    unrepresentable = true;
+    return null;
+  });
+  if (!unrepresentable)
+    return JSON.parse(serialized);
+  handleUnrepresentable(schema, ctx, json, params, "BigInt defaults cannot be represented in JSON Schema");
+  return UNREPRESENTABLE_DEFAULT;
+}
+var defaultProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+  const value = serializeDefaultValue(def.defaultValue, schema, ctx, json, params);
+  if (value !== UNREPRESENTABLE_DEFAULT)
+    json.default = value;
+};
+var prefaultProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+  if (ctx.io !== "input")
+    return;
+  const value = serializeDefaultValue(def.defaultValue, schema, ctx, json, params);
+  if (value !== UNREPRESENTABLE_DEFAULT)
+    json._prefault = value;
+};
+var catchProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+  let catchValue;
+  try {
+    catchValue = def.catchValue(undefined);
+  } catch {
+    handleUnrepresentable(schema, ctx, json, params, "Dynamic catch values are not supported in JSON Schema");
+    return;
+  }
+  json.default = catchValue;
+};
+var pipeProcessor = (schema, ctx, _json, params) => {
+  const def = schema._zod.def;
+  const inIsTransform = def.in._zod.traits.has("$ZodTransform");
+  const innerType = ctx.io === "input" ? inIsTransform ? def.out : def.in : def.out;
+  processSchema(innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = innerType;
+};
+var readonlyProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+  json.readOnly = true;
+};
+var optionalProcessor = (schema, ctx, _json, params) => {
+  const def = schema._zod.def;
+  processSchema(def.innerType, ctx, params);
+  const seen = ctx.seen.get(schema);
+  seen.ref = def.innerType;
+};
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/classic/errors.js
+var _installedErrorProtos = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
+function _lazyMethod(proto, key, make) {
+  Object.defineProperty(proto, key, {
+    configurable: true,
+    enumerable: false,
+    get() {
+      const value = make(this);
+      Object.defineProperty(this, key, { value, configurable: true, writable: true });
+      return value;
+    },
+    set(value) {
+      Object.defineProperty(this, key, { value, configurable: true, writable: true });
+    }
+  });
+}
+var initializer2 = (inst, issues) => {
+  $ZodError.init(inst, issues);
+  inst.name = "ZodError";
+  const proto = Object.getPrototypeOf(inst);
+  if (_installedErrorProtos.has(proto))
+    return;
+  _installedErrorProtos.add(proto);
+  _lazyMethod(proto, "format", (self) => (mapper) => formatError(self, mapper));
+  _lazyMethod(proto, "flatten", (self) => (mapper) => flattenError(self, mapper));
+  _lazyMethod(proto, "addIssue", (self) => (issue) => {
+    self.issues.push(issue);
+    self.message = JSON.stringify(self.issues, jsonStringifyReplacer, 2);
+  });
+  _lazyMethod(proto, "addIssues", (self) => (issues) => {
+    self.issues.push(...issues);
+    self.message = JSON.stringify(self.issues, jsonStringifyReplacer, 2);
+  });
+  Object.defineProperty(proto, "isEmpty", {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.issues.length === 0;
+    }
+  });
+};
+var ZodRealError = /* @__PURE__ */ $constructor("ZodError", initializer2, undefined, {
+  Parent: Error
+});
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/classic/parse.js
+var parse2 = /* @__PURE__ */ _parse(ZodRealError);
+var parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
+var safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
+var safeParseAsync = /* @__PURE__ */ _safeParseAsync(ZodRealError);
+var encode = /* @__PURE__ */ _encode(ZodRealError);
+var decode = /* @__PURE__ */ _decode(ZodRealError);
+var encodeAsync = /* @__PURE__ */ _encodeAsync(ZodRealError);
+var decodeAsync = /* @__PURE__ */ _decodeAsync(ZodRealError);
+var safeEncode = /* @__PURE__ */ _safeEncode(ZodRealError);
+var safeDecode = /* @__PURE__ */ _safeDecode(ZodRealError);
+var safeEncodeAsync = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
+var safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
+
+// ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/classic/schemas.js
+function _ensureDefaultLocale() {
+  if (!globalConfig.localeError)
+    config(en_default());
+}
+function _ensureDefaultMemoizer() {
+  if (!globalConfig.memoizer)
+    config({ memoizer: memoizer() });
+}
+var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
+  _ensureDefaultLocale();
+  $ZodType.init(inst, def);
+  inst.def = def;
+  inst.type = def.type;
+  return inst;
+}, {
+  check(...chks) {
+    const def = this.def;
+    return this.clone(mergeDefs(def, {
+      checks: [
+        ...def.checks ?? [],
+        ...chks.map((ch) => typeof ch === "function" ? { _zod: { check: ch, def: { check: "custom" }, onattach: [] } } : ch)
+      ]
+    }), { parent: true });
+  },
+  with(...chks) {
+    return this.check(...chks);
+  },
+  clone(def, params) {
+    return clone(this, def, params);
+  },
+  brand() {
+    return this;
+  },
+  register(reg, meta) {
+    reg.add(this, meta);
+    return this;
+  },
+  refine(check, params) {
+    return this.check(refine(check, params));
+  },
+  superRefine(refinement, params) {
+    return this.check(superRefine(refinement, params));
+  },
+  overwrite(fn) {
+    return this.check(_overwrite(fn));
+  },
+  optional() {
+    return optional(this);
+  },
+  exactOptional() {
+    return exactOptional(this);
+  },
+  nullable() {
+    return nullable(this);
+  },
+  nullish() {
+    return optional(nullable(this));
+  },
+  nonoptional(params) {
+    return nonoptional(this, params);
+  },
+  array() {
+    return array(this);
+  },
+  or(arg) {
+    return union([this, arg]);
+  },
+  and(arg) {
+    return intersection(this, arg);
+  },
+  transform(tx) {
+    return pipe(this, transform(tx));
+  },
+  default(d) {
+    return _default(this, d);
+  },
+  prefault(d) {
+    return prefault(this, d);
+  },
+  catch(params) {
+    return _catch(this, params);
+  },
+  pipe(target) {
+    return pipe(this, target);
+  },
+  readonly() {
+    return readonly(this);
+  },
+  describe(description) {
+    const cl = this.clone();
+    globalRegistry.add(cl, { description });
+    return cl;
+  },
+  meta(...args) {
+    if (args.length === 0)
+      return globalRegistry.get(this);
+    const cl = this.clone();
+    globalRegistry.add(cl, args[0]);
+    return cl;
+  },
+  isOptional() {
+    return this.safeParse(undefined).success;
+  },
+  isNullable() {
+    return this.safeParse(null).success;
+  },
+  apply(fn, ...args) {
+    return args.length === 0 ? fn(this) : fn(this, ...args);
+  },
+  get "~standard"() {
+    return hide(this, "~standard", {
+      ...standardProps(this),
+      jsonSchema: {
+        input: createStandardJSONSchemaMethod(this, "input"),
+        output: createStandardJSONSchemaMethod(this, "output")
+      }
+    });
+  },
+  set "~standard"(value) {
+    own(this, "~standard", value);
+  },
+  parse: function _parse(data, params) {
+    return parse2(this, data, params, { callee: _parse });
+  },
+  parseAsync: async function _parseAsync(data, params) {
+    return await parseAsync(this, data, params, { callee: _parseAsync });
+  },
+  safeParse(data, params) {
+    return safeParse(this, data, params);
+  },
+  async safeParseAsync(data, params) {
+    return safeParseAsync(this, data, params);
+  },
+  get spa() {
+    return this?.safeParseAsync;
+  },
+  set spa(value) {
+    own(this, "spa", value);
+  },
+  validate(data, params) {
+    return validate(this, data, params);
+  },
+  validateAsync(data, params) {
+    return validateAsync(this, data, params);
+  },
+  encode: function _encode(data, params) {
+    return encode(this, data, params, { callee: _encode });
+  },
+  decode: function _decode(data, params) {
+    return decode(this, data, params, { callee: _decode });
+  },
+  encodeAsync: async function _encodeAsync(data, params) {
+    return await encodeAsync(this, data, params, { callee: _encodeAsync });
+  },
+  decodeAsync: async function _decodeAsync(data, params) {
+    return await decodeAsync(this, data, params, { callee: _decodeAsync });
+  },
+  safeEncode(data, params) {
+    return safeEncode(this, data, params);
+  },
+  safeDecode(data, params) {
+    return safeDecode(this, data, params);
+  },
+  async safeEncodeAsync(data, params) {
+    return safeEncodeAsync(this, data, params);
+  },
+  async safeDecodeAsync(data, params) {
+    return safeDecodeAsync(this, data, params);
+  },
+  toJSONSchema(params) {
+    return createToJSONSchemaMethod(this, {})(params);
+  },
+  get description() {
+    return globalRegistry.get(this)?.description;
+  },
+  get _def() {
+    return this._zod.def;
+  }
+});
+var _ZodString = /* @__PURE__ */ $constructor("_ZodString", (inst, def) => {
+  $ZodString.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => stringProcessor(inst, ctx, json, params);
+}, /* @__PURE__ */ derived({
+  format: (inst) => aggregateChecks(inst).format ?? null,
+  minLength: (inst) => aggregateChecks(inst).minimum ?? null,
+  maxLength: (inst) => aggregateChecks(inst).maximum ?? null
+}, {
+  regex(...args) {
+    return this.check(_regex(...args));
+  },
+  includes(...args) {
+    return this.check(_includes(...args));
+  },
+  startsWith(...args) {
+    return this.check(_startsWith(...args));
+  },
+  endsWith(...args) {
+    return this.check(_endsWith(...args));
+  },
+  min(...args) {
+    return this.check(_minLength(...args));
+  },
+  max(...args) {
+    return this.check(_maxLength(...args));
+  },
+  length(...args) {
+    return this.check(_length(...args));
+  },
+  nonempty(...args) {
+    return this.check(_minLength(1, ...args));
+  },
+  lowercase(params) {
+    return this.check(_lowercase(params));
+  },
+  uppercase(params) {
+    return this.check(_uppercase(params));
+  },
+  trim() {
+    return this.check(_trim());
+  },
+  normalize(...args) {
+    return this.check(_normalize(...args));
+  },
+  toLowerCase() {
+    return this.check(_toLowerCase());
+  },
+  toUpperCase() {
+    return this.check(_toUpperCase());
+  },
+  slugify() {
+    return this.check(_slugify());
+  }
+}));
+var ZodString = /* @__PURE__ */ $constructor("ZodString", (inst, def) => {
+  $ZodString.init(inst, def);
+  _ZodString.init(inst, def);
+}, {
+  email(params) {
+    return this.check(_email(ZodEmail, params));
+  },
+  url(params) {
+    return this.check(_url(ZodURL, params));
+  },
+  jwt(params) {
+    return this.check(_jwt(ZodJWT, params));
+  },
+  emoji(params) {
+    return this.check(_emoji2(ZodEmoji, params));
+  },
+  guid(params) {
+    return this.check(_guid(ZodGUID, params));
+  },
+  uuid(params) {
+    return this.check(_uuid(ZodUUID, params));
+  },
+  uuidv4(params) {
+    return this.check(_uuidv4(ZodUUID, params));
+  },
+  uuidv6(params) {
+    return this.check(_uuidv6(ZodUUID, params));
+  },
+  uuidv7(params) {
+    return this.check(_uuidv7(ZodUUID, params));
+  },
+  nanoid(params) {
+    return this.check(_nanoid(ZodNanoID, params));
+  },
+  cuid(params) {
+    return this.check(_cuid(ZodCUID, params));
+  },
+  cuid2(params) {
+    return this.check(_cuid2(ZodCUID2, params));
+  },
+  ulid(params) {
+    return this.check(_ulid(ZodULID, params));
+  },
+  base64(params) {
+    return this.check(_base64(ZodBase64, params));
+  },
+  base64url(params) {
+    return this.check(_base64url(ZodBase64URL, params));
+  },
+  xid(params) {
+    return this.check(_xid(ZodXID, params));
+  },
+  ksuid(params) {
+    return this.check(_ksuid(ZodKSUID, params));
+  },
+  ipv4(params) {
+    return this.check(_ipv4(ZodIPv4, params));
+  },
+  ipv6(params) {
+    return this.check(_ipv6(ZodIPv6, params));
+  },
+  cidrv4(params) {
+    return this.check(_cidrv4(ZodCIDRv4, params));
+  },
+  cidrv6(params) {
+    return this.check(_cidrv6(ZodCIDRv6, params));
+  },
+  e164(params) {
+    return this.check(_e164(ZodE164, params));
+  },
+  datetime(params) {
+    return this.check(_isoDateTime(ZodISODateTime, params));
+  },
+  date(params) {
+    return this.check(_isoDate(ZodISODate, params));
+  },
+  time(params) {
+    return this.check(_isoTime(ZodISOTime, params));
+  },
+  duration(params) {
+    return this.check(_isoDuration(ZodISODuration, params));
+  }
+});
+function string2(params) {
+  return _string(ZodString, params);
+}
+var ZodStringFormat = /* @__PURE__ */ $constructor("ZodStringFormat", (inst, def) => {
+  $ZodStringFormat.init(inst, def);
+  _ZodString.init(inst, def);
+});
+var ZodISODateTime = /* @__PURE__ */ $constructor("ZodISODateTime", (inst, def) => {
+  $ZodISODateTime.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodISODate = /* @__PURE__ */ $constructor("ZodISODate", (inst, def) => {
+  $ZodISODate.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodISOTime = /* @__PURE__ */ $constructor("ZodISOTime", (inst, def) => {
+  $ZodISOTime.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodISODuration = /* @__PURE__ */ $constructor("ZodISODuration", (inst, def) => {
+  $ZodISODuration.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodEmail = /* @__PURE__ */ $constructor("ZodEmail", (inst, def) => {
+  $ZodEmail.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodGUID = /* @__PURE__ */ $constructor("ZodGUID", (inst, def) => {
+  $ZodGUID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodUUID = /* @__PURE__ */ $constructor("ZodUUID", (inst, def) => {
+  $ZodUUID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodURL = /* @__PURE__ */ $constructor("ZodURL", (inst, def) => {
+  $ZodURL.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodEmoji = /* @__PURE__ */ $constructor("ZodEmoji", (inst, def) => {
+  $ZodEmoji.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodNanoID = /* @__PURE__ */ $constructor("ZodNanoID", (inst, def) => {
+  $ZodNanoID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodCUID = /* @__PURE__ */ $constructor("ZodCUID", (inst, def) => {
+  $ZodCUID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodCUID2 = /* @__PURE__ */ $constructor("ZodCUID2", (inst, def) => {
+  $ZodCUID2.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodULID = /* @__PURE__ */ $constructor("ZodULID", (inst, def) => {
+  $ZodULID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodXID = /* @__PURE__ */ $constructor("ZodXID", (inst, def) => {
+  $ZodXID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodKSUID = /* @__PURE__ */ $constructor("ZodKSUID", (inst, def) => {
+  $ZodKSUID.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodIPv4 = /* @__PURE__ */ $constructor("ZodIPv4", (inst, def) => {
+  $ZodIPv4.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodIPv6 = /* @__PURE__ */ $constructor("ZodIPv6", (inst, def) => {
+  $ZodIPv6.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodCIDRv4 = /* @__PURE__ */ $constructor("ZodCIDRv4", (inst, def) => {
+  $ZodCIDRv4.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodCIDRv6 = /* @__PURE__ */ $constructor("ZodCIDRv6", (inst, def) => {
+  $ZodCIDRv6.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodBase64 = /* @__PURE__ */ $constructor("ZodBase64", (inst, def) => {
+  $ZodBase64.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodBase64URL = /* @__PURE__ */ $constructor("ZodBase64URL", (inst, def) => {
+  $ZodBase64URL.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodE164 = /* @__PURE__ */ $constructor("ZodE164", (inst, def) => {
+  $ZodE164.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodJWT = /* @__PURE__ */ $constructor("ZodJWT", (inst, def) => {
+  $ZodJWT.init(inst, def);
+  ZodStringFormat.init(inst, def);
+});
+var ZodNumber = /* @__PURE__ */ $constructor("ZodNumber", (inst, def) => {
+  $ZodNumber.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => numberProcessor(inst, ctx, json, params);
+  inst.isFinite = true;
+}, /* @__PURE__ */ derived({
+  minValue: (inst) => {
+    const { minimum, exclusiveMinimum } = aggregateChecks(inst);
+    return Math.max(minimum ?? Number.NEGATIVE_INFINITY, exclusiveMinimum ?? Number.NEGATIVE_INFINITY);
+  },
+  maxValue: (inst) => {
+    const { maximum, exclusiveMaximum } = aggregateChecks(inst);
+    return Math.min(maximum ?? Number.POSITIVE_INFINITY, exclusiveMaximum ?? Number.POSITIVE_INFINITY);
+  },
+  isInt: (inst) => {
+    const { isInt, multipleOf } = aggregateChecks(inst);
+    return !!isInt || !!multipleOf?.some(Number.isSafeInteger);
+  },
+  format: (inst) => aggregateChecks(inst).format ?? null
+}, {
+  gt(value, params) {
+    return this.check(_gt(value, params));
+  },
+  gte(value, params) {
+    return this.check(_gte(value, params));
+  },
+  min(value, params) {
+    return this.check(_gte(value, params));
+  },
+  lt(value, params) {
+    return this.check(_lt(value, params));
+  },
+  lte(value, params) {
+    return this.check(_lte(value, params));
+  },
+  max(value, params) {
+    return this.check(_lte(value, params));
+  },
+  int(params) {
+    return this.check(int(params));
+  },
+  safe(params) {
+    return this.check(int(params));
+  },
+  positive(params) {
+    return this.check(_gt(0, params));
+  },
+  nonnegative(params) {
+    return this.check(_gte(0, params));
+  },
+  negative(params) {
+    return this.check(_lt(0, params));
+  },
+  nonpositive(params) {
+    return this.check(_lte(0, params));
+  },
+  multipleOf(value, params) {
+    return this.check(_multipleOf(value, params));
+  },
+  step(value, params) {
+    return this.check(_multipleOf(value, params));
+  },
+  finite() {
+    return this;
+  }
+}));
+function number2(params) {
+  return _number(ZodNumber, params);
+}
+var ZodNumberFormat = /* @__PURE__ */ $constructor("ZodNumberFormat", (inst, def) => {
+  $ZodNumberFormat.init(inst, def);
+  ZodNumber.init(inst, def);
+});
+function int(params) {
+  return _int(ZodNumberFormat, params);
+}
+var ZodBoolean = /* @__PURE__ */ $constructor("ZodBoolean", (inst, def) => {
+  $ZodBoolean.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => booleanProcessor(inst, ctx, json, params);
+});
+function boolean2(params) {
+  return _boolean(ZodBoolean, params);
+}
+var ZodUnknown = /* @__PURE__ */ $constructor("ZodUnknown", (inst, def) => {
+  $ZodUnknown.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => unknownProcessor(inst, ctx, json, params);
+});
+function unknown() {
+  return _unknown(ZodUnknown);
+}
+var ZodNever = /* @__PURE__ */ $constructor("ZodNever", (inst, def) => {
+  $ZodNever.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => neverProcessor(inst, ctx, json, params);
+});
+function never(params) {
+  return _never(ZodNever, params);
+}
+var ZodArray = /* @__PURE__ */ $constructor("ZodArray", (inst, def) => {
+  _ensureDefaultMemoizer();
+  $ZodArray.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => arrayProcessor(inst, ctx, json, params);
+  inst.element = def.element;
+}, {
+  min(n, params) {
+    return this.check(_minLength(n, params));
+  },
+  nonempty(params) {
+    return this.check(_minLength(1, params));
+  },
+  max(n, params) {
+    return this.check(_maxLength(n, params));
+  },
+  length(n, params) {
+    return this.check(_length(n, params));
+  },
+  unwrap() {
+    return this.element;
+  }
+});
+function array(element, params) {
+  return _array(ZodArray, element, params);
+}
+var ZodObject = /* @__PURE__ */ $constructor("ZodObject", (inst, def) => {
+  _ensureDefaultMemoizer();
+  $ZodObjectJIT.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => objectProcessor(inst, ctx, json, params);
+  installLazyProp(inst, "shape", (self) => self._zod.def.shape, false);
+}, {
+  keyof() {
+    return _enum(Object.keys(this._zod.def.shape));
+  },
+  catchall(catchall) {
+    return this.clone(mergeDefs(this._zod.def, { catchall }));
+  },
+  passthrough() {
+    return this.clone(mergeDefs(this._zod.def, { catchall: unknown() }));
+  },
+  loose() {
+    return this.clone(mergeDefs(this._zod.def, { catchall: unknown() }));
+  },
+  strict() {
+    return this.clone(mergeDefs(this._zod.def, { catchall: never() }));
+  },
+  strip() {
+    return this.clone(mergeDefs(this._zod.def, { catchall: undefined }));
+  },
+  extend(incoming) {
+    return extend(this, incoming);
+  },
+  safeExtend(incoming) {
+    return safeExtend(this, incoming);
+  },
+  merge(other) {
+    return merge(this, other);
+  },
+  pick(mask) {
+    return pick(this, mask);
+  },
+  omit(mask) {
+    return omit(this, mask);
+  },
+  partial(...args) {
+    return partial(ZodOptional, this, args[0]);
+  },
+  exactPartial(...args) {
+    return partial(ZodExactOptional, this, args[0], "exactPartial");
+  },
+  required(...args) {
+    return required(ZodNonOptional, this, args[0]);
+  }
+});
+function object(shape, params) {
+  const def = {
+    type: "object",
+    shape: shape ?? {},
+    ...normalizeParams(params)
+  };
+  return new ZodObject(def);
+}
+var ZodUnion = /* @__PURE__ */ $constructor("ZodUnion", (inst, def) => {
+  $ZodUnion.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => unionProcessor(inst, ctx, json, params);
+  inst.options = def.options;
+});
+function union(options, params) {
+  return new ZodUnion({
+    type: "union",
+    options,
+    ...normalizeParams(params)
+  });
+}
+var ZodIntersection = /* @__PURE__ */ $constructor("ZodIntersection", (inst, def) => {
+  $ZodIntersection.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => intersectionProcessor(inst, ctx, json, params);
+});
+function intersection(left, right) {
+  return new ZodIntersection({
+    type: "intersection",
+    left,
+    right
+  });
+}
+var ZodRecord = /* @__PURE__ */ $constructor("ZodRecord", (inst, def) => {
+  _ensureDefaultMemoizer();
+  $ZodRecord.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => recordProcessor(inst, ctx, json, params);
+  inst.keyType = def.keyType;
+  inst.valueType = def.valueType;
+});
+function record(keyType, valueType, params) {
+  if (!valueType || !valueType._zod) {
+    return new ZodRecord({
+      type: "record",
+      keyType: string2(),
+      valueType: keyType,
+      ...normalizeParams(valueType)
+    });
+  }
+  return new ZodRecord({
+    type: "record",
+    keyType,
+    valueType,
+    ...normalizeParams(params)
+  });
+}
+var ZodEnum = /* @__PURE__ */ $constructor("ZodEnum", (inst, def) => {
+  $ZodEnum.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => enumProcessor(inst, ctx, json, params);
+  inst.enum = def.entries;
+  inst.options = [...inst._zod.values];
+  const keys = new Set(Object.keys(def.entries));
+  inst.extract = (values, params) => {
+    const newEntries = {};
+    for (const value of values) {
+      if (keys.has(value)) {
+        newEntries[value] = def.entries[value];
+      } else
+        throw new Error(`Key ${value} not found in enum`);
+    }
+    return new ZodEnum({
+      ...def,
+      checks: [],
+      ...normalizeParams(params),
+      entries: newEntries
+    });
+  };
+  inst.exclude = (values, params) => {
+    const newEntries = { ...def.entries };
+    for (const value of values) {
+      if (keys.has(value)) {
+        delete newEntries[value];
+      } else
+        throw new Error(`Key ${value} not found in enum`);
+    }
+    return new ZodEnum({
+      ...def,
+      checks: [],
+      ...normalizeParams(params),
+      entries: newEntries
+    });
+  };
+});
+function _enum(values, params) {
+  const entries = Array.isArray(values) ? Object.fromEntries(values.map((v) => [v, v])) : values;
+  return new ZodEnum({
+    type: "enum",
+    entries,
+    ...normalizeParams(params)
+  });
+}
+var ZodTransform = /* @__PURE__ */ $constructor("ZodTransform", (inst, def) => {
+  _ensureDefaultMemoizer();
+  $ZodTransform.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => transformProcessor(inst, ctx, json, params);
+  inst._zod.parse = (payload, _ctx) => {
+    if (_ctx.direction === "backward") {
+      throw new $ZodEncodeError(inst.constructor.name);
+    }
+    payload.addIssue = (issue2) => {
+      if (typeof issue2 === "string") {
+        payload.issues.push(issue(issue2, payload.value, def));
+      } else {
+        const _issue = issue2;
+        if (_issue.fatal)
+          _issue.continue = false;
+        _issue.code ?? (_issue.code = "custom");
+        if (!("input" in _issue))
+          _issue.input = payload.value;
+        _issue.inst ?? (_issue.inst = inst);
+        payload.issues.push(issue(_issue));
+      }
+    };
+    const output = def.transform(payload.value, payload);
+    if (output instanceof Promise) {
+      return output.then((output) => {
+        payload.value = output;
+        return payload;
+      });
+    }
+    payload.value = output;
+    return payload;
+  };
+});
+function transform(fn) {
+  return new ZodTransform({
+    type: "transform",
+    transform: fn
+  });
+}
+var ZodOptional = /* @__PURE__ */ $constructor("ZodOptional", (inst, def) => {
+  $ZodOptional.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => optionalProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function optional(innerType) {
+  return new ZodOptional({
+    type: "optional",
+    innerType
+  });
+}
+var ZodExactOptional = /* @__PURE__ */ $constructor("ZodExactOptional", (inst, def) => {
+  $ZodExactOptional.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => optionalProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function exactOptional(innerType) {
+  return new ZodExactOptional({
+    type: "optional",
+    innerType
+  });
+}
+var ZodNullable = /* @__PURE__ */ $constructor("ZodNullable", (inst, def) => {
+  $ZodNullable.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => nullableProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function nullable(innerType) {
+  return new ZodNullable({
+    type: "nullable",
+    innerType
+  });
+}
+var ZodDefault = /* @__PURE__ */ $constructor("ZodDefault", (inst, def) => {
+  $ZodDefault.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => defaultProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+  inst.removeDefault = inst.unwrap;
+});
+function _default(innerType, defaultValue) {
+  return new ZodDefault({
+    type: "default",
+    innerType,
+    get defaultValue() {
+      return typeof defaultValue === "function" ? defaultValue() : shallowClone(defaultValue);
+    }
+  });
+}
+var ZodPrefault = /* @__PURE__ */ $constructor("ZodPrefault", (inst, def) => {
+  $ZodPrefault.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => prefaultProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function prefault(innerType, defaultValue) {
+  return new ZodPrefault({
+    type: "prefault",
+    innerType,
+    get defaultValue() {
+      return typeof defaultValue === "function" ? defaultValue() : shallowClone(defaultValue);
+    }
+  });
+}
+var ZodNonOptional = /* @__PURE__ */ $constructor("ZodNonOptional", (inst, def) => {
+  $ZodNonOptional.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => nonoptionalProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function nonoptional(innerType, params) {
+  return new ZodNonOptional({
+    type: "nonoptional",
+    innerType,
+    ...normalizeParams(params)
+  });
+}
+var ZodCatch = /* @__PURE__ */ $constructor("ZodCatch", (inst, def) => {
+  $ZodCatch.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => catchProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+  inst.removeCatch = inst.unwrap;
+});
+function _catch(innerType, catchValue) {
+  return new ZodCatch({
+    type: "catch",
+    innerType,
+    catchValue: typeof catchValue === "function" ? catchValue : constantCatch(catchValue)
+  });
+}
+var ZodPipe = /* @__PURE__ */ $constructor("ZodPipe", (inst, def) => {
+  $ZodPipe.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => pipeProcessor(inst, ctx, json, params);
+  inst.in = def.in;
+  inst.out = def.out;
+});
+function pipe(in_, out) {
+  return new ZodPipe({
+    type: "pipe",
+    in: in_,
+    out
+  });
+}
+var ZodReadonly = /* @__PURE__ */ $constructor("ZodReadonly", (inst, def) => {
+  $ZodReadonly.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => readonlyProcessor(inst, ctx, json, params);
+  inst.unwrap = () => inst._zod.def.innerType;
+});
+function readonly(innerType) {
+  return new ZodReadonly({
+    type: "readonly",
+    innerType
+  });
+}
+var ZodCustom = /* @__PURE__ */ $constructor("ZodCustom", (inst, def) => {
+  $ZodCustom.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => customProcessor(inst, ctx, json, params);
+});
+function refine(fn, _params = {}) {
+  return _refine(ZodCustom, fn, _params);
+}
+function superRefine(fn, params) {
+  return _superRefine(fn, params);
+}
+// ../plugin/src/agents/language-directive.ts
+var ENGLISH_LANGUAGE_NAMES = new Intl.DisplayNames(["en"], {
+  type: "language",
+  fallback: "none"
+});
+function resolveLanguageName(language) {
+  const code = typeof language === "string" ? language.trim().toLowerCase() : "";
+  if (!/^[a-z]{2}$/.test(code))
+    return "";
+  let english;
+  try {
+    english = ENGLISH_LANGUAGE_NAMES.of(code) ?? undefined;
+  } catch {
+    return "";
+  }
+  if (!english)
+    return "";
+  let endonym;
+  try {
+    endonym = new Intl.DisplayNames([code], { type: "language", fallback: "none" }).of(code) ?? undefined;
+  } catch {
+    endonym = undefined;
+  }
+  return endonym && endonym !== english ? `${english} (${endonym})` : english;
+}
+function isValidLanguageCode(language) {
+  return resolveLanguageName(language) !== "";
+}
+function buildContentLanguageDirective(language, options = {}) {
+  const target = resolveLanguageName(language);
+  if (!target)
+    return "";
+  const lines = [
+    "## Output language",
+    "",
+    `Write human-readable prose you author in: ${target}.`,
+    "",
+    "Do not translate or rename structural tokens. Copy required output schemas exactly:",
+    "- XML tag names, XML attribute names, JSON keys, tool names, tool-call argument keys, enum values, booleans/null, and required sentinel strings stay in English exactly as shown.",
+    "- Keep code identifiers, file paths, commands, config keys, CLI flags, URLs, commit hashes, model/provider IDs, stack traces, diagnostics, and transcript role markers such as U:, A:, and TC: verbatim.",
+    "- Localize only free-text prose values/content: summaries, memory text, explanations, titles, observations, and answers — unless the prompt says to preserve original wording.",
+    "",
+    "These literal values must remain English when used:",
+    "PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING;",
+    "causal_incident, trajectory_correction;",
+    "feature, design, docs, release, investigation, bug, refactor, infra;",
+    "memory, observation; true, false; No relevant memories found.",
+    "",
+    "Preserve the required output shape. Do not add commentary outside the requested XML/JSON/tool output."
+  ];
+  if (options.preserveUserQuotes) {
+    lines.push("", `Preserve U: lines and directly quoted user text in their original source language; write the surrounding summary prose in ${target}.`);
+  }
+  if (options.retrospective) {
+    lines.push("", `Write the lesson text in ${target}; paraphrase source text and never quote the user.`);
+  }
+  return lines.join(`
+`);
+}
+function withContentLanguageDirective(systemPrompt, language, options = {}) {
+  const directive = buildContentLanguageDirective(language, options);
+  return directive ? `${systemPrompt}
+
+${directive}` : systemPrompt;
+}
+function buildMigrationLanguageDirective(language) {
+  const target = resolveLanguageName(language);
+  if (!target)
+    return "";
+  return [
+    "## Output language",
+    "",
+    "Preserve each migrated memory's existing language — do NOT translate a memory just because an output language is set. When merging memories written in different languages, use the language of the clearest / source-majority memory; otherwise keep the source phrasing. Only the category re-mapping changes."
+  ].join(`
+`);
+}
+function withMigrationLanguageDirective(systemPrompt, language) {
+  const directive = buildMigrationLanguageDirective(language);
+  return directive ? `${systemPrompt}
+
+${directive}` : systemPrompt;
+}
+function buildPrimaryLanguageDirective(language) {
+  const target = resolveLanguageName(language);
+  if (!target)
+    return "";
+  return `Use ${target} for your natural-language replies to the user unless the user explicitly asks for another language. Keep code, identifiers, file paths, commands, logs, and quoted text verbatim.`;
+}
+
+// ../plugin/src/features/magic-context/defaults.ts
+var DEFAULT_PROTECTED_TAGS = 20;
+
+// ../plugin/src/features/magic-context/dreamer/cron.ts
+var FIELDS = [
+  { name: "minute", min: 0, max: 59 },
+  { name: "hour", min: 0, max: 23 },
+  { name: "day-of-month", min: 1, max: 31 },
+  { name: "month", min: 1, max: 12 },
+  { name: "day-of-week", min: 0, max: 7 }
+];
+var MINUTE_MS = 60000;
+var MAX_SEARCH_MS = 4 * 366 * 24 * 60 * MINUTE_MS;
+function parseField(token, spec) {
+  const values = new Set;
+  const normalize = (n) => spec.name === "day-of-week" && n === 7 ? 0 : n;
+  for (const part of token.split(",")) {
+    const piece = part.trim();
+    if (piece.length === 0)
+      return null;
+    const [rangePart, stepPart, ...extra] = piece.split("/");
+    if (extra.length > 0)
+      return null;
+    let step = 1;
+    if (stepPart !== undefined) {
+      if (!/^\d+$/.test(stepPart))
+        return null;
+      step = Number(stepPart);
+      if (step < 1)
+        return null;
+    }
+    let lo;
+    let hi;
+    if (rangePart === "*") {
+      lo = spec.min;
+      hi = spec.max;
+    } else if (rangePart.includes("-")) {
+      const [loStr, hiStr, ...rest] = rangePart.split("-");
+      if (rest.length > 0)
+        return null;
+      if (!/^\d+$/.test(loStr) || !/^\d+$/.test(hiStr))
+        return null;
+      lo = Number(loStr);
+      hi = Number(hiStr);
+    } else {
+      if (!/^\d+$/.test(rangePart))
+        return null;
+      lo = Number(rangePart);
+      hi = stepPart !== undefined ? spec.max : lo;
+    }
+    if (lo < spec.min || lo > spec.max || hi < spec.min || hi > spec.max)
+      return null;
+    if (lo > hi)
+      return null;
+    for (let v = lo;v <= hi; v += step) {
+      values.add(normalize(v));
+    }
+  }
+  return values.size > 0 ? values : null;
+}
+function parseCron(expression) {
+  const trimmed = expression.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "empty cron expression" };
+  }
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length !== 5) {
+    return {
+      ok: false,
+      error: `expected 5 fields (minute hour day-of-month month day-of-week), got ${tokens.length}`
+    };
+  }
+  const sets = [];
+  for (let i = 0;i < FIELDS.length; i++) {
+    const parsed = parseField(tokens[i], FIELDS[i]);
+    if (!parsed) {
+      return {
+        ok: false,
+        error: `invalid ${FIELDS[i].name} field "${tokens[i]}" (allowed ${FIELDS[i].min}-${FIELDS[i].max})`
+      };
+    }
+    sets.push(parsed);
+  }
+  return {
+    ok: true,
+    cron: {
+      minute: sets[0],
+      hour: sets[1],
+      dom: sets[2],
+      month: sets[3],
+      dow: sets[4],
+      domRestricted: tokens[2] !== "*",
+      dowRestricted: tokens[4] !== "*"
+    }
+  };
+}
+function isValidCron(expression) {
+  return parseCron(expression).ok;
+}
+function matchesDay(cron, date) {
+  const dom = cron.dom.has(date.getDate());
+  const dow = cron.dow.has(date.getDay());
+  if (cron.domRestricted && cron.dowRestricted)
+    return dom || dow;
+  if (cron.domRestricted)
+    return dom;
+  if (cron.dowRestricted)
+    return dow;
+  return true;
+}
+function matchesCron(cron, date) {
+  return cron.minute.has(date.getMinutes()) && cron.hour.has(date.getHours()) && cron.month.has(date.getMonth() + 1) && matchesDay(cron, date);
+}
+function civilMinuteKey(date) {
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${p(date.getFullYear(), 4)}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}`;
+}
+function nextOccurrence(cron, after, excludeCivilMinute, maxSearchMs = MAX_SEARCH_MS) {
+  const afterMs = after.getTime();
+  let cursorMs = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
+  const capMs = afterMs + Math.max(0, Math.min(MAX_SEARCH_MS, maxSearchMs));
+  while (cursorMs <= capMs) {
+    const candidate = new Date(cursorMs);
+    if (matchesCron(cron, candidate)) {
+      if (!excludeCivilMinute || civilMinuteKey(candidate) !== excludeCivilMinute) {
+        return candidate;
+      }
+    }
+    cursorMs += MINUTE_MS;
+  }
+  return null;
+}
+function nextDueAtMs(expression, afterMs, consumedScheduledAtMs, maxSearchMs = MAX_SEARCH_MS) {
+  if (expression.trim().length === 0)
+    return null;
+  const parsed = parseCron(expression);
+  if (!parsed.ok)
+    return null;
+  const exclude = consumedScheduledAtMs !== undefined ? civilMinuteKey(new Date(consumedScheduledAtMs)) : undefined;
+  const next = nextOccurrence(parsed.cron, new Date(afterMs), exclude, maxSearchMs);
+  return next ? next.getTime() : null;
+}
+
+// ../plugin/src/shared/prompt-surface.ts
+function isValidPromptSurfaceModelKey(key) {
+  if (key.length === 0 || key.trim() !== key)
+    return false;
+  const slash = key.indexOf("/");
+  if (slash < 0)
+    return !key.includes("*");
+  if (slash === 0 || slash === key.length - 1)
+    return false;
+  const provider = key.slice(0, slash);
+  const modelID = key.slice(slash + 1);
+  if (provider.trim() !== provider || modelID.trim() !== modelID || provider.includes("*") || modelID.includes("*") && modelID !== "*") {
+    return false;
+  }
+  if (modelID === "*")
+    return true;
+  return modelID.length > 0 && !modelID.startsWith("/") && !modelID.endsWith("/") && !modelID.includes("//");
+}
+function modelKeyLookupOrder(modelKey) {
+  if (!modelKey)
+    return [];
+  const slash = modelKey.indexOf("/");
+  if (slash <= 0 || slash === modelKey.length - 1)
+    return [];
+  const provider = modelKey.slice(0, slash);
+  let modelID = modelKey.slice(slash + 1);
+  const candidates = [];
+  while (modelID.length > 0) {
+    candidates.push({ key: `${provider}/${modelID}`, source: "exact" });
+    candidates.push({ key: modelID, source: "bare" });
+    const lastDash = modelID.lastIndexOf("-");
+    if (lastDash <= 0)
+      break;
+    modelID = modelID.slice(0, lastDash);
+  }
+  candidates.push({ key: `${provider}/*`, source: "wildcard" });
+  const seen = new Set;
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate.key))
+      return false;
+    seen.add(candidate.key);
+    return true;
+  });
+}
+function resolveModelConfigValue(values, modelKey) {
+  if (!values)
+    return;
+  for (const candidate of modelKeyLookupOrder(modelKey)) {
+    const value = values[candidate.key];
+    if (value !== undefined) {
+      return { value, source: candidate.source };
+    }
+  }
+  return;
+}
+function resolveModelConfigOrDefault(values, modelKey, fallback) {
+  return resolveModelConfigValue(values, modelKey)?.value ?? fallback;
+}
+
+// ../plugin/src/config/schema/agent-overrides.ts
+var PermissionValueSchema = _enum(["ask", "allow", "deny"]);
+var PermissionSchema = object({
+  edit: PermissionValueSchema.optional(),
+  bash: union([PermissionValueSchema, record(string2(), PermissionValueSchema)]).optional(),
+  webfetch: PermissionValueSchema.optional(),
+  doom_loop: PermissionValueSchema.optional(),
+  external_directory: PermissionValueSchema.optional()
+}).optional();
+var AgentOverrideConfigSchema = object({
+  model: string2().optional().describe("Primary model ID (e.g. 'claude-sonnet-4-6')"),
+  temperature: number2().min(0).max(2).optional().describe("Sampling temperature (0-2)"),
+  top_p: number2().min(0).max(1).optional().describe("Nucleus sampling top_p (0-1)"),
+  prompt: string2().optional().describe("Additional system prompt text"),
+  tools: record(string2(), boolean2()).optional().describe("Tool enable/disable overrides"),
+  disable: boolean2().optional().describe("Disable this agent"),
+  description: string2().optional().describe("Agent description"),
+  mode: _enum(["subagent", "primary", "all"]).optional().describe("Agent mode (subagent, primary, or all)"),
+  color: string2().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Hex color for the agent (e.g. '#a1b2c3')"),
+  maxSteps: number2().optional().describe("Maximum tool-call steps per invocation"),
+  permission: PermissionSchema.describe("Per-tool permission overrides"),
+  maxTokens: number2().optional().describe("Maximum output tokens"),
+  variant: string2().optional().describe("OpenCode reasoning variant (e.g. for extended thinking)"),
+  fallback_models: union([string2(), array(string2())]).optional().describe("Fallback model IDs if primary is unavailable")
+});
+
+// ../plugin/src/config/schema/magic-context.ts
+var DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
+var EXECUTE_THRESHOLD_CAP_MESSAGE = "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
+var DEFAULT_HISTORIAN_TIMEOUT_MS = 300000;
+var DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
+var DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+var PiThinkingLevelSchema = _enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional();
+var PiConfigSchema = object({
+  subagent_extensions: array(string2().trim().min(1)).optional().describe("User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.")
+}).optional();
+var PromptSurfacePresetSchema = _enum(["full", "light"]);
+var PromptSurfaceModelKeySchema = string2().refine(isValidPromptSurfaceModelKey, {
+  message: "Use a non-empty bare model key, provider/model key, or the literal provider/* wildcard; model IDs may contain additional slashes and matching is case-sensitive."
+});
+var PromptSurfaceToolKeySchema = string2().refine((value) => value.trim().length > 0, {
+  message: "tool description keys must not be empty or whitespace-only"
+});
+var PromptSurfaceConfigSchema = object({
+  default: PromptSurfacePresetSchema.default("full").describe('Fallback prompt-surface preset ("full" or "light").'),
+  models: record(PromptSurfaceModelKeySchema, PromptSurfacePresetSchema).optional().describe("Literal per-model routing. Keys are bare model IDs, provider/model, or provider/*; matching is case-sensitive and preserves additional slashes in model IDs."),
+  guidance_override_path: string2().refine((value) => value.trim().length > 0, {
+    message: "guidance_override_path must not be empty or whitespace-only"
+  }).optional().describe("USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file."),
+  tool_descriptions: record(PromptSurfaceToolKeySchema, string2().refine((value) => value.trim().length > 0, {
+    message: "tool description values must not be empty or whitespace-only"
+  })).optional().describe("USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged.")
+}).describe("Prompt-surface preset routing. Project config may select default/models, while guidance_override_path and tool_descriptions are user-level only.");
+var CronScheduleSchema = string2().refine((s) => s.trim() === "" || isValidCron(s), {
+  message: 'Invalid schedule: use a 5-field cron expression (e.g. "0 3 * * *" for 3am daily, "0 3 * * 0" for Sunday 3am, "0 */6 * * *" every 6h) or "" to disable.'
+}).describe('5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task.');
+var DreamTaskBaseConfigSchema = object({
+  schedule: CronScheduleSchema.default(""),
+  model: string2().optional().describe("Per-task model override (inherits dreamer.model)"),
+  fallback_models: union([string2(), array(string2())]).optional().describe("Per-task fallback chain (inherits dreamer.fallback_models)"),
+  thinking_level: PiThinkingLevelSchema.describe("Pi only: per-task thinking level"),
+  timeout_minutes: number2().min(5).default(20).describe("Minutes allowed for this task before it is aborted")
+});
+var PromotionThresholdSchema = number2().min(2).max(20).optional().describe("review-user-memories: min candidate observations before promotion is considered (default: 3)");
+var PrimerPromotionThresholdSchema = number2().min(2).max(20).optional().describe("promote-primers: min recurring source days before promotion is considered (default: 2)");
+var DreamTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
+  promotion_threshold: PromotionThresholdSchema
+});
+var ReviewUserMemoriesTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
+  promotion_threshold: PromotionThresholdSchema
+});
+var PromotePrimersTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
+  promotion_threshold: PrimerPromotionThresholdSchema
+});
+var DEFAULT_TASK_SCHEDULES = {
+  "map-memories": "0 2 * * *",
+  verify: "0 3 * * *",
+  "verify-broad": "0 4 * * 0",
+  curate: "0 4 * * 0",
+  "compress-cues": "0 4 * * *",
+  "classify-memories": "0 6 * * *",
+  retrospective: "0 5 * * *",
+  "maintain-docs": "",
+  "evaluate-smart-notes": "0 3 * * *",
+  "review-user-memories": "0 3 * * *",
+  "promote-primers": "0 3 * * *",
+  "refresh-primers": "0 3 * * *"
+};
+function defaultTaskConfig(task) {
+  const base = { schedule: DEFAULT_TASK_SCHEDULES[task] };
+  if (task === "review-user-memories")
+    base.promotion_threshold = 3;
+  if (task === "promote-primers")
+    base.promotion_threshold = 2;
+  return base;
+}
+var DreamTasksSchema = object({
+  "map-memories": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("map-memories"))),
+  verify: DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("verify"))),
+  "verify-broad": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("verify-broad"))),
+  curate: DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("curate"))),
+  "compress-cues": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("compress-cues"))),
+  "classify-memories": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("classify-memories"))),
+  retrospective: DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("retrospective"))),
+  "maintain-docs": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("maintain-docs"))),
+  "evaluate-smart-notes": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("evaluate-smart-notes"))),
+  "review-user-memories": ReviewUserMemoriesTaskConfigSchema.default(() => ReviewUserMemoriesTaskConfigSchema.parse(defaultTaskConfig("review-user-memories"))),
+  "promote-primers": PromotePrimersTaskConfigSchema.default(() => PromotePrimersTaskConfigSchema.parse(defaultTaskConfig("promote-primers"))),
+  "refresh-primers": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("refresh-primers")))
+}).describe("Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model.");
+var DreamerConfigSchema = AgentOverrideConfigSchema.merge(object({
+  tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
+  inject_docs: boolean2().default(true).describe("Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)"),
+  thinking_level: PiThinkingLevelSchema.describe("Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.")
+}));
+var SidekickConfigSchema = AgentOverrideConfigSchema.extend({
+  timeout_ms: number2().default(30000).describe("Timeout for sidekick calls in milliseconds"),
+  system_prompt: string2().optional().describe("Custom system prompt for sidekick"),
+  thinking_level: PiThinkingLevelSchema.describe("Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level.")
+}).optional();
+var HistorianConfigSchema = AgentOverrideConfigSchema.extend({
+  two_pass: boolean2().default(false).describe("Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)"),
+  thinking_level: PiThinkingLevelSchema.describe("Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max"),
+  disallowed_tools: array(_enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"])).default([]).describe(`OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: [])`)
+}).optional();
+var EmbeddingFallbackProviderSchema = _enum(["local", "openai-compatible", "off"]);
+function expandConfigPath(value) {
+  const trimmed = value.trim();
+  if (trimmed === "~")
+    return homedir();
+  if (trimmed.startsWith("~/"))
+    return `${homedir()}/${trimmed.slice(2)}`;
+  return trimmed;
+}
+var BaseEmbeddingConfigSchema = object({
+  provider: _enum(["local", "openai-compatible", "off", "synapse"]).default("local").describe("Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings."),
+  fallback_provider: EmbeddingFallbackProviderSchema.optional().describe("Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid."),
+  model: string2().optional().describe("Embedding model name. Required for openai-compatible, ignored for local."),
+  endpoint: string2().optional().describe("API endpoint URL. Required when provider is openai-compatible."),
+  api_key: string2().optional().describe("API key for remote embedding provider (optional)"),
+  input_type: string2().optional().describe("Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset."),
+  query_input_type: string2().optional().describe("Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type."),
+  truncate: string2().optional().describe("Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' | 'START' | 'END'). Omitted from the request when unset."),
+  max_input_tokens: number2().int().positive().optional().describe("Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted."),
+  local_dtype: _enum([
+    "auto",
+    "fp32",
+    "fp16",
+    "q8",
+    "int8",
+    "uint8",
+    "q4",
+    "bnb4",
+    "q4f16",
+    "q2",
+    "q2f16",
+    "q1",
+    "q1f16"
+  ]).optional().describe("Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259.")
+}).superRefine((data, ctx) => {
+  const validationProvider = data.provider === "synapse" ? data.fallback_provider : data.provider;
+  if (validationProvider === "openai-compatible" && !data.endpoint?.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["endpoint"],
+      message: "endpoint is required when embedding.provider is openai-compatible"
+    });
+  }
+  if (validationProvider === "openai-compatible" && !data.model?.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["model"],
+      message: "model is required when embedding.provider is openai-compatible"
+    });
+  }
+});
+var EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) => {
+  if (data.provider === "synapse") {
+    const model = data.model?.trim();
+    const endpoint = data.endpoint?.trim();
+    const apiKey = data.api_key?.trim();
+    const inputType = data.input_type?.trim();
+    const queryInputType = data.query_input_type?.trim();
+    const truncate = data.truncate?.trim();
+    return {
+      provider: "synapse",
+      ...data.fallback_provider ? { fallback_provider: data.fallback_provider } : {},
+      ...model ? { model } : {},
+      ...endpoint ? { endpoint } : {},
+      ...apiKey ? { api_key: apiKey } : {},
+      ...inputType ? { input_type: inputType } : {},
+      ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...truncate ? { truncate } : {},
+      ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}
+    };
+  }
+  if (data.provider === "local") {
+    return {
+      provider: "local",
+      model: data.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+      ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {},
+      ...data.local_dtype ? { local_dtype: data.local_dtype } : {}
+    };
+  }
+  if (data.provider === "openai-compatible") {
+    const apiKey = data.api_key?.trim();
+    const inputType = data.input_type?.trim();
+    const queryInputType = data.query_input_type?.trim();
+    const truncate = data.truncate?.trim();
+    return {
+      provider: "openai-compatible",
+      model: data.model?.trim() ?? "",
+      endpoint: data.endpoint?.trim() ?? "",
+      ...apiKey ? { api_key: apiKey } : {},
+      ...inputType ? { input_type: inputType } : {},
+      ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...truncate ? { truncate } : {},
+      ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}
+    };
+  }
+  return { provider: "off" };
+});
+var MagicContextConfigSchema = object({
+  enabled: boolean2().default(true).describe("Enable magic context (default: true)"),
+  allow_home_project: boolean2().default(false).describe("Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace."),
+  mural: object({
+    enabled: boolean2().default(false),
+    model: string2().trim().min(1).optional().describe("Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).")
+  }).default({ enabled: false }).describe("Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task."),
+  transform_mode: _enum(["ts", "rust"]).default("ts").describe('Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.'),
+  auto_update: boolean2().optional().describe("Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates."),
+  language: string2().trim().toLowerCase().refine((s) => isValidLanguageCode(s), 'language must be a 2-letter ISO 639-1 code (e.g. "tr", "es", "de")').optional().describe("Output language for Magic Context's generated content and guidance, as a " + '2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the ' + "historian, dreamer, sidekick, and the agent-guidance block instruct the model to " + "write its PROSE in this language while keeping all structural tokens (XML tags, " + "the five memory category names, code identifiers, file paths) in English. " + "USER-LEVEL ONLY (ignored in project config for security). Unset = today's " + "behavior (model mirrors the conversation; English scaffolding). Changing it " + "triggers one cache re-materialization; existing compartments/memories keep their " + "original language until naturally rewritten."),
+  historian: HistorianConfigSchema.describe("Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)"),
+  dreamer: DreamerConfigSchema.optional().describe("Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)"),
+  smart_notes: object({
+    retina_handoff: boolean2().default(false).describe("When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed.")
+  }).default({ retina_handoff: false }).describe("Smart-note ownership transition controls."),
+  cache_ttl: union([string2(), object({ default: string2() }).catchall(string2())]).default("5m").describe('Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.'),
+  prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe("Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes)."),
+  output_reserve: union([
+    number2().min(0),
+    object({ default: number2().min(0) }).catchall(number2().min(0))
+  ]).optional().describe('User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.'),
+  toast_duration_ms: number2().min(0).max(60000).default(5000).describe("TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000)"),
+  execute_threshold_percentage: union([
+    number2().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE),
+    object({ default: number2().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE) }).catchall(number2().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE))
+  ]).default(DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE).describe('Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE'),
+  execute_threshold_tokens: object({
+    default: number2().min(5000).max(2000000).optional()
+  }).catchall(number2().min(5000).max(2000000)).optional().describe("Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000."),
+  protected_tags: number2().min(1).max(100).optional().describe("Number of recent tags to protect from dropping (min: 1, max: 100, default: 20)"),
+  clear_reasoning_age: number2().min(10).default(50).describe("Clear reasoning/thinking blocks older than N tags (default: 50)"),
+  history_budget_percentage: number2().min(0.05).max(0.5).default(DEFAULT_HISTORY_BUDGET_PERCENTAGE).describe("Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15)"),
+  historian_timeout_ms: number2().min(60000).default(DEFAULT_HISTORIAN_TIMEOUT_MS).describe("Timeout for each historian prompt call in milliseconds (default: 300000)"),
+  commit_cluster_trigger: object({
+    enabled: boolean2().default(true).describe("Enable commit-cluster based historian triggering (default: true)"),
+    min_clusters: number2().min(1).default(3).describe("Minimum commit clusters required to trigger historian (min: 1, default: 3)")
+  }).default({ enabled: true, min_clusters: 3 }).describe("Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail"),
+  system_prompt_injection: object({
+    enabled: boolean2().default(true).describe("When false, NO injection happens for ANY agent — global escape hatch. (default: true)"),
+    skip_signatures: array(string2()).default(["<!-- magic-context: skip -->"]).describe(`Substring opt-out list. If the agent's system prompt contains any of these strings, skip ALL Magic Context injection for that call. Default "<!-- magic-context: skip -->" is meant to be added inside a user's custom agent prompt to opt that agent out.`)
+  }).default({
+    enabled: true,
+    skip_signatures: ["<!-- magic-context: skip -->"]
+  }).describe("Controls whether and where Magic Context augments the system prompt. Lets users opt specific agents out of the Magic Context guidance and the surrounding project-docs / user-profile blocks. OpenCode's internal hidden agents — title, summary, and compaction — are always skipped automatically."),
+  sqlite: object({
+    cache_size_mb: number2().min(2).max(2048).default(64).describe("Page-cache size in MiB per connection (PRAGMA cache_size). Larger keeps more hot pages resident, cutting re-reads on repeated full-table scans. (min 2, max 2048, default 64)"),
+    mmap_size_mb: number2().min(0).max(8192).default(0).describe("Memory-mapped I/O size in MiB (PRAGMA mmap_size). 0 disables mmap (SQLite default). Raising it can cut read overhead on large DBs at the cost of address space. (min 0, max 8192, default 0)")
+  }).default({ cache_size_mb: 64, mmap_size_mb: 0 }).describe("SQLite connection tuning for Magic Context's own context.db. These are per-connection PRAGMAs applied at open; they do not change the schema or what is stored."),
+  storage: object({
+    enforce_private_permissions: boolean2().default(true).describe("When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.")
+  }).default({ enforce_private_permissions: true }).describe("Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories."),
+  embedding: EmbeddingConfigSchema.default({
+    provider: "local",
+    model: DEFAULT_LOCAL_EMBEDDING_MODEL
+  }).describe("Embedding provider configuration"),
+  subc: object({
+    connection_file: string2().trim().min(1).transform(expandConfigPath).describe("Path to the owner-only subc connection file.")
+  }).optional().describe("User-only Synapse daemon connection settings."),
+  shadow_embedding: object({
+    enabled: boolean2().default(false).describe("Developer-only Synapse shadow embedding lane switch.")
+  }).default({ enabled: false }).describe("Developer-only Synapse shadow embedding lane."),
+  temporal_awareness: boolean2().default(true).describe('Inject wall-clock gap markers (<!-- +Xm -->) between user messages where > 5 min elapsed since the previous message, and add compact date ranges to compartment headings. Gives the agent a sense of session pacing and "how long ago" across multi-day sessions. Graduated from experimental.temporal_awareness; default: true (set false to opt out).'),
+  keep_subagents: boolean2().default(false).describe("Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect."),
+  fail_closed_blocking: boolean2().default(true).describe("When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart."),
+  compaction: object({
+    enabled: boolean2().default(true).describe("When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, /ctx-flush, and /ctx-session-upgrade refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.")
+  }).default({ enabled: true }).describe("Compaction-off mode gate. Default true (MC manages the context window as today). Set compaction.enabled=false to keep the knowledge layer while letting native compaction (or nothing) own the window. Boot-resolved; requires a restart to change."),
+  todowrite: object({
+    enabled: boolean2().default(true).describe("Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there."),
+    overlay: boolean2().default(true).describe("Pi only: show the persistent todo overlay above the editor while tasks are active.")
+  }).default({ enabled: true, overlay: true }).describe("Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart."),
+  pi: PiConfigSchema.describe("Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load."),
+  smart_drops: boolean2().default(false).describe("Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart."),
+  caveman_text_compression: object({
+    enabled: boolean2().default(false).describe("Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%)."),
+    min_chars: number2().min(100).max(1e4).default(500).describe("Text parts shorter than this (characters) stay untouched. Min 100, max 10000. Default: 500.")
+  }).default({ enabled: false, min_chars: 500 }).describe("Age-tier caveman compression for long user/assistant text parts. Active for primary sessions when enabled; never for subagents. Oldest 20% of eligible tags (outside protected tail) go to ultra, next 20% to full, next 20% to lite, newest 40% untouched. Graduated from experimental.caveman_text_compression; opt-in, default off (lossy)."),
+  memory: object({
+    enabled: boolean2().default(true).describe("Enable cross-session memory (default: true)"),
+    injection_budget_tokens: number2().min(500).max(20000).default(4000).describe("Token budget for memory injection on session start (min: 500, max: 20000, default: 4000)"),
+    auto_promote: boolean2().default(true).describe("Automatically promote eligible session facts into memory (default: true)"),
+    retrieval_count_promotion_threshold: number2().min(1).default(3).describe("retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3)"),
+    auto_search: object({
+      enabled: boolean2().default(true).describe("Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled."),
+      score_threshold: number2().min(0.3).max(0.95).default(0.6).describe("Top hit score must exceed this threshold for the hint to fire (min: 0.3, max: 0.95, default: 0.60)"),
+      min_prompt_chars: number2().min(5).max(500).default(20).describe("Skip hint when user message is shorter than this (min: 5, max: 500, default: 20)")
+    }).default({ enabled: true, score_threshold: 0.6, min_prompt_chars: 20 }).describe("Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled."),
+    git_commit_indexing: object({
+      enabled: boolean2().default(false).describe("Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled."),
+      since_days: number2().min(7).max(3650).default(365).describe("Days of HEAD history to index (min: 7, max: 3650, default: 365)"),
+      max_commits: number2().min(100).max(20000).default(2000).describe("Max commits kept per project; oldest evicted (min: 100, max: 20000, default: 2000)")
+    }).default({ enabled: false, since_days: 365, max_commits: 2000 }).describe("Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled.")
+  }).default({
+    enabled: true,
+    injection_budget_tokens: 4000,
+    auto_promote: true,
+    retrieval_count_promotion_threshold: 3,
+    auto_search: { enabled: true, score_threshold: 0.6, min_prompt_chars: 20 },
+    git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 }
+  }).describe("Cross-session memory configuration"),
+  sidekick: SidekickConfigSchema.describe("Optional sidekick agent configuration for session-start memory retrieval")
+}).transform((data) => {
+  return {
+    ...data,
+    protected_tags: data.protected_tags ?? DEFAULT_PROTECTED_TAGS
+  };
+});
+
+// ../plugin/src/features/magic-context/compartment-chunk-embedding.ts
+import { createHash } from "node:crypto";
+
+// ../plugin/src/features/magic-context/recursive-text-splitter.ts
+var DEFAULT_SEPARATORS = [`
+
+`, `
+`, " ", ""];
+function splitOnSeparator(text, separator) {
+  const splits = separator ? text.split(separator) : text.split("");
+  return splits.filter((s) => s !== "");
+}
+function mergeSplits(splits, separator, chunkSize, lengthFunction) {
+  const docs = [];
+  const currentDoc = [];
+  let total = 0;
+  const joinDocs = (docsToJoin) => {
+    const joined = docsToJoin.join(separator).trim();
+    return joined === "" ? null : joined;
+  };
+  for (const d of splits) {
+    const len = lengthFunction(d);
+    if (total + len + currentDoc.length * separator.length > chunkSize) {
+      if (currentDoc.length > 0) {
+        const doc = joinDocs(currentDoc);
+        if (doc !== null)
+          docs.push(doc);
+        while (total > 0 && currentDoc.length > 0) {
+          total -= lengthFunction(currentDoc[0]);
+          currentDoc.shift();
+        }
+      }
+    }
+    currentDoc.push(d);
+    total += len;
+  }
+  const doc = joinDocs(currentDoc);
+  if (doc !== null)
+    docs.push(doc);
+  return docs;
+}
+function splitTextRecursive(text, separators, chunkSize, lengthFunction) {
+  const finalChunks = [];
+  let separator = separators[separators.length - 1];
+  let newSeparators;
+  for (let i = 0;i < separators.length; i += 1) {
+    const s = separators[i];
+    if (s === "") {
+      separator = s;
+      break;
+    }
+    if (text.includes(s)) {
+      separator = s;
+      newSeparators = separators.slice(i + 1);
+      break;
+    }
+  }
+  const splits = splitOnSeparator(text, separator);
+  let goodSplits = [];
+  for (const s of splits) {
+    if (lengthFunction(s) < chunkSize) {
+      goodSplits.push(s);
+    } else {
+      if (goodSplits.length) {
+        finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+        goodSplits = [];
+      }
+      if (!newSeparators) {
+        finalChunks.push(s);
+      } else {
+        finalChunks.push(...splitTextRecursive(s, newSeparators, chunkSize, lengthFunction));
+      }
+    }
+  }
+  if (goodSplits.length) {
+    finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+  }
+  return finalChunks;
+}
+function recursiveCharacterSplit(text, options) {
+  const chunkSize = options.chunkSize;
+  const lengthFunction = options.lengthFunction ?? ((t) => t.length);
+  const separators = options.separators ?? DEFAULT_SEPARATORS;
+  if (text.length === 0)
+    return [];
+  return splitTextRecursive(text, separators, chunkSize, lengthFunction);
+}
+
+// ../plugin/src/features/magic-context/compartment-chunk-embedding.ts
+var DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
+var CHUNK_WINDOW_SAFETY_RATIO = 0.9;
+var loadFtsRowsStatements = new WeakMap;
+var existingHashStatements = new WeakMap;
+var existingHashByProjectStatements = new WeakMap;
+var deleteByCompartmentStatements = new WeakMap;
+var insertEmbeddingStatements = new WeakMap;
+var searchRowsStatements = new WeakMap;
+var searchRowsByModelStatements = new WeakMap;
+var searchPoolProbeStatements = new WeakMap;
+var backfillCandidateStatements = new WeakMap;
+var DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+var decodedSearchPools = new WeakMap;
+var decodedSearchPoolLru = new Map;
+var decodedSearchPoolBytes = 0;
+function getLoadFtsRowsStatement(db) {
+  let stmt = loadFtsRowsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT message_ordinal AS messageOrdinal, role, content
+             FROM message_history_fts
+             WHERE session_id = ?
+               AND message_ordinal >= ?
+               AND message_ordinal <= ?
+               AND role IN ('user', 'assistant')
+             ORDER BY message_ordinal ASC`);
+    loadFtsRowsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getExistingHashStatement(db, scopedToProject) {
+  const map = scopedToProject ? existingHashByProjectStatements : existingHashStatements;
+  let stmt = map.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT window_index AS windowIndex, chunk_hash AS chunkHash
+             FROM compartment_chunk_embeddings
+             WHERE compartment_id = ?
+               AND model_id = ?
+               ${scopedToProject ? "AND project_path = ?" : ""}
+             ORDER BY window_index ASC`);
+    map.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteByCompartmentStatement(db) {
+  let stmt = deleteByCompartmentStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM compartment_chunk_embeddings WHERE compartment_id = ? AND model_id = ?");
+    deleteByCompartmentStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getInsertEmbeddingStatement(db) {
+  let stmt = insertEmbeddingStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO compartment_chunk_embeddings (
+                compartment_id, session_id, project_path, harness, window_index,
+                start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertEmbeddingStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getSearchPoolProbeStatement(db) {
+  let stmt = searchPoolProbeStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT COUNT(*) AS rowCount, MAX(id) AS maxRowId
+             FROM compartment_chunk_embeddings
+             WHERE session_id = ? AND project_path = ? AND model_id = ?`);
+    searchPoolProbeStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getSearchRowsStatement(db, withModel) {
+  const map = withModel ? searchRowsByModelStatements : searchRowsStatements;
+  let stmt = map.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT e.compartment_id AS compartmentId,
+                    e.session_id AS sessionId,
+                    c.title AS title,
+                    c.start_message AS compartmentStart,
+                    c.end_message AS compartmentEnd,
+                    e.window_index AS windowIndex,
+                    e.start_ordinal AS windowStart,
+                    e.end_ordinal AS windowEnd,
+                    e.chunk_hash AS chunkHash,
+                    e.model_id AS modelId,
+                    e.dims AS dims,
+                    e.vector AS vector
+             FROM compartment_chunk_embeddings e
+             JOIN compartments c ON c.id = e.compartment_id
+             WHERE e.session_id = ?
+               AND e.project_path = ?
+               ${withModel ? "AND e.model_id = ?" : ""}
+             ORDER BY e.compartment_id ASC, e.window_index ASC`);
+    map.set(db, stmt);
+  }
+  return stmt;
+}
+function searchPoolKey(sessionId, projectPath, modelId) {
+  return JSON.stringify([sessionId, projectPath, modelId]);
+}
+function getDecodedSearchPool(db) {
+  let pool = decodedSearchPools.get(db);
+  if (!pool) {
+    pool = new Map;
+    decodedSearchPools.set(db, pool);
+  }
+  return pool;
+}
+function removeDecodedSearchPoolEntry(entry) {
+  if (entry.pool.get(entry.key) === entry) {
+    entry.pool.delete(entry.key);
+  }
+  if (decodedSearchPoolLru.delete(entry)) {
+    decodedSearchPoolBytes -= entry.byteSize;
+  }
+}
+function touchDecodedSearchPoolEntry(entry) {
+  decodedSearchPoolLru.delete(entry);
+  decodedSearchPoolLru.set(entry, true);
+}
+function estimateDecodedSearchPoolBytes(rows) {
+  let bytes = 0;
+  for (const row of rows) {
+    bytes += row.vector.byteLength + 256 + 2 * (row.sessionId.length + row.title.length + row.chunkHash.length + row.modelId.length);
+  }
+  return bytes;
+}
+function cacheDecodedSearchPool(pool, key, rowCount, maxRowId, rows) {
+  const existing = pool.get(key);
+  if (existing)
+    removeDecodedSearchPoolEntry(existing);
+  const entry = {
+    pool,
+    key,
+    rowCount,
+    maxRowId,
+    rows,
+    byteSize: estimateDecodedSearchPoolBytes(rows)
+  };
+  pool.set(key, entry);
+  decodedSearchPoolLru.set(entry, true);
+  decodedSearchPoolBytes += entry.byteSize;
+  while (decodedSearchPoolBytes > DECODED_SEARCH_POOL_CACHE_MAX_BYTES) {
+    const oldest = decodedSearchPoolLru.keys().next().value;
+    if (!oldest)
+      break;
+    removeDecodedSearchPoolEntry(oldest);
+  }
+}
+function invalidateDecodedSearchPools(db, predicate) {
+  const pool = decodedSearchPools.get(db);
+  if (!pool)
+    return;
+  for (const [key, entry] of [...pool.entries()]) {
+    const parsed = JSON.parse(key);
+    if (predicate(parsed))
+      removeDecodedSearchPoolEntry(entry);
+  }
+}
+function isFinitePositiveInteger(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function normalizeCompartmentChunkMaxInputTokens(value) {
+  if (!isFinitePositiveInteger(value)) {
+    return DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS;
+  }
+  return Math.max(1, Math.floor(value));
+}
+function normalizeContent(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function formatOrdinalRange(start, end) {
+  return start === end ? `[${start}]` : `[${start}-${end}]`;
+}
+function rolePrefix(role) {
+  if (role === "user")
+    return "U";
+  if (role === "assistant")
+    return "A";
+  return null;
+}
+function parseOrdinal(value) {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+function parseCanonicalLineRange(line) {
+  const match = /^\[(\d+)(?:-(\d+))?\]\s+[UA]:/.exec(line.trim());
+  if (!match)
+    return null;
+  const start = Number.parseInt(match[1], 10);
+  const end = match[2] ? Number.parseInt(match[2], 10) : start;
+  if (!Number.isFinite(start) || !Number.isFinite(end))
+    return null;
+  return { start, end };
+}
+function hashChunkText(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+function vectorBlob(vector) {
+  return new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+}
+function toFloat32Array(blob) {
+  if (blob instanceof Uint8Array) {
+    const buffer = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
+    return new Float32Array(buffer);
+  }
+  return new Float32Array(blob.slice(0));
+}
+function buildCanonicalChunkTextFromFts(db, sessionId, startOrdinal, endOrdinal) {
+  if (endOrdinal < startOrdinal)
+    return "";
+  const rows = getLoadFtsRowsStatement(db).all(sessionId, startOrdinal, endOrdinal).map((row) => row);
+  const lines = [];
+  let current = null;
+  const flush = () => {
+    if (!current || current.parts.length === 0)
+      return;
+    lines.push(`${formatOrdinalRange(current.start, current.end)} ${current.role}: ${current.parts.join(" / ")}`);
+    current = null;
+  };
+  for (const row of rows) {
+    const ordinal = parseOrdinal(row.messageOrdinal);
+    const prefix = rolePrefix(row.role);
+    const content = typeof row.content === "string" ? normalizeContent(row.content) : "";
+    if (ordinal === null || prefix === null || content.length === 0)
+      continue;
+    if (current && current.role === prefix) {
+      current.end = ordinal;
+      current.parts.push(content);
+      continue;
+    }
+    flush();
+    current = { role: prefix, start: ordinal, end: ordinal, parts: [content] };
+  }
+  flush();
+  return lines.join(`
+`);
+}
+function buildCompartmentSummaryFallbackText(db, compartmentId) {
+  const row = db.prepare("SELECT title, p1, content FROM compartments WHERE id = ?").get(compartmentId);
+  if (!row)
+    return "";
+  const title = typeof row.title === "string" ? row.title.trim() : "";
+  const p1 = typeof row.p1 === "string" ? row.p1.trim() : "";
+  const body = p1.length > 0 ? p1 : typeof row.content === "string" ? row.content.trim() : "";
+  return [title, body].filter((s) => s.length > 0).join(`
+`);
+}
+function canonicalizeInMemoryChunkTextForEmbedding(chunkText, startOrdinal, endOrdinal) {
+  const lines = [];
+  for (const rawLine of chunkText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const match = /^(\[(\d+)(?:-(\d+))?\]\s+[UA]:)\s*(.*)$/.exec(line);
+    if (!match)
+      continue;
+    const lineStart = Number.parseInt(match[2], 10);
+    const lineEnd = match[3] ? Number.parseInt(match[3], 10) : lineStart;
+    if (startOrdinal != null && lineEnd < startOrdinal)
+      continue;
+    if (endOrdinal != null && lineStart > endOrdinal)
+      continue;
+    const rawParts = match[4].split(" / ").map((part) => normalizeContent(part)).filter((part) => part.length > 0);
+    const ordinalSpan = lineEnd - lineStart + 1;
+    const roleLabel = match[1].slice(match[1].indexOf("]") + 2);
+    if (ordinalSpan === rawParts.length) {
+      const retained = rawParts.map((part, index) => ({ ordinal: lineStart + index, part })).filter(({ ordinal, part }) => {
+        if (part.startsWith("TC:"))
+          return false;
+        if (startOrdinal != null && ordinal < startOrdinal)
+          return false;
+        if (endOrdinal != null && ordinal > endOrdinal)
+          return false;
+        return true;
+      });
+      if (retained.length === 0)
+        continue;
+      const retainedStart = retained[0].ordinal;
+      const retainedEnd = retained[retained.length - 1].ordinal;
+      lines.push(`${formatOrdinalRange(retainedStart, retainedEnd)} ${roleLabel} ${retained.map(({ part }) => part).join(" / ")}`);
+      continue;
+    }
+    const parts = rawParts.filter((part) => !part.startsWith("TC:"));
+    if (parts.length === 0)
+      continue;
+    lines.push(`${match[1]} ${parts.join(" / ")}`);
+  }
+  return lines.join(`
+`);
+}
+function chunkCanonicalText(canonicalText, startOrdinal, endOrdinal, maxInputTokens) {
+  const lines = canonicalText.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+  if (lines.length === 0 || endOrdinal < startOrdinal)
+    return [];
+  const normalizedMax = normalizeCompartmentChunkMaxInputTokens(maxInputTokens);
+  const effectiveMax = Math.max(1, Math.floor(normalizedMax * CHUNK_WINDOW_SAFETY_RATIO));
+  const fullText = lines.join(`
+`);
+  if (estimateTokens(fullText) <= effectiveMax) {
+    return [
+      {
+        windowIndex: 0,
+        startOrdinal,
+        endOrdinal,
+        text: fullText,
+        chunkHash: hashChunkText(fullText)
+      }
+    ];
+  }
+  const windows = [];
+  let currentLines = [];
+  let currentStart = null;
+  let currentEnd = null;
+  let currentTokens = 0;
+  const flush = () => {
+    if (currentLines.length === 0 || currentStart === null || currentEnd === null)
+      return;
+    const text = currentLines.join(`
+`);
+    windows.push({
+      windowIndex: windows.length + 1,
+      startOrdinal: currentStart,
+      endOrdinal: currentEnd,
+      text,
+      chunkHash: hashChunkText(text)
+    });
+    currentLines = [];
+    currentStart = null;
+    currentEnd = null;
+    currentTokens = 0;
+  };
+  for (const line of lines) {
+    const range = parseCanonicalLineRange(line);
+    const lineStart = range?.start ?? startOrdinal;
+    const lineEnd = range?.end ?? lineStart;
+    const lineTokens = estimateTokens(line);
+    if (lineTokens > effectiveMax) {
+      flush();
+      for (const slice of splitOversizedLine(line, effectiveMax)) {
+        windows.push({
+          windowIndex: windows.length + 1,
+          startOrdinal: lineStart,
+          endOrdinal: lineEnd,
+          text: slice,
+          chunkHash: hashChunkText(slice)
+        });
+      }
+      continue;
+    }
+    if (currentLines.length > 0 && currentTokens + lineTokens > effectiveMax) {
+      flush();
+    }
+    if (currentLines.length === 0) {
+      currentStart = lineStart;
+    }
+    currentLines.push(line);
+    currentEnd = lineEnd;
+    currentTokens += lineTokens;
+  }
+  flush();
+  return windows;
+}
+function splitOversizedLine(line, effectiveMax) {
+  let slices = [];
+  try {
+    slices = recursiveCharacterSplit(line, {
+      chunkSize: effectiveMax,
+      lengthFunction: estimateTokens
+    });
+  } catch (error) {
+    log("[magic-context] recursiveCharacterSplit failed; using char-budget fallback:", error);
+    slices = [];
+  }
+  if (slices.length === 0) {
+    slices = charBudgetSplit(line, effectiveMax);
+  }
+  const safe = [];
+  const pushChecked = (slice) => {
+    if (estimateTokens(slice) > effectiveMax && slice.length > 1) {
+      safe.push(...charBudgetSplit(slice, effectiveMax));
+      return;
+    }
+    safe.push(slice);
+  };
+  for (const slice of slices) {
+    if (estimateTokens(slice) <= effectiveMax) {
+      safe.push(slice);
+    } else {
+      for (const sub of charBudgetSplit(slice, effectiveMax))
+        pushChecked(sub);
+    }
+  }
+  return safe.filter((s) => s.length > 0);
+}
+function charBudgetSplit(text, effectiveMax) {
+  const totalTokens = Math.max(1, estimateTokens(text));
+  const charsPerToken = Math.max(1, Math.floor(text.length / totalTokens));
+  const sliceChars = Math.max(1, effectiveMax * charsPerToken);
+  const out = [];
+  let pos = 0;
+  while (pos < text.length) {
+    let end = Math.min(text.length, pos + sliceChars);
+    let slice = text.slice(pos, end);
+    while (slice.length > 1 && estimateTokens(slice) > effectiveMax) {
+      end = pos + Math.max(1, Math.floor((end - pos) / 2));
+      slice = text.slice(pos, end);
+    }
+    out.push(slice);
+    pos = end;
+  }
+  return out;
+}
+function getExistingChunkHashes(db, compartmentId, modelId, projectPath) {
+  const scoped = typeof projectPath === "string" && projectPath.length > 0;
+  const rows = scoped ? getExistingHashStatement(db, true).all(compartmentId, modelId, projectPath) : getExistingHashStatement(db, false).all(compartmentId, modelId);
+  return new Map(rows.filter((row) => typeof row.windowIndex === "number" && typeof row.chunkHash === "string").map((row) => [row.windowIndex, row.chunkHash]));
+}
+function chunkEmbeddingWindowsAreCurrent(db, compartmentId, modelId, windows, projectPath) {
+  const existing = getExistingChunkHashes(db, compartmentId, modelId, projectPath);
+  if (existing.size !== windows.length)
+    return false;
+  return windows.every((window) => existing.get(window.windowIndex) === window.chunkHash);
+}
+function replaceCompartmentChunkEmbeddings(db, rows) {
+  if (rows.length === 0)
+    return;
+  const compartmentId = rows[0].compartmentId;
+  const modelId = rows[0].modelId;
+  const now = Date.now();
+  db.transaction(() => {
+    getDeleteByCompartmentStatement(db).run(compartmentId, modelId);
+    const insert = getInsertEmbeddingStatement(db);
+    for (const row of rows) {
+      insert.run(row.compartmentId, row.sessionId, row.projectPath, getHarness(), row.window.windowIndex, row.window.startOrdinal, row.window.endOrdinal, row.window.chunkHash, row.modelId, row.vector.length, vectorBlob(row.vector), row.createdAt ?? now);
+    }
+  })();
+  invalidateDecodedSearchPools(db, ([sessionId, projectPath, cachedModelId]) => sessionId === rows[0].sessionId && projectPath === rows[0].projectPath && cachedModelId === modelId);
+}
+function loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId) {
+  if (!modelId) {
+    throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
+  }
+  const key = searchPoolKey(sessionId, projectPath, modelId);
+  const pool = getDecodedSearchPool(db);
+  const probe = getSearchPoolProbeStatement(db).get(sessionId, projectPath, modelId);
+  const rowCount = typeof probe?.rowCount === "number" ? probe.rowCount : 0;
+  const maxRowId = typeof probe?.maxRowId === "number" ? probe.maxRowId : 0;
+  const cached = pool.get(key);
+  if (cached && cached.rowCount === rowCount && cached.maxRowId === maxRowId) {
+    touchDecodedSearchPoolEntry(cached);
+    return cached.rows;
+  }
+  if (cached)
+    removeDecodedSearchPoolEntry(cached);
+  const rows = getSearchRowsStatement(db, true).all(sessionId, projectPath, modelId);
+  const decodedRows = rows.filter((row) => typeof row.compartmentId === "number" && typeof row.sessionId === "string" && typeof row.title === "string" && typeof row.compartmentStart === "number" && typeof row.compartmentEnd === "number" && typeof row.windowIndex === "number" && typeof row.windowStart === "number" && typeof row.windowEnd === "number" && typeof row.chunkHash === "string" && typeof row.modelId === "string" && typeof row.dims === "number" && (row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer)).map((row) => ({
+    compartmentId: row.compartmentId,
+    sessionId: row.sessionId,
+    title: row.title,
+    startOrdinal: row.compartmentStart,
+    endOrdinal: row.compartmentEnd,
+    windowIndex: row.windowIndex,
+    windowStartOrdinal: row.windowStart,
+    windowEndOrdinal: row.windowEnd,
+    chunkHash: row.chunkHash,
+    modelId: row.modelId,
+    dims: row.dims,
+    vector: toFloat32Array(row.vector)
+  }));
+  cacheDecodedSearchPool(pool, key, rowCount, maxRowId, decodedRows);
+  return decodedRows;
+}
+function mapBackfillCandidateRows(rows) {
+  return rows.filter((row) => {
+    if (row === null || typeof row !== "object")
+      return false;
+    const candidate = row;
+    return typeof candidate.id === "number" && typeof candidate.sessionId === "string" && typeof candidate.startMessage === "number" && typeof candidate.endMessage === "number" && typeof candidate.title === "string";
+  }).map((row) => ({
+    id: row.id,
+    sessionId: row.sessionId,
+    startMessage: row.startMessage,
+    endMessage: row.endMessage,
+    title: row.title
+  }));
+}
+var sessionBackfillCandidateStatements = new WeakMap;
+function loadUnembeddedSessionChunkCandidates(db, projectPath, sessionId, modelId, limit, excludeIds) {
+  if (excludeIds && excludeIds.length > 0) {
+    const placeholders = excludeIds.map(() => "?").join(", ");
+    const stmt = db.prepare(`SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND c.id NOT IN (${placeholders})
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )
+             ORDER BY c.start_message ASC, c.id ASC
+             LIMIT ?`);
+    const rows = stmt.all(projectPath, sessionId, ...excludeIds, projectPath, modelId, Math.max(1, limit));
+    return mapBackfillCandidateRows(rows);
+  }
+  let stmt = sessionBackfillCandidateStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )
+             ORDER BY c.start_message ASC, c.id ASC
+             LIMIT ?`);
+    sessionBackfillCandidateStatements.set(db, stmt);
+  }
+  const rows = stmt.all(projectPath, sessionId, projectPath, modelId, Math.max(1, limit));
+  return mapBackfillCandidateRows(rows);
+}
+function countUnembeddedSessionCompartments(db, projectPath, sessionId, modelId) {
+  const row = db.prepare(`SELECT COUNT(*) AS n
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )`).get(projectPath, sessionId, projectPath, modelId);
+  return typeof row?.n === "number" ? row.n : 0;
+}
+function countSessionCompartmentEmbedCoverage(db, projectPath, sessionId, modelId) {
+  const row = db.prepare(`SELECT
+               COUNT(*) AS total,
+               SUM(CASE WHEN EXISTS (
+                   SELECT 1 FROM compartment_chunk_embeddings e
+                   WHERE e.compartment_id = c.id
+                     AND e.project_path = ?
+                     AND e.model_id = ?
+               ) THEN 1 ELSE 0 END) AS embedded
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL`).get(projectPath, modelId, projectPath, sessionId);
+  return {
+    total: typeof row?.total === "number" ? row.total : 0,
+    embedded: typeof row?.embedded === "number" ? row.embedded : 0
+  };
+}
+
+// ../plugin/src/features/magic-context/memory/cosine-similarity.ts
+function cosineSimilarity(a, b) {
+  if (a.length !== b.length) {
+    return 0;
+  }
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0;index < a.length; index++) {
+    dotProduct += a[index] * b[index];
+    normA += a[index] * a[index];
+    normB += b[index] * b[index];
+  }
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-synapse.ts
+import { createHash as createHash2 } from "node:crypto";
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/client.js
+import { promises as fs2 } from "node:fs";
+import { debuglog } from "node:util";
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/auth.js
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+var NONCE_LEN = 32;
+var MAX_AUTH_MESSAGE_LEN = 4096;
+var SERVER_PROOF_DOMAIN = "subc-server-v1";
+var CLIENT_AUTH_DOMAIN = "subc-client-v1";
+var DEFAULT_CLIENT_ROLE = "client";
+
+class AuthError extends Error {
+}
+function computeProof(key, domain, clientNonce, serverNonce, daemonId) {
+  const mac = createHmac("sha256", Buffer.from(key));
+  mac.update(Buffer.from(domain, "utf8"));
+  mac.update(Buffer.from(clientNonce));
+  mac.update(Buffer.from(serverNonce));
+  mac.update(Buffer.from(daemonId));
+  return new Uint8Array(mac.digest());
+}
+function constantTimeEq(a, b) {
+  if (a.length !== b.length)
+    return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+async function writeMessage(sock, value, deadlineMs) {
+  const json = Buffer.from(JSON.stringify(value), "utf8");
+  if (json.length > MAX_AUTH_MESSAGE_LEN) {
+    throw new AuthError(`auth message too large: ${json.length} > ${MAX_AUTH_MESSAGE_LEN}`);
+  }
+  const lenPrefix = new Uint8Array(4);
+  new DataView(lenPrefix.buffer).setUint32(0, json.length, true);
+  await sock.write(lenPrefix, deadlineMs);
+  await sock.write(json, deadlineMs);
+}
+async function readMessage(sock, deadlineMs) {
+  const lenBytes = await sock.readExact(4, deadlineMs);
+  const len = new DataView(lenBytes.buffer, lenBytes.byteOffset, 4).getUint32(0, true);
+  if (len > MAX_AUTH_MESSAGE_LEN) {
+    throw new AuthError(`auth message too large: ${len} > ${MAX_AUTH_MESSAGE_LEN}`);
+  }
+  const body = len === 0 ? new Uint8Array(0) : await sock.readExact(len, deadlineMs);
+  try {
+    return JSON.parse(Buffer.from(body).toString("utf8"));
+  } catch (err) {
+    throw new AuthError(`auth message JSON decode failed: ${String(err)}`);
+  }
+}
+async function authenticateClient(sock, conn, deadlineMs) {
+  const clientNonce = new Uint8Array(randomBytes(NONCE_LEN));
+  await writeMessage(sock, { client_nonce: Array.from(clientNonce), role: DEFAULT_CLIENT_ROLE }, deadlineMs);
+  const proof = await readMessage(sock, deadlineMs);
+  const serverNonce = Uint8Array.from(proof.server_nonce);
+  const daemonId = Uint8Array.from(proof.daemon_id);
+  const serverProof = Uint8Array.from(proof.server_proof);
+  const expected = computeProof(conn.key, SERVER_PROOF_DOMAIN, clientNonce, serverNonce, daemonId);
+  if (!constantTimeEq(expected, serverProof)) {
+    throw new AuthError("server proof mismatch — wrong key or impostor daemon");
+  }
+  if (!constantTimeEq(daemonId, conn.daemonId)) {
+    throw new AuthError("daemon id mismatch — connection file points at a different daemon");
+  }
+  const clientAuth = computeProof(conn.key, CLIENT_AUTH_DOMAIN, clientNonce, serverNonce, daemonId);
+  await writeMessage(sock, { client_auth: Array.from(clientAuth) }, deadlineMs);
+}
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/connection-file.js
+import { promises as fs } from "node:fs";
+var SCHEMA_VERSION = 1;
+var MIN_KEY_LEN = 32;
+var DAEMON_ID_LEN = 16;
+
+class ConnectionFileError extends Error {
+}
+function toBytes(value, field) {
+  if (!Array.isArray(value) || value.some((n) => typeof n !== "number")) {
+    throw new ConnectionFileError(`connection file field '${field}' must be a JSON array of bytes`);
+  }
+  return Uint8Array.from(value);
+}
+function validate2(info) {
+  if (info.schema !== SCHEMA_VERSION) {
+    throw new ConnectionFileError(`unsupported connection file schema ${info.schema}; expected ${SCHEMA_VERSION}`);
+  }
+  if (info.endpoints.length === 0) {
+    throw new ConnectionFileError("connection file must include at least one endpoint");
+  }
+  if (info.key.length < MIN_KEY_LEN) {
+    throw new ConnectionFileError(`connection file key is too short: ${info.key.length} bytes, need at least ${MIN_KEY_LEN}`);
+  }
+  if (info.daemonId.length !== DAEMON_ID_LEN) {
+    throw new ConnectionFileError(`connection file daemon_id must be ${DAEMON_ID_LEN} bytes, got ${info.daemonId.length}`);
+  }
+}
+async function verifyOwnerOnly(path) {
+  if (process.platform === "win32")
+    return;
+  const stat = await fs.stat(path);
+  const mode = stat.mode & 511;
+  if ((mode & 63) !== 0) {
+    throw new ConnectionFileError(`connection file ${path} has insecure permissions 0o${mode.toString(8)}; expected owner-only 0600`);
+  }
+}
+async function readConnectionFile(path) {
+  await verifyOwnerOnly(path);
+  const raw = await fs.readFile(path, "utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new ConnectionFileError(`connection file JSON read failed for ${path}: ${String(err)}`);
+  }
+  const endpointsRaw = parsed.endpoints;
+  if (!Array.isArray(endpointsRaw)) {
+    throw new ConnectionFileError("connection file 'endpoints' must be an array");
+  }
+  const endpoints = endpointsRaw.map((e) => {
+    const ep = e;
+    if (typeof ep.host !== "string" || typeof ep.port !== "number") {
+      throw new ConnectionFileError("connection file endpoint must be { host: string, port: number }");
+    }
+    return { host: ep.host, port: ep.port };
+  });
+  const info = {
+    schema: parsed.schema,
+    endpoints,
+    key: toBytes(parsed.key, "key"),
+    daemonId: toBytes(parsed.daemon_id, "daemon_id"),
+    pid: parsed.pid,
+    daemonVer: parsed.daemon_ver ?? ""
+  };
+  validate2(info);
+  return info;
+}
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/envelope.js
+var PROTOCOL_VERSION = 2;
+var HEADER_LEN = 21;
+var FROZEN_PREFIX_LEN = 5;
+var MAX_FRAME_BODY_LEN = 64 * 1024 * 1024;
+var FrameType;
+(function(FrameType) {
+  FrameType[FrameType["Request"] = 0] = "Request";
+  FrameType[FrameType["Response"] = 1] = "Response";
+  FrameType[FrameType["Push"] = 2] = "Push";
+  FrameType[FrameType["StreamData"] = 3] = "StreamData";
+  FrameType[FrameType["StreamEnd"] = 4] = "StreamEnd";
+  FrameType[FrameType["Error"] = 5] = "Error";
+  FrameType[FrameType["Cancel"] = 6] = "Cancel";
+  FrameType[FrameType["Ping"] = 7] = "Ping";
+  FrameType[FrameType["Pong"] = 8] = "Pong";
+  FrameType[FrameType["Hello"] = 9] = "Hello";
+  FrameType[FrameType["HelloAck"] = 10] = "HelloAck";
+  FrameType[FrameType["Goodbye"] = 11] = "Goodbye";
+})(FrameType || (FrameType = {}));
+var FRAME_TYPE_MAX = FrameType.Goodbye;
+function isPureHeader(ty) {
+  return ty === FrameType.Cancel || ty === FrameType.Ping || ty === FrameType.Pong || ty === FrameType.Goodbye;
+}
+var Priority;
+(function(Priority) {
+  Priority[Priority["Passive"] = 0] = "Passive";
+  Priority[Priority["Interactive"] = 1] = "Interactive";
+  Priority[Priority["Background"] = 2] = "Background";
+})(Priority || (Priority = {}));
+var AdmissionClass;
+(function(AdmissionClass) {
+  AdmissionClass[AdmissionClass["Normal"] = 0] = "Normal";
+  AdmissionClass[AdmissionClass["Expedite"] = 1] = "Expedite";
+  AdmissionClass[AdmissionClass["Sheddable"] = 2] = "Sheddable";
+})(AdmissionClass || (AdmissionClass = {}));
+var FLAG_BINARY = 1;
+var FLAG_PRIORITY_MASK = 6;
+var FLAG_PRIORITY_SHIFT = 1;
+var FLAG_LAST = 8;
+var FLAG_ADMISSION_MASK = 48;
+var FLAG_ADMISSION_SHIFT = 4;
+var FLAG_RESERVED_MASK = 192;
+function buildFlags(binary, priority, last, admissionClass = AdmissionClass.Normal) {
+  let flags = 0;
+  if (binary)
+    flags |= FLAG_BINARY;
+  flags |= priority << FLAG_PRIORITY_SHIFT;
+  if (last)
+    flags |= FLAG_LAST;
+  flags |= admissionClass << FLAG_ADMISSION_SHIFT;
+  return flags;
+}
+function encodeHeader(header) {
+  const buffer = new Uint8Array(HEADER_LEN);
+  const view = new DataView(buffer.buffer);
+  view.setUint32(0, header.len, true);
+  buffer[4] = header.ver;
+  buffer[5] = header.ty;
+  buffer[6] = header.flags;
+  view.setUint16(7, header.channel, true);
+  view.setUint32(9, header.epoch, true);
+  view.setBigUint64(13, header.corr, true);
+  return buffer;
+}
+
+class DecodeError extends Error {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+    this.name = "DecodeError";
+  }
+}
+function decodeHeader(bytes) {
+  if (bytes.length < FROZEN_PREFIX_LEN) {
+    throw new DecodeError(`header shorter than frozen prefix: have ${bytes.length} bytes`, "too_short_for_prefix");
+  }
+  const ver = bytes[4];
+  if (ver !== PROTOCOL_VERSION)
+    throw new DecodeError(`unsupported envelope version ${ver}`, "unsupported_version");
+  if (bytes.length < HEADER_LEN) {
+    throw new DecodeError(`header too short for version: have ${bytes.length} bytes, need ${HEADER_LEN}`, "too_short_for_header");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const len = view.getUint32(0, true);
+  const typeByte = bytes[5];
+  if (typeByte > FRAME_TYPE_MAX)
+    throw new DecodeError(`unknown frame type byte ${typeByte}`, "unknown_frame_type");
+  const ty = typeByte;
+  const flags = bytes[6];
+  if ((flags & FLAG_RESERVED_MASK) !== 0) {
+    throw new DecodeError(`reserved flag bits set in flags 0b${flags.toString(2).padStart(8, "0")}`, "reserved_flag_bits");
+  }
+  if ((flags & FLAG_PRIORITY_MASK) >> FLAG_PRIORITY_SHIFT === 3) {
+    throw new DecodeError(`reserved priority bits set in flags 0b${flags.toString(2).padStart(8, "0")}`, "reserved_priority_bits");
+  }
+  const admission = (flags & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT;
+  if (admission === 3) {
+    throw new DecodeError(`reserved admission class set in flags 0b${flags.toString(2).padStart(8, "0")}`, "reserved_admission_class");
+  }
+  if (admission === AdmissionClass.Sheddable && ty !== FrameType.Push && ty !== FrameType.StreamData) {
+    throw new DecodeError(`SHEDDABLE admission class is illegal on ${FrameType[ty]} in flags 0b${flags.toString(2).padStart(8, "0")}`, "sheddable_illegal_frame_type");
+  }
+  const channel = view.getUint16(7, true);
+  const epoch = view.getUint32(9, true);
+  if (channel === 0 && epoch !== 0) {
+    throw new DecodeError(`control channel carried nonzero epoch ${epoch}`, "nonzero_epoch_on_control_channel");
+  }
+  if (isPureHeader(ty) && len !== 0) {
+    throw new DecodeError(`pure-header frame ${FrameType[ty]} declared non-zero body length ${len}`, "pure_header_frame_with_body");
+  }
+  return { len, ver, ty, flags, channel, epoch, corr: view.getBigUint64(13, true) };
+}
+function buildFrame(ty, flags, channel, epoch, corr, body) {
+  return buildFrameWithVersion(PROTOCOL_VERSION, ty, flags, channel, epoch, corr, body);
+}
+function buildFrameWithVersion(ver, ty, flags, channel, epoch, corr, body) {
+  if (body.length > MAX_FRAME_BODY_LEN) {
+    throw new DecodeError(`frame body ${body.length} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
+  }
+  const header = { len: body.length, ver, ty, flags, channel, epoch, corr };
+  decodeHeader(encodeHeader(header));
+  return { header, body };
+}
+function encodeFrame(frame) {
+  if (frame.header.len !== frame.body.length) {
+    throw new DecodeError(`frame header length ${frame.header.len} does not match body length ${frame.body.length}`, "frame_length_mismatch");
+  }
+  const header = encodeHeader(frame.header);
+  const output = new Uint8Array(header.length + frame.body.length);
+  output.set(header, 0);
+  output.set(frame.body, header.length);
+  return output;
+}
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/route-handle.js
+var connectionToken = new WeakMap;
+
+class RouteHandle {
+  channel;
+  epoch;
+  constructor(channel, epoch, token) {
+    if (!Number.isInteger(channel) || channel <= 0 || channel > 65535) {
+      throw new RangeError(`route channel must be an integer in 1..65535, got ${channel}`);
+    }
+    if (!Number.isInteger(epoch) || epoch <= 0 || epoch > 4294967295) {
+      throw new RangeError(`route epoch must be an integer in 1..4294967295, got ${epoch}`);
+    }
+    this.channel = channel;
+    this.epoch = epoch;
+    connectionToken.set(this, token);
+    Object.freeze(this);
+  }
+  static create(channel, epoch, token) {
+    return new RouteHandle(channel, epoch, token);
+  }
+}
+function createRouteHandle(channel, epoch, token) {
+  const factory = RouteHandle;
+  return factory.create(channel, epoch, token);
+}
+
+class StaleRouteHandleError extends Error {
+  handle;
+  code = "stale_route_handle";
+  constructor(handle) {
+    super(`route handle (${handle.channel}, ${handle.epoch}) is not live on the current connection`);
+    this.handle = handle;
+    this.name = "StaleRouteHandleError";
+  }
+}
+function newConnectionToken() {
+  return Object.freeze({});
+}
+function belongsToConnection(handle, token) {
+  return connectionToken.get(handle) === token;
+}
+function sameRouteHandle(left, right) {
+  return left === right;
+}
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/socket.js
+import net from "node:net";
+class SocketClosedError extends Error {
+}
+
+class SocketTimeoutError extends Error {
+}
+
+class SocketWriteNotQueuedError extends Error {
+  cause;
+  constructor(message, cause) {
+    super(message);
+    this.cause = cause;
+  }
+}
+
+class SocketWriteQueuedError extends Error {
+  cause;
+  constructor(message, cause) {
+    super(message);
+    this.cause = cause;
+  }
+}
+
+class SubcSocket {
+  sock;
+  chunks = [];
+  buffered = 0;
+  waiter = null;
+  closedErr = null;
+  bufferedBytes() {
+    return this.buffered;
+  }
+  constructor(sock) {
+    this.sock = sock;
+    sock.on("data", (chunk) => {
+      this.chunks.push(chunk);
+      this.buffered += chunk.length;
+      this.tryServe();
+    });
+    const fail = (err) => {
+      if (!this.closedErr)
+        this.closedErr = err;
+      this.tryServe();
+    };
+    sock.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    sock.on("end", () => fail(new SocketClosedError("subc closed the connection")));
+    sock.on("close", () => fail(new SocketClosedError("subc connection closed")));
+  }
+  localPort() {
+    return this.sock.localPort ?? null;
+  }
+  static connect(host, port, deadlineMs) {
+    return new Promise((resolve, reject) => {
+      const sock = net.connect({ host, port });
+      sock.setNoDelay(true);
+      const timer = setTimeout(() => {
+        sock.destroy();
+        reject(new SocketTimeoutError(`timed out connecting to ${host}:${port}`));
+      }, Math.max(0, deadlineMs - Date.now()));
+      sock.once("connect", () => {
+        clearTimeout(timer);
+        resolve(new SubcSocket(sock));
+      });
+      sock.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+  async readFrame(headerDeadlineMs, bodyDeadline, onHeader) {
+    const prefix = await this.readExact(FROZEN_PREFIX_LEN, headerDeadlineMs);
+    const version = prefix[4];
+    if (version !== PROTOCOL_VERSION)
+      throw new DecodeError(`unsupported envelope version ${version}`, "unsupported_version");
+    const remainder = await this.readExact(HEADER_LEN - FROZEN_PREFIX_LEN, headerDeadlineMs);
+    const headerBytes = new Uint8Array(HEADER_LEN);
+    headerBytes.set(prefix);
+    headerBytes.set(remainder, FROZEN_PREFIX_LEN);
+    const header = decodeHeader(headerBytes);
+    if (header.len > MAX_FRAME_BODY_LEN) {
+      throw new DecodeError(`frame body ${header.len} exceeds max ${MAX_FRAME_BODY_LEN}`, "frame_body_too_large");
+    }
+    onHeader?.();
+    const bodyDeadlineMs = typeof bodyDeadline === "number" ? bodyDeadline : Date.now() + bodyDeadline.afterHeaderMs;
+    const body = header.len === 0 ? new Uint8Array(0) : await this.readExact(header.len, bodyDeadlineMs);
+    return { header, body };
+  }
+  readExact(n, deadlineMs) {
+    if (this.waiter) {
+      return Promise.reject(new Error("concurrent readExact is not supported"));
+    }
+    if (n === 0)
+      return Promise.resolve(new Uint8Array(0));
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      if (Number.isFinite(deadlineMs)) {
+        const remaining = deadlineMs - Date.now();
+        if (remaining <= 0) {
+          reject(new SocketTimeoutError(`timed out waiting for ${n} bytes`));
+          return;
+        }
+        timer = setTimeout(() => {
+          this.waiter = null;
+          reject(new SocketTimeoutError(`timed out waiting for ${n} bytes`));
+        }, remaining);
+      }
+      this.waiter = { need: n, resolve, reject, timer };
+      this.tryServe();
+    });
+  }
+  async write(bytes, deadlineMs) {
+    try {
+      await this.writeTracked(bytes, deadlineMs).completed;
+    } catch (err) {
+      if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) {
+        throw err.cause ?? err;
+      }
+      throw err;
+    }
+  }
+  writeTracked(bytes, deadlineMs) {
+    if (this.closedErr) {
+      return {
+        queued: false,
+        completed: Promise.reject(new SocketWriteNotQueuedError("subc socket was closed before bytes could be queued", this.closedErr))
+      };
+    }
+    let queued = false;
+    let settled = false;
+    let timer = null;
+    const completed = new Promise((resolve, reject) => {
+      const settle = (run) => {
+        if (settled)
+          return;
+        settled = true;
+        if (timer)
+          clearTimeout(timer);
+        run();
+      };
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) {
+        settle(() => reject(new SocketWriteNotQueuedError("timed out before bytes could be queued to subc", new SocketTimeoutError("timed out writing to subc"))));
+        return;
+      }
+      timer = setTimeout(() => {
+        const timeout = new SocketTimeoutError("timed out writing to subc");
+        settle(() => reject(queued ? new SocketWriteQueuedError("timed out after bytes were handed to the subc socket", timeout) : new SocketWriteNotQueuedError("timed out before bytes could be queued to subc", timeout)));
+      }, remaining);
+      try {
+        this.sock.write(Buffer.from(bytes), (err) => {
+          settle(() => {
+            if (err) {
+              reject(new SocketWriteQueuedError("subc socket reported a write error after bytes were handed to the socket", err instanceof Error ? err : new Error(String(err))));
+            } else {
+              resolve();
+            }
+          });
+        });
+        queued = true;
+      } catch (err) {
+        settle(() => reject(new SocketWriteNotQueuedError("subc socket write threw before bytes could be queued", err instanceof Error ? err : new Error(String(err)))));
+      }
+    });
+    return { queued, completed };
+  }
+  close() {
+    this.sock.destroy();
+  }
+  tryServe() {
+    const w = this.waiter;
+    if (!w)
+      return;
+    if (this.buffered >= w.need) {
+      const out = this.take(w.need);
+      this.waiter = null;
+      if (w.timer)
+        clearTimeout(w.timer);
+      w.resolve(out);
+      return;
+    }
+    if (this.closedErr) {
+      this.waiter = null;
+      if (w.timer)
+        clearTimeout(w.timer);
+      w.reject(this.closedErr);
+    }
+  }
+  take(n) {
+    const out = Buffer.allocUnsafe(n);
+    let off = 0;
+    while (off < n) {
+      const head = this.chunks[0];
+      const want = n - off;
+      if (head.length <= want) {
+        head.copy(out, off);
+        off += head.length;
+        this.chunks.shift();
+      } else {
+        head.copy(out, off, 0, want);
+        this.chunks[0] = head.subarray(want);
+        off += want;
+      }
+    }
+    this.buffered -= n;
+    return out;
+  }
+}
+
+// ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/client.js
+var debug = debuglog("subc-client");
+var DEFAULT_HANDSHAKE_TIMEOUT_MS = 1e4;
+var DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+var TIMEOUT_ARBITRATION_GRACE_MS = 50;
+var REQUEST_DEADLINE_MARKER = "request_deadline";
+var DEADLINE_NO_DROP_CODE = "deadline_exceeded_no_drop_observed";
+var ROUTE_OPEN_RETRY_DEADLINE_MS = 30000;
+var BODY_READ_TIMEOUT_MS = 30000;
+var EMPTY_BODY = new Uint8Array(0);
+var DEFAULT_MANAGED_TARGET_KIND = "management_surface";
+var SUBC_MODULE_ID_ENV = "SUBC_MODULE_ID";
+var SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
+var DEFAULT_RECONNECT_BACKOFF = {
+  baseMs: 100,
+  capMs: 2000,
+  maxAttempts: 6
+};
+
+class SubcCallError extends Error {
+  kind;
+  code;
+  cause;
+  constructor(kind, message, code, cause) {
+    super(message);
+    this.kind = kind;
+    this.code = code;
+    this.cause = cause;
+    this.name = "SubcCallError";
+  }
+}
+
+class SubcError extends Error {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+  }
+}
+
+class SubcClient {
+  sock;
+  currentConn;
+  opts;
+  nextCorr = 1n;
+  pending = new Map;
+  lateResponses = new Map;
+  routes = new Map;
+  liveRoutes = new Map;
+  connectionToken = newConnectionToken();
+  ingressEpochDropCount = 0;
+  closedErr = null;
+  closeStarted = false;
+  reconnecting = null;
+  generation = 1;
+  readerActive = false;
+  constructor(sock, currentConn, opts) {
+    this.sock = sock;
+    this.currentConn = currentConn;
+    this.opts = opts;
+    this.readLoop(sock, this.generation);
+  }
+  get conn() {
+    return this.currentConn;
+  }
+  static async connect(opts) {
+    const normalized = normalizeConnectOptions(opts);
+    const opened = await SubcClient.openConnection(normalized);
+    return new SubcClient(opened.sock, opened.conn, normalized);
+  }
+  async catalogList(moduleId) {
+    const body = this.encode(moduleId === undefined ? { op: "catalog.list" } : { op: "catalog.list", module_id: moduleId });
+    const reply = await this.controlRpc(body);
+    const parsed = this.parseJson(reply);
+    return parsed.modules ?? [];
+  }
+  async routeOpen(target, identity, opts = {}) {
+    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const consumerCapabilities = opts.consumerCapabilities;
+    const body = this.encode({
+      op: "route.open",
+      target,
+      identity,
+      ...consumerIdentity ? { consumer_identity: consumerIdentity } : {},
+      ...consumerCapabilities !== undefined ? { consumer_capabilities: consumerCapabilities } : {}
+    });
+    let installed = null;
+    const install = (frame) => {
+      if (frame.header.ty !== FrameType.Response)
+        return true;
+      const parsed = this.parseJson(frame);
+      if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") {
+        throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
+      }
+      installed = this.installRoute(parsed.route_channel, parsed.route_epoch);
+      return true;
+    };
+    const closeLateRoute = (frame) => {
+      if (frame.header.ty !== FrameType.Response)
+        return;
+      try {
+        const parsed = this.parseJson(frame);
+        if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number")
+          return;
+        const lateHandle = this.installRoute(parsed.route_channel, parsed.route_epoch);
+        this.failHandle(lateHandle, new SubcError("late route.open was closed", "route_closed"));
+        this.liveRoutes.delete(lateHandle.channel);
+        this.sendRouteGoodbye(lateHandle, true);
+      } catch {
+        this.closeConnectionAfterCleanupFailure();
+      }
+    };
+    await this.controlRpc(body, install, closeLateRoute);
+    if (!installed)
+      throw new SubcError("route.open response was not installed");
+    return installed;
+  }
+  async request(handle, body, opts = {}) {
+    this.assertLiveHandle(handle);
+    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const priority = opts.priority ?? Priority.Interactive;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    const reply = await this.send(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
+    return this.parseJson(reply);
+  }
+  async call(moduleId, method, params, opts = {}) {
+    const body = params === undefined ? { method } : { method, params };
+    let retriedUnknownChannel = false;
+    for (;; ) {
+      const routeHandle = await this.cachedRouteHandle(moduleId, opts);
+      try {
+        return await this.managedRequest(routeHandle, body, opts);
+      } catch (err) {
+        if (!(err instanceof SubcCallError))
+          throw this.terminalCallError("managed call failed", err);
+        if (err.code === "unknown_channel" && !retriedUnknownChannel && !this.closeStarted) {
+          retriedUnknownChannel = true;
+          this.evictRouteHandle(routeHandle);
+          continue;
+        }
+        if (err.kind === "not_sent") {
+          try {
+            await this.reconnectAfterDrop(err);
+          } catch (reconnectErr) {
+            throw this.notSentRecoveryError("managed call was not sent", reconnectErr);
+          }
+          continue;
+        }
+        if (err.kind === "outcome_unknown" && err.code !== DEADLINE_NO_DROP_CODE) {
+          this.scheduleReconnectAfterDrop(err);
+        }
+        throw err;
+      }
+    }
+  }
+  subscribe(handle, body, onEvent, opts = {}) {
+    this.assertLiveHandle(handle);
+    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const priority = opts.priority ?? Priority.Interactive;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    const corr = this.allocateCorr();
+    const key = pendingKey(handle, corr);
+    const closed = new Promise((resolve, reject) => {
+      if (this.closedErr) {
+        reject(this.closedErr);
+        return;
+      }
+      this.pending.set(key, {
+        handle,
+        resolve: () => resolve(),
+        reject,
+        onProgress: onEvent,
+        timer: null,
+        subscription: true
+      });
+      const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false, admission), handle.channel, handle.epoch, corr, bytes);
+      this.sock.write(encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch((err) => {
+        const pending = this.pending.get(key);
+        if (pending)
+          this.rejectPending(key, pending, err instanceof Error ? err : new SubcError(String(err)));
+      });
+    });
+    let cancelled = false;
+    const unsubscribe = () => {
+      if (cancelled)
+        return;
+      cancelled = true;
+      this.cancel(handle, corr, priority);
+    };
+    return { unsubscribe, closed };
+  }
+  cancel(handle, corr, priority = Priority.Interactive) {
+    this.assertLiveHandle(handle);
+    const cancel = buildFrame(FrameType.Cancel, buildFlags(false, priority, false), handle.channel, handle.epoch, corr, EMPTY_BODY);
+    this.sock.write(encodeFrame(cancel), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => {
+      return;
+    });
+  }
+  async routePoll(handle, kind) {
+    this.assertLiveHandle(handle);
+    const body = this.encode({
+      op: "route.poll",
+      route_channel: handle.channel,
+      route_epoch: handle.epoch,
+      kind
+    });
+    const reply = await this.controlRpc(body, (frame) => {
+      if (frame.header.ty !== FrameType.Response)
+        return true;
+      const parsed = this.parseJson(frame);
+      return parsed.route_channel === handle.channel && parsed.route_epoch === handle.epoch;
+    });
+    return this.parseJson(reply);
+  }
+  async closeRoute(handle, opts = {}) {
+    this.assertLiveHandle(handle);
+    for (const [key, cached] of this.routes) {
+      if (cached.handle && sameRouteHandle(cached.handle, handle)) {
+        cached.closed = true;
+        cached.handle = null;
+        this.routes.delete(key);
+      }
+    }
+    if (opts.drain)
+      await this.drainUnaryOnHandle(handle);
+    this.failHandle(handle, new SubcError("route closed by closeRoute", "route_closed"));
+    if (this.liveRoutes.get(handle.channel) === handle)
+      this.liveRoutes.delete(handle.channel);
+    this.sendRouteGoodbye(handle);
+  }
+  async closeManagedRoute(target, identity, opts = {}) {
+    const key = routeCacheKey(target, identity, routeOpenConsumerIdentity(opts));
+    const cached = this.routes.get(key);
+    if (!cached)
+      return;
+    cached.closed = true;
+    this.routes.delete(key);
+    const handle = cached.handle;
+    cached.handle = null;
+    if (handle)
+      await this.closeRoute(handle, opts);
+  }
+  async closeRouteChannel(handle, opts = {}) {
+    await this.closeRoute(handle, opts);
+  }
+  close() {
+    this.closeStarted = true;
+    this.fail(new SubcError("client closed"));
+    this.sock.close();
+  }
+  drainUnaryOnHandle(handle) {
+    const waiters = [];
+    for (const pending of this.pending.values()) {
+      if (pending.handle === handle && !pending.subscription) {
+        waiters.push(new Promise((resolve) => {
+          const previous = pending.onSettle;
+          pending.onSettle = () => {
+            previous?.();
+            resolve();
+          };
+        }));
+      }
+    }
+    return Promise.all(waiters).then(() => {
+      return;
+    });
+  }
+  sendRouteGoodbye(handle, closeOnQueueFailure = false) {
+    this.assertLiveConnection(handle);
+    if (this.closedErr) {
+      if (closeOnQueueFailure)
+        this.closeConnectionAfterCleanupFailure();
+      return;
+    }
+    const goodbye = buildFrame(FrameType.Goodbye, buildFlags(false, Priority.Interactive, false), handle.channel, handle.epoch, 0n, EMPTY_BODY);
+    const write = this.sock.writeTracked(encodeFrame(goodbye), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS);
+    if (!write.queued && closeOnQueueFailure)
+      this.closeConnectionAfterCleanupFailure();
+    write.completed.catch(() => {
+      if (closeOnQueueFailure && !write.queued)
+        this.closeConnectionAfterCleanupFailure();
+    });
+  }
+  static async openConnection(opts) {
+    const conn = await readConnectionFile(opts.connectionFile);
+    const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    const endpoint = conn.endpoints[0];
+    const sock = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+    try {
+      await authenticateClient(sock, conn, deadline);
+    } catch (err) {
+      sock.close();
+      throw err;
+    }
+    return { sock, conn };
+  }
+  async controlRpc(body, acceptFrame, onLateResponse) {
+    return this.send(null, body, Priority.Interactive, AdmissionClass.Normal, undefined, undefined, acceptFrame, onLateResponse);
+  }
+  send(handle, body, priority, admission, timeoutMs, onProgress, acceptFrame, onLateResponse) {
+    if (handle)
+      this.assertLiveHandle(handle);
+    if (this.closedErr)
+      return Promise.reject(this.closedErr);
+    let corr;
+    try {
+      corr = this.allocateCorr();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const key = pendingKey(handle, corr);
+    const channel = handle?.channel ?? 0;
+    const epoch = handle?.epoch ?? 0;
+    const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false, admission), channel, epoch, corr, body);
+    return new Promise((resolve, reject) => {
+      const ms = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      const pending = {
+        handle,
+        resolve,
+        reject,
+        onProgress,
+        timer: null,
+        acceptFrame,
+        onLateResponse
+      };
+      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
+      this.pending.set(key, pending);
+      this.sock.write(encodeFrame(frame), Date.now() + ms).catch((error) => {
+        const current = this.pending.get(key);
+        if (current)
+          this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
+      });
+    });
+  }
+  arbitrateTimeout(key, pending, channel, corr, ms) {
+    const settleAsTimeout = () => {
+      if (pending.onLateResponse)
+        this.lateResponses.set(key, pending.onLateResponse);
+      this.rejectPending(key, pending, new SubcError(this.timeoutMessage(channel, corr, ms), REQUEST_DEADLINE_MARKER));
+    };
+    const graceDeadline = Date.now() + this.opts.timeoutArbitrationGraceMs;
+    const arbitrate = () => {
+      if (this.pending.get(key) !== pending)
+        return;
+      const readerDraining = this.readerActive || this.sock.bufferedBytes() > 0;
+      if (readerDraining && Date.now() < graceDeadline) {
+        setImmediate(arbitrate);
+        return;
+      }
+      settleAsTimeout();
+    };
+    setImmediate(arbitrate);
+  }
+  async managedRequest(handle, body, opts) {
+    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const priority = opts.priority ?? Priority.Interactive;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    try {
+      const reply = await this.sendManaged(handle, bytes, priority, admission, opts.timeoutMs, opts.onProgress);
+      return this.parseJson(reply);
+    } catch (error) {
+      if (error instanceof SubcCallError)
+        throw error;
+      throw this.terminalCallError("managed call failed", error);
+    }
+  }
+  sendManaged(handle, body, priority, admission, timeoutMs, onProgress) {
+    try {
+      this.assertLiveHandle(handle);
+    } catch (error) {
+      return Promise.reject(this.notSentCallError("request used a stale route handle", error));
+    }
+    if (this.closedErr) {
+      return Promise.reject(this.notSentCallError("request was not sent because the subc connection was already closed", this.closedErr));
+    }
+    let corr;
+    try {
+      corr = this.allocateCorr();
+    } catch (error) {
+      return Promise.reject(this.notSentCallError("request correlation allocator was exhausted", error));
+    }
+    const key = pendingKey(handle, corr);
+    const frame = buildFrame(FrameType.Request, buildFlags(false, priority, false, admission), handle.channel, handle.epoch, corr, body);
+    let handedToSocket = false;
+    const classifyFailure = (error) => {
+      if (!handedToSocket)
+        return this.notSentCallError("request bytes were not queued to the subc socket", error);
+      if (error instanceof SubcError && error.code === REQUEST_DEADLINE_MARKER) {
+        return new SubcCallError("outcome_unknown", `managed call deadline exceeded after request bytes were queued to the local socket; no terminal response was observed; outcome unknown${causeMessage(error)}`, DEADLINE_NO_DROP_CODE, error);
+      }
+      return this.outcomeUnknownCallError("connection dropped before the managed call returned a response", error);
+    };
+    return new Promise((resolve, reject) => {
+      const ms = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      const pending = {
+        handle,
+        resolve,
+        reject,
+        onProgress,
+        timer: null,
+        classifyFailure
+      };
+      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
+      this.pending.set(key, pending);
+      const write = this.sock.writeTracked(encodeFrame(frame), Date.now() + ms);
+      handedToSocket = write.queued;
+      write.completed.catch((error) => {
+        const current = this.pending.get(key);
+        if (current)
+          this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
+      });
+    });
+  }
+  async cachedRouteHandle(moduleId, opts) {
+    const identity = opts.identity ?? this.opts.identity;
+    if (!identity) {
+      throw new SubcCallError("terminal", "managed call requires a BindIdentity in SubcClient.connect({ identity }) or call(..., { identity })", "missing_identity");
+    }
+    const target = { kind: opts.targetKind ?? this.opts.targetKind, module_id: moduleId };
+    const consumerIdentity = routeOpenConsumerIdentity(opts);
+    const key = routeCacheKey(target, identity, consumerIdentity);
+    let cached = this.routes.get(key);
+    if (!cached) {
+      cached = {
+        key,
+        moduleId,
+        target,
+        identity,
+        consumerIdentity,
+        handle: null,
+        opening: null
+      };
+      this.routes.set(key, cached);
+    }
+    if (cached.handle && this.isLiveHandle(cached.handle))
+      return cached.handle;
+    if (!cached.opening) {
+      cached.opening = this.openCachedRoute(cached).finally(() => {
+        cached.opening = null;
+      });
+    }
+    return cached.opening;
+  }
+  async openCachedRoute(cached) {
+    const routeRetryDeadline = Date.now() + ROUTE_OPEN_RETRY_DEADLINE_MS;
+    let routeRetryDelay = this.opts.reconnectBackoff.baseMs;
+    let routeRetryAttempt = 0;
+    for (;; ) {
+      if (cached.closed)
+        throw this.routeClosedDuringOpen();
+      try {
+        await this.ensureConnectedForManaged();
+      } catch (error) {
+        throw this.notSentRecoveryError("route.open could not run because reconnect failed", error);
+      }
+      if (cached.handle && this.isLiveHandle(cached.handle))
+        return cached.handle;
+      try {
+        const handle = await this.routeOpen(cached.target, cached.identity, {
+          consumerIdentity: cached.consumerIdentity ?? null
+        });
+        if (cached.closed) {
+          this.liveRoutes.delete(handle.channel);
+          this.sendRouteGoodbye(handle);
+          throw this.routeClosedDuringOpen();
+        }
+        cached.handle = handle;
+        return handle;
+      } catch (error) {
+        if (error instanceof SubcCallError && error.code === "route_closed")
+          throw error;
+        if (!this.closeStarted && isConsumerReconnectTransient(error)) {
+          try {
+            await this.reconnectAfterDrop(error);
+          } catch (reconnectError) {
+            throw this.notSentRecoveryError("route.open was not sent and reconnect failed", reconnectError);
+          }
+          continue;
+        }
+        if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
+          routeRetryAttempt += 1;
+          if (routeRetryAttempt < this.opts.reconnectBackoff.maxAttempts && Date.now() < routeRetryDeadline) {
+            await this.opts.sleep(routeRetryDelay);
+            routeRetryDelay = Math.min(routeRetryDelay * 2, this.opts.reconnectBackoff.capMs);
+            continue;
+          }
+          throw this.notSentCallError(`route.open failed for module ${cached.moduleId}: ${error.code} (retry budget exhausted)`, error);
+        }
+        throw this.terminalCallError(`route.open failed for module ${cached.moduleId}`, error);
+      }
+    }
+  }
+  async ensureConnectedForManaged() {
+    if (this.closeStarted)
+      throw new SubcError("client closed");
+    if (this.reconnecting)
+      await this.reconnecting;
+    if (this.closedErr)
+      await this.reconnectAfterDrop(this.closedErr);
+  }
+  scheduleReconnectAfterDrop(err) {
+    if (this.closeStarted || this.reconnecting)
+      return;
+    this.reconnectAfterDrop(err).catch(() => {});
+  }
+  reconnectAfterDrop(trigger) {
+    if (this.closeStarted)
+      return Promise.reject(new SubcError("client closed"));
+    if (this.reconnecting)
+      return this.reconnecting;
+    const promise = this.reconnectWithRetry(trigger).finally(() => {
+      if (this.reconnecting === promise)
+        this.reconnecting = null;
+    });
+    this.reconnecting = promise;
+    return promise;
+  }
+  async reconnectWithRetry(_trigger) {
+    let attempt = 0;
+    let delay = this.opts.reconnectBackoff.baseMs;
+    for (;; ) {
+      if (this.closeStarted)
+        throw new SubcError("client closed");
+      attempt += 1;
+      try {
+        const opened = await SubcClient.openConnection(this.opts);
+        if (this.closeStarted) {
+          opened.sock.close();
+          throw new SubcError("client closed");
+        }
+        this.replaceConnection(opened);
+        await this.reopenCachedRoutes();
+        return;
+      } catch (err) {
+        if (!isConsumerReconnectTransient(err) || attempt >= this.opts.reconnectBackoff.maxAttempts) {
+          if (err instanceof AuthError && attempt > 1) {
+            throw new AuthError(`reconnect gave up after ${attempt} attempts: ${err.message} — the connection file and the daemon's key disagree persistently ` + `(daemon restarting in a loop, split connection-file paths, or a genuinely foreign daemon on this port); ` + `check the daemon, then restart this host app`);
+          }
+          throw err;
+        }
+        await this.opts.sleep(delay);
+        delay = Math.min(delay * 2, this.opts.reconnectBackoff.capMs);
+      }
+    }
+  }
+  replaceConnection(opened) {
+    this.sock.close();
+    this.sock = opened.sock;
+    this.currentConn = opened.conn;
+    this.closedErr = null;
+    this.generation += 1;
+    this.connectionToken = newConnectionToken();
+    this.liveRoutes.clear();
+    this.lateResponses.clear();
+    this.nextCorr = 1n;
+    this.readLoop(opened.sock, this.generation);
+  }
+  async reopenCachedRoutes() {
+    for (const cached of this.routes.values())
+      cached.handle = null;
+    for (const cached of this.routes.values()) {
+      if (cached.closed)
+        continue;
+      const handle = await this.routeOpen(cached.target, cached.identity, {
+        consumerIdentity: cached.consumerIdentity ?? null
+      });
+      if (cached.closed) {
+        this.liveRoutes.delete(handle.channel);
+        this.sendRouteGoodbye(handle);
+        continue;
+      }
+      cached.handle = handle;
+    }
+  }
+  timeoutMessage(channel, corr, ms) {
+    const port = this.sock.localPort();
+    const where = port === null ? "channel" : `local_port=${port} channel`;
+    return `request on ${where} ${channel} corr ${corr} timed out after ${ms}ms`;
+  }
+  routeClosedDuringOpen() {
+    return new SubcCallError("not_sent", "route was closed before route.open completed", "route_closed");
+  }
+  async readLoop(sock, generation) {
+    try {
+      for (;; ) {
+        this.readerActive = false;
+        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS }, () => {
+          this.readerActive = true;
+        });
+        try {
+          if (this.sock === sock && this.generation === generation)
+            this.dispatch(frame);
+        } finally {
+          this.readerActive = false;
+        }
+      }
+    } catch (error) {
+      if (this.sock === sock && this.generation === generation) {
+        this.fail(error instanceof Error ? error : new SubcError(String(error)));
+      }
+    }
+  }
+  dispatch(frame) {
+    let handle = null;
+    if (frame.header.channel !== 0) {
+      handle = this.liveRoutes.get(frame.header.channel) ?? null;
+      if (!handle || handle.epoch !== frame.header.epoch) {
+        this.ingressEpochDropCount += 1;
+        return;
+      }
+    }
+    const key = pendingKey(handle, frame.header.corr);
+    const pending = this.pending.get(key);
+    if (pending) {
+      if (pending.acceptFrame && !pending.acceptFrame(frame))
+        return;
+      switch (frame.header.ty) {
+        case FrameType.Push:
+        case FrameType.StreamData:
+          pending.onProgress?.(frame.body);
+          return;
+        case FrameType.Response:
+        case FrameType.StreamEnd:
+          this.settle(key, pending, () => pending.resolve(frame));
+          return;
+        case FrameType.Error:
+          this.settle(key, pending, () => pending.reject(this.errorFromFrame(frame)));
+          return;
+        default:
+          return;
+      }
+    }
+    const late = this.lateResponses.get(key);
+    if (late && (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.Error)) {
+      this.lateResponses.delete(key);
+      late(frame);
+      return;
+    }
+    if (frame.header.ty === FrameType.Goodbye && handle) {
+      this.failHandle(handle, new SubcError("route closed by subc (GOODBYE)"));
+      if (this.liveRoutes.get(handle.channel) === handle)
+        this.liveRoutes.delete(handle.channel);
+      this.evictRouteHandle(handle);
+      return;
+    }
+    if (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.Error || frame.header.ty === FrameType.StreamEnd) {
+      debug("dropped terminal frame with no waiter: type=%d channel=%d epoch=%d corr=%s port=%s", frame.header.ty, frame.header.channel, frame.header.epoch, frame.header.corr, this.sock.localPort() ?? "?");
+    }
+  }
+  settle(key, pending, run) {
+    if (this.pending.get(key) !== pending)
+      return false;
+    this.pending.delete(key);
+    if (pending.timer)
+      clearTimeout(pending.timer);
+    run();
+    pending.onSettle?.();
+    return true;
+  }
+  rejectPending(key, pending, err) {
+    this.settle(key, pending, () => pending.reject(pending.classifyFailure?.(err) ?? err));
+  }
+  errorFromFrame(frame) {
+    try {
+      const parsed = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+      return new SubcError(parsed.message ?? "subc error", parsed.code);
+    } catch {
+      return new SubcError(Buffer.from(frame.body).toString("utf8") || "subc error");
+    }
+  }
+  evictRouteHandle(handle) {
+    for (const cached of this.routes.values()) {
+      if (cached.handle && sameRouteHandle(cached.handle, handle))
+        cached.handle = null;
+    }
+  }
+  failHandle(handle, error) {
+    for (const [key, pending] of this.pending) {
+      if (pending.handle && sameRouteHandle(pending.handle, handle))
+        this.rejectPending(key, pending, error);
+    }
+  }
+  fail(err) {
+    if (!this.closedErr)
+      this.closedErr = err;
+    for (const [key, pending] of this.pending) {
+      this.rejectPending(key, pending, err);
+    }
+  }
+  notSentCallError(message, cause) {
+    return new SubcCallError("not_sent", `${message}${causeMessage(cause)}`, errorCode(cause), cause);
+  }
+  outcomeUnknownCallError(message, cause) {
+    return new SubcCallError("outcome_unknown", `${message}${causeMessage(cause)}`, errorCode(cause), cause);
+  }
+  terminalCallError(message, cause) {
+    if (cause instanceof SubcCallError)
+      return cause;
+    return new SubcCallError("terminal", `${message}${causeMessage(cause)}`, errorCode(cause), cause);
+  }
+  notSentRecoveryError(message, cause) {
+    if (cause instanceof SubcCallError)
+      return cause;
+    if (isConsumerReconnectTransient(cause))
+      return this.notSentCallError(message, cause);
+    return this.terminalCallError(message, cause);
+  }
+  get droppedIngressFrames() {
+    return this.ingressEpochDropCount;
+  }
+  installRoute(channel, epoch) {
+    const handle = createRouteHandle(channel, epoch, this.connectionToken);
+    this.liveRoutes.set(channel, handle);
+    return handle;
+  }
+  isLiveHandle(handle) {
+    return belongsToConnection(handle, this.connectionToken) && this.liveRoutes.get(handle.channel) === handle;
+  }
+  assertLiveConnection(handle) {
+    if (!belongsToConnection(handle, this.connectionToken))
+      throw new StaleRouteHandleError(handle);
+  }
+  assertLiveHandle(handle) {
+    if (!this.isLiveHandle(handle))
+      throw new StaleRouteHandleError(handle);
+  }
+  allocateCorr() {
+    const maximum = 0xffffffffffffffffn;
+    if (this.nextCorr > maximum) {
+      const error = new SubcError("channel-0 correlation id allocator exhausted", "corr_exhausted");
+      this.fail(error);
+      this.sock.close();
+      this.scheduleReconnectAfterDrop(error);
+      throw error;
+    }
+    const corr = this.nextCorr;
+    this.nextCorr += 1n;
+    return corr;
+  }
+  closeConnectionAfterCleanupFailure() {
+    const error = new SubcError("late route cleanup could not be queued", "late_route_cleanup_failed");
+    this.fail(error);
+    this.sock.close();
+    this.scheduleReconnectAfterDrop(error);
+  }
+  encode(value) {
+    return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
+  }
+  parseJson(frame) {
+    return JSON.parse(Buffer.from(frame.body).toString("utf8"));
+  }
+}
+function isConsumerReconnectTransient(err) {
+  if (err instanceof SocketClosedError || err instanceof SocketTimeoutError)
+    return true;
+  if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError)
+    return true;
+  if (err instanceof SubcCallError)
+    return err.kind === "not_sent" || err.kind === "outcome_unknown";
+  if (err instanceof AuthError)
+    return true;
+  if (err instanceof SubcError || err instanceof ConnectionFileError)
+    return false;
+  const code = errorCode(err);
+  return code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || code === "ENOENT";
+}
+function isRetryableRouteOpenCode(code) {
+  return code === "unknown_module" || code === "module_reloading" || code === "target_unavailable" || code === "module_timeout";
+}
+async function connectionFileExists(path) {
+  try {
+    await fs2.access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function normalizeConnectOptions(opts) {
+  return {
+    connectionFile: opts.connectionFile,
+    handshakeTimeoutMs: opts.handshakeTimeoutMs,
+    identity: opts.identity,
+    targetKind: opts.targetKind ?? DEFAULT_MANAGED_TARGET_KIND,
+    reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
+    sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+    timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS
+  };
+}
+function routeCacheKey(target, identity, consumerIdentity) {
+  const consumerPart = consumerIdentity ? `${consumerIdentity.module_id}\x00${consumerIdentity.launch_nonce}` : "";
+  return `${target.kind}\x00${target.module_id}\x00${identity.project_root}\x00${identity.harness}\x00${identity.session}\x00${consumerPart}`;
+}
+function routeOpenConsumerIdentity(opts = {}) {
+  if (opts.consumerIdentity !== undefined)
+    return opts.consumerIdentity ?? undefined;
+  const moduleId = process.env[SUBC_MODULE_ID_ENV];
+  const launchNonce = process.env[SUBC_LAUNCH_NONCE_ENV];
+  if (!moduleId || !launchNonce)
+    return;
+  return { module_id: moduleId, launch_nonce: launchNonce };
+}
+function errorCode(err) {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const code = err.code;
+    if (typeof code === "string")
+      return code;
+  }
+  return;
+}
+function causeMessage(cause) {
+  if (cause === undefined)
+    return "";
+  return `: ${cause instanceof Error ? cause.message : String(cause)}`;
+}
+function pendingKey(handle, corr) {
+  return handle ? `${handle.channel}:${handle.epoch}:${corr}` : `0:0:${corr}`;
+}
+// ../plugin/src/features/magic-context/memory/embedding-synapse.ts
+var SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
+var SYNAPSE_MAX_INPUT_TOKENS = 8192;
+var SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS = 3000;
+var SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS = 120000;
+
+class SynapseEmbeddingError extends Error {
+  code;
+  retryAfterMs;
+  permanent;
+  constructor(code, message, options) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "SynapseEmbeddingError";
+    this.code = code;
+    this.permanent = options?.permanent ?? isPermanentSynapseCode(code);
+    this.retryAfterMs = options?.retryAfterMs ?? (this.permanent ? undefined : 100);
+  }
+}
+function isPermanentSynapseCode(code) {
+  return code === "artifact_invalid" || code === "substitution_rejected" || code === "not_certified" || code === "probe_required" || code === "idempotency_conflict" || code === "schema_violation";
+}
+function asRecord(value) {
+  return value !== null && typeof value === "object" ? value : null;
+}
+function responseBody(value) {
+  const record = asRecord(value);
+  const result = asRecord(record?.result);
+  return result ? { ...record, ...result } : record ?? {};
+}
+function readRetryAfter(value) {
+  const record = asRecord(value);
+  const candidate = record?.retry_after_ms ?? record?.retryAfterMs;
+  if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate < 0)
+    return;
+  return Math.ceil(candidate);
+}
+function readErrorCode(value) {
+  const record = asRecord(value);
+  if (typeof record?.code === "string")
+    return record.code;
+  if (value instanceof Error && "code" in value && typeof value.code === "string") {
+    return value.code;
+  }
+  return;
+}
+function classifyError(value) {
+  if (value instanceof SynapseEmbeddingError)
+    return value;
+  const code = readErrorCode(value) ?? (value instanceof Error ? value.name : "transport");
+  const normalized = code.toLowerCase();
+  let mapped = "transport";
+  if (normalized.includes("queue_full"))
+    mapped = "queue_full";
+  else if (normalized.includes("model_loading"))
+    mapped = "model_loading";
+  else if (normalized.includes("timeout") || normalized.includes("deadline"))
+    mapped = "timeout";
+  else if (normalized.includes("artifact_invalid"))
+    mapped = "artifact_invalid";
+  else if (normalized.includes("substitution"))
+    mapped = "substitution_rejected";
+  else if (normalized.includes("not_certified"))
+    mapped = "not_certified";
+  else if (normalized.includes("probe_required"))
+    mapped = "probe_required";
+  else if (normalized.includes("idempotency_conflict"))
+    mapped = "idempotency_conflict";
+  else if (normalized.includes("schema"))
+    mapped = "schema_violation";
+  else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
+    mapped = "module_restarted";
+  const message = value instanceof Error ? value.message : String(value);
+  return new SynapseEmbeddingError(mapped, message, {
+    retryAfterMs: readRetryAfter(value) ?? (isPermanentSynapseCode(mapped) ? undefined : 100),
+    cause: value
+  });
+}
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function sha256(value) {
+  return createHash2("sha256").update(value).digest("hex");
+}
+function stableJson(value) {
+  if (Array.isArray(value))
+    return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+function getSynapseLaneIdentity(model, fingerprint) {
+  return `synapse:v1:${sha256(stableJson({ model, fingerprint }))}`;
+}
+function getSynapseBatchRequestKey(args) {
+  return sha256(stableJson({
+    op: "embed.batch",
+    model: args.model,
+    required_fingerprint: args.fingerprint,
+    required_epoch: args.tableEpoch,
+    allow_equivalent: false,
+    accept_declared: false,
+    ids: args.items.map((item) => item.id),
+    content_sha256: args.items.map((item) => item.contentSha256)
+  }));
+}
+function hashContent(text) {
+  return sha256(text);
+}
+function extractCatalogEntries(value) {
+  const body = responseBody(value);
+  const raw = Array.isArray(body.models) ? body.models : Array.isArray(body.entries) ? body.entries : Array.isArray(value) ? value : [];
+  const envelopeEpoch = typeof body.table_epoch === "number" && Number.isInteger(body.table_epoch) ? body.table_epoch : undefined;
+  return raw.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record)
+      return [];
+    const model = typeof record.model === "string" && record.model.length > 0 ? record.model : typeof record.model_id === "string" ? record.model_id : "";
+    const fingerprint = typeof record.fingerprint === "string" && record.fingerprint.length > 0 ? record.fingerprint : Array.isArray(record.fingerprints) && typeof record.fingerprints[0] === "string" ? record.fingerprints[0] : "";
+    const entryEpoch = record.table_epoch ?? record.tableEpoch;
+    const tableEpoch = typeof entryEpoch === "number" && Number.isInteger(entryEpoch) ? entryEpoch : envelopeEpoch;
+    const dims = record.dims ?? record.dimensions;
+    if (model.length === 0 || fingerprint.length === 0 || typeof tableEpoch !== "number" || !Number.isInteger(tableEpoch)) {
+      return [];
+    }
+    const rawBatch = record.recommended_batch ?? record.recommendedBatch;
+    const batchRecord = asRecord(rawBatch);
+    const recommendedBatch = typeof rawBatch === "number" ? rawBatch : batchRecord ? batchRecord.rows : undefined;
+    const recommendedTokenBudget = batchRecord ? batchRecord.token_budget : undefined;
+    const state = typeof record.state === "string" ? record.state : undefined;
+    return [
+      {
+        model,
+        fingerprint,
+        table_epoch: tableEpoch,
+        ...typeof dims === "number" && Number.isInteger(dims) && dims > 0 ? { dims } : {},
+        ...typeof recommendedBatch === "number" && recommendedBatch > 0 ? { recommended_batch: Math.floor(recommendedBatch) } : {},
+        ...typeof recommendedTokenBudget === "number" && recommendedTokenBudget > 0 ? { recommended_token_budget: Math.floor(recommendedTokenBudget) } : {},
+        ...record.provenance !== undefined ? { provenance: record.provenance } : {},
+        ...typeof record.certified === "boolean" ? { certified: record.certified } : {},
+        ...typeof record.status === "string" ? { status: record.status } : state ? { status: state } : {}
+      }
+    ];
+  });
+}
+function extractVector(value) {
+  const body = responseBody(value);
+  const fromVectors = Array.isArray(body.vectors) ? asRecord(body.vectors[0])?.vector : undefined;
+  const raw = fromVectors ?? body.vector ?? body.embedding;
+  if (!Array.isArray(raw) || raw.some((item) => typeof item !== "number" || !Number.isFinite(item))) {
+    return null;
+  }
+  return { vector: Float32Array.from(raw), metadata: body };
+}
+function extractBatchItems(value) {
+  const body = responseBody(value);
+  const raw = Array.isArray(body.vectors) ? body.vectors : Array.isArray(body.items) ? body.items : Array.isArray(body.results) ? body.results : [];
+  return raw.flatMap((item) => {
+    const record = asRecord(item);
+    return record ? [record] : [];
+  });
+}
+var sharedClient = null;
+var sharedClientFile = null;
+var sharedClientPromise = null;
+var factoryClients = new WeakMap;
+async function getSharedClient(options) {
+  if (options.clientFactory) {
+    let promise = factoryClients.get(options.clientFactory);
+    if (!promise) {
+      promise = options.clientFactory();
+      factoryClients.set(options.clientFactory, promise);
+    }
+    return promise;
+  }
+  if (sharedClient && sharedClientFile === options.connectionFile)
+    return sharedClient;
+  if (sharedClientPromise && sharedClientFile === options.connectionFile)
+    return sharedClientPromise;
+  sharedClientFile = options.connectionFile;
+  sharedClientPromise = SubcClient.connect({ connectionFile: options.connectionFile }).then((client) => {
+    sharedClient = client;
+    return client;
+  });
+  return sharedClientPromise;
+}
+
+class SynapseEmbeddingProvider {
+  modelId;
+  maxInputTokens = SYNAPSE_MAX_INPUT_TOKENS;
+  metadata;
+  options;
+  client = null;
+  initialized = false;
+  initializing = null;
+  permanentFailure = false;
+  batchLimit = 16;
+  tokenBudget = null;
+  constructor(options) {
+    this.options = options;
+    const model = options.model || SYNAPSE_DEFAULT_MODEL;
+    const fingerprint = options.fingerprint ?? "";
+    this.metadata = fingerprint && Number.isInteger(options.tableEpoch) && Number.isInteger(options.dims) && (options.dims ?? 0) > 0 ? {
+      model,
+      fingerprint,
+      table_epoch: options.tableEpoch,
+      dims: options.dims,
+      ...options.recommendedBatch ? { recommended_batch: Math.max(1, Math.floor(options.recommendedBatch)) } : {},
+      ...options.provenance !== undefined ? { provenance: options.provenance } : {},
+      laneIdentity: getSynapseLaneIdentity(model, fingerprint)
+    } : null;
+    this.modelId = this.metadata?.laneIdentity ?? "synapse:v1:pending";
+    this.batchLimit = this.metadata?.recommended_batch ?? 16;
+    this.tokenBudget = this.metadata?.recommended_token_budget ?? null;
+  }
+  nextPage(items, start) {
+    const hardEnd = Math.min(items.length, start + this.batchLimit);
+    if (this.tokenBudget === null)
+      return items.slice(start, hardEnd);
+    let end = start;
+    let tokens = 0;
+    while (end < hardEnd) {
+      tokens += Math.ceil(items[end].text.length / 4);
+      if (tokens > this.tokenBudget && end > start)
+        break;
+      end += 1;
+    }
+    return items.slice(start, Math.max(end, start + 1));
+  }
+  static async discover(options) {
+    const provider = new SynapseEmbeddingProvider(options);
+    if (!await provider.initialize() || !provider.metadata) {
+      throw new SynapseEmbeddingError("not_certified", "Synapse lane is not ready");
+    }
+    return provider.metadata;
+  }
+  async initialize() {
+    if (this.initialized)
+      return true;
+    if (this.permanentFailure)
+      return false;
+    if (this.initializing)
+      return this.initializing;
+    this.initializing = (async () => {
+      try {
+        if (!this.options.clientFactory && !await connectionFileExists(this.options.connectionFile)) {
+          throw new SynapseEmbeddingError("transport", `Synapse connection file is unavailable: ${this.options.connectionFile}`);
+        }
+        this.client = await getSharedClient(this.options);
+        if (!this.metadata) {
+          const discovered = await this.callWithRetry("models.list", {}, this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS, false);
+          const entries = extractCatalogEntries(discovered);
+          const requested = this.options.model?.trim() || SYNAPSE_DEFAULT_MODEL;
+          const entry = entries.find((candidate) => candidate.model === requested);
+          if (!entry) {
+            throw new SynapseEmbeddingError("artifact_invalid", `Synapse models.list did not return requested model ${requested}`);
+          }
+          if (entry.certified === false || entry.status === "not_certified") {
+            throw new SynapseEmbeddingError("not_certified", `Synapse model ${entry.model} is not certified`);
+          }
+          const metadata = {
+            ...entry,
+            laneIdentity: getSynapseLaneIdentity(entry.model, entry.fingerprint)
+          };
+          this.metadata = metadata;
+          this.modelId = metadata.laneIdentity;
+          this.batchLimit = metadata.recommended_batch ?? this.batchLimit;
+          this.tokenBudget = metadata.recommended_token_budget ?? this.tokenBudget;
+        }
+        this.initialized = true;
+        return true;
+      } catch (error) {
+        const classified = classifyError(error);
+        if (classified.permanent) {
+          this.permanentFailure = true;
+          log(`[magic-context] Synapse lane disabled: ${classified.code}: ${classified.message}`);
+        } else {
+          log(`[magic-context] Synapse lane unavailable: ${classified.message}`);
+        }
+        this.initialized = false;
+        return false;
+      } finally {
+        this.initializing = null;
+      }
+    })();
+    return this.initializing;
+  }
+  async embed(text, signal) {
+    if (!await this.initialize() || signal?.aborted || !this.metadata)
+      return null;
+    try {
+      const value = await this.callWithRetry("embed.query", this.requestConstraints({
+        text,
+        deadline_ms: this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS
+      }), this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS, true, signal);
+      const extracted = extractVector(value);
+      if (!extracted)
+        throw new SynapseEmbeddingError("schema_violation", "Synapse query returned no vector");
+      this.validateResponse(extracted.metadata, extracted.vector.length);
+      return extracted.vector;
+    } catch (error) {
+      this.logCallFailure(error, "embed.query");
+      return null;
+    }
+  }
+  async embedBatch(texts, signal) {
+    if (texts.length === 0)
+      return [];
+    const items = texts.map((text, index) => ({
+      id: `item:${index}`,
+      text,
+      contentSha256: hashContent(text)
+    }));
+    const map = await this.embedItems(items, signal);
+    return items.map((item) => map.get(item.id) ?? null);
+  }
+  async embedItems(items, signal) {
+    const output = new Map;
+    if (items.length === 0 || !await this.initialize() || !this.metadata || signal?.aborted) {
+      return output;
+    }
+    for (let start = 0;start < items.length; ) {
+      if (signal?.aborted || this.permanentFailure)
+        break;
+      const page = this.nextPage(items, start);
+      start += page.length;
+      try {
+        const requestKey = this.requestKey(page);
+        let body = {};
+        let restarted = false;
+        for (;; ) {
+          try {
+            body = await this.callWithRetry("embed.batch", this.batchRequest(page, requestKey), this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS, true, signal);
+            const first = responseBody(body);
+            const jobId = typeof first.job_id === "string" ? first.job_id : null;
+            if (jobId)
+              body = await this.pollBatch(jobId, requestKey, signal);
+            break;
+          } catch (error) {
+            const classified = classifyError(error);
+            if (classified.code !== "module_restarted" || restarted)
+              throw classified;
+            restarted = true;
+          }
+        }
+        const batchEnvelope = responseBody(body);
+        for (const item of extractBatchItems(body)) {
+          const id = typeof item.id === "string" ? item.id : "";
+          const vector = item.vector ?? item.embedding;
+          if (!id || !Array.isArray(vector)) {
+            throw new SynapseEmbeddingError("schema_violation", "Synapse batch item is malformed");
+          }
+          const expected = page.find((candidate) => candidate.id === id);
+          if (!expected) {
+            throw new SynapseEmbeddingError("schema_violation", `Synapse returned unknown item ${id}`);
+          }
+          if (typeof item.content_sha256 === "string" && item.content_sha256 !== expected.contentSha256) {
+            throw new SynapseEmbeddingError("artifact_invalid", `Synapse content hash mismatch for item ${id}`);
+          }
+          const vectorArray = Float32Array.from(vector);
+          this.validateResponse({ ...batchEnvelope, ...item }, vectorArray.length);
+          output.set(id, vectorArray);
+        }
+      } catch (error) {
+        const classified = classifyError(error);
+        this.logCallFailure(classified, "embed.batch");
+        if (classified.code === "idempotency_conflict")
+          throw classified;
+        if (classified.permanent) {
+          this.permanentFailure = true;
+          this.initialized = false;
+          break;
+        }
+      }
+    }
+    return output;
+  }
+  async dispose() {
+    this.initialized = false;
+    this.client = null;
+  }
+  isLoaded() {
+    return this.initialized;
+  }
+  requestConstraints(extra) {
+    const metadata = this.metadata;
+    if (!metadata)
+      return extra;
+    return {
+      ...extra,
+      model: metadata.model,
+      required_fingerprint: metadata.fingerprint,
+      required_epoch: metadata.table_epoch,
+      allow_equivalent: false,
+      accept_declared: false
+    };
+  }
+  batchRequest(items, requestKey) {
+    return this.requestConstraints({
+      items: items.map((item) => ({
+        id: item.id,
+        text: item.text,
+        content_sha256: item.contentSha256
+      })),
+      request_key: requestKey
+    });
+  }
+  requestKey(items) {
+    if (!this.metadata)
+      throw new SynapseEmbeddingError("transport", "Synapse metadata is unavailable");
+    return getSynapseBatchRequestKey({
+      model: this.metadata.model,
+      fingerprint: this.metadata.fingerprint,
+      tableEpoch: this.metadata.table_epoch,
+      items
+    });
+  }
+  async pollBatch(jobId, requestKey, signal) {
+    let cursor = null;
+    const allItems = [];
+    for (;; ) {
+      if (signal?.aborted)
+        return {};
+      const body = await this.callWithRetry("embed.result", this.requestConstraints({
+        job_id: jobId,
+        cursor,
+        request_key: requestKey
+      }), this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS, true, signal);
+      const parsed = responseBody(body);
+      const items = extractBatchItems(body);
+      allItems.push(...items);
+      const nextCursor = parsed.next_cursor ?? parsed.cursor;
+      const done = parsed.done === true || parsed.complete === true || nextCursor === undefined || nextCursor === null;
+      if (done)
+        return { ...parsed, items: allItems };
+      cursor = nextCursor;
+    }
+  }
+  async callWithRetry(method, params, timeoutMs, retryEmbeddings, signal) {
+    let attempt = 0;
+    for (;; ) {
+      if (signal?.aborted)
+        throw new SynapseEmbeddingError("transport", "Synapse request aborted");
+      try {
+        if (!this.client)
+          throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
+        return await this.client.call(this.options.moduleId ?? "synapse", method, params, {
+          timeoutMs,
+          targetKind: "management_surface",
+          identity: {
+            project_root: this.options.projectRoot,
+            harness: getHarness(),
+            session: this.options.session
+          }
+        });
+      } catch (error) {
+        const classified = classifyError(error);
+        if (classified.code === "idempotency_conflict")
+          throw classified;
+        const outcomeUnknown = error instanceof SubcCallError && error.kind === "outcome_unknown";
+        const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
+        if (!retryable || attempt >= 3)
+          throw classified;
+        const delay = classified.retryAfterMs ?? Math.min(2000, 100 * 2 ** attempt);
+        attempt += 1;
+        await wait(delay);
+      }
+    }
+  }
+  validateResponse(body, dims) {
+    const metadata = this.metadata;
+    if (!metadata) {
+      throw new SynapseEmbeddingError("artifact_invalid", "Synapse lane metadata missing");
+    }
+    if (metadata.dims === undefined) {
+      const envelopeDims = body.dims;
+      if (typeof envelopeDims === "number" && envelopeDims !== dims) {
+        throw new SynapseEmbeddingError("artifact_invalid", `Synapse envelope declares ${envelopeDims} dimensions but the vector has ${dims}`);
+      }
+      metadata.dims = dims;
+    }
+    if (dims !== metadata.dims) {
+      throw new SynapseEmbeddingError("artifact_invalid", `Synapse returned ${dims} dimensions, expected ${metadata.dims}`);
+    }
+    const fingerprint = body.fingerprint ?? body.served_fingerprint;
+    if (typeof fingerprint !== "string") {
+      throw new SynapseEmbeddingError("artifact_invalid", "Synapse response omitted the served fingerprint");
+    }
+    if (fingerprint !== metadata.fingerprint) {
+      throw new SynapseEmbeddingError("substitution_rejected", `Synapse fingerprint changed from ${metadata.fingerprint} to ${fingerprint}`);
+    }
+    const epoch = body.table_epoch ?? body.tableEpoch;
+    if (typeof epoch !== "number") {
+      throw new SynapseEmbeddingError("artifact_invalid", "Synapse response omitted the served table epoch");
+    }
+    if (epoch !== metadata.table_epoch) {
+      throw new SynapseEmbeddingError("substitution_rejected", `Synapse table epoch changed from ${metadata.table_epoch} to ${epoch}`);
+    }
+  }
+  logCallFailure(error, operation) {
+    const classified = classifyError(error);
+    if (classified.permanent)
+      this.permanentFailure = true;
+    const suffix = classified.retryAfterMs === undefined ? "" : ` retry_after_ms=${classified.retryAfterMs}`;
+    log(`[magic-context] Synapse ${operation} failed: ${classified.code}${suffix}: ${classified.message}`);
+  }
+}
+
+// ../plugin/src/features/magic-context/memory/normalize-hash.ts
+import { createHash as createHash3 } from "node:crypto";
+function normalizeMemoryContent(content) {
+  return content.toLowerCase().replace(/\s+/g, " ").trim();
+}
+function computeNormalizedHash(content) {
+  const normalized = normalizeMemoryContent(content);
+  return createHash3("md5").update(normalized).digest("hex");
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-identity.ts
+function normalizeEndpoint(endpoint) {
+  return endpoint?.trim().replace(/\/+$/, "") ?? "";
+}
+function getEmbeddingProviderIdentity(config) {
+  if (config.provider === "off") {
+    return "embedding-provider:off";
+  }
+  if (config.provider === "synapse") {
+    const resolved = config;
+    if (!resolved.model || !resolved.synapse_fingerprint)
+      return "synapse:v1:pending";
+    return getSynapseLaneIdentity(resolved.model, resolved.synapse_fingerprint);
+  }
+  if (config.provider !== "local" && config.provider !== "openai-compatible") {
+    throw new Error("Unknown embedding provider");
+  }
+  const truncate = config.provider === "openai-compatible" ? config.truncate?.trim() : undefined;
+  const localDtype = config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32" ? config.local_dtype : undefined;
+  const identityInput = config.provider === "openai-compatible" ? {
+    provider: "openai-compatible",
+    model: config.model.trim(),
+    endpoint: normalizeEndpoint(config.endpoint),
+    apiKeyPresent: Boolean(config.api_key?.trim()),
+    inputType: config.input_type?.trim() || "",
+    ...truncate ? { truncate } : {}
+  } : {
+    provider: "local",
+    model: config.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+    endpoint: "",
+    apiKeyPresent: false,
+    ...localDtype ? { localDtype } : {}
+  };
+  return `embedding-provider:${computeNormalizedHash(JSON.stringify(identityInput))}`;
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-local.ts
+import { chmodSync, mkdirSync } from "node:fs";
+import { open as open2, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+var LOCK_POLL_MS = 150;
+var STALE_LOCK_MS = 3 * 60000;
+var MAX_LOCK_WAIT_MS = 5 * 60000;
+async function acquireModelLoadLock(lockPath) {
+  const waitStart = Date.now();
+  while (true) {
+    try {
+      const handle = await open2(lockPath, "wx");
+      try {
+        await handle.writeFile(`pid=${process.pid} started=${Date.now()}
+`);
+      } catch {}
+      await handle.close();
+      return async () => {
+        try {
+          await unlink(lockPath);
+        } catch {}
+      };
+    } catch (error) {
+      const code = error.code;
+      if (code !== "EEXIST" && code !== "EPERM") {
+        throw error;
+      }
+      try {
+        const info = await stat(lockPath);
+        if (Date.now() - info.mtimeMs > STALE_LOCK_MS) {
+          log(`[magic-context] embedding-load lock stale (>${STALE_LOCK_MS}ms), taking over`);
+          try {
+            await unlink(lockPath);
+          } catch {}
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - waitStart > MAX_LOCK_WAIT_MS) {
+        throw new Error(`[magic-context] embedding-load lock wait exceeded ${MAX_LOCK_WAIT_MS}ms; another process is still loading the model. Skipping this init attempt to avoid an unsynchronized native load.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
+    }
+  }
+}
+function startLockHeartbeat(lockPath) {
+  const HEARTBEAT_MS = Math.floor(STALE_LOCK_MS / 3);
+  const timer = setInterval(() => {
+    writeFile(lockPath, `pid=${process.pid} alive=${Date.now()}
+`).catch(() => {});
+  }, HEARTBEAT_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+async function injectWasmOrtForElectron() {
+  if (typeof process === "undefined" || !process.versions?.electron) {
+    return false;
+  }
+  try {
+    const ortWebSpec = `onnxruntime-${"web"}`;
+    const ortWeb = await import(ortWebSpec);
+    try {
+      const { createRequire: createRequireFn } = await import("node:module");
+      const requireFn = createRequireFn(import.meta.url);
+      const mainEntry = requireFn.resolve("onnxruntime-web");
+      const distDir = dirname(mainEntry);
+      const wasmPathsPrefix = `${pathToFileURL(distDir).href}/`;
+      if (ortWeb.env?.wasm) {
+        ortWeb.env.wasm.wasmPaths = wasmPathsPrefix;
+      }
+    } catch (pathError) {
+      log("[magic-context] could not resolve local onnxruntime-web/dist, falling back to default WASM paths:", pathError instanceof Error ? pathError.message : String(pathError));
+    }
+    globalThis[Symbol.for("onnxruntime")] = ortWeb;
+    log("[magic-context] Electron detected — using onnxruntime-web (WASM) for embeddings (bypasses onnxruntime-node native load)");
+    return true;
+  } catch (error) {
+    log("[magic-context] failed to inject onnxruntime-web for Electron — letting transformers fall back to native:", error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+var DEFAULT_LOCAL_DTYPE = "fp32";
+async function withQuietConsole(fn) {
+  const origWarn = console.warn;
+  const origError = console.error;
+  const redirect = (...args) => {
+    const message = args.map((a) => typeof a === "string" ? a : String(a)).join(" ");
+    log(`[transformers] ${message}`);
+  };
+  console.warn = redirect;
+  console.error = redirect;
+  try {
+    return await fn();
+  } finally {
+    console.warn = origWarn;
+    console.error = origError;
+  }
+}
+var nativeRuntimeMissing = false;
+function isNativeRuntimeMissingError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const lower = message.toLowerCase();
+  const code = error?.code;
+  const name = error?.name;
+  if (code === "ERR_DLOPEN_FAILED" && lower.includes("onnxruntime")) {
+    return true;
+  }
+  const mentionsNativeRuntime = lower.includes("onnxruntime-node") || lower.includes("onnxruntime_binding");
+  if (!mentionsNativeRuntime)
+    return false;
+  return code === "ERR_MODULE_NOT_FOUND" || name === "ResolveMessage" || lower.includes("cannot find package") || lower.includes("cannot find module") || lower.includes("err_module_not_found");
+}
+function isTransientLoadError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (!message)
+    return false;
+  const lower = message.toLowerCase();
+  return lower.includes("protobuf parsing failed") || lower.includes("unable to get model file path or buffer") || lower.includes("ebusy") || lower.includes("resource busy") || lower.includes("resource temporarily unavailable");
+}
+function isArrayLikeNumber(value) {
+  if (typeof value !== "object" || value === null || !("length" in value)) {
+    return false;
+  }
+  const arr = value;
+  if (typeof arr.length !== "number") {
+    return false;
+  }
+  return arr.length === 0 || typeof arr[0] === "number";
+}
+function toFloat32Array2(values) {
+  return values instanceof Float32Array ? new Float32Array(values) : Float32Array.from(Array.from(values));
+}
+function extractBatchEmbeddings(result, expectedCount) {
+  const { data } = result;
+  if (Array.isArray(data) && data.length === expectedCount && data.every((entry) => typeof entry !== "number" && isArrayLikeNumber(entry))) {
+    return data.map((entry) => toFloat32Array2(entry));
+  }
+  if (!isArrayLikeNumber(data)) {
+    log("[magic-context] embedding batch returned unexpected data shape");
+    return Array.from({ length: expectedCount }, () => null);
+  }
+  const flatData = toFloat32Array2(data);
+  const dimension = result.dims?.at(-1) ?? flatData.length / expectedCount;
+  if (!Number.isInteger(dimension) || dimension <= 0 || flatData.length !== expectedCount * dimension) {
+    log("[magic-context] embedding batch returned invalid dimensions");
+    return Array.from({ length: expectedCount }, () => null);
+  }
+  const embeddings = [];
+  for (let index = 0;index < expectedCount; index++) {
+    embeddings.push(flatData.slice(index * dimension, (index + 1) * dimension));
+  }
+  return embeddings;
+}
+
+class LocalEmbeddingProvider {
+  modelId;
+  maxInputTokens;
+  model;
+  dtype;
+  pipeline = null;
+  initPromise = null;
+  inFlight = 0;
+  disposing = false;
+  disposePromise = null;
+  inFlightWaiters = [];
+  constructor(model = DEFAULT_LOCAL_EMBEDDING_MODEL, maxInputTokens = 512, dtype = DEFAULT_LOCAL_DTYPE) {
+    this.model = model;
+    this.maxInputTokens = maxInputTokens;
+    this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+    this.modelId = getEmbeddingProviderIdentity({
+      provider: "local",
+      model,
+      ...dtype && dtype !== DEFAULT_LOCAL_DTYPE ? { local_dtype: dtype } : {}
+    });
+  }
+  async initialize() {
+    if (this.disposing) {
+      return false;
+    }
+    if (this.pipeline) {
+      return true;
+    }
+    if (nativeRuntimeMissing) {
+      return false;
+    }
+    if (this.initPromise) {
+      await this.initPromise;
+      return this.pipeline !== null;
+    }
+    this.initPromise = (async () => {
+      try {
+        if (this.disposing) {
+          return;
+        }
+        const injectedWasmOrt = await injectWasmOrtForElectron();
+        const transformersSpec = "@huggingface/transformers";
+        const transformersModule = await import(transformersSpec);
+        const env = transformersModule.env;
+        const LogLevel = transformersModule.LogLevel;
+        if (LogLevel && "ERROR" in LogLevel) {
+          env.logLevel = LogLevel.ERROR;
+        }
+        const modelCacheDir = join(getMagicContextStorageDir(), "models");
+        try {
+          if (shouldEnforcePrivateStoragePermissions()) {
+            mkdirSync(modelCacheDir, { recursive: true, mode: 448 });
+            if (process.platform !== "win32") {
+              try {
+                chmodSync(modelCacheDir, 448);
+              } catch {}
+            }
+          } else {
+            mkdirSync(modelCacheDir, { recursive: true });
+          }
+          env.cacheDir = modelCacheDir;
+        } catch {
+          log("[magic-context] could not create model cache dir, using library default");
+        }
+        const createPipeline = transformersModule.pipeline;
+        const lockPath = join(modelCacheDir, ".load.lock");
+        const releaseLock = await acquireModelLoadLock(lockPath);
+        const stopHeartbeat = startLockHeartbeat(lockPath);
+        try {
+          const MAX_ATTEMPTS = 3;
+          let lastError;
+          for (let attempt = 1;attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+              const pipeline = await withQuietConsole(() => createPipeline("feature-extraction", this.model, {
+                dtype: this.dtype,
+                ...injectedWasmOrt ? { device: "auto" } : {}
+              }));
+              if (this.disposing) {
+                await pipeline.dispose?.();
+                this.pipeline = null;
+              } else {
+                this.pipeline = pipeline;
+              }
+              lastError = undefined;
+              break;
+            } catch (error) {
+              lastError = error;
+              if (!isTransientLoadError(error) || attempt === MAX_ATTEMPTS) {
+                break;
+              }
+              const delayMs = 300 * attempt + Math.floor(Math.random() * 200);
+              log(`[magic-context] embedding model load attempt ${attempt}/${MAX_ATTEMPTS} failed transiently, retrying in ${delayMs}ms`);
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+          }
+          if (this.pipeline) {
+            log(`[magic-context] embedding model loaded: ${this.model}`);
+          } else if (this.disposing) {
+            return;
+          } else {
+            throw lastError ?? new Error("unknown embedding load failure");
+          }
+        } finally {
+          stopHeartbeat();
+          await releaseLock();
+        }
+      } catch (error) {
+        if (isNativeRuntimeMissingError(error)) {
+          nativeRuntimeMissing = true;
+          log("[magic-context] local embeddings are disabled because the onnxruntime-node native binding is missing or failed to load. Run `npx @cortexkit/magic-context@latest doctor` for repair guidance (use `doctor --force` to reinstall cached plugin packages), or configure an `openai-compatible` embedding HTTP endpoint. Existing memories are unaffected.");
+        } else {
+          log("[magic-context] embedding model failed to load:", error);
+        }
+        this.pipeline = null;
+      } finally {
+        this.initPromise = null;
+      }
+    })();
+    await this.initPromise;
+    return this.pipeline !== null;
+  }
+  waitForInFlightToDrain() {
+    if (this.inFlight === 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.inFlightWaiters.push(resolve);
+    });
+  }
+  finishInFlight() {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    if (this.inFlight !== 0)
+      return;
+    const waiters = this.inFlightWaiters.splice(0);
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+  async embed(text, signal, _purpose) {
+    if (signal?.aborted)
+      return null;
+    if (this.disposing)
+      return null;
+    this.inFlight += 1;
+    try {
+      if (!await this.initialize()) {
+        return null;
+      }
+      const pipeline = this.pipeline;
+      if (!pipeline) {
+        return null;
+      }
+      const result = await withQuietConsole(() => pipeline(text, {
+        pooling: "mean",
+        normalize: true
+      }));
+      return extractBatchEmbeddings(result, 1)[0] ?? null;
+    } catch (error) {
+      log("[magic-context] embedding failed:", error);
+      return null;
+    } finally {
+      this.finishInFlight();
+    }
+  }
+  async embedBatch(texts, signal, _purpose) {
+    if (texts.length === 0) {
+      return [];
+    }
+    if (signal?.aborted) {
+      return Array.from({ length: texts.length }, () => null);
+    }
+    if (this.disposing) {
+      return Array.from({ length: texts.length }, () => null);
+    }
+    this.inFlight += 1;
+    try {
+      if (!await this.initialize()) {
+        return Array.from({ length: texts.length }, () => null);
+      }
+      const pipeline = this.pipeline;
+      if (!pipeline) {
+        return Array.from({ length: texts.length }, () => null);
+      }
+      const result = await withQuietConsole(() => pipeline(texts, {
+        pooling: "mean",
+        normalize: true
+      }));
+      return extractBatchEmbeddings(result, texts.length);
+    } catch (error) {
+      log("[magic-context] embedding batch failed:", error);
+      return Array.from({ length: texts.length }, () => null);
+    } finally {
+      this.finishInFlight();
+    }
+  }
+  async dispose() {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.disposing = true;
+    this.disposePromise = (async () => {
+      if (this.initPromise) {
+        await this.initPromise;
+      }
+      await this.waitForInFlightToDrain();
+      const pipelineToDispose = this.pipeline;
+      this.pipeline = null;
+      this.initPromise = null;
+      if (!pipelineToDispose) {
+        return;
+      }
+      try {
+        await pipelineToDispose.dispose?.();
+      } catch (error) {
+        log("[magic-context] embedding model dispose failed:", error);
+      }
+    })();
+    return this.disposePromise;
+  }
+  isLoaded() {
+    return this.pipeline !== null;
+  }
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-ssrf.ts
+var METADATA_HOSTNAMES = new Set(["metadata.google.internal", "metadata.goog"]);
+var IPV6_METADATA_HOSTS = new Set(["fd00:ec2::254"]);
+function isLinkLocalIpv4(host) {
+  return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+function ipv4FromMappedIpv6(host) {
+  const m = /^::ffff:(.+)$/.exec(host);
+  if (!m)
+    return null;
+  const tail = m[1];
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(tail))
+    return tail;
+  const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+  if (hex) {
+    const hi = Number.parseInt(hex[1], 16);
+    const lo = Number.parseInt(hex[2], 16);
+    if (Number.isNaN(hi) || Number.isNaN(lo))
+      return null;
+    return `${hi >> 8 & 255}.${hi & 255}.${lo >> 8 & 255}.${lo & 255}`;
+  }
+  return null;
+}
+function blockedEmbeddingEndpointReason(endpoint) {
+  const trimmed = endpoint.trim();
+  if (trimmed.length === 0)
+    return null;
+  let url;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return `embedding endpoint is not a valid URL: ${trimmed}`;
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (METADATA_HOSTNAMES.has(host)) {
+    return `embedding endpoint host ${host} is a cloud metadata service (blocked)`;
+  }
+  if (IPV6_METADATA_HOSTS.has(host)) {
+    return `embedding endpoint host ${host} is the AWS IPv6 metadata service (blocked)`;
+  }
+  if (isLinkLocalIpv4(host)) {
+    return `embedding endpoint host ${host} is link-local / cloud metadata (blocked)`;
+  }
+  const mappedV4 = ipv4FromMappedIpv6(host);
+  if (mappedV4 && isLinkLocalIpv4(mappedV4)) {
+    return `embedding endpoint host ${host} (IPv4-mapped ${mappedV4}) is link-local / cloud metadata (blocked)`;
+  }
+  if (host.startsWith("fe80:")) {
+    return `embedding endpoint host ${host} is link-local / cloud metadata (blocked)`;
+  }
+  return null;
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-openai.ts
+function normalizeEndpoint2(endpoint) {
+  return endpoint?.trim().replace(/\/+$/, "") ?? "";
+}
+function embeddingModelsMatch(served, requested) {
+  const a = served.trim().toLowerCase();
+  const b = requested.trim().toLowerCase();
+  if (a.length === 0 || b.length === 0)
+    return true;
+  if (a === b)
+    return true;
+  const longer = a.length >= b.length ? a : b;
+  const shorter = a.length >= b.length ? b : a;
+  const isBoundary = (ch) => ch === "-" || ch === "/";
+  if (longer.startsWith(shorter) && isBoundary(longer.charAt(shorter.length)))
+    return true;
+  if (longer.endsWith(shorter) && isBoundary(longer.charAt(longer.length - shorter.length - 1)))
+    return true;
+  return false;
+}
+var FAILURE_THRESHOLD = 3;
+var FAILURE_WINDOW_MS = 60000;
+var OPEN_DURATION_MS = 5 * 60000;
+var FETCH_TIMEOUT_MS = 30000;
+
+class OpenAICompatibleEmbeddingProvider {
+  modelId;
+  maxInputTokens;
+  endpoint;
+  model;
+  apiKey;
+  inputType;
+  queryInputType;
+  truncate;
+  initialized = false;
+  failureTimes = [];
+  circuitOpenUntil = 0;
+  openLogged = false;
+  modelMismatchLogged = false;
+  halfOpenProbeInFlight = false;
+  constructor(options) {
+    this.endpoint = normalizeEndpoint2(options.endpoint);
+    this.model = options.model?.trim() ?? "";
+    this.apiKey = options.apiKey?.trim() ?? "";
+    this.inputType = options.inputType?.trim() ?? "";
+    this.queryInputType = options.queryInputType?.trim() ?? "";
+    this.truncate = options.truncate?.trim() ?? "";
+    this.maxInputTokens = typeof options.maxInputTokens === "number" && Number.isFinite(options.maxInputTokens) ? Math.max(1, Math.floor(options.maxInputTokens)) : 512;
+    this.modelId = getEmbeddingProviderIdentity({
+      provider: "openai-compatible",
+      endpoint: this.endpoint,
+      model: this.model,
+      ...this.apiKey ? { api_key: this.apiKey } : {},
+      ...this.inputType ? { input_type: this.inputType } : {},
+      ...this.truncate ? { truncate: this.truncate } : {}
+    });
+  }
+  async initialize() {
+    if (this.initialized)
+      return true;
+    if (!this.endpoint || !this.model) {
+      log("[magic-context] openai-compatible embedding provider is missing endpoint or model");
+      this.initialized = false;
+      return false;
+    }
+    const blockedReason = blockedEmbeddingEndpointReason(this.endpoint);
+    if (blockedReason) {
+      log(`[magic-context] embedding endpoint blocked: ${blockedReason}`);
+      this.initialized = false;
+      return false;
+    }
+    this.initialized = true;
+    return true;
+  }
+  resolveInputTypeForPurpose(purpose = "passage") {
+    if (purpose === "query") {
+      return this.queryInputType || this.inputType;
+    }
+    return this.inputType;
+  }
+  async embed(text, signal, purpose) {
+    const [embedding] = await this.embedBatch([text], signal, purpose);
+    return embedding ?? null;
+  }
+  async embedBatch(texts, signal, purpose) {
+    if (texts.length === 0) {
+      return [];
+    }
+    const requestTexts = texts.map((t) => t.trim().length === 0 ? " " : t);
+    if (!await this.initialize()) {
+      return Array.from({ length: texts.length }, () => null);
+    }
+    if (signal?.aborted) {
+      return Array.from({ length: texts.length }, () => null);
+    }
+    let isProbe = false;
+    let internalController;
+    let timeoutHandle;
+    let onOuterAbort;
+    try {
+      const claim = this.claimProbeOrShortCircuit();
+      if (claim === "short_circuit") {
+        return Array.from({ length: texts.length }, () => null);
+      }
+      isProbe = claim === "probe";
+      internalController = new AbortController;
+      timeoutHandle = setTimeout(() => internalController?.abort(), FETCH_TIMEOUT_MS);
+      onOuterAbort = () => internalController?.abort();
+      if (signal) {
+        signal.addEventListener("abort", onOuterAbort, { once: true });
+      }
+      const inputTypeForRequest = this.resolveInputTypeForPurpose(purpose);
+      const response = await fetch(`${this.endpoint}/embeddings`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}
+        },
+        body: JSON.stringify({
+          model: this.model,
+          input: requestTexts,
+          ...inputTypeForRequest ? { input_type: inputTypeForRequest } : {},
+          ...this.truncate ? { truncate: this.truncate } : {}
+        }),
+        redirect: "error",
+        signal: internalController.signal
+      });
+      if (!response.ok) {
+        log(`[magic-context] openai-compatible embedding request failed: ${response.status} ${response.statusText}`);
+        this.recordFailure(isProbe);
+        return Array.from({ length: texts.length }, () => null);
+      }
+      const rawBody = await response.text();
+      if (rawBody.trim().length === 0) {
+        log(`[magic-context] openai-compatible embedding request returned empty body (status=${response.status}, content-type=${response.headers.get("content-type") ?? "none"})`);
+        this.recordFailure(isProbe);
+        return Array.from({ length: texts.length }, () => null);
+      }
+      let body;
+      try {
+        body = JSON.parse(rawBody);
+      } catch (parseError) {
+        const snippet = rawBody.slice(0, 200).replace(/\s+/g, " ");
+        log(`[magic-context] openai-compatible embedding response was not JSON (status=${response.status}, ${rawBody.length}B body, snippet="${snippet}"):`, parseError instanceof Error ? parseError.message : parseError);
+        this.recordFailure(isProbe);
+        return Array.from({ length: texts.length }, () => null);
+      }
+      const servedModel = typeof body.model === "string" ? body.model : "";
+      if (this.model && servedModel && !embeddingModelsMatch(servedModel, this.model)) {
+        if (!this.modelMismatchLogged) {
+          log(`[magic-context] embedding endpoint served a DIFFERENT model than requested — refusing the substituted vectors (they have the wrong dimensions/space). requested="${this.model}" served="${servedModel}". The endpoint likely substituted a loaded model; load/select "${this.model}" on the endpoint, or set embedding.model to the served model.`);
+          this.modelMismatchLogged = true;
+        }
+        this.recordFailure(isProbe);
+        return Array.from({ length: texts.length }, () => null);
+      }
+      const items = Array.isArray(body.data) ? body.data : [];
+      const results = Array.from({ length: texts.length }, (_, index) => {
+        const embedding = items[index]?.embedding;
+        return Array.isArray(embedding) ? Float32Array.from(embedding) : null;
+      });
+      if (results.every((r) => r === null)) {
+        this.recordFailure(isProbe);
+      } else {
+        this.recordSuccess();
+      }
+      return results;
+    } catch (error) {
+      const isAbort = error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"));
+      if (isAbort) {
+        if (signal?.aborted) {} else {
+          log(`[magic-context] openai-compatible embedding request timed out after ${FETCH_TIMEOUT_MS}ms`);
+          this.recordFailure(isProbe);
+        }
+      } else {
+        log("[magic-context] openai-compatible embedding request failed:", error);
+        this.recordFailure(isProbe);
+      }
+      return Array.from({ length: texts.length }, () => null);
+    } finally {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
+      if (signal && onOuterAbort) {
+        signal.removeEventListener("abort", onOuterAbort);
+      }
+      if (isProbe) {
+        this.halfOpenProbeInFlight = false;
+      }
+    }
+  }
+  async dispose() {
+    this.initialized = false;
+  }
+  isLoaded() {
+    return this.initialized;
+  }
+  claimProbeOrShortCircuit() {
+    if (this.circuitOpenUntil === 0) {
+      return "allow";
+    }
+    if (Date.now() < this.circuitOpenUntil) {
+      return "short_circuit";
+    }
+    if (this.halfOpenProbeInFlight) {
+      return "short_circuit";
+    }
+    this.halfOpenProbeInFlight = true;
+    log("[magic-context] openai-compatible embedding: circuit half-open, probing endpoint");
+    return "probe";
+  }
+  recordFailure(isProbe) {
+    if (isProbe) {
+      this.circuitOpenUntil = Date.now() + OPEN_DURATION_MS;
+      if (!this.openLogged) {
+        log(`[magic-context] openai-compatible embedding: probe failed, re-opening circuit for ${OPEN_DURATION_MS / 60000}min`);
+        this.openLogged = true;
+      }
+      this.failureTimes = [];
+      return;
+    }
+    const now = Date.now();
+    const cutoff = now - FAILURE_WINDOW_MS;
+    this.failureTimes = this.failureTimes.filter((t) => t > cutoff);
+    this.failureTimes.push(now);
+    if (this.failureTimes.length >= FAILURE_THRESHOLD) {
+      this.circuitOpenUntil = now + OPEN_DURATION_MS;
+      if (!this.openLogged) {
+        log(`[magic-context] openai-compatible embedding: opening circuit for ${OPEN_DURATION_MS / 60000}min after ${this.failureTimes.length} failures in ${FAILURE_WINDOW_MS / 1000}s`);
+        this.openLogged = true;
+      }
+      this.failureTimes = [];
+    }
+  }
+  recordSuccess() {
+    if (this.failureTimes.length > 0 || this.circuitOpenUntil > 0 || this.openLogged) {
+      log("[magic-context] openai-compatible embedding: endpoint recovered, circuit closed");
+    }
+    this.failureTimes = [];
+    this.circuitOpenUntil = 0;
+    this.openLogged = false;
+  }
+  _getCircuitState() {
+    if (this.circuitOpenUntil === 0)
+      return "closed";
+    if (Date.now() < this.circuitOpenUntil) {
+      return this.halfOpenProbeInFlight ? "half_open" : "open";
+    }
+    return "half_open";
+  }
+  _getFailureCount() {
+    return this.failureTimes.length;
+  }
+  _resetCircuit() {
+    this.failureTimes = [];
+    this.circuitOpenUntil = 0;
+    this.openLogged = false;
+    this.halfOpenProbeInFlight = false;
+  }
+}
+
+// ../plugin/src/features/magic-context/project-embedding-registry.ts
+import { createHash as createHash5, randomUUID } from "node:crypto";
+
+// ../plugin/src/features/magic-context/git-commits/storage-git-commit-embeddings.ts
+var saveStatements = new WeakMap;
+var loadProjectStatements = new WeakMap;
+var loadUnembeddedStatements = new WeakMap;
+var countEmbeddedStatements = new WeakMap;
+function getSaveStatement(db) {
+  let stmt = saveStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO git_commit_embeddings (sha, embedding, model_id, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(sha, model_id) DO UPDATE SET
+                  embedding = excluded.embedding,
+                  created_at = excluded.created_at`);
+    saveStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getLoadProjectStatement(db) {
+  let stmt = loadProjectStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT e.sha AS sha, e.embedding AS embedding, e.model_id AS model_id
+             FROM git_commit_embeddings e
+             JOIN git_commits c ON c.sha = e.sha
+             WHERE c.project_path = ? AND e.model_id = ?`);
+    loadProjectStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getCountEmbeddedStatement(db) {
+  let stmt = countEmbeddedStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT COUNT(*) AS count FROM git_commit_embeddings e
+             JOIN git_commits c ON c.sha = e.sha WHERE c.project_path = ? AND e.model_id = ?`);
+    countEmbeddedStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function saveCommitEmbedding(db, sha, embedding, modelId) {
+  const bytes = new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  getSaveStatement(db).run(sha, bytes, modelId, Date.now());
+}
+function loadProjectCommitEmbeddings(db, projectPath, modelId) {
+  const rows = getLoadProjectStatement(db).all(projectPath, modelId);
+  const map = new Map;
+  for (const row of rows) {
+    const buffer = row.embedding.buffer.slice(row.embedding.byteOffset, row.embedding.byteOffset + row.embedding.byteLength);
+    map.set(row.sha, new Float32Array(buffer));
+  }
+  return map;
+}
+function countEmbeddedCommits(db, projectPath, modelId) {
+  const row = getCountEmbeddedStatement(db).get(projectPath, modelId);
+  return row?.count ?? 0;
+}
+
+// ../plugin/src/features/magic-context/git-commits/storage-git-commits.ts
+var insertStatements = new WeakMap;
+var existingShasStatements = new WeakMap;
+var projectCountStatements = new WeakMap;
+var evictOverflowStatements = new WeakMap;
+var latestCommitTimeStatements = new WeakMap;
+function getProjectCountStatement(db) {
+  let stmt = projectCountStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT COUNT(*) AS count FROM git_commits WHERE project_path = ?");
+    projectCountStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getCommitCount(db, projectPath) {
+  const row = getProjectCountStatement(db).get(projectPath);
+  return row?.count ?? 0;
+}
+
+// ../plugin/src/features/magic-context/git-commits/sweep-coordinator.ts
+var GIT_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
+var GIT_SWEEP_LEASE_TTL_MS = 5 * 60 * 1000;
+var GIT_SWEEP_NON_INDEXABLE_REPROBE_MS = 24 * 60 * 60 * 1000;
+var GIT_SWEEP_LEASE_RENEWAL_MS = 60 * 1000;
+function runImmediate(db, body) {
+  db.exec("BEGIN IMMEDIATE");
+  let committed = false;
+  try {
+    const result = body();
+    db.exec("COMMIT");
+    committed = true;
+    return result;
+  } finally {
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function rowToState(row) {
+  return {
+    projectPath: row.project_path,
+    leaseHolder: row.lease_holder,
+    leaseExpiresAt: row.lease_expires_at,
+    lastSweptAt: row.last_swept_at
+  };
+}
+function getGitSweepCoordinatorState(db, projectPath) {
+  const row = db.prepare(`SELECT project_path, lease_holder, lease_expires_at, last_swept_at
+             FROM git_sweep_coordinator
+             WHERE project_path = ?`).get(projectPath);
+  return row ? rowToState(row) : null;
+}
+function acquireGitSweepLease(db, projectPath, holderId, options = {}) {
+  const cooldownMs = options.cooldownMs ?? GIT_SWEEP_COOLDOWN_MS;
+  const leaseTtlMs = options.leaseTtlMs ?? GIT_SWEEP_LEASE_TTL_MS;
+  return runImmediate(db, () => {
+    const now = Date.now();
+    const row = getGitSweepCoordinatorState(db, projectPath);
+    if (row?.leaseHolder && row.leaseExpiresAt !== null && row.leaseExpiresAt > now) {
+      return {
+        acquired: false,
+        projectPath,
+        reason: "lease_active",
+        leaseHolder: row.leaseHolder,
+        leaseExpiresAt: row.leaseExpiresAt,
+        lastSweptAt: row.lastSweptAt,
+        nextAllowedAt: null
+      };
+    }
+    if (!options.ignoreCooldown && row?.lastSweptAt !== null && row?.lastSweptAt !== undefined) {
+      const nextAllowedAt = row.lastSweptAt + cooldownMs;
+      if (nextAllowedAt > now) {
+        return {
+          acquired: false,
+          projectPath,
+          reason: "cooldown_active",
+          leaseHolder: row.leaseHolder,
+          leaseExpiresAt: row.leaseExpiresAt,
+          lastSweptAt: row.lastSweptAt,
+          nextAllowedAt
+        };
+      }
+    }
+    const leaseExpiresAt = now + leaseTtlMs;
+    db.prepare(`INSERT INTO git_sweep_coordinator (
+                 project_path,
+                 lease_holder,
+                 lease_expires_at,
+                 last_swept_at
+             ) VALUES (?, ?, ?, NULL)
+             ON CONFLICT(project_path) DO UPDATE SET
+                 lease_holder = excluded.lease_holder,
+                 lease_expires_at = excluded.lease_expires_at`).run(projectPath, holderId, leaseExpiresAt);
+    return {
+      acquired: true,
+      projectPath,
+      holderId,
+      acquiredAt: now,
+      leaseExpiresAt
+    };
+  });
+}
+function renewGitSweepLease(db, projectPath, holderId, leaseTtlMs = GIT_SWEEP_LEASE_TTL_MS) {
+  return runImmediate(db, () => {
+    const now = Date.now();
+    const leaseExpiresAt = now + leaseTtlMs;
+    const result = db.prepare(`UPDATE git_sweep_coordinator
+                 SET lease_expires_at = ?
+                 WHERE project_path = ?
+                   AND lease_holder = ?
+                   AND lease_expires_at > ?`).run(leaseExpiresAt, projectPath, holderId, now);
+    return result.changes === 1;
+  });
+}
+function releaseGitSweepLease(db, projectPath, holderId) {
+  runImmediate(db, () => {
+    db.prepare(`UPDATE git_sweep_coordinator
+             SET lease_holder = NULL,
+                 lease_expires_at = NULL
+             WHERE project_path = ?
+               AND lease_holder = ?`).run(projectPath, holderId);
+  });
+}
+
+// ../plugin/src/features/magic-context/memory/storage-memory-embeddings.ts
+var saveEmbeddingStatements = new WeakMap;
+var saveEmbeddingIfHashMatchesStatements = new WeakMap;
+var loadAllEmbeddingsStatements = new WeakMap;
+var deleteEmbeddingStatements = new WeakMap;
+var getStoredModelIdStatements = new WeakMap;
+var clearAllEmbeddingsStatements = new WeakMap;
+var clearModelEmbeddingsStatements = new WeakMap;
+function isEmbeddingBlob(value) {
+  return value instanceof Uint8Array || value instanceof ArrayBuffer;
+}
+function isEmbeddingRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.memoryId === "number" && isEmbeddingBlob(candidate.embedding) && (candidate.modelId === null || typeof candidate.modelId === "string");
+}
+function toFloat32Array3(blob) {
+  if (blob instanceof Uint8Array) {
+    const buffer = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
+    return new Float32Array(buffer);
+  }
+  return new Float32Array(blob.slice(0));
+}
+function getSaveEmbeddingStatement(db) {
+  let stmt = saveEmbeddingStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (?, ?, ?) ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding");
+    saveEmbeddingStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getSaveEmbeddingIfHashMatchesStatement(db) {
+  let stmt = saveEmbeddingIfHashMatchesStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO memory_embeddings (memory_id, embedding, model_id) SELECT ?, ?, ? FROM memories WHERE id = ? AND normalized_hash = ? ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding");
+    saveEmbeddingIfHashMatchesStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getLoadAllEmbeddingsStatement(db) {
+  let stmt = loadAllEmbeddingsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT memory_embeddings.memory_id AS memoryId, memory_embeddings.embedding AS embedding, memory_embeddings.model_id AS modelId FROM memory_embeddings INNER JOIN memories ON memories.id = memory_embeddings.memory_id WHERE memories.project_path = ? AND memory_embeddings.model_id = ? ORDER BY memory_embeddings.memory_id ASC");
+    loadAllEmbeddingsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function saveEmbedding(db, memoryId, embedding, modelId) {
+  const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  getSaveEmbeddingStatement(db).run(memoryId, blob, modelId);
+}
+function saveEmbeddingIfHashMatches(db, memoryId, embedding, modelId, normalizedHash) {
+  const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  return getSaveEmbeddingIfHashMatchesStatement(db).run(memoryId, blob, modelId, memoryId, normalizedHash).changes > 0;
+}
+function loadAllEmbeddings(db, projectPath, modelId) {
+  const rows = getLoadAllEmbeddingsStatement(db).all(projectPath, modelId).filter(isEmbeddingRow);
+  const embeddings = new Map;
+  for (const row of rows) {
+    embeddings.set(row.memoryId, {
+      embedding: toFloat32Array3(row.embedding),
+      modelId: row.modelId
+    });
+  }
+  return embeddings;
+}
+function getMemoryEmbedCoverage(db, projectPath, modelId) {
+  const row = db.prepare(`SELECT
+               COUNT(*) AS total,
+               SUM(CASE WHEN EXISTS (
+                   SELECT 1 FROM memory_embeddings e
+                   WHERE e.memory_id = m.id AND e.model_id = ?
+               ) THEN 1 ELSE 0 END) AS embedded
+             FROM memories m
+             WHERE m.project_path = ? AND m.status = 'active'`).get(modelId, projectPath);
+  return {
+    total: typeof row?.total === "number" ? row.total : 0,
+    embedded: typeof row?.embedded === "number" ? row.embedded : 0
+  };
+}
+
+// ../plugin/src/features/magic-context/memory/embedding-cache.ts
+var DEFAULT_EMBEDDING_CACHE_TTL_MS = 60000;
+var projectEmbeddingCache = new Map;
+var embeddingCacheTtlMs = DEFAULT_EMBEDDING_CACHE_TTL_MS;
+function cacheKey(projectPath, modelId) {
+  return `${projectPath}\x00${modelId}`;
+}
+function getValidCacheEntry(projectPath, modelId) {
+  const entry = projectEmbeddingCache.get(cacheKey(projectPath, modelId));
+  if (!entry) {
+    return null;
+  }
+  if (entry.expiresAt <= Date.now()) {
+    projectEmbeddingCache.delete(cacheKey(projectPath, modelId));
+    return null;
+  }
+  return entry;
+}
+function getProjectEmbeddings(db, projectPath, modelId) {
+  const cached = getValidCacheEntry(projectPath, modelId);
+  if (cached) {
+    return cached.embeddings;
+  }
+  const embeddings = loadAllEmbeddings(db, projectPath, modelId);
+  projectEmbeddingCache.set(cacheKey(projectPath, modelId), {
+    embeddings,
+    expiresAt: Date.now() + embeddingCacheTtlMs
+  });
+  return embeddings;
+}
+function peekProjectEmbeddings(projectPath, modelId) {
+  return getValidCacheEntry(projectPath, modelId)?.embeddings ?? null;
+}
+function invalidateProject(projectPath) {
+  for (const key of projectEmbeddingCache.keys()) {
+    if (key.startsWith(`${projectPath}\x00`)) {
+      projectEmbeddingCache.delete(key);
+    }
+  }
+}
+function invalidateMemory(projectPath, memoryId) {
+  for (const key of projectEmbeddingCache.keys()) {
+    if (!key.startsWith(`${projectPath}\x00`))
+      continue;
+    const entry = projectEmbeddingCache.get(key);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      projectEmbeddingCache.delete(key);
+      continue;
+    }
+    entry.embeddings.delete(memoryId);
+  }
+}
+
+// ../plugin/src/features/magic-context/session-project-storage.ts
+var SESSION_CHUNK_REPAIR_BATCH_SIZE = 100;
+var upsertSessionProjectStatements = new WeakMap;
+var repairSessionChunkProjectStatements = new WeakMap;
+var repairProjectChunkProjectStatements = new WeakMap;
+function getUpsertSessionProjectStatement(db) {
+  let stmt = upsertSessionProjectStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_id, harness) DO UPDATE SET
+                 project_path = excluded.project_path,
+                 updated_at = excluded.updated_at
+             WHERE session_projects.project_path <> excluded.project_path`);
+    upsertSessionProjectStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getRepairSessionChunkProjectStatement(db) {
+  let stmt = repairSessionChunkProjectStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`UPDATE compartment_chunk_embeddings
+             SET project_path = ?
+             WHERE id IN (
+                 SELECT id
+                 FROM compartment_chunk_embeddings
+                 WHERE session_id = ?
+                   AND harness = ?
+                   AND project_path <> ?
+                 LIMIT ?
+             )`);
+    repairSessionChunkProjectStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function recordSessionProjectIdentity(db, sessionId, projectPath) {
+  if (!sessionId || !projectPath)
+    return;
+  if (!projectPath.startsWith("git:") && !projectPath.startsWith("dir:") && isUserHomeDirectory(projectPath))
+    return;
+  const harness = getHarness();
+  const now = Date.now();
+  db.transaction(() => {
+    getUpsertSessionProjectStatement(db).run(sessionId, harness, projectPath, now);
+    getRepairSessionChunkProjectStatement(db).run(projectPath, sessionId, harness, projectPath, SESSION_CHUNK_REPAIR_BATCH_SIZE);
+  })();
+}
+
+// ../plugin/src/features/magic-context/storage-embedding-measurements.ts
+import { createHash as createHash4 } from "node:crypto";
+function normalizedQueryHash(query) {
+  const normalized = query.trim().replace(/\s+/g, " ").toLowerCase();
+  return createHash4("sha256").update(normalized).digest("hex");
+}
+var MEASUREMENT_CORPUS_SESSION_ROW_CAP = 2000;
+function recordEmbeddingMeasurement(db, input) {
+  const queryTextHash = normalizedQueryHash(input.queryText);
+  const dedupKey = queryTextHash;
+  const result = db.prepare(`INSERT OR IGNORE INTO embedding_measurement_corpus
+            (session_id, project_path, dedup_key, cohort_key, query_text_hash,
+             primary_result_ids_json, shadow_result_ids_json, primary_latency_ms, shadow_latency_ms,
+             primary_failed, shadow_failed, primary_model_id, shadow_model_id,
+             primary_fingerprint, shadow_fingerprint, primary_epoch, shadow_epoch,
+             corpus_hash, coverage_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.projectPath, dedupKey, input.cohortKey, queryTextHash, JSON.stringify(input.primaryResultIds.slice(0, 10)), JSON.stringify(input.shadowResultIds.slice(0, 10)), input.primaryLatencyMs, input.shadowLatencyMs, input.primaryFailed ? 1 : 0, input.shadowFailed ? 1 : 0, input.primaryModelId, input.shadowModelId, input.primaryFingerprint, input.shadowFingerprint, input.primaryEpoch, input.shadowEpoch, input.corpusHash, JSON.stringify(input.coverage), Date.now());
+  if (result.changes > 0) {
+    const rowCount = db.prepare("SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?").get(input.sessionId).count;
+    const overflow = rowCount - MEASUREMENT_CORPUS_SESSION_ROW_CAP;
+    if (overflow > 0) {
+      db.prepare(`DELETE FROM embedding_measurement_corpus
+                  WHERE session_id = ?
+                    AND id IN (
+                        SELECT id FROM embedding_measurement_corpus
+                        WHERE session_id = ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                    )`).run(input.sessionId, input.sessionId, overflow);
+    }
+  }
+  return result.changes > 0;
+}
+function beginSynapseBatchLedger(db, input) {
+  const now = Date.now();
+  db.prepare(`INSERT INTO synapse_batch_ledger
+            (session_id, project_path, scope, manifest_json, request_key, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+         ON CONFLICT(session_id, request_key) DO UPDATE SET
+            manifest_json = excluded.manifest_json,
+            updated_at = excluded.updated_at`).run(input.sessionId, input.projectPath, input.scope, JSON.stringify(input.manifest), input.requestKey, now, now);
+}
+function finishSynapseBatchLedger(db, sessionId, requestKey, status) {
+  db.prepare("UPDATE synapse_batch_ledger SET status = ?, updated_at = ? WHERE session_id = ? AND request_key = ?").run(status, Date.now(), sessionId, requestKey);
+}
+var SYNAPSE_BATCH_LEDGER_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+
+// ../plugin/src/features/magic-context/project-embedding-registry.ts
+var OFF_PROVIDER_IDENTITY = "embedding-provider:off";
+var SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
+var CHUNK_DRAIN_BATCH_SIZE = 8;
+var EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
+var MAX_WINDOWS_PER_EMBED_CALL = 2;
+var SESSION_EMBED_LEASE_RENEWAL_MS = 60 * 1000;
+var EMBED_SLICE_RETRY_ATTEMPTS = 3;
+var EMBED_SLICE_RETRY_BASE_MS = 250;
+var EMBED_SLOW_FAILURE_NO_RETRY_MS = 1e4;
+var MAX_CONSECUTIVE_FAILED_BATCHES = 3;
+var projectRegistrations = new Map;
+var shadowRegistrations = new Map;
+var shadowQueue = [];
+var shadowWorker = null;
+var SHADOW_MAX_ITEMS_PER_TICK = 64;
+var SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
+var SHADOW_MAX_WALL_CLOCK_MS = 2000;
+var pendingShadowBackfills = new Map;
+var shadowBackfillLastIds = new Map;
+var shadowBackfillStopReasons = new Map;
+var loadUnembeddedMemoriesStatements = new WeakMap;
+var upsertActiveIdentityStatements = new WeakMap;
+var backfillActiveIdentityStatements = new Map;
+var staleIdentityStatements = new Map;
+var deleteActiveIdentityStatements = new WeakMap;
+var untrustedLoadProjects = new Set;
+var testProviderFactory = null;
+function synapseConfigFields(config) {
+  const raw = config;
+  return {
+    ...typeof raw.model === "string" ? { model: raw.model } : {},
+    ...typeof raw.synapse_fingerprint === "string" ? { fingerprint: raw.synapse_fingerprint } : {},
+    ...typeof raw.synapse_table_epoch === "number" ? { tableEpoch: raw.synapse_table_epoch } : {},
+    ...typeof raw.synapse_dims === "number" ? { dims: raw.synapse_dims } : {},
+    ...raw.synapse_provenance !== undefined ? { provenance: raw.synapse_provenance } : {}
+  };
+}
+function createProvider(config, context) {
+  if (testProviderFactory) {
+    return testProviderFactory(config);
+  }
+  if (config.provider === "off") {
+    return null;
+  }
+  if (config.provider === "openai-compatible") {
+    return new OpenAICompatibleEmbeddingProvider({
+      endpoint: config.endpoint,
+      model: config.model,
+      apiKey: config.api_key,
+      inputType: config.input_type,
+      queryInputType: config.query_input_type,
+      truncate: config.truncate,
+      maxInputTokens: config.max_input_tokens
+    });
+  }
+  if (config.provider === "local") {
+    return new LocalEmbeddingProvider(config.model, config.max_input_tokens, config.local_dtype);
+  }
+  if (config.provider === "synapse") {
+    const synapse = config;
+    return new SynapseEmbeddingProvider({
+      connectionFile: synapse.synapse_connection_file ?? "",
+      projectRoot: context?.projectRoot ?? "",
+      session: context?.session ?? "embedding",
+      model: synapse.model,
+      fingerprint: synapse.synapse_fingerprint,
+      tableEpoch: synapse.synapse_table_epoch,
+      dims: synapse.synapse_dims,
+      recommendedBatch: synapse.synapse_recommended_batch,
+      provenance: synapse.synapse_provenance
+    });
+  }
+  throw new Error("Unknown embedding provider");
+}
+function contentSha256(value) {
+  return createHash5("sha256").update(value).digest("hex");
+}
+function snapshotFor(registration) {
+  const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
+  const enabled = !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
+  const gitCommitEnabled = !registration.observationMode && providerIsOn && registration.features.gitCommitEnabled;
+  const configuredModel = "model" in registration.config && typeof registration.config.model === "string" ? registration.config.model.trim() : "";
+  return {
+    projectIdentity: registration.projectIdentity,
+    sourceDirectory: registration.sourceDirectory,
+    providerIdentity: registration.providerIdentity,
+    runtimeFingerprint: registration.runtimeFingerprint,
+    generation: registration.generation,
+    features: { ...registration.features },
+    enabled,
+    gitCommitEnabled,
+    modelId: registration.observationMode || !providerIsOn ? "off" : registration.modelId,
+    chunkModelId: registration.observationMode || !providerIsOn ? "off" : registration.chunkModelId,
+    model: registration.observationMode || !providerIsOn ? "off" : configuredModel ? configuredModel : registration.modelId,
+    provider: registration.observationMode || !providerIsOn ? "off" : registration.config.provider ?? "local"
+  };
+}
+function startShadowWorker() {
+  if (shadowWorker)
+    return;
+  shadowWorker = runShadowWorker().finally(() => {
+    shadowWorker = null;
+    if (shadowQueue.length > 0 || hasPendingShadowBackfill())
+      startShadowWorker();
+  });
+}
+function getShadowEmbeddingMeasurementCohort(projectIdentity) {
+  const registration = shadowRegistrations.get(projectIdentity);
+  if (!registration)
+    return null;
+  const fields = synapseConfigFields(registration.config);
+  return {
+    modelId: registration.modelId,
+    chunkModelId: registration.chunkModelId,
+    fingerprint: fields.fingerprint ?? "",
+    epoch: fields.tableEpoch ?? 0,
+    dims: fields.dims ?? 0
+  };
+}
+function getPrimaryEmbeddingMeasurementCohort(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  if (!registration)
+    return null;
+  const fields = synapseConfigFields(registration.config);
+  return {
+    modelId: registration.modelId,
+    chunkModelId: registration.chunkModelId,
+    fingerprint: fields.fingerprint ?? "",
+    epoch: fields.tableEpoch ?? 0,
+    dims: fields.dims ?? 0
+  };
+}
+async function embedShadowTextForProject(projectIdentity, text, signal) {
+  const registration = shadowRegistrations.get(projectIdentity);
+  if (!registration)
+    return null;
+  try {
+    return await registration.provider.embed(text, signal, "query");
+  } catch (error) {
+    log("[magic-context] Synapse shadow query failed:", error);
+    return null;
+  }
+}
+function enqueueShadowEmbeddingItems(projectIdentity, scope, ids) {
+  if (ids.length === 0 || !shadowRegistrations.has(projectIdentity))
+    return;
+  shadowQueue.push({ projectIdentity, scope, ids: [...ids] });
+  startShadowWorker();
+}
+function shadowBackfillMissingBase(scope, primaryModelId, shadowModelId, projectIdentity) {
+  if (scope === "memory") {
+    return {
+      sql: `SELECT m.id AS id
+                  FROM memories m
+                  JOIN memory_embeddings mp ON mp.memory_id = m.id AND mp.model_id = ?
+                  LEFT JOIN memory_embeddings ms ON ms.memory_id = m.id AND ms.model_id = ?
+                  WHERE m.project_path = ? AND m.status = 'active' AND ms.memory_id IS NULL`,
+      params: [primaryModelId, shadowModelId, projectIdentity],
+      orderBy: " ORDER BY m.id"
+    };
+  }
+  if (scope === "commit") {
+    return {
+      sql: `SELECT gc.sha AS id
+                  FROM git_commits gc
+                  JOIN git_commit_embeddings gp ON gp.sha = gc.sha AND gp.model_id = ?
+                  LEFT JOIN git_commit_embeddings gs ON gs.sha = gc.sha AND gs.model_id = ?
+                  WHERE gc.project_path = ? AND gs.sha IS NULL`,
+      params: [primaryModelId, shadowModelId, projectIdentity],
+      orderBy: " ORDER BY gc.committed_at DESC, gc.sha"
+    };
+  }
+  return {
+    sql: `SELECT DISTINCT cp.compartment_id AS id
+              FROM compartment_chunk_embeddings cp
+              WHERE cp.project_path = ? AND cp.model_id = ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM compartment_chunk_embeddings cs
+                    WHERE cs.compartment_id = cp.compartment_id AND cs.model_id = ?
+                )`,
+    params: [projectIdentity, primaryModelId, shadowModelId],
+    orderBy: " ORDER BY cp.compartment_id"
+  };
+}
+function shadowBackfillMissingIds(db, projectIdentity, scope, primaryModelId, shadowModelId, limit) {
+  const { sql, params, orderBy } = shadowBackfillMissingBase(scope, primaryModelId, shadowModelId, projectIdentity);
+  const rows = db.prepare(`${sql}${orderBy} LIMIT ?`).all(...params, limit);
+  return rows.map((row) => String(row.id));
+}
+function shadowModelIdForScope(registration, scope) {
+  return scope === "chunk" ? registration.chunkModelId : registration.modelId;
+}
+function hasPendingShadowBackfill(projectIdentity) {
+  if (projectIdentity === undefined)
+    return pendingShadowBackfills.size > 0;
+  const scopes = pendingShadowBackfills.get(projectIdentity);
+  return scopes !== undefined && scopes.size > 0;
+}
+function pumpShadowBackfill() {
+  for (const [projectIdentity, scopes] of pendingShadowBackfills) {
+    const db = dbForShadowQueue.get(projectIdentity);
+    const shadow = shadowRegistrations.get(projectIdentity);
+    const primary = projectRegistrations.get(projectIdentity);
+    if (!db || !shadow || !primary) {
+      pendingShadowBackfills.delete(projectIdentity);
+      continue;
+    }
+    for (const scope of [...scopes]) {
+      const primaryModelId = shadowModelIdForScope(primary, scope);
+      const shadowModelId = shadowModelIdForScope(shadow, scope);
+      const stallKey = `${projectIdentity}:${scope}`;
+      if (primaryModelId === "off" || shadowModelId === "off") {
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      const ids = shadowBackfillMissingIds(db, projectIdentity, scope, primaryModelId, shadowModelId, SHADOW_MAX_ITEMS_PER_TICK);
+      if (ids.length === 0) {
+        shadowBackfillStopReasons.set(stallKey, "drained");
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      const signature = ids.join(",");
+      if (shadowBackfillLastIds.get(stallKey) === signature) {
+        shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+        log(`[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` + `the last batch produced no writes (provider failure or timeout is the usual cause); ` + `${ids.length}+ items remain and retry on the next registration or manual --shadow run`);
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      shadowBackfillLastIds.set(stallKey, signature);
+      shadowQueue.push({ projectIdentity, scope, ids });
+    }
+    if (scopes.size === 0)
+      pendingShadowBackfills.delete(projectIdentity);
+  }
+}
+async function embedShadowItems(registration, items, db, scope) {
+  const raw = registration.config;
+  const fingerprint = typeof raw.synapse_fingerprint === "string" ? raw.synapse_fingerprint : "";
+  const tableEpoch = typeof raw.synapse_table_epoch === "number" ? raw.synapse_table_epoch : 0;
+  const requestKey = getSynapseBatchRequestKey({
+    model: typeof raw.model === "string" ? raw.model : SYNAPSE_DEFAULT_MODEL,
+    fingerprint,
+    tableEpoch,
+    items
+  });
+  beginSynapseBatchLedger(db, {
+    sessionId: `shadow:${registration.projectIdentity}`,
+    projectPath: registration.projectIdentity,
+    scope,
+    manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+    requestKey
+  });
+  try {
+    if (registration.provider.embedItems) {
+      const vectors = await registration.provider.embedItems(items);
+      finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, vectors.size === items.length ? "complete" : "partial");
+      return vectors;
+    }
+    const positional = await registration.provider.embedBatch(items.map((item) => item.text));
+    const vectors = new Map(items.flatMap((item, index) => {
+      const vector = positional[index];
+      return vector ? [[item.id, vector]] : [];
+    }));
+    finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, vectors.size === items.length ? "complete" : "partial");
+    return vectors;
+  } catch (error) {
+    finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, "failed");
+    throw error;
+  }
+}
+async function processShadowQueueItem(item) {
+  const registration = shadowRegistrations.get(item.projectIdentity);
+  if (!registration)
+    return;
+  const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+  if (item.scope === "memory") {
+    const db = dbForShadowQueue.get(item.projectIdentity);
+    if (!db)
+      return;
+    const placeholders = boundedIds.map(() => "?").join(",");
+    const rows = db.prepare(`SELECT id, content, normalized_hash FROM memories
+                 WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`).all(item.projectIdentity, ...boundedIds.map((id) => Number(id)));
+    const vectors = await embedShadowItems(registration, rows.map((row) => ({
+      id: `memory:${row.id}`,
+      text: row.content,
+      contentSha256: contentSha256(row.content)
+    })), db, "memory");
+    db.transaction(() => {
+      for (const row of rows) {
+        const vector = vectors.get(`memory:${row.id}`);
+        if (vector)
+          saveEmbeddingIfHashMatches(db, row.id, vector, registration.modelId, row.normalized_hash);
+      }
+    })();
+    return;
+  }
+  if (item.scope === "commit") {
+    const db = dbForShadowQueue.get(item.projectIdentity);
+    if (!db)
+      return;
+    const placeholders = boundedIds.map(() => "?").join(",");
+    const rows = db.prepare(`SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders})`).all(item.projectIdentity, ...boundedIds);
+    const vectors = await embedShadowItems(registration, rows.map((row) => ({
+      id: `commit:${row.sha}`,
+      text: row.message,
+      contentSha256: contentSha256(row.message)
+    })), db, "commit");
+    db.transaction(() => {
+      for (const row of rows) {
+        const vector = vectors.get(`commit:${row.sha}`);
+        if (vector)
+          saveCommitEmbedding(db, row.sha, vector, registration.modelId);
+      }
+    })();
+    return;
+  }
+  const db = dbForShadowQueue.get(item.projectIdentity);
+  if (!db)
+    return;
+  const placeholders = boundedIds.map(() => "?").join(",");
+  const candidates = db.prepare(`SELECT id, session_id, start_message, end_message
+         FROM compartments WHERE id IN (${placeholders})`).all(...boundedIds.map((id) => Number(id)));
+  const prepared = candidates.flatMap((candidate) => {
+    const text = buildCanonicalChunkTextFromFts(db, candidate.session_id, candidate.start_message, candidate.end_message) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    if (!text)
+      return [];
+    const windows = chunkCanonicalText(text, candidate.start_message, candidate.end_message, SYNAPSE_MAX_INPUT_TOKENS);
+    return windows.length > 0 ? [{ candidate, windows }] : [];
+  });
+  const items = prepared.flatMap((item) => item.windows.map((window) => ({
+    id: `chunk:${item.candidate.id}:${window.windowIndex}`,
+    text: window.text,
+    contentSha256: contentSha256(window.text)
+  })));
+  const vectors = await embedShadowItems(registration, items, db, "chunk");
+  for (const item of prepared) {
+    const rows = item.windows.flatMap((window) => {
+      const vector = vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`);
+      return vector ? [
+        {
+          compartmentId: item.candidate.id,
+          sessionId: item.candidate.session_id,
+          projectPath: registration.projectIdentity,
+          window,
+          modelId: registration.chunkModelId,
+          vector
+        }
+      ] : [];
+    });
+    if (rows.length === item.windows.length)
+      replaceCompartmentChunkEmbeddings(db, rows);
+  }
+}
+var dbForShadowQueue = new Map;
+async function runShadowWorker() {
+  const startedAt = Date.now();
+  let processed = 0;
+  let processedBytes = 0;
+  for (;; ) {
+    if (shadowQueue.length === 0) {
+      pumpShadowBackfill();
+      if (shadowQueue.length === 0)
+        break;
+    }
+    if (processed >= SHADOW_MAX_ITEMS_PER_TICK || Date.now() - startedAt >= SHADOW_MAX_WALL_CLOCK_MS) {
+      break;
+    }
+    const item = shadowQueue.shift();
+    if (!item)
+      break;
+    const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
+    if (processed > 0 && processedBytes + itemBytes > SHADOW_MAX_BYTES_PER_TICK) {
+      shadowQueue.unshift(item);
+      break;
+    }
+    try {
+      await processShadowQueueItem(item);
+    } catch (error) {
+      log("[magic-context] Synapse shadow write failed:", error);
+    }
+    processed += item.ids.length;
+    processedBytes += itemBytes;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+function getProjectEmbeddingSnapshot(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  return registration ? snapshotFor(registration) : null;
+}
+function getProjectChunkEmbeddingModelId(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  return registration && !registration.observationMode ? registration.chunkModelId : "off";
+}
+function getProjectEmbeddingMaxInputTokens(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  const configMax = registration?.config && "max_input_tokens" in registration.config ? registration.config.max_input_tokens : undefined;
+  return normalizeCompartmentChunkMaxInputTokens(registration?.provider?.maxInputTokens ?? configMax);
+}
+function getOrCreateProjectProvider(registration) {
+  if (registration.providerIdentity === OFF_PROVIDER_IDENTITY || registration.observationMode) {
+    return null;
+  }
+  if (registration.provider) {
+    return registration.provider;
+  }
+  const provider = createProvider(registration.config, {
+    projectRoot: registration.sourceDirectory,
+    session: `project:${registration.projectIdentity}`
+  });
+  registration.provider = provider;
+  return provider;
+}
+async function embedTextForProject(projectIdentity, text, signal, purpose = "passage") {
+  const registration = projectRegistrations.get(projectIdentity);
+  if (!registration)
+    return null;
+  const generation = registration.generation;
+  const modelId = registration.modelId;
+  const provider = getOrCreateProjectProvider(registration);
+  if (!provider)
+    return null;
+  const vector = await provider.embed(text, signal, purpose);
+  if (!vector)
+    return null;
+  const current = projectRegistrations.get(projectIdentity);
+  if (!current || current.generation !== generation || current.runtimeFingerprint !== registration.runtimeFingerprint) {
+    return null;
+  }
+  return { vector, modelId, chunkModelId: registration.chunkModelId, generation };
+}
+async function embedBatchForProject(projectIdentity, texts, signal, purpose = "passage") {
+  if (texts.length === 0) {
+    const registration = projectRegistrations.get(projectIdentity);
+    if (!registration || registration.observationMode)
+      return null;
+    return { vectors: [], modelId: registration.modelId, generation: registration.generation };
+  }
+  const registration = projectRegistrations.get(projectIdentity);
+  if (!registration)
+    return null;
+  const generation = registration.generation;
+  const modelId = registration.modelId;
+  const runtimeFingerprint = registration.runtimeFingerprint;
+  const provider = getOrCreateProjectProvider(registration);
+  if (!provider)
+    return null;
+  const vectors = await provider.embedBatch(texts, signal, purpose);
+  const current = projectRegistrations.get(projectIdentity);
+  if (!current || current.generation !== generation || current.runtimeFingerprint !== runtimeFingerprint) {
+    return null;
+  }
+  return { vectors, modelId, generation };
+}
+async function embedItemsForProject(projectIdentity, items, signal, db, sessionId = projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  if (!registration || registration.observationMode || items.length === 0)
+    return null;
+  const generation = registration.generation;
+  const modelId = registration.modelId;
+  const runtimeFingerprint = registration.runtimeFingerprint;
+  const provider = getOrCreateProjectProvider(registration);
+  if (!provider)
+    return null;
+  const rawConfig = registration.config;
+  const fingerprint = typeof rawConfig.synapse_fingerprint === "string" ? rawConfig.synapse_fingerprint : "";
+  const tableEpoch = typeof rawConfig.synapse_table_epoch === "number" ? rawConfig.synapse_table_epoch : undefined;
+  const isSynapse = registration.providerIdentity.startsWith("synapse:v1:") && fingerprint && tableEpoch !== undefined;
+  const ledgerKey = isSynapse ? getSynapseBatchRequestKey({
+    model: typeof rawConfig.model === "string" ? rawConfig.model : registration.modelId,
+    fingerprint,
+    tableEpoch,
+    items
+  }) : null;
+  if (db && ledgerKey) {
+    beginSynapseBatchLedger(db, {
+      sessionId,
+      projectPath: projectIdentity,
+      scope: items[0].id.split(":", 1)[0],
+      manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+      requestKey: ledgerKey
+    });
+  }
+  let vectors;
+  try {
+    if (provider.embedItems) {
+      vectors = await provider.embedItems(items, signal);
+    } else {
+      const positional = await provider.embedBatch(items.map((item) => item.text), signal, "passage");
+      vectors = new Map(items.flatMap((item, index) => {
+        const vector = positional[index];
+        return vector ? [[item.id, vector]] : [];
+      }));
+    }
+  } catch (error) {
+    if (db && ledgerKey)
+      finishSynapseBatchLedger(db, sessionId, ledgerKey, "failed");
+    throw error;
+  }
+  if (db && ledgerKey) {
+    finishSynapseBatchLedger(db, sessionId, ledgerKey, vectors.size === items.length ? "complete" : "partial");
+  }
+  const current = projectRegistrations.get(projectIdentity);
+  if (!current || current.generation !== generation || current.runtimeFingerprint !== runtimeFingerprint) {
+    return null;
+  }
+  return { vectors, modelId, generation };
+}
+async function embedItemsWindowBounded(projectIdentity, items, signal, db) {
+  if (items.length <= MAX_WINDOWS_PER_EMBED_CALL) {
+    return embedItemsForProject(projectIdentity, items, signal, db, projectIdentity);
+  }
+  const vectors = new Map;
+  let modelId = null;
+  let generation = null;
+  for (let start = 0;start < items.length; start += MAX_WINDOWS_PER_EMBED_CALL) {
+    const result = await embedItemsForProject(projectIdentity, items.slice(start, start + MAX_WINDOWS_PER_EMBED_CALL), signal, db, projectIdentity);
+    if (!result)
+      return null;
+    if (modelId === null) {
+      modelId = result.modelId;
+      generation = result.generation;
+    } else if (modelId !== result.modelId || generation !== result.generation) {
+      return null;
+    }
+    for (const [id, vector] of result.vectors)
+      vectors.set(id, vector);
+  }
+  return modelId === null || generation === null ? null : { vectors, modelId, generation };
+}
+async function embedCandidateChunkBatch(db, projectIdentity, modelId, candidates, signal) {
+  const noWork = [];
+  const failed = [];
+  if (candidates.length === 0)
+    return { embedded: 0, noWork, failed };
+  const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
+  const prepared = [];
+  for (const candidate of candidates) {
+    const canonicalText = buildCanonicalChunkTextFromFts(db, candidate.sessionId, candidate.startMessage, candidate.endMessage) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    if (canonicalText.length === 0) {
+      noWork.push(candidate.id);
+      continue;
+    }
+    const windows = chunkCanonicalText(canonicalText, candidate.startMessage, candidate.endMessage, maxInputTokens);
+    if (windows.length === 0 || chunkEmbeddingWindowsAreCurrent(db, candidate.id, modelId, windows, projectIdentity)) {
+      noWork.push(candidate.id);
+      continue;
+    }
+    prepared.push({ candidate, windows });
+  }
+  if (prepared.length === 0)
+    return { embedded: 0, noWork, failed };
+  let embedded = 0;
+  let i = 0;
+  while (i < prepared.length) {
+    if (signal?.aborted)
+      break;
+    const slice = [];
+    let windowCount = 0;
+    do {
+      const item = prepared[i];
+      slice.push(item);
+      windowCount += item.windows.length;
+      i += 1;
+    } while (i < prepared.length && windowCount + prepared[i].windows.length <= MAX_WINDOWS_PER_EMBED_CALL);
+    const items = slice.flatMap((item) => item.windows.map((window) => ({
+      id: `chunk:${item.candidate.id}:${window.windowIndex}`,
+      text: window.text,
+      contentSha256: contentSha256(window.text)
+    })));
+    const persistedIds = new Set;
+    for (let attempt = 0;attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
+      if (signal?.aborted)
+        break;
+      let result = null;
+      const attemptStart = Date.now();
+      try {
+        result = await embedItemsWindowBounded(projectIdentity, items, signal, db);
+      } catch (error) {
+        log("[magic-context] failed to proactively embed compartment chunks:", error);
+      }
+      if (signal?.aborted)
+        break;
+      if (result) {
+        for (const item of slice) {
+          if (persistedIds.has(item.candidate.id))
+            continue;
+          const vectors = item.windows.map((window) => result.vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`));
+          if (vectors.length !== item.windows.length || vectors.some((v) => !v)) {
+            continue;
+          }
+          const rows = item.windows.map((window, index) => ({
+            compartmentId: item.candidate.id,
+            sessionId: item.candidate.sessionId,
+            projectPath: projectIdentity,
+            window,
+            modelId,
+            vector: vectors[index]
+          }));
+          replaceCompartmentChunkEmbeddings(db, rows);
+          persistedIds.add(item.candidate.id);
+          enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
+            String(item.candidate.id)
+          ]);
+        }
+      }
+      if (persistedIds.size === slice.length)
+        break;
+      if (persistedIds.size > 0)
+        break;
+      if (Date.now() - attemptStart >= EMBED_SLOW_FAILURE_NO_RETRY_MS)
+        break;
+      if (attempt < EMBED_SLICE_RETRY_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, EMBED_SLICE_RETRY_BASE_MS * 2 ** attempt));
+      }
+    }
+    embedded += persistedIds.size;
+    if (!signal?.aborted) {
+      for (const item of slice) {
+        if (!persistedIds.has(item.candidate.id))
+          failed.push(item.candidate.id);
+      }
+    }
+  }
+  return { embedded, noWork, failed };
+}
+async function embedSessionCompartmentChunks(db, projectIdentity, sessionId, options) {
+  const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+  if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+    return { status: "disabled", embedded: 0, total: 0 };
+  }
+  recordSessionProjectIdentity(db, sessionId, projectIdentity);
+  const total = countUnembeddedSessionCompartments(db, projectIdentity, sessionId, snapshot.chunkModelId);
+  if (total === 0)
+    return { status: "nothing", embedded: 0, total: 0 };
+  const holderId = `session-embed-${randomUUID()}`;
+  const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
+  if (!lease.acquired)
+    return { status: "busy", embedded: 0, total };
+  let leaseLost = false;
+  const drainAbort = new AbortController;
+  const forwardCallerAbort = () => drainAbort.abort();
+  if (options?.signal?.aborted)
+    drainAbort.abort();
+  else
+    options?.signal?.addEventListener("abort", forwardCallerAbort, { once: true });
+  const renewal = setInterval(() => {
+    try {
+      if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+        leaseLost = true;
+        drainAbort.abort();
+      }
+    } catch {}
+  }, SESSION_EMBED_LEASE_RENEWAL_MS);
+  renewal.unref?.();
+  const batchSize = Math.max(1, options?.batchSize ?? CHUNK_DRAIN_BATCH_SIZE);
+  const skipIds = [];
+  const failedIds = [];
+  let embedded = 0;
+  let aborted = false;
+  let providerDown = false;
+  let consecutiveFailedBatches = 0;
+  try {
+    options?.onProgress?.({ embedded, total });
+    for (;; ) {
+      if (leaseLost || drainAbort.signal.aborted) {
+        aborted = true;
+        break;
+      }
+      const candidates = loadUnembeddedSessionChunkCandidates(db, projectIdentity, sessionId, snapshot.chunkModelId, batchSize, [...skipIds, ...failedIds]);
+      if (candidates.length === 0)
+        break;
+      const {
+        embedded: n,
+        noWork,
+        failed
+      } = await embedCandidateChunkBatch(db, projectIdentity, snapshot.chunkModelId, candidates, drainAbort.signal);
+      if (leaseLost || !renewGitSweepLease(db, projectIdentity, holderId)) {
+        leaseLost = true;
+        drainAbort.abort();
+        aborted = true;
+        break;
+      }
+      for (const id of noWork)
+        skipIds.push(id);
+      for (const id of failed)
+        failedIds.push(id);
+      if (n === 0 && noWork.length === 0) {
+        consecutiveFailedBatches += 1;
+        if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) {
+          providerDown = true;
+          break;
+        }
+      } else {
+        consecutiveFailedBatches = 0;
+      }
+      embedded += n;
+      options?.onProgress?.({ embedded: Math.min(embedded, total), total });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    clearInterval(renewal);
+    options?.signal?.removeEventListener("abort", forwardCallerAbort);
+    try {
+      releaseGitSweepLease(db, projectIdentity, holderId);
+    } catch (error) {
+      log("[magic-context] embed drain: lease release failed (will TTL-expire):", error);
+    }
+  }
+  if (aborted)
+    return { status: "aborted", embedded, total, failed: failedIds.length };
+  if (providerDown || failedIds.length > 0) {
+    const remaining = Math.max(0, countUnembeddedSessionCompartments(db, projectIdentity, sessionId, snapshot.chunkModelId) - skipIds.length);
+    if (remaining > 0) {
+      return { status: "stalled", embedded, total, remaining, failed: failedIds.length };
+    }
+  }
+  return { status: "done", embedded, total, failed: failedIds.length };
+}
+function getEmbeddingCoverageStatus(db, projectIdentity, sessionId) {
+  const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+  if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+    return {
+      enabled: false,
+      model: snapshot?.model ?? "off",
+      provider: snapshot?.provider ?? "off",
+      session: { embedded: 0, total: 0 },
+      memories: { embedded: 0, total: 0 },
+      commits: { embedded: 0, total: 0, gitEnabled: false }
+    };
+  }
+  const session = countSessionCompartmentEmbedCoverage(db, projectIdentity, sessionId, snapshot.chunkModelId);
+  const memories = getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId);
+  const gitEnabled = snapshot.gitCommitEnabled;
+  const commits = gitEnabled ? {
+    embedded: countEmbeddedCommits(db, projectIdentity, snapshot.modelId),
+    total: getCommitCount(db, projectIdentity),
+    gitEnabled: true
+  } : { embedded: 0, total: 0, gitEnabled: false };
+  return {
+    enabled: true,
+    model: snapshot.model,
+    provider: snapshot.provider,
+    session,
+    memories,
+    commits
+  };
+}
+
+// ../plugin/src/features/magic-context/memory/embedding.ts
+var DEFAULT_EMBEDDING_CONFIG = {
+  provider: "local",
+  model: DEFAULT_LOCAL_EMBEDDING_MODEL
+};
+var embeddingConfig = DEFAULT_EMBEDDING_CONFIG;
+var provider = null;
+function createProvider2(config) {
+  if (config.provider === "off") {
+    return null;
+  }
+  if (config.provider === "openai-compatible") {
+    return new OpenAICompatibleEmbeddingProvider({
+      endpoint: config.endpoint,
+      model: config.model,
+      apiKey: config.api_key,
+      inputType: config.input_type,
+      queryInputType: config.query_input_type,
+      truncate: config.truncate,
+      maxInputTokens: config.max_input_tokens
+    });
+  }
+  if (config.provider === "local") {
+    return new LocalEmbeddingProvider(config.model, config.max_input_tokens, config.local_dtype);
+  }
+  if (config.provider === "synapse") {
+    const synapse = config;
+    return new SynapseEmbeddingProvider({
+      connectionFile: synapse.synapse_connection_file ?? "",
+      projectRoot: "",
+      session: "embedding",
+      model: synapse.model,
+      fingerprint: synapse.synapse_fingerprint,
+      tableEpoch: synapse.synapse_table_epoch,
+      dims: synapse.synapse_dims,
+      recommendedBatch: synapse.synapse_recommended_batch,
+      provenance: synapse.synapse_provenance
+    });
+  }
+  throw new Error("Unknown embedding provider");
+}
+function getOrCreateProvider() {
+  if (provider) {
+    return provider;
+  }
+  provider = createProvider2(embeddingConfig);
+  return provider;
+}
+function isEmbeddingEnabled() {
+  return embeddingConfig.provider !== "off";
+}
+async function embedText(text, signal) {
+  const currentProvider = getOrCreateProvider();
+  if (!currentProvider) {
+    return null;
+  }
+  if (!await currentProvider.initialize()) {
+    return null;
+  }
+  return currentProvider.embed(text, signal);
+}
+// ../plugin/src/features/magic-context/memory/embedding-backfill.ts
+async function ensureMemoryEmbeddings(args) {
+  const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
+  if (!snapshot?.enabled) {
+    return args.existingEmbeddings;
+  }
+  const missingMemories = args.memories.filter((memory) => !args.existingEmbeddings.has(memory.id));
+  if (missingMemories.length === 0) {
+    return args.existingEmbeddings;
+  }
+  try {
+    const result = await embedBatchForProject(args.projectIdentity, missingMemories.map((memory) => memory.content));
+    if (!result) {
+      return args.existingEmbeddings;
+    }
+    const staged = new Map;
+    args.db.transaction(() => {
+      for (const [index, memory] of missingMemories.entries()) {
+        const embedding = result.vectors[index];
+        if (!embedding) {
+          continue;
+        }
+        const saved = saveEmbeddingIfHashMatches(args.db, memory.id, embedding, result.modelId, memory.normalizedHash);
+        if (saved) {
+          staged.set(memory.id, { embedding, modelId: result.modelId });
+        }
+      }
+    })();
+    const currentSnapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
+    if (!currentSnapshot || currentSnapshot.generation !== result.generation) {
+      return args.existingEmbeddings;
+    }
+    for (const [id, embedding] of staged) {
+      args.existingEmbeddings.set(id, embedding);
+    }
+  } catch (error) {
+    log("[magic-context] failed to backfill memory embeddings:", error);
+  }
+  return args.existingEmbeddings;
+}
+// ../plugin/src/features/magic-context/mural/storage-mural-cues.ts
+import { createHash as createHash6 } from "node:crypto";
+function computeCueContentHash(content) {
+  return createHash6("sha256").update(content).digest("hex");
+}
+var muralCueColumnCache = new WeakMap;
+var muralCueRejectionColumnCache = new WeakMap;
+function hasMuralCueColumns(db) {
+  const cached = muralCueColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const present = columns.some((column) => column.name === "mural_cue");
+  muralCueColumnCache.set(db, present);
+  return present;
+}
+function hasMuralCueRejectionCountColumn(db) {
+  const cached = muralCueRejectionColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const present = columns.some((column) => column.name === "mural_cue_rejection_count");
+  muralCueRejectionColumnCache.set(db, present);
+  return present;
+}
+function getMuralCueState(db, memoryIds) {
+  const out = new Map;
+  if (!hasMuralCueColumns(db))
+    return out;
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  if (ids.length === 0)
+    return out;
+  const placeholders = ids.map(() => "?").join(", ");
+  const rejectionCountColumn = hasMuralCueRejectionCountColumn(db) ? "COALESCE(mural_cue_rejection_count, 0) AS mural_cue_rejection_count" : "0 AS mural_cue_rejection_count";
+  const rows = db.prepare(`SELECT id, mural_cue, mural_cue_hash, ${rejectionCountColumn} FROM memories WHERE id IN (${placeholders})`).all(...ids);
+  for (const row of rows) {
+    out.set(row.id, {
+      cue: row.mural_cue ?? null,
+      hash: row.mural_cue_hash ?? null,
+      ...row.mural_cue_rejection_count > 0 ? { rejectionCount: row.mural_cue_rejection_count } : {}
+    });
+  }
+  return out;
+}
+function memoryNeedsCue(state, currentContent) {
+  if (!state || state.cue === null || state.hash === null)
+    return true;
+  return state.hash !== computeCueContentHash(currentContent);
+}
+function setMuralCue(db, projectPath, id, cue, contentHash) {
+  if (!hasMuralCueColumns(db))
+    return;
+  withPrivilegedWriter(db, () => {
+    const owned = db.prepare("SELECT 1 FROM memories WHERE id = ? AND project_path = ?").get(id, projectPath);
+    if (!owned) {
+      throw new Error(`Memory ${id} does not belong to project ${projectPath}`);
+    }
+    const rejectionReset = hasMuralCueRejectionCountColumn(db) ? ", mural_cue_rejection_count = 0" : "";
+    db.prepare(`UPDATE memories SET mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?${rejectionReset} WHERE id = ? AND project_path = ?`).run(cue, contentHash, Date.now(), id, projectPath);
+  });
+}
+function recordMuralCueRejection(db, projectPath, id, contentHash) {
+  if (!hasMuralCueColumns(db) || !hasMuralCueRejectionCountColumn(db))
+    return 0;
+  let count = 0;
+  withPrivilegedWriter(db, () => {
+    const owned = db.prepare("SELECT 1 FROM memories WHERE id = ? AND project_path = ?").get(id, projectPath);
+    if (!owned) {
+      throw new Error(`Memory ${id} does not belong to project ${projectPath}`);
+    }
+    const row = db.prepare("SELECT mural_cue_hash, mural_cue_rejection_count FROM memories WHERE id = ?").get(id);
+    count = row?.mural_cue_hash === contentHash ? (row.mural_cue_rejection_count ?? 0) + 1 : 1;
+    db.prepare("UPDATE memories SET mural_cue = NULL, mural_cue_hash = ?, mural_cue_at = ?, mural_cue_rejection_count = ? WHERE id = ? AND project_path = ?").run(contentHash, Date.now(), count, id, projectPath);
+  });
+  return count;
+}
+
+// ../plugin/src/features/magic-context/memory/visibility.ts
+var FOREIGN_VISIBLE_SQL = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
+
+// ../plugin/src/features/magic-context/memory/storage-memory.ts
+var COLUMN_MAP = {
+  id: "id",
+  projectPath: "project_path",
+  category: "category",
+  content: "content",
+  normalizedHash: "normalized_hash",
+  importance: "importance",
+  scope: "scope",
+  shareable: "shareable",
+  sourceSessionId: "source_session_id",
+  sourceType: "source_type",
+  seenCount: "seen_count",
+  retrievalCount: "retrieval_count",
+  firstSeenAt: "first_seen_at",
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+  lastSeenAt: "last_seen_at",
+  lastRetrievedAt: "last_retrieved_at",
+  status: "status",
+  expiresAt: "expires_at",
+  verificationStatus: "verification_status",
+  verifiedAt: "verified_at",
+  supersededByMemoryId: "superseded_by_memory_id",
+  mergedFrom: "merged_from",
+  metadataJson: "metadata_json"
+};
+var MEMORY_CATEGORY_LOOKUP = {
+  PROJECT_RULES: true,
+  ARCHITECTURE: true,
+  CONFIG_VALUES: true,
+  ARCHITECTURE_DECISIONS: true,
+  CONSTRAINTS: true,
+  CONFIG_DEFAULTS: true,
+  NAMING: true,
+  USER_PREFERENCES: true,
+  USER_DIRECTIVES: true,
+  ENVIRONMENT: true,
+  WORKFLOW_RULES: true,
+  KNOWN_ISSUES: true
+};
+var MEMORY_STATUS_LOOKUP = {
+  active: true,
+  permanent: true,
+  archived: true
+};
+var MEMORY_SCOPE_LOOKUP = {
+  project: true,
+  ecosystem: true,
+  universe: true
+};
+var MEMORY_SOURCE_TYPE_LOOKUP = {
+  historian: true,
+  agent: true,
+  dreamer: true,
+  user: true
+};
+var VERIFICATION_STATUS_LOOKUP = {
+  unverified: true,
+  verified: true,
+  stale: true,
+  flagged: true
+};
+var insertMemoryStatements = new WeakMap;
+var getMemoryByHashStatements = new WeakMap;
+var getMemoryByIdStatements = new WeakMap;
+var getMemoriesByIdsStatements = new Map;
+var activeMemoriesNoExpiryStatements = new WeakMap;
+var updateMemorySeenCountStatements = new WeakMap;
+var updateMemoryRetrievalCountStatements = new WeakMap;
+var updateMemoryStatusStatements = new WeakMap;
+var updateArchivedMemoryStatements = new WeakMap;
+var updateMemoryVerificationStatements = new WeakMap;
+var updateMemoryContentStatements = new WeakMap;
+var supersededMemoryStatements = new WeakMap;
+var mergeMemoryStatsStatements = new WeakMap;
+var deleteMemoryStatements = new WeakMap;
+var deleteMemoryEmbeddingStatements = new WeakMap;
+var deleteEmbeddingOnContentUpdateStatements = new WeakMap;
+var getMemoryCountStatements = new WeakMap;
+var getMemoryCountByProjectStatements = new WeakMap;
+var getMemoryCountsByStatusStatements = new WeakMap;
+var memoriesByProjectStatements = new Map;
+var memoryImportanceColumnCache = new WeakMap;
+var memoryScopeColumnCache = new WeakMap;
+var memoryShareableColumnCache = new WeakMap;
+var memoryClassifiedAtColumnCache = new WeakMap;
+function hasMemoryImportanceColumn(db) {
+  const cached = memoryImportanceColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const hasColumn = columns.some((column) => column.name === "importance");
+  memoryImportanceColumnCache.set(db, hasColumn);
+  return hasColumn;
+}
+function hasMemoryScopeColumn(db) {
+  const cached = memoryScopeColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const hasColumn = columns.some((column) => column.name === "scope");
+  memoryScopeColumnCache.set(db, hasColumn);
+  return hasColumn;
+}
+function hasMemoryShareableColumn(db) {
+  const cached = memoryShareableColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const hasColumn = columns.some((column) => column.name === "shareable");
+  memoryShareableColumnCache.set(db, hasColumn);
+  return hasColumn;
+}
+function hasMemoryClassifiedAtColumn(db) {
+  const cached = memoryClassifiedAtColumnCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const columns = db.prepare("PRAGMA table_info(memories)").all();
+  const hasColumn = columns.some((column) => column.name === "classified_at");
+  memoryClassifiedAtColumnCache.set(db, hasColumn);
+  return hasColumn;
+}
+function getUnclassifiedMemoryIds(db, memoryIds) {
+  if (!hasMemoryClassifiedAtColumn(db))
+    return [...memoryIds];
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  if (ids.length === 0)
+    return [];
+  const ph = ids.map(() => "?").join(", ");
+  const rows = db.prepare(`SELECT id FROM memories WHERE id IN (${ph}) AND classified_at IS NOT NULL`).all(...ids);
+  const classified = new Set(rows.map((r) => r.id));
+  return ids.filter((id) => !classified.has(id));
+}
+function getMemorySelectColumns(db, tableName = "memories") {
+  return Object.entries(COLUMN_MAP).map(([property, column]) => {
+    if (property === "importance" && !hasMemoryImportanceColumn(db)) {
+      return "50 AS importance";
+    }
+    if (property === "importance") {
+      return `COALESCE(${tableName}.${column}, 50) AS ${property}`;
+    }
+    if (property === "scope" && !hasMemoryScopeColumn(db)) {
+      return "'project' AS scope";
+    }
+    if (property === "scope") {
+      return `COALESCE(${tableName}.${column}, 'project') AS ${property}`;
+    }
+    if (property === "shareable" && !hasMemoryShareableColumn(db)) {
+      return "0 AS shareable";
+    }
+    if (property === "shareable") {
+      return `COALESCE(${tableName}.${column}, 0) AS ${property}`;
+    }
+    return `${tableName}.${column} AS ${property}`;
+  }).join(", ");
+}
+function isMemoryCategory(value) {
+  return typeof value === "string" && value in MEMORY_CATEGORY_LOOKUP;
+}
+function isMemoryStatus(value) {
+  return typeof value === "string" && value in MEMORY_STATUS_LOOKUP;
+}
+function isMemoryScope(value) {
+  return typeof value === "string" && value in MEMORY_SCOPE_LOOKUP;
+}
+function isMemorySourceType(value) {
+  return typeof value === "string" && value in MEMORY_SOURCE_TYPE_LOOKUP;
+}
+function isVerificationStatus(value) {
+  return typeof value === "string" && value in VERIFICATION_STATUS_LOOKUP;
+}
+function isNullableString(value) {
+  return value === null || typeof value === "string";
+}
+function isNullableNumber(value) {
+  return value === null || typeof value === "number";
+}
+function isMemoryCountByStatusRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && isMemoryStatus(candidate.status) && isNullableNumber(candidate.superseded_by_memory_id);
+}
+function isMemoryRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.projectPath === "string" && isMemoryCategory(candidate.category) && typeof candidate.content === "string" && typeof candidate.normalizedHash === "string" && typeof candidate.importance === "number" && isMemoryScope(candidate.scope) && typeof candidate.shareable === "number" && isNullableString(candidate.sourceSessionId) && isMemorySourceType(candidate.sourceType) && typeof candidate.seenCount === "number" && typeof candidate.retrievalCount === "number" && typeof candidate.firstSeenAt === "number" && typeof candidate.createdAt === "number" && typeof candidate.updatedAt === "number" && typeof candidate.lastSeenAt === "number" && isNullableNumber(candidate.lastRetrievedAt) && isMemoryStatus(candidate.status) && isNullableNumber(candidate.expiresAt) && isVerificationStatus(candidate.verificationStatus) && isNullableNumber(candidate.verifiedAt) && isNullableNumber(candidate.supersededByMemoryId) && isNullableString(candidate.mergedFrom) && isNullableString(candidate.metadataJson);
+}
+function toMemory(row) {
+  return {
+    id: row.id,
+    projectPath: row.projectPath,
+    category: row.category,
+    content: row.content,
+    normalizedHash: row.normalizedHash,
+    importance: row.importance,
+    scope: row.scope,
+    shareable: row.shareable,
+    sourceSessionId: row.sourceSessionId,
+    sourceType: row.sourceType,
+    seenCount: row.seenCount,
+    retrievalCount: row.retrievalCount,
+    firstSeenAt: row.firstSeenAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    lastSeenAt: row.lastSeenAt,
+    lastRetrievedAt: row.lastRetrievedAt,
+    status: row.status,
+    expiresAt: row.expiresAt,
+    verificationStatus: row.verificationStatus,
+    verifiedAt: row.verifiedAt,
+    supersededByMemoryId: row.supersededByMemoryId,
+    mergedFrom: row.mergedFrom,
+    metadataJson: row.metadataJson
+  };
+}
+function getInsertMemoryStatement(db) {
+  let stmt = insertMemoryStatements.get(db);
+  if (!stmt) {
+    stmt = hasMemoryImportanceColumn(db) ? db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, importance, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") : db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    insertMemoryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoryByHashStatement(db) {
+  let stmt = getMemoryByHashStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?`);
+    getMemoryByHashStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoryByIdStatement(db) {
+  let stmt = getMemoryByIdStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`);
+    getMemoryByIdStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoriesByIdsStatement(db, idCount) {
+  const key = `n${idCount}`;
+  let map = getMemoriesByIdsStatements.get(key);
+  if (!map) {
+    map = new WeakMap;
+    getMemoriesByIdsStatements.set(key, map);
+  }
+  let stmt = map.get(db);
+  if (!stmt) {
+    const placeholders = new Array(idCount).fill("?").join(", ");
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`);
+    map.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoriesByProjectStatement(db, statuses) {
+  const key = statuses.join(",");
+  let statements = memoriesByProjectStatements.get(key);
+  if (!statements) {
+    statements = new WeakMap;
+    memoriesByProjectStatements.set(key, statements);
+  }
+  let stmt = statements.get(db);
+  if (!stmt) {
+    const placeholders = statuses.map(() => "?").join(", ");
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updated_at DESC, id ASC`);
+    statements.set(db, stmt);
+  }
+  return stmt;
+}
+function getActiveMemoriesNoExpiryStatement(db) {
+  let stmt = activeMemoriesNoExpiryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updated_at DESC, id ASC`);
+    activeMemoriesNoExpiryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateMemorySeenCountStatement(db) {
+  let stmt = updateMemorySeenCountStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE id = ?");
+    updateMemorySeenCountStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateMemoryRetrievalCountStatement(db) {
+  let stmt = updateMemoryRetrievalCountStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE id = ?");
+    updateMemoryRetrievalCountStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateMemoryStatusStatement(db) {
+  let stmt = updateMemoryStatusStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET status = ?, updated_at = ? WHERE id = ?");
+    updateMemoryStatusStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateArchivedMemoryStatement(db) {
+  let stmt = updateArchivedMemoryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET status = 'archived', metadata_json = ?, updated_at = ? WHERE id = ?");
+    updateArchivedMemoryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateMemoryContentStatement(db) {
+  let stmt = updateMemoryContentStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?");
+    updateMemoryContentStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getSupersededMemoryStatement(db) {
+  let stmt = supersededMemoryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET superseded_by_memory_id = ?, status = 'archived', updated_at = ? WHERE id = ?");
+    supersededMemoryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMergeMemoryStatsStatement(db) {
+  let stmt = mergeMemoryStatsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE memories SET seen_count = ?, retrieval_count = ?, merged_from = ?, status = ?, updated_at = ? WHERE id = ?");
+    mergeMemoryStatsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteMemoryStatement(db) {
+  let stmt = deleteMemoryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM memories WHERE id = ?");
+    deleteMemoryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteMemoryEmbeddingStatement(db) {
+  let stmt = deleteMemoryEmbeddingStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?");
+    deleteMemoryEmbeddingStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoryCountsByStatusStatement(db) {
+  let stmt = getMemoryCountsByStatusStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT id, status, superseded_by_memory_id FROM memories WHERE project_path = ?");
+    getMemoryCountsByStatusStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function buildInsertMemoryValues(input, normalizedHash, now, includeImportance) {
+  const insertValues = [
+    input.projectPath,
+    input.category,
+    input.content,
+    normalizedHash
+  ];
+  if (includeImportance) {
+    insertValues.push(input.importance ?? 50);
+  }
+  insertValues.push(input.sourceSessionId ?? null, input.sourceType ?? "historian", 1, 0, now, now, now, now, null, "active", input.expiresAt ?? null, "unverified", null, null, null, input.metadataJson ?? null);
+  return insertValues;
+}
+function loadInsertedMemory(db, rowid) {
+  const inserted = getMemoryById(db, Number(rowid));
+  if (!inserted) {
+    throw new Error("Failed to load inserted memory row");
+  }
+  return inserted;
+}
+
+class ModuleMemoryAuthorityError extends Error {
+  projectPath;
+  code = "MEMORY_MODULE_AUTHORITY";
+  constructor(projectPath) {
+    super(`memory writes for module-managed project ${projectPath} must use the Rust ctx_memory module facade`);
+    this.projectPath = projectPath;
+    this.name = "ModuleMemoryAuthorityError";
+  }
+}
+function assertTsMemoryWriteAllowed(db, projectPath) {
+  try {
+    const managed = db.prepare("SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1").get(projectPath, projectPath);
+    if (managed)
+      throw new ModuleMemoryAuthorityError(projectPath);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("no such table"))
+      throw error;
+  }
+}
+function assertTsMemoryIdWriteAllowed(db, id) {
+  const memory = getMemoryById(db, id);
+  if (memory)
+    assertTsMemoryWriteAllowed(db, memory.projectPath);
+  return memory;
+}
+function insertMemory(db, input) {
+  assertTsMemoryWriteAllowed(db, input.projectPath);
+  const now = Date.now();
+  const normalizedHash = computeNormalizedHash(input.content);
+  const insertValues = buildInsertMemoryValues(input, normalizedHash, now, hasMemoryImportanceColumn(db));
+  const result = getInsertMemoryStatement(db).run(...insertValues);
+  const insertedResult = result;
+  const inserted = loadInsertedMemory(db, insertedResult.lastInsertRowid);
+  invalidateProject(input.projectPath);
+  return inserted;
+}
+function getMemoryByHash(db, projectPath, category, normalizedHash) {
+  const result = getMemoryByHashStatement(db).get(projectPath, category, normalizedHash);
+  if (!isMemoryRow(result)) {
+    return null;
+  }
+  return toMemory(result);
+}
+function getMemoriesByProject(db, projectPath, statuses = ["active", "permanent"], expiryCutoff = Date.now()) {
+  if (statuses.length === 0) {
+    return [];
+  }
+  const rows = getMemoriesByProjectStatement(db, statuses).all(projectPath, ...statuses, expiryCutoff).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+function sqlPlaceholders(values) {
+  return values.map(() => "?").join(", ");
+}
+function uniqueValues(values) {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+function buildWorkspaceMemorySqlFilter(args) {
+  if (args.shareCategories === null || args.shareCategories === undefined) {
+    return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
+  }
+  const identities = uniqueValues(args.identities);
+  const identitySet = new Set(identities);
+  const ownSet = new Set(uniqueValues(args.ownIdentities ?? []).filter((identity) => identitySet.has(identity)));
+  const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
+  if (foreignIdentities.length === 0) {
+    return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
+  }
+  const ownIdentities = identities.filter((identity) => ownSet.has(identity));
+  const shareCategories = uniqueValues([...args.shareCategories]);
+  const qualifier = args.tableName ? `${args.tableName}.` : "";
+  const classification = args.includeClassificationFields === false ? "" : ` AND ${qualifier}shareable = 1 AND ${qualifier}scope IN ('project','ecosystem','universe')`;
+  const predicates = [];
+  const params = [];
+  if (ownIdentities.length > 0) {
+    predicates.push(`${qualifier}project_path IN (${sqlPlaceholders(ownIdentities)})`);
+    params.push(...ownIdentities);
+  }
+  if (foreignIdentities.length > 0 && shareCategories.length > 0) {
+    predicates.push(`(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)})${classification})`);
+    params.push(...foreignIdentities, ...shareCategories);
+  }
+  if (predicates.length === 0) {
+    return { clause: " AND 0 = 1", params: [], active: true, predicate: FOREIGN_VISIBLE_SQL };
+  }
+  return {
+    clause: ` AND (${predicates.join(" OR ")})`,
+    params,
+    active: true,
+    predicate: FOREIGN_VISIBLE_SQL
+  };
+}
+function getMemoriesByProjects(db, projectPaths, statuses = ["active", "permanent"], expiryCutoff = Date.now(), ownIdentities, shareCategories) {
+  const identities = uniqueValues(projectPaths);
+  if (identities.length === 0 || statuses.length === 0)
+    return [];
+  const identitySet = new Set(identities);
+  const ownSet = new Set(uniqueValues(ownIdentities ?? []).filter((identity) => identitySet.has(identity)));
+  const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
+  const ownIdentitiesResolved = identities.filter((identity) => ownSet.has(identity));
+  if (foreignIdentities.length === 0 || shareCategories === null || shareCategories === undefined) {
+    if (identities.length === 1) {
+      return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
+    }
+    const rows = db.prepare(`SELECT ${getMemorySelectColumns(db)}
+                   FROM memories
+                  WHERE project_path IN (${sqlPlaceholders(identities)})
+                    AND status IN (${sqlPlaceholders(statuses)})
+                    AND (expires_at IS NULL OR expires_at > ?)
+                  ORDER BY category ASC, updated_at DESC, id ASC`).all(...identities, ...statuses, expiryCutoff).filter(isMemoryRow);
+    return rows.map(toMemory);
+  }
+  const shareCats = uniqueValues([...shareCategories]);
+  const hasClassification = hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db);
+  const predicates = [];
+  const params = [];
+  if (ownIdentitiesResolved.length > 0) {
+    predicates.push(`(project_path IN (${sqlPlaceholders(ownIdentitiesResolved)})
+              AND status IN (${sqlPlaceholders(statuses)})
+              AND (expires_at IS NULL OR expires_at > ?))`);
+    params.push(...ownIdentitiesResolved, ...statuses, expiryCutoff);
+  }
+  if (foreignIdentities.length > 0 && shareCats.length > 0) {
+    const classification = hasClassification ? " AND shareable = 1 AND scope IN ('project','ecosystem','universe')" : "";
+    predicates.push(`(project_path IN (${sqlPlaceholders(foreignIdentities)})
+              AND status IN ('active','permanent')
+              AND (expires_at IS NULL OR expires_at > ?)
+              AND category IN (${sqlPlaceholders(shareCats)})${classification})`);
+    params.push(...foreignIdentities, expiryCutoff, ...shareCats);
+  }
+  if (predicates.length === 0)
+    return [];
+  const rows = db.prepare(`SELECT ${getMemorySelectColumns(db)}
+               FROM memories
+              WHERE (${predicates.join(" OR ")})
+              ORDER BY category ASC, updated_at DESC, id ASC`).all(...params).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+function getMaxMemoryIdForProjects(db, projectPaths, ownIdentities, shareCategories, expiryCutoff = Date.now()) {
+  const identities = uniqueValues(projectPaths);
+  if (identities.length === 0)
+    return 0;
+  const sharingFilter = buildWorkspaceMemorySqlFilter({
+    identities,
+    ownIdentities,
+    shareCategories,
+    includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db)
+  });
+  const row = db.prepare(`SELECT COALESCE(MAX(id), 0) AS max_id
+               FROM memories
+              WHERE project_path IN (${sqlPlaceholders(identities)})
+                AND status IN ('active', 'permanent')
+                AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}`).get(...identities, expiryCutoff, ...sharingFilter.params);
+  return typeof row?.max_id === "number" ? row.max_id : 0;
+}
+function getAllActiveMemoriesForMigration(db, projectPath) {
+  const rows = getActiveMemoriesNoExpiryStatement(db).all(projectPath).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+function getMemoryById(db, id) {
+  const result = getMemoryByIdStatement(db).get(id);
+  if (!isMemoryRow(result)) {
+    return null;
+  }
+  return toMemory(result);
+}
+function getMemoriesByIds(db, ids) {
+  const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isInteger(id))));
+  if (uniqueIds.length === 0) {
+    return [];
+  }
+  const rows = getMemoriesByIdsStatement(db, uniqueIds.length).all(...uniqueIds).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+function updateMemorySeenCount(db, id) {
+  assertTsMemoryIdWriteAllowed(db, id);
+  const now = Date.now();
+  getUpdateMemorySeenCountStatement(db).run(now, now, id);
+}
+function updateMemoryRetrievalCount(db, id) {
+  assertTsMemoryIdWriteAllowed(db, id);
+  const now = Date.now();
+  getUpdateMemoryRetrievalCountStatement(db).run(now, now, id);
+}
+function updateMemoryStatus(db, id, status) {
+  assertTsMemoryIdWriteAllowed(db, id);
+  getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
+}
+function mergeMetadataJson(existing, patch) {
+  let base = {};
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        base = parsed;
+      }
+    } catch {
+      base = {};
+    }
+  }
+  return JSON.stringify({ ...base, ...patch });
+}
+function updateMemoryContent(db, id, content, normalizedHash) {
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  db.transaction(() => {
+    getUpdateMemoryContentStatement(db).run(content, normalizedHash, Date.now(), id);
+    if (hasMemoryShareableColumn(db)) {
+      db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(id);
+    }
+    if (hasMemoryClassifiedAtColumn(db)) {
+      db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(id);
+    }
+    if (hasMuralCueColumns(db)) {
+      const rejectionReset = hasMuralCueRejectionCountColumn(db) ? ", mural_cue_rejection_count = 0" : "";
+      db.prepare(`UPDATE memories SET mural_cue = NULL, mural_cue_hash = NULL, mural_cue_at = NULL${rejectionReset} WHERE id = ?`).run(id);
+    }
+    let stmt = deleteEmbeddingOnContentUpdateStatements.get(db);
+    if (!stmt) {
+      stmt = db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?");
+      deleteEmbeddingOnContentUpdateStatements.set(db, stmt);
+    }
+    stmt.run(id);
+  })();
+  if (memory) {
+    invalidateMemory(memory.projectPath, id);
+  }
+}
+function normalizeImportance(value) {
+  if (!Number.isFinite(value))
+    return 50;
+  return Math.max(1, Math.min(100, Math.round(value)));
+}
+function setMemoryClassification(db, id, classification) {
+  const hasImportance = classification.importance !== undefined;
+  const hasScope = classification.scope !== undefined;
+  const hasShareable = classification.shareable !== undefined;
+  if (!hasImportance && !hasScope && !hasShareable) {
+    throw new Error("setMemoryClassification requires at least one supplied field");
+  }
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  if (!memory)
+    return false;
+  const assignments = [];
+  const values = [];
+  if (hasImportance) {
+    const next = normalizeImportance(classification.importance);
+    if (memory.importance !== next) {
+      assignments.push("importance = ?");
+      values.push(next);
+    }
+  }
+  if (hasScope) {
+    const next = classification.scope;
+    if (!isMemoryScope(next)) {
+      throw new Error(`invalid memory scope: ${String(next)}`);
+    }
+    if (memory.scope !== next) {
+      assignments.push("scope = ?");
+      values.push(next);
+    }
+  }
+  if (hasShareable) {
+    const next = classification.shareable ? 1 : 0;
+    if ((memory.shareable ? 1 : 0) !== next) {
+      assignments.push("shareable = ?");
+      values.push(next);
+    }
+  }
+  const fieldChanged = assignments.length > 0;
+  if (hasMemoryClassifiedAtColumn(db)) {
+    assignments.push("classified_at = ?");
+    values.push(Date.now());
+  }
+  if (assignments.length === 0)
+    return false;
+  db.prepare(`UPDATE memories SET ${assignments.join(", ")} WHERE id = ?`).run(...values, id);
+  return fieldChanged;
+}
+function supersededMemory(db, id, supersededById) {
+  assertTsMemoryIdWriteAllowed(db, id);
+  getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
+}
+function mergeMemoryStats(db, id, seenCount, retrievalCount, mergedFrom, status) {
+  assertTsMemoryIdWriteAllowed(db, id);
+  getMergeMemoryStatsStatement(db).run(seenCount, retrievalCount, mergedFrom, status, Date.now(), id);
+}
+function archiveMemory(db, id, reason) {
+  const trimmedReason = reason?.trim();
+  if (!trimmedReason) {
+    updateMemoryStatus(db, id, "archived");
+    return;
+  }
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  if (!memory) {
+    return;
+  }
+  getUpdateArchivedMemoryStatement(db).run(mergeMetadataJson(memory.metadataJson, { archive_reason: trimmedReason }), Date.now(), id);
+}
+function deleteMemory(db, id) {
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  db.transaction(() => {
+    getDeleteMemoryEmbeddingStatement(db).run(id);
+    getDeleteMemoryStatement(db).run(id);
+  })();
+  if (memory) {
+    invalidateMemory(memory.projectPath, id);
+  }
+}
+function getMemoryCountsByStatus(db, projectPath) {
+  const rows = getMemoryCountsByStatusStatement(db).all(projectPath).filter(isMemoryCountByStatusRow);
+  const counts = {
+    total: rows.length,
+    active: 0,
+    permanent: 0,
+    archived: 0,
+    merged: 0,
+    ids: [],
+    archivedIds: [],
+    mergedIds: []
+  };
+  for (const row of rows) {
+    counts.ids.push(row.id);
+    if (typeof row.superseded_by_memory_id === "number") {
+      counts.merged += 1;
+      counts.mergedIds.push(row.id);
+    } else if (row.status === "active") {
+      counts.active += 1;
+    } else if (row.status === "permanent") {
+      counts.permanent += 1;
+    } else {
+      counts.archived += 1;
+      counts.archivedIds.push(row.id);
+    }
+  }
+  counts.ids.sort((left, right) => left - right);
+  counts.archivedIds.sort((left, right) => left - right);
+  counts.mergedIds.sort((left, right) => left - right);
+  return counts;
+}
+
+// ../plugin/src/features/magic-context/memory/promotion.ts
+function isPromotableCategory(category) {
+  return PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category);
+}
+function resolveExpiresAt(category) {
+  const ttl = CATEGORY_DEFAULT_TTL[category];
+  return ttl === undefined ? null : Date.now() + ttl;
+}
+function promoteSessionFactsDurable(db, sessionId, projectPath, facts) {
+  const refs = [];
+  for (const fact of facts) {
+    if (!fact || typeof fact.category !== "string" || typeof fact.content !== "string" || fact.content.trim().length === 0) {
+      continue;
+    }
+    if (!isPromotableCategory(fact.category)) {
+      continue;
+    }
+    const normalizedHash = computeNormalizedHash(fact.content);
+    const existingMemory = getMemoryByHash(db, projectPath, fact.category, normalizedHash);
+    if (existingMemory) {
+      updateMemorySeenCount(db, existingMemory.id);
+      continue;
+    }
+    const memoryInput = {
+      projectPath,
+      category: fact.category,
+      content: fact.content,
+      sourceSessionId: sessionId,
+      sourceType: "historian",
+      expiresAt: resolveExpiresAt(fact.category)
+    };
+    const memory = insertMemory(db, memoryInput);
+    refs.push({ memoryId: memory.id, content: memory.content });
+  }
+  return refs;
+}
+async function embedPromotedFacts(db, sessionId, projectPath, refs) {
+  for (const ref of refs) {
+    await embedAndStoreMemory(db, sessionId, projectPath, ref.memoryId, ref.content);
+  }
+}
+async function embedAndStoreMemory(db, sessionId, projectPath, memoryId, content) {
+  try {
+    const hashBeforeEmbed = getMemoryById(db, memoryId)?.normalizedHash;
+    if (!hashBeforeEmbed) {
+      return;
+    }
+    const result = await embedTextForProject(projectPath, content);
+    if (result) {
+      db.transaction(() => {
+        saveEmbeddingIfHashMatches(db, memoryId, result.vector, result.modelId, hashBeforeEmbed);
+      })();
+    }
+  } catch (error) {
+    sessionLog(sessionId, `memory embedding failed for memory ${memoryId}:`, error);
+  }
+}
+// ../plugin/src/features/magic-context/memory/storage-memory-fts.ts
+var DEFAULT_SEARCH_LIMIT = 10;
+var searchStatements = new WeakMap;
+var unionSearchStatements = new Map;
+function getSearchStatement(db) {
+  let stmt = searchStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`);
+    searchStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUnionSearchStatement(db, arity) {
+  let statements = unionSearchStatements.get(arity);
+  if (!statements) {
+    statements = new WeakMap;
+    unionSearchStatements.set(arity, statements);
+  }
+  let stmt = statements.get(db);
+  if (!stmt) {
+    const placeholders = Array.from({ length: arity }, () => "?").join(", ");
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`);
+    statements.set(db, stmt);
+  }
+  return stmt;
+}
+function uniqueProjectPaths(projectPaths) {
+  return [...new Set(projectPaths.filter((path) => path.length > 0))];
+}
+function sanitizeFtsQuery(query) {
+  const tokens = query.split(/\s+/).filter((token) => token.length > 0);
+  if (tokens.length === 0)
+    return "";
+  return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" ");
+}
+function searchMemoriesFTS(db, projectPath, query, limit = DEFAULT_SEARCH_LIMIT) {
+  const trimmedQuery = query.trim();
+  if (trimmedQuery.length === 0 || limit <= 0) {
+    return [];
+  }
+  const sanitized = sanitizeFtsQuery(trimmedQuery);
+  if (sanitized.length === 0) {
+    return [];
+  }
+  const rows = getSearchStatement(db).all(projectPath, Date.now(), sanitized, limit).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+function searchMemoriesFTSUnion(db, projectPaths, query, limit = DEFAULT_SEARCH_LIMIT, ownIdentities, shareCategories) {
+  const identities = uniqueProjectPaths(projectPaths);
+  if (identities.length === 0)
+    return [];
+  const sharingFilter = buildWorkspaceMemorySqlFilter({
+    identities,
+    ownIdentities,
+    shareCategories,
+    tableName: "memories",
+    includeClassificationFields: (() => {
+      const columns = db.prepare("PRAGMA table_info(memories)").all();
+      return columns.some((row) => row.name === "shareable") && columns.some((row) => row.name === "scope");
+    })()
+  });
+  if (identities.length === 1 && !sharingFilter.active) {
+    return searchMemoriesFTS(db, identities[0], query, limit);
+  }
+  const trimmedQuery = query.trim();
+  if (trimmedQuery.length === 0 || limit <= 0)
+    return [];
+  const sanitized = sanitizeFtsQuery(trimmedQuery);
+  if (sanitized.length === 0)
+    return [];
+  const rows = sharingFilter.active ? db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`).all(...identities, Date.now(), sanitized, ...sharingFilter.params, limit).filter(isMemoryRow) : getUnionSearchStatement(db, identities.length).all(...identities, Date.now(), sanitized, limit).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
+// ../plugin/src/features/magic-context/memory/storage-memory-verifications.ts
+var MEMORY_VERIFICATION_SENTINEL = "";
+function placeholders(values) {
+  return values.map(() => "?").join(", ");
+}
+function uniqueSortedFiles(files) {
+  return Array.from(new Set(files.filter((file) => file !== MEMORY_VERIFICATION_SENTINEL))).sort();
+}
+function recordMemoryMapping(db, memoryId, normalizedFiles, now) {
+  const realFiles = uniqueSortedFiles(normalizedFiles);
+  const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+  const insert = db.prepare("INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)");
+  for (const file of filesToWrite) {
+    insert.run(memoryId, file, now);
+  }
+  return filesToWrite.length;
+}
+function recordMemoryVerifications(db, memoryId, normalizedFiles, now) {
+  const realFiles = uniqueSortedFiles(normalizedFiles);
+  const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+  const insert = db.prepare("INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, ?, ?)");
+  for (const file of filesToWrite) {
+    insert.run(memoryId, file, now, now);
+  }
+  return filesToWrite.length;
+}
+function getUnmappedMemoryIds(db, memoryIds) {
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  if (ids.length === 0)
+    return [];
+  const rows = db.prepare(`SELECT DISTINCT memory_id FROM memory_verifications WHERE memory_id IN (${placeholders(ids)})`).all(...ids);
+  const mapped = new Set(rows.map((r) => r.memory_id));
+  return ids.filter((id) => !mapped.has(id));
+}
+function clearMemoryVerifications(db, memoryId) {
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+}
+function getMemoryVerifications(db, memoryIds) {
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  const result = new Map;
+  if (ids.length === 0)
+    return result;
+  const rows = db.prepare(`SELECT memory_id, file_path, verified_at, mapped_at
+               FROM memory_verifications
+              WHERE memory_id IN (${placeholders(ids)})
+              ORDER BY memory_id, file_path`).all(...ids);
+  for (const row of rows) {
+    const existing = result.get(row.memory_id) ?? {
+      files: [],
+      hasSentinel: false,
+      verifiedAt: 0,
+      mappedAt: 0
+    };
+    if (row.file_path === MEMORY_VERIFICATION_SENTINEL) {
+      existing.hasSentinel = true;
+    } else if (!existing.files.includes(row.file_path)) {
+      existing.files.push(row.file_path);
+    }
+    existing.verifiedAt = Math.max(existing.verifiedAt, row.verified_at);
+    existing.mappedAt = Math.max(existing.mappedAt, row.mapped_at ?? 0);
+    result.set(row.memory_id, existing);
+  }
+  for (const state of result.values()) {
+    state.files.sort();
+  }
+  return result;
+}
+// ../plugin/src/features/magic-context/memory/verification-paths.ts
+import { execFile } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
+var GIT_TIMEOUT_MS = 1e4;
+var defaultExecFileForVerificationPaths = async (file, args, options) => await execFileAsync(file, [...args], options);
+var execFileForVerificationPaths = defaultExecFileForVerificationPaths;
+async function runGit(cwd, args) {
+  try {
+    const result = await execFileForVerificationPaths("git", args, {
+      cwd,
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+      encoding: "utf8"
+    });
+    return String(result.stdout);
+  } catch {
+    return null;
+  }
+}
+function toPosixPath(value) {
+  return value.split(path.sep).join("/");
+}
+function isWithin(root, candidate) {
+  const rel = path.relative(root, candidate);
+  return rel === "" || !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+function safeRealpath(value) {
+  try {
+    return realpathSync.native(value);
+  } catch {
+    return null;
+  }
+}
+async function resolveGitTopLevel(cwd) {
+  const stdout = await runGit(cwd, ["rev-parse", "--show-toplevel"]);
+  const root = stdout?.trim();
+  return root ? safeRealpath(root) ?? path.resolve(root) : null;
+}
+async function readGitHead(cwd) {
+  const stdout = await runGit(cwd, ["rev-parse", "HEAD"]);
+  const head = stdout?.trim();
+  return head && /^[0-9a-f]{40}$/i.test(head) ? head : null;
+}
+async function readGitChangedFilesSince(cwd, revision) {
+  if (!/^[0-9a-f]{7,40}$/i.test(revision))
+    return null;
+  const gitRoot = await resolveGitTopLevel(cwd);
+  if (!gitRoot)
+    return null;
+  const stdout = await runGit(gitRoot, ["diff", "--name-only", "-z", revision]);
+  if (stdout === null)
+    return null;
+  return new Set(stdout.split("\x00").filter(Boolean));
+}
+async function readGitFileChangeTimesSince(cwd, sinceMs) {
+  const gitRoot = await resolveGitTopLevel(cwd);
+  if (!gitRoot)
+    return null;
+  const sinceSec = Math.max(0, Math.floor(sinceMs / 1000));
+  const stdout = await runGit(gitRoot, [
+    "log",
+    `--since=@${sinceSec}`,
+    "--name-only",
+    "--format=%ct"
+  ]);
+  if (stdout === null)
+    return null;
+  const times = new Map;
+  let currentMs = 0;
+  for (const rawLine of stdout.split(`
+`)) {
+    const line = rawLine.trimEnd();
+    if (line === "")
+      continue;
+    if (/^\d+$/.test(line)) {
+      currentMs = Number.parseInt(line, 10) * 1000;
+      continue;
+    }
+    if (currentMs > 0 && !times.has(line)) {
+      times.set(line, currentMs);
+    }
+  }
+  return times;
+}
+async function gitTrackedPath(gitRoot, repoRelativePath) {
+  const stdout = await runGit(gitRoot, [
+    "ls-files",
+    "-z",
+    "--full-name",
+    "--error-unmatch",
+    "--",
+    repoRelativePath
+  ]);
+  const fallbackStdout = stdout === null ? await runGit(gitRoot, ["ls-files", "-z", "--full-name"]) : null;
+  if (stdout === null && fallbackStdout === null)
+    return null;
+  const matches = (stdout ?? fallbackStdout ?? "").split("\x00").filter(Boolean);
+  if (matches.length === 0)
+    return null;
+  return matches.find((match) => match === repoRelativePath) ?? matches.find((match) => match.toLowerCase() === repoRelativePath.toLowerCase()) ?? (matches.length === 1 ? matches[0] : null);
+}
+function verificationFileExists(baseRoot, filePath) {
+  if (!filePath || filePath === ".")
+    return false;
+  const root = path.resolve(baseRoot);
+  const candidate = path.resolve(root, filePath);
+  return isWithin(root, candidate) && existsSync(candidate);
+}
+async function normalizeVerificationFiles(args) {
+  const cwd = path.resolve(args.cwd);
+  const gitRoot = await resolveGitTopLevel(cwd);
+  const root = gitRoot ?? cwd;
+  const rootReal = safeRealpath(root) ?? root;
+  const warnings = [];
+  const normalized = [];
+  for (const raw of args.files) {
+    const value = typeof raw === "string" ? raw.trim() : "";
+    if (!value) {
+      warnings.push("Skipped blank verification path.");
+      continue;
+    }
+    if (value === ".") {
+      warnings.push('Skipped verification path "." (repo/project root is not a file).');
+      continue;
+    }
+    const candidate = path.resolve(cwd, value);
+    const candidateReal = safeRealpath(candidate);
+    if (candidateReal && !isWithin(rootReal, candidateReal)) {
+      warnings.push(`Skipped verification path "${value}" because it resolves outside the project.`);
+      continue;
+    }
+    if (!candidateReal && !isWithin(path.resolve(root), candidate)) {
+      warnings.push(`Skipped verification path "${value}" because it escapes the project.`);
+      continue;
+    }
+    if (path.resolve(root) === candidate) {
+      warnings.push(`Skipped verification path "${value}" because it is the repo/project root.`);
+      continue;
+    }
+    if (existsSync(candidate)) {
+      try {
+        if (statSync(candidate).isDirectory()) {
+          warnings.push(`Skipped verification path "${value}" because it is a directory.`);
+          continue;
+        }
+      } catch {
+        warnings.push(`Skipped verification path "${value}" because it could not be inspected.`);
+        continue;
+      }
+    }
+    if (gitRoot) {
+      const repoRelative = toPosixPath(path.relative(gitRoot, candidateReal ?? candidate));
+      if (!repoRelative || repoRelative === "." || repoRelative.startsWith("../")) {
+        warnings.push(`Skipped verification path "${value}" because it is not inside the git repo.`);
+        continue;
+      }
+      const tracked = await gitTrackedPath(gitRoot, repoRelative);
+      if (!tracked) {
+        warnings.push(`Skipped verification path "${value}" because it is not a tracked git file.`);
+        continue;
+      }
+      if (candidateReal && tracked !== repoRelative) {
+        const realRelative = toPosixPath(path.relative(gitRoot, candidateReal));
+        if (realRelative !== tracked) {
+          warnings.push(`Skipped verification path "${value}" because it is not a tracked git file.`);
+          continue;
+        }
+      }
+      normalized.push(tracked);
+    } else {
+      if (!existsSync(candidate)) {
+        warnings.push(`Skipped verification path "${value}" because it does not exist.`);
+        continue;
+      }
+      const projectRelative = toPosixPath(path.relative(cwd, candidate));
+      if (!projectRelative || projectRelative === "." || projectRelative.startsWith("../")) {
+        warnings.push(`Skipped verification path "${value}" because it is not inside the project.`);
+        continue;
+      }
+      normalized.push(projectRelative);
+    }
+  }
+  return {
+    files: Array.from(new Set(normalized)).sort(),
+    warnings,
+    gitRoot
+  };
+}
+// ../plugin/src/hooks/magic-context/read-session-db.ts
+import { existsSync as existsSync2 } from "node:fs";
+import { join as join2 } from "node:path";
+function getOpenCodeDbPath() {
+  return join2(getDataDir(), "opencode", "opencode.db");
+}
+function openCodeDbExists() {
+  return existsSync2(getOpenCodeDbPath());
+}
+var cachedReadOnlyDb = null;
+function closeCachedReadOnlyDb() {
+  if (!cachedReadOnlyDb) {
+    return;
+  }
+  try {
+    closeQuietly(cachedReadOnlyDb.db);
+  } catch (error) {
+    log("[magic-context] failed to close cached OpenCode read-only DB:", error);
+  } finally {
+    cachedReadOnlyDb = null;
+  }
+}
+function getReadOnlySessionDb() {
+  const dbPath = getOpenCodeDbPath();
+  if (cachedReadOnlyDb?.path === dbPath) {
+    return cachedReadOnlyDb.db;
+  }
+  closeCachedReadOnlyDb();
+  const db = new Database(dbPath, { readonly: true });
+  cachedReadOnlyDb = { path: dbPath, db };
+  return db;
+}
+function withReadOnlySessionDb(fn) {
+  return fn(getReadOnlySessionDb());
+}
+function getRawSessionMessageCountFromDb(db, sessionId) {
+  const row = db.prepare(`SELECT COUNT(*) as count FROM message WHERE session_id = ?
+             AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                      AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')`).get(sessionId);
+  return typeof row?.count === "number" ? row.count : 0;
+}
+function isMidTurn(_deps, sessionId) {
+  try {
+    return withReadOnlySessionDb((db) => isMidTurnFromOpenCodeDb(db, sessionId));
+  } catch (error) {
+    log("[magic-context] failed to inspect OpenCode mid-turn state:", error);
+    return false;
+  }
+}
+function isMidTurnFromOpenCodeDb(db, sessionId) {
+  const latestAssistant = db.prepare(`SELECT id,
+                    json_extract(data, '$.finish') as finish,
+                    time_created as timeCreated
+             FROM message
+             WHERE session_id = ?
+               AND json_extract(data, '$.role') = 'assistant'
+             ORDER BY time_created DESC
+             LIMIT 1`).get(sessionId);
+  if (typeof latestAssistant?.id !== "string")
+    return false;
+  if (hasNewerRealUserMessage(db, sessionId, latestAssistant.timeCreated))
+    return false;
+  if (latestAssistant.finish === "tool-calls")
+    return true;
+  const partRows = db.prepare("SELECT data FROM part WHERE session_id = ? AND message_id = ?").all(sessionId, latestAssistant.id);
+  return partRows.some((row) => {
+    if (typeof row.data !== "string" || row.data.length === 0)
+      return false;
+    try {
+      const part = JSON.parse(row.data);
+      return part.type === "tool" && part.providerExecuted !== true;
+    } catch {
+      return false;
+    }
+  });
+}
+function hasNewerRealUserMessage(db, sessionId, latestAssistantTimeCreated) {
+  if (typeof latestAssistantTimeCreated !== "number")
+    return false;
+  const row = db.prepare(`SELECT 1 as one
+             FROM message m
+             WHERE m.session_id = ?
+               AND m.time_created > ?
+               AND json_extract(m.data, '$.role') = 'user'
+               AND NOT (
+                 EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM part p
+                   WHERE p.message_id = m.id
+                     AND COALESCE(json_extract(p.data, '$.synthetic'), 0) NOT IN (1, 'true')
+                     AND json_extract(p.data, '$.metadata.marker.kind') IS NULL
+                     AND COALESCE(json_extract(p.data, '$.ignored'), 0) NOT IN (1, 'true')
+                 )
+               )
+             LIMIT 1`).get(sessionId, latestAssistantTimeCreated);
+  return row?.one === 1;
+}
+function getMessageTimesFromOpenCodeDb(sessionId, messageIds) {
+  const result = new Map;
+  if (messageIds.length === 0)
+    return result;
+  try {
+    withReadOnlySessionDb((db) => {
+      const placeholders = messageIds.map(() => "?").join(",");
+      const rows = db.prepare(`SELECT id, time_created FROM message WHERE session_id = ? AND id IN (${placeholders})`).all(sessionId, ...messageIds);
+      for (const row of rows) {
+        if (typeof row.id === "string" && typeof row.time_created === "number") {
+          result.set(row.id, row.time_created);
+        }
+      }
+    });
+  } catch (error) {
+    log("[magic-context] failed to resolve message times from OpenCode DB:", error);
+  }
+  return result;
+}
+
+// ../plugin/src/hooks/magic-context/read-session-raw.ts
+function isRawMessageRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "string" && typeof candidate.data === "string";
+}
+function isRawPartRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.message_id === "string" && typeof candidate.data === "string";
+}
+function parseJsonRecord(value) {
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function isRawCompactionSummaryInfo(info) {
+  if (info === null || typeof info !== "object" || Array.isArray(info))
+    return false;
+  const candidate = info;
+  return candidate.summary === true && candidate.finish === "stop";
+}
+function parseJsonUnknown(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+function attachRawPartVersion(value, timeUpdated) {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    return value;
+  if (typeof timeUpdated !== "number")
+    return value;
+  try {
+    Object.defineProperty(value, "__magicContextPartUpdatedAt", {
+      value: timeUpdated,
+      enumerable: false,
+      configurable: true
+    });
+  } catch {}
+  return value;
+}
+function readRawSessionMessagesFromDb(db, sessionId) {
+  const messageRows = db.prepare("SELECT id, data, time_created, time_updated FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC").all(sessionId).filter(isRawMessageRow);
+  const partRows = db.prepare("SELECT message_id, data, time_updated FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC").all(sessionId).filter(isRawPartRow);
+  const partsByMessageId = new Map;
+  for (const part of partRows) {
+    const list = partsByMessageId.get(part.message_id) ?? [];
+    list.push(attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated));
+    partsByMessageId.set(part.message_id, list);
+  }
+  const filtered = messageRows.filter((row) => !isRawCompactionSummaryInfo(parseJsonRecord(row.data)));
+  return filtered.flatMap((row, index) => {
+    const info = parseJsonRecord(row.data);
+    if (!info)
+      return [];
+    const role = typeof info.role === "string" ? info.role : "unknown";
+    return {
+      ordinal: index + 1,
+      id: row.id,
+      role,
+      parts: partsByMessageId.get(row.id) ?? [],
+      createdAt: row.time_created ?? null,
+      version: row.time_updated ?? null
+    };
+  });
+}
+function readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark = Number.MAX_SAFE_INTEGER) {
+  const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
+  const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
+  if (pageSize === 0)
+    return [];
+  const messageRows = db.prepare(`SELECT id, data, time_created, time_updated
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )
+             ORDER BY time_created ASC, id ASC
+             LIMIT ? OFFSET ?`).all(sessionId, pageSize, Math.max(0, Math.floor(afterOrdinal))).filter(isRawMessageRow).map((row, index) => ({
+    ...row,
+    ordinal: Math.floor(afterOrdinal) + index + 1
+  }));
+  if (messageRows.length === 0)
+    return [];
+  const placeholders = messageRows.map(() => "?").join(", ");
+  const partRows = db.prepare(`SELECT message_id, data, time_updated
+             FROM part
+             WHERE session_id = ? AND message_id IN (${placeholders})
+             ORDER BY time_created ASC, id ASC`).all(sessionId, ...messageRows.map((row) => row.id)).filter(isRawPartRow);
+  const partsByMessageId = new Map;
+  for (const part of partRows) {
+    const list = partsByMessageId.get(part.message_id) ?? [];
+    list.push(attachRawPartVersion(parseJsonUnknown(part.data), part.time_updated));
+    partsByMessageId.set(part.message_id, list);
+  }
+  return messageRows.map((row) => {
+    const info = parseJsonRecord(row.data);
+    return {
+      ordinal: row.ordinal,
+      id: row.id,
+      role: typeof info?.role === "string" ? info.role : "unknown",
+      parts: partsByMessageId.get(row.id) ?? [],
+      createdAt: row.time_created ?? null,
+      version: row.time_updated ?? null
+    };
+  });
+}
+function countRawSessionMessageOrdinalsFromDb(db, sessionId) {
+  const row = db.prepare(`SELECT COUNT(*) AS count
+             FROM message
+             WHERE session_id = ?
+               AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`).get(sessionId);
+  return typeof row?.count === "number" ? row.count : 0;
+}
+function readRawSessionMessageOrdinalByIdFromDb(db, sessionId, messageId) {
+  const row = db.prepare(`SELECT COUNT(candidate.id) AS ordinal
+             FROM message AS target
+             JOIN message AS candidate
+               ON candidate.session_id = target.session_id
+              AND NOT (
+                  CASE WHEN json_valid(candidate.data) = 1
+                       THEN COALESCE(json_extract(candidate.data, '$.summary'), 0)
+                       ELSE 0 END = 1
+                  AND CASE WHEN json_valid(candidate.data) = 1
+                           THEN COALESCE(json_extract(candidate.data, '$.finish'), '')
+                           ELSE '' END = 'stop'
+              )
+              AND (candidate.time_created < target.time_created
+                   OR (candidate.time_created = target.time_created AND candidate.id <= target.id))
+             WHERE target.session_id = ?
+               AND target.id = ?
+               AND NOT (
+                   CASE WHEN json_valid(target.data) = 1
+                        THEN COALESCE(json_extract(target.data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(target.data) = 1
+                            THEN COALESCE(json_extract(target.data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`).get(sessionId, messageId);
+  const ordinal = row?.ordinal;
+  return typeof ordinal === "number" && ordinal > 0 ? ordinal : null;
+}
+
+// ../plugin/src/shared/record-type-guard.ts
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// ../plugin/src/hooks/magic-context/read-session-true-raw-tokens.ts
+function completedToolArcCrossesBoundary(invOrdinal, resOrdinal, boundary) {
+  return invOrdinal < boundary && boundary <= resOrdinal;
+}
+var MAX_MESSAGE_CACHE_ENTRIES = 1e5;
+var MAX_MESSAGE_CACHE_KEY_BYTES = 64 * 1024 * 1024;
+var FNV1A_32_OFFSET = 2166136261;
+var FNV1A_32_PRIME = 16777619;
+var messageEstimateCache = new Map;
+var messageEstimateCacheBytes = 0;
+var EMPTY_BREAKDOWN = {
+  text: 0,
+  reasoning: 0,
+  toolInput: 0,
+  toolOutput: 0,
+  image: 0,
+  other: 0,
+  total: 0
+};
+function addBreakdown(target, kind, value) {
+  if (kind === "total")
+    return;
+  const safeValue = Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+  target[kind] += safeValue;
+  target.total += safeValue;
+}
+function estimateStructured(value) {
+  if (typeof value === "string")
+    return estimateTokens(value);
+  if (value === undefined || value === null)
+    return 0;
+  return estimateTokens(stableStringify(value));
+}
+function firstStringField(record, fields) {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === "string" && value.length > 0)
+      return value;
+  }
+  return null;
+}
+function stringValue(value) {
+  if (typeof value === "string")
+    return value;
+  if (value === undefined || value === null)
+    return "";
+  return stableStringify(value);
+}
+function textFromToolResultContent(content) {
+  if (typeof content === "string")
+    return content;
+  if (Array.isArray(content)) {
+    const pieces = [];
+    for (const entry of content) {
+      if (typeof entry === "string") {
+        pieces.push(entry);
+      } else if (isRecord(entry)) {
+        const text = firstStringField(entry, ["text", "content", "value"]);
+        pieces.push(text ?? stableStringify(entry));
+      } else if (entry !== null && entry !== undefined) {
+        pieces.push(String(entry));
+      }
+    }
+    return pieces.join(`
+`);
+  }
+  return stringValue(content);
+}
+function looksImageLike(part) {
+  const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
+  const mime = typeof part.mime === "string" ? part.mime.toLowerCase() : "";
+  const mediaType = typeof part.mediaType === "string" ? part.mediaType.toLowerCase() : "";
+  return type.includes("image") || mime.startsWith("image/") || mediaType.startsWith("image/") || part.image_url !== undefined || part.imageUrl !== undefined || part.image !== undefined;
+}
+function defaultImageTokenHeuristic(part) {
+  if (isRecord(part)) {
+    const width = part.width;
+    const height = part.height;
+    if (typeof width === "number" && typeof height === "number" && width > 0 && height > 0) {
+      return Math.max(256, Math.min(4096, Math.ceil(width * height / 750)));
+    }
+  }
+  return 1024;
+}
+function partType(part) {
+  return typeof part.type === "string" ? part.type : "";
+}
+function hasOwn(record, key) {
+  return Object.hasOwn(record, key);
+}
+function recursiveByteLength(value) {
+  if (value === null || value === undefined)
+    return 0;
+  if (typeof value === "string")
+    return value.length;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value).length;
+  }
+  if (Array.isArray(value)) {
+    return value.reduce((sum, item) => sum + recursiveByteLength(item), value.length);
+  }
+  if (isRecord(value)) {
+    let total = Object.keys(value).length;
+    for (const [key, child] of Object.entries(value)) {
+      total += key.length + recursiveByteLength(child);
+    }
+    return total;
+  }
+  return String(value).length;
+}
+function updateFnv1a32(hash, text) {
+  let next = hash;
+  for (let index = 0;index < text.length; index += 1) {
+    next ^= text.charCodeAt(index);
+    next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
+  }
+  return next;
+}
+function contentStringsHash(fields) {
+  let hash = FNV1A_32_OFFSET;
+  for (const field of fields) {
+    hash = updateFnv1a32(hash, `${field.length}:`);
+    hash = updateFnv1a32(hash, field);
+    hash = updateFnv1a32(hash, "\x00");
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+function rawPartVersion(part) {
+  return part.__magicContextPartUpdatedAt ?? part.updated_at ?? part.updatedAt ?? part.version ?? part.revision ?? "";
+}
+function callIdFromPart(part) {
+  const direct = firstStringField(part, ["callID", "callId", "toolCallId", "tool_call_id", "id"]);
+  if (direct)
+    return direct;
+  const state = isRecord(part.state) ? part.state : null;
+  return state ? firstStringField(state, ["callID", "callId", "toolCallId", "tool_call_id", "id"]) ?? "" : "";
+}
+function toolSignalFromPart(part) {
+  if (!isRecord(part))
+    return null;
+  const type = partType(part);
+  const state = isRecord(part.state) ? part.state : null;
+  const callId = callIdFromPart(part);
+  if (!callId && type !== "tool")
+    return null;
+  if (type === "tool") {
+    const hasInput = state !== null && hasOwn(state, "input");
+    const outputKey = state ? hasOwn(state, "output") ? "output" : hasOwn(state, "error") ? "error" : hasOwn(state, "result") ? "result" : null : null;
+    const hasOutput = outputKey !== null;
+    const outputValue = outputKey && state ? state[outputKey] : undefined;
+    const providerExecuted = part.providerExecuted === true;
+    const openInvocation = !providerExecuted && !hasOutput;
+    return {
+      callId,
+      hasInput: hasInput || openInvocation,
+      hasOutput,
+      inputText: hasInput && state ? stringValue(state.input) : "",
+      outputText: hasOutput ? stringValue(outputValue) : ""
+    };
+  }
+  if (type === "tool-invocation") {
+    const args = part.args ?? part.input;
+    return {
+      callId,
+      hasInput: args !== undefined,
+      hasOutput: false,
+      inputText: args !== undefined ? stringValue(args) : "",
+      outputText: ""
+    };
+  }
+  if (type === "tool_use") {
+    const input = part.input;
+    return {
+      callId,
+      hasInput: input !== undefined,
+      hasOutput: false,
+      inputText: input !== undefined ? stringValue(input) : "",
+      outputText: ""
+    };
+  }
+  if (type === "tool_result") {
+    const content = part.content ?? part.output ?? part.result;
+    return {
+      callId,
+      hasInput: false,
+      hasOutput: content !== undefined,
+      inputText: "",
+      outputText: content !== undefined ? textFromToolResultContent(content) : ""
+    };
+  }
+  return null;
+}
+function partCheapFingerprint(part) {
+  if (!isRecord(part))
+    return `${typeof part}:${recursiveByteLength(part)}`;
+  const version = rawPartVersion(part);
+  const type = typeof part.type === "string" ? part.type : "";
+  return `${type}:${String(version)}:${recursiveByteLength(part)}`;
+}
+function messageCacheKey(message, options) {
+  const namespace = "cacheNamespace" in options ? options.cacheNamespace : "estimate";
+  const cheapFingerprint = message.parts.map(partCheapFingerprint).join("|");
+  return [
+    namespace,
+    options.providerShapeVersion,
+    message.id || `ordinal:${message.ordinal}`,
+    message.role,
+    message.parts.length,
+    cheapFingerprint
+  ].join("\x00");
+}
+function setCachedEstimate(key, breakdown) {
+  const keyEstimateBytes = key.length * 2 + 64;
+  const existing = messageEstimateCache.get(key);
+  if (existing)
+    messageEstimateCacheBytes -= existing.keyEstimateBytes;
+  messageEstimateCache.set(key, { breakdown, keyEstimateBytes });
+  messageEstimateCacheBytes += keyEstimateBytes;
+  while (messageEstimateCache.size > MAX_MESSAGE_CACHE_ENTRIES || messageEstimateCacheBytes > MAX_MESSAGE_CACHE_KEY_BYTES) {
+    const first = messageEstimateCache.keys().next().value;
+    if (typeof first !== "string")
+      break;
+    const removed = messageEstimateCache.get(first);
+    if (removed)
+      messageEstimateCacheBytes -= removed.keyEstimateBytes;
+    messageEstimateCache.delete(first);
+  }
+}
+function cloneBreakdown(value) {
+  return { ...value };
+}
+function estimateNonToolPart(part, options, breakdown) {
+  if (!isRecord(part)) {
+    if (part !== null && part !== undefined)
+      addBreakdown(breakdown, "other", estimateStructured(part));
+    return true;
+  }
+  const type = partType(part);
+  if (type === "step-start" || type === "step-finish" || type === "meta" && Object.keys(part).length <= 1) {
+    return true;
+  }
+  if (type === "text") {
+    const text = firstStringField(part, ["text", "content"]);
+    if (text)
+      addBreakdown(breakdown, "text", estimateTokens(text));
+    return true;
+  }
+  if (type === "reasoning" || type === "thinking" || type === "redacted_thinking") {
+    const text = firstStringField(part, ["thinking", "text", "content", "reasoning"]);
+    if (text) {
+      addBreakdown(breakdown, "reasoning", estimateTokens(text));
+    } else {
+      addBreakdown(breakdown, "other", estimateStructured(part));
+    }
+    return true;
+  }
+  const reasoningText = firstStringField(part, ["thinking", "reasoning"]);
+  if (reasoningText && type.length === 0) {
+    addBreakdown(breakdown, "reasoning", estimateTokens(reasoningText));
+    return true;
+  }
+  if (looksImageLike(part)) {
+    addBreakdown(breakdown, "image", options.imageTokenHeuristic?.(part) ?? defaultImageTokenHeuristic(part));
+    const altText = firstStringField(part, ["alt", "text", "description"]);
+    if (altText)
+      addBreakdown(breakdown, "text", estimateTokens(altText));
+    return true;
+  }
+  if (type.includes("file") || type === "source") {
+    const content = firstStringField(part, ["content", "text", "source"]);
+    if (content)
+      addBreakdown(breakdown, "text", estimateTokens(content));
+    else
+      addBreakdown(breakdown, "other", estimateStructured(part));
+    return true;
+  }
+  return false;
+}
+function estimateTrueRawMessageTokens(message, options) {
+  const breakdown = cloneBreakdown(EMPTY_BREAKDOWN);
+  const countedInput = new Set;
+  const countedOutput = new Set;
+  let ordinalToolIndex = 0;
+  for (const part of message.parts) {
+    const signal = toolSignalFromPart(part);
+    if (signal) {
+      const localKey = `${signal.callId || "tool"}:${message.ordinal}:${ordinalToolIndex}`;
+      ordinalToolIndex += 1;
+      if (signal.hasInput) {
+        const key = `${signal.callId}:input:${message.ordinal}`;
+        if (!countedInput.has(key)) {
+          countedInput.add(key);
+          addBreakdown(breakdown, "toolInput", estimateTokens(signal.inputText));
+        }
+      }
+      if (signal.hasOutput) {
+        const key = `${signal.callId}:output:${message.ordinal}:${localKey}`;
+        if (!countedOutput.has(key)) {
+          countedOutput.add(key);
+          addBreakdown(breakdown, "toolOutput", estimateTokens(signal.outputText));
+        }
+      }
+      continue;
+    }
+    if (!estimateNonToolPart(part, options, breakdown)) {
+      addBreakdown(breakdown, "other", estimateStructured(part));
+    }
+  }
+  return breakdown;
+}
+function buildToolArcs(messages) {
+  const openQueues = new Map;
+  const arcs = [];
+  for (const message of messages) {
+    for (const part of message.parts) {
+      const signal = toolSignalFromPart(part);
+      if (!signal || signal.callId.length === 0)
+        continue;
+      if (signal.hasInput && signal.hasOutput) {
+        arcs.push({
+          callId: signal.callId,
+          invOrdinal: message.ordinal,
+          resOrdinal: message.ordinal
+        });
+        continue;
+      }
+      if (signal.hasInput) {
+        const queue = openQueues.get(signal.callId) ?? [];
+        queue.push(message.ordinal);
+        openQueues.set(signal.callId, queue);
+        continue;
+      }
+      if (signal.hasOutput) {
+        const queue = openQueues.get(signal.callId) ?? [];
+        const invOrdinal = queue.shift();
+        if (queue.length === 0)
+          openQueues.delete(signal.callId);
+        else
+          openQueues.set(signal.callId, queue);
+        if (invOrdinal !== undefined) {
+          arcs.push({ callId: signal.callId, invOrdinal, resOrdinal: message.ordinal });
+        }
+      }
+    }
+  }
+  for (const [callId, queue] of openQueues) {
+    for (const invOrdinal of queue) {
+      arcs.push({ callId, invOrdinal, resOrdinal: null });
+    }
+  }
+  return arcs.sort((a, b) => a.invOrdinal - b.invOrdinal || (a.resOrdinal ?? Number.MAX_SAFE_INTEGER) - (b.resOrdinal ?? Number.MAX_SAFE_INTEGER));
+}
+function fenceBoundaryForToolArcs(candidate, arcs, lastCompartmentEndOrdinal, recentOpenArcCutoff) {
+  let boundary = candidate;
+  for (const arc of arcs) {
+    if (arc.resOrdinal !== null) {
+      if (completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, boundary)) {
+        boundary = arc.resOrdinal + 1;
+      }
+      continue;
+    }
+    if (arc.invOrdinal < recentOpenArcCutoff)
+      continue;
+    if (arc.invOrdinal >= lastCompartmentEndOrdinal + 1 && arc.invOrdinal < boundary) {
+      return arc.invOrdinal;
+    }
+    if (arc.invOrdinal >= boundary) {
+      return arc.invOrdinal;
+    }
+  }
+  return boundary;
+}
+function tokenForMessage(message, options) {
+  const key = messageCacheKey(message, options);
+  const cached = messageEstimateCache.get(key);
+  if (cached)
+    return cloneBreakdown(cached.breakdown);
+  const breakdown = estimateTrueRawMessageTokens(message, options);
+  setCachedEstimate(key, breakdown);
+  return cloneBreakdown(breakdown);
+}
+function buildTrueRawTokenIndex(sessionId, messages, options) {
+  const ordered = [...messages].sort((a, b) => a.ordinal - b.ordinal);
+  const sliceCount = ordered.length;
+  const firstOrdinal = ordered.length > 0 ? ordered[0].ordinal : 1;
+  const terminalOrdinal = ordered.length > 0 ? ordered[ordered.length - 1].ordinal : 0;
+  const rawMessageCount = Math.max(sliceCount, terminalOrdinal, options.absoluteMessageCount ?? sliceCount);
+  const ordinalSpan = terminalOrdinal >= firstOrdinal ? terminalOrdinal - firstOrdinal + 1 : 0;
+  const tokensByOrdinal = new Map;
+  const idsByOrdinal = new Map;
+  const prefix = new Array(ordinalSpan + 1).fill(0);
+  for (const message of ordered) {
+    const stored = options.storedTotalForMessage?.(message);
+    const total = stored !== undefined && stored !== null ? stored : tokenForMessage(message, options).total;
+    tokensByOrdinal.set(message.ordinal, total);
+    idsByOrdinal.set(message.ordinal, message.id);
+    const relative = message.ordinal - firstOrdinal + 1;
+    if (relative >= 1 && relative <= ordinalSpan) {
+      prefix[relative] = total;
+    }
+  }
+  for (let k = 1;k <= ordinalSpan; k += 1) {
+    prefix[k] += prefix[k - 1];
+  }
+  const ordinalToIndex = (ordinal) => Math.max(0, Math.min(ordinalSpan, ordinal - firstOrdinal));
+  return {
+    sessionId,
+    providerShapeVersion: options.providerShapeVersion,
+    rawMessageCount,
+    tokenForOrdinal(ordinal) {
+      return tokensByOrdinal.get(ordinal) ?? 0;
+    },
+    messageIdAtOrdinal(ordinal) {
+      return idsByOrdinal.get(ordinal) ?? null;
+    },
+    suffixTokensFromOrdinal(ordinal) {
+      if (ordinal <= firstOrdinal)
+        return prefix[ordinalSpan];
+      if (ordinal > terminalOrdinal)
+        return 0;
+      return prefix[ordinalSpan] - prefix[ordinalToIndex(ordinal)];
+    },
+    rangeTokens(startInclusive, endExclusive) {
+      const start = Math.max(firstOrdinal, startInclusive);
+      const end = Math.max(start, Math.min(terminalOrdinal + 1, endExclusive));
+      return prefix[end - firstOrdinal] - prefix[start - firstOrdinal];
+    },
+    findSuffixStartForTokens(tokens) {
+      if (!Number.isFinite(tokens) || tokens <= 0)
+        return terminalOrdinal + 1;
+      const target = Math.max(0, Math.floor(tokens));
+      const total = prefix[ordinalSpan];
+      if (total < target)
+        return firstOrdinal;
+      const cut = total - target;
+      let lo = 0;
+      let hi = ordinalSpan;
+      let best = 0;
+      while (lo <= hi) {
+        const mid = lo + hi >> 1;
+        if (prefix[mid] <= cut) {
+          best = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      return firstOrdinal + best;
+    },
+    findHeadEndForCap(startInclusive, endExclusive, capTokens) {
+      const start = Math.max(firstOrdinal, Math.min(terminalOrdinal + 1, startInclusive));
+      const end = Math.max(start, Math.min(terminalOrdinal + 1, endExclusive));
+      if (!Number.isFinite(capTokens) || capTokens <= 0)
+        return start;
+      const startIndex = start - firstOrdinal;
+      const endIndex = end - firstOrdinal;
+      const cut = prefix[startIndex] + Math.floor(capTokens);
+      let lo = startIndex + 1;
+      let hi = endIndex;
+      let bestEndIndex = startIndex;
+      while (lo <= hi) {
+        const mid = lo + hi >> 1;
+        if (prefix[mid] <= cut) {
+          bestEndIndex = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      let bestEnd = firstOrdinal + bestEndIndex;
+      if (bestEnd === start && start < end)
+        bestEnd = start + 1;
+      return Math.min(bestEnd, end);
+    }
+  };
+}
+function partContentFingerprint(part) {
+  if (!isRecord(part))
+    return `${typeof part}:${recursiveByteLength(part)}`;
+  const tool = toolSignalFromPart(part);
+  if (tool) {
+    return contentStringsHash([tool.inputText, tool.outputText]);
+  }
+  const text = firstStringField(part, ["text", "thinking", "reasoning", "content", "url"]) ?? "";
+  return contentStringsHash([text]);
+}
+function computeRawRangeFingerprint(messages, startInclusive, endExclusive) {
+  const pieces = [];
+  for (const message of messages) {
+    if (message.ordinal < startInclusive || message.ordinal >= endExclusive)
+      continue;
+    const partFingerprint = message.parts.map(partContentFingerprint).join(",");
+    pieces.push(`${message.ordinal}:${message.id}:${message.parts.length}:${partFingerprint}`);
+  }
+  return pieces.join("|");
+}
+
+// ../plugin/src/hooks/magic-context/tag-content-primitives.ts
+var encoder = new TextEncoder;
+var TAG_PREFIX_REGEX = /^(?:§\d+§\s*)+/;
+var MALFORMED_TAG_PREFIX_REGEX = /^(?:§\d+">§(?:\d+§)?\s*)+/;
+var DANGLING_TAG_PREFIX_REGEX = /^(?:\u00a7\d+(?!\.\d)[^\s\u00a7\w.]?\s*)+/;
+function byteSize(value) {
+  return encoder.encode(value).length;
+}
+function stripTagPrefix(value) {
+  let stripped = value;
+  for (let pass = 0;pass < 8; pass++) {
+    const prev = stripped;
+    stripped = stripped.replace(MALFORMED_TAG_PREFIX_REGEX, "");
+    stripped = stripped.replace(TAG_PREFIX_REGEX, "");
+    stripped = stripped.replace(DANGLING_TAG_PREFIX_REGEX, "");
+    if (stripped === prev)
+      break;
+  }
+  return stripped;
+}
+function peelLeadingMcTagNotation(value) {
+  const body = stripTagPrefix(value);
+  if (body === value)
+    return { tagPrefix: "", body };
+  return { tagPrefix: value.slice(0, value.length - body.length), body };
+}
+function prependTag(tagId, value) {
+  const stripped = stripTagPrefix(value);
+  return `§${tagId}§ ${stripped}`;
+}
+
+// ../plugin/src/hooks/magic-context/tag-part-guards.ts
+function isTextPart(part) {
+  if (part === null || typeof part !== "object")
+    return false;
+  const p = part;
+  return p.type === "text" && typeof p.text === "string";
+}
+function isFilePart(part) {
+  if (part === null || typeof part !== "object")
+    return false;
+  const p = part;
+  return p.type === "file" && typeof p.url === "string";
+}
+
+// ../plugin/src/hooks/magic-context/edit-marker.ts
+var TRUNCATION_SENTINEL = "...[truncated]";
+var EDIT_REGION_HINT_LEN = 40;
+var PATH_KEYS = new Set(["filePath", "file_path", "path"]);
+var DIFF_KEYS = new Set(["oldString", "newString", "content", "old_string", "new_string"]);
+function safeSlice(str, maxLen) {
+  if (str.length <= maxLen)
+    return str;
+  const lastCharCode = str.charCodeAt(maxLen - 1);
+  if (lastCharCode >= 55296 && lastCharCode <= 56319) {
+    return str.slice(0, maxLen - 1);
+  }
+  return str.slice(0, maxLen);
+}
+function applyEditMarkerToInput(input) {
+  for (const key of Object.keys(input)) {
+    if (PATH_KEYS.has(key))
+      continue;
+    const value = input[key];
+    if (typeof value !== "string" || !DIFF_KEYS.has(key))
+      continue;
+    if (value.endsWith(TRUNCATION_SENTINEL))
+      continue;
+    input[key] = value.length > EDIT_REGION_HINT_LEN ? `${safeSlice(value, EDIT_REGION_HINT_LEN)}${TRUNCATION_SENTINEL}` : value;
+  }
+}
+
+// ../plugin/src/hooks/magic-context/tool-drop-target.ts
+var IGNORE_PART_TYPES = new Set([
+  "thinking",
+  "reasoning",
+  "redacted_thinking",
+  "meta",
+  "step-start",
+  "step-finish"
+]);
+function isToolCallId(value) {
+  return typeof value === "string" && value.length > 0;
+}
+function extractToolCallObservation(part) {
+  if (!isRecord(part))
+    return null;
+  if (part.type === "tool" && isToolCallId(part.callID)) {
+    return { callId: part.callID, kind: "result" };
+  }
+  if (part.type === "tool-invocation" && isToolCallId(part.callID)) {
+    return { callId: part.callID, kind: "invocation" };
+  }
+  if (part.type === "tool_use" && isToolCallId(part.id)) {
+    return { callId: part.id, kind: "invocation" };
+  }
+  if (part.type === "tool_result" && isToolCallId(part.tool_use_id)) {
+    return { callId: part.tool_use_id, kind: "result" };
+  }
+  return null;
+}
+
+// ../plugin/src/hooks/magic-context/read-session-chunk.ts
+var BLOCK_TOKEN_MEMO_MAX = 2048;
+var blockTokenMemo = new Map;
+function estimateBlockTokens(blockText) {
+  const cached = blockTokenMemo.get(blockText);
+  if (cached !== undefined) {
+    blockTokenMemo.delete(blockText);
+    blockTokenMemo.set(blockText, cached);
+    return cached;
+  }
+  const count = estimateTokens(blockText);
+  if (blockTokenMemo.size >= BLOCK_TOKEN_MEMO_MAX) {
+    const oldest = blockTokenMemo.keys().next().value;
+    if (oldest !== undefined)
+      blockTokenMemo.delete(oldest);
+  }
+  blockTokenMemo.set(blockText, count);
+  return count;
+}
+var activeRawMessageCache = null;
+var activeAbsoluteCountCache = null;
+var sessionProviders = new Map;
+function setRawMessageProvider(sessionId, provider) {
+  sessionProviders.set(sessionId, provider);
+  return () => {
+    const current = sessionProviders.get(sessionId);
+    if (current === provider)
+      sessionProviders.delete(sessionId);
+  };
+}
+function withRawMessageProvider(sessionId, provider, fn) {
+  const cleanup = setRawMessageProvider(sessionId, provider);
+  let result;
+  try {
+    result = fn();
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  if (result !== null && typeof result === "object" && typeof result.then === "function") {
+    return result.finally(cleanup);
+  }
+  cleanup();
+  return result;
+}
+function cleanUserText(text) {
+  return removeSystemReminders(text).replace(OMO_INTERNAL_INITIATOR_MARKER, "").trim();
+}
+function withRawSessionMessageCache(fn) {
+  const outerCache = activeRawMessageCache;
+  if (!outerCache) {
+    activeRawMessageCache = new Map;
+    activeAbsoluteCountCache = new Map;
+  }
+  try {
+    return fn();
+  } finally {
+    if (!outerCache) {
+      activeRawMessageCache = null;
+      activeAbsoluteCountCache = null;
+    }
+  }
+}
+function readRawSessionMessages(sessionId) {
+  if (activeRawMessageCache) {
+    const cached = activeRawMessageCache.get(sessionId);
+    if (cached) {
+      return cached;
+    }
+    const messages = readRawSessionMessagesFromSource(sessionId);
+    activeRawMessageCache.set(sessionId, messages);
+    return messages;
+  }
+  return readRawSessionMessagesFromSource(sessionId);
+}
+function readRawSessionMessagePage(sessionId, afterOrdinal, limit, finalWatermark) {
+  const provider = sessionProviders.get(sessionId);
+  if (provider?.readMessagePage) {
+    return provider.readMessagePage(afterOrdinal, limit, finalWatermark);
+  }
+  if (provider) {
+    return provider.readMessages().filter((message) => message.ordinal > afterOrdinal && message.ordinal <= finalWatermark).slice(0, limit);
+  }
+  if (!openCodeDbExists())
+    return [];
+  return withReadOnlySessionDb((db) => readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark));
+}
+function getRawSessionMessageOrdinalCount(sessionId) {
+  const provider = sessionProviders.get(sessionId);
+  if (provider) {
+    if (provider.getMessageCount)
+      return provider.getMessageCount();
+    return provider.readMessages().length;
+  }
+  if (!openCodeDbExists())
+    return 0;
+  return withReadOnlySessionDb((db) => countRawSessionMessageOrdinalsFromDb(db, sessionId));
+}
+readRawSessionMessages.readPage = readRawSessionMessagePage;
+readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
+function getCachedAbsoluteMessageCount(sessionId) {
+  return activeAbsoluteCountCache?.get(sessionId) ?? null;
+}
+function readRawSessionMessageOrdinalById(sessionId, messageId) {
+  const provider = sessionProviders.get(sessionId);
+  if (provider?.readMessageOrdinalById) {
+    return provider.readMessageOrdinalById(messageId);
+  }
+  if (provider?.readMessageIdOrdinals) {
+    return provider.readMessageIdOrdinals().get(messageId) ?? null;
+  }
+  if (provider?.readMessageOrdinalPage) {
+    let after = null;
+    let ordinal = 0;
+    while (true) {
+      const page = provider.readMessageOrdinalPage(after, 500);
+      if (page.length === 0)
+        return null;
+      for (const entry of page) {
+        if (entry.contributesOrdinal)
+          ordinal += 1;
+        if (entry.id === messageId)
+          return entry.contributesOrdinal ? ordinal : null;
+      }
+      const last = page.at(-1);
+      if (!last || page.length < 500)
+        return null;
+      after = { timeCreated: last.timeCreated, id: last.id };
+    }
+  }
+  if (provider?.readMessageById) {
+    return provider.readMessageById(messageId)?.ordinal ?? null;
+  }
+  if (provider) {
+    return provider.readMessages().find((message) => message.id === messageId)?.ordinal ?? null;
+  }
+  if (!openCodeDbExists())
+    return null;
+  return withReadOnlySessionDb((db) => readRawSessionMessageOrdinalByIdFromDb(db, sessionId, messageId));
+}
+function readRawSessionMessagesFromSource(sessionId) {
+  const provider = sessionProviders.get(sessionId);
+  if (provider)
+    return provider.readMessages();
+  if (!openCodeDbExists())
+    return [];
+  return withReadOnlySessionDb((db) => readRawSessionMessagesFromDb(db, sessionId));
+}
+function getRawSessionMessageCount(sessionId) {
+  const provider = sessionProviders.get(sessionId);
+  if (provider) {
+    if (provider.getMessageCount)
+      return provider.getMessageCount();
+    return provider.readMessages().length;
+  }
+  if (!openCodeDbExists())
+    return 0;
+  return withReadOnlySessionDb((db) => getRawSessionMessageCountFromDb(db, sessionId));
+}
+function getRawSessionTagKeysThrough(sessionId, upToMessageIndex) {
+  const messages = readRawSessionMessages(sessionId);
+  const messageFileKeys = new Set;
+  const toolObservations = new Map;
+  const unpairedInvocations = new Map;
+  for (const message of messages) {
+    if (message.ordinal > upToMessageIndex)
+      break;
+    for (const [partIndex, part] of message.parts.entries()) {
+      if (isTextPart(part)) {
+        messageFileKeys.add(`${message.id}:p${partIndex}`);
+        continue;
+      }
+      if (isFilePart(part)) {
+        messageFileKeys.add(`${message.id}:file${partIndex}`);
+        continue;
+      }
+      const obs = extractToolCallObservation(part);
+      if (!obs)
+        continue;
+      let ownerMsgId;
+      if (obs.kind === "invocation") {
+        ownerMsgId = message.id;
+        const queue = unpairedInvocations.get(obs.callId) ?? [];
+        queue.push(message.id);
+        unpairedInvocations.set(obs.callId, queue);
+      } else {
+        const queue = unpairedInvocations.get(obs.callId);
+        if (queue && queue.length > 0) {
+          const popped = queue.shift();
+          if (queue.length === 0)
+            unpairedInvocations.delete(obs.callId);
+          ownerMsgId = popped ?? message.id;
+        } else {
+          ownerMsgId = message.id;
+        }
+      }
+      const owners = toolObservations.get(obs.callId) ?? new Set;
+      owners.add(ownerMsgId);
+      toolObservations.set(obs.callId, owners);
+    }
+  }
+  return { messageFileKeys, toolObservations };
+}
+var PROTECTED_TAIL_USER_TURNS = 5;
+function getLegacyProtectedTailStartOrdinal(sessionId) {
+  const messages = readRawSessionMessages(sessionId);
+  const userOrdinals = messages.filter((m) => m.role === "user" && hasMeaningfulUserText(m.parts)).map((m) => m.ordinal);
+  if (userOrdinals.length < PROTECTED_TAIL_USER_TURNS) {
+    return 1;
+  }
+  return userOrdinals[userOrdinals.length - PROTECTED_TAIL_USER_TURNS];
+}
+function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal) {
+  const messages = readRawSessionMessages(sessionId);
+  const totalMessageCount = getCachedAbsoluteMessageCount(sessionId) ?? messages.length;
+  const startOrdinal = Math.max(1, offset);
+  const lines = [];
+  const lineMeta = [];
+  const flushedToolOnlyBlocks = [];
+  let totalTokens = 0;
+  let messagesProcessed = 0;
+  let lastOrdinal = startOrdinal - 1;
+  let highestScannedOrdinal = startOrdinal - 1;
+  let lastMessageId = "";
+  let firstMessageId = "";
+  let currentBlock = null;
+  let pendingNoiseMeta = [];
+  let commitClusters = 0;
+  let lastFlushedRole = "";
+  function recordFilteredNoise(meta) {
+    pendingNoiseMeta.push(meta);
+    if (!currentBlock) {
+      highestScannedOrdinal = Math.max(highestScannedOrdinal, meta.ordinal);
+    }
+  }
+  function flushCurrentBlock() {
+    if (!currentBlock)
+      return true;
+    const blockText = formatBlock(currentBlock);
+    const blockTokens = estimateBlockTokens(blockText);
+    if (totalTokens + blockTokens > tokenBudget && totalTokens > 0) {
+      return false;
+    }
+    if (currentBlock.role === "A" && currentBlock.commitHashes.length > 0 && lastFlushedRole !== "A") {
+      commitClusters++;
+    }
+    lastFlushedRole = currentBlock.role;
+    if (!firstMessageId)
+      firstMessageId = currentBlock.meta[0]?.messageId ?? "";
+    lastOrdinal = currentBlock.meta[currentBlock.meta.length - 1]?.ordinal ?? currentBlock.endOrdinal;
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, lastOrdinal);
+    lastMessageId = currentBlock.meta[currentBlock.meta.length - 1]?.messageId ?? "";
+    messagesProcessed += currentBlock.meta.length;
+    lines.push(blockText);
+    lineMeta.push(...currentBlock.meta);
+    totalTokens += blockTokens;
+    if (currentBlock.isToolOnly) {
+      flushedToolOnlyBlocks.push({
+        start: currentBlock.startOrdinal,
+        end: currentBlock.endOrdinal
+      });
+    }
+    currentBlock = null;
+    return true;
+  }
+  for (const msg of messages) {
+    if (eligibleEndOrdinal !== undefined && msg.ordinal >= eligibleEndOrdinal)
+      break;
+    if (msg.ordinal < startOrdinal)
+      continue;
+    const meta = { ordinal: msg.ordinal, messageId: msg.id };
+    if (msg.role === "user" && !hasMeaningfulUserText(msg.parts)) {
+      const tcSummaries = extractToolCallSummaries(msg.parts);
+      if (tcSummaries.length === 0) {
+        recordFilteredNoise(meta);
+        continue;
+      }
+      const tcText = tcSummaries.join(" / ");
+      if (currentBlock && currentBlock.role === "A") {
+        currentBlock.endOrdinal = msg.ordinal;
+        currentBlock.parts.push(tcText);
+        currentBlock.meta.push(...pendingNoiseMeta, meta);
+        pendingNoiseMeta = [];
+      } else {
+        if (!flushCurrentBlock())
+          break;
+        currentBlock = {
+          role: "A",
+          startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
+          endOrdinal: msg.ordinal,
+          parts: [tcText],
+          meta: [...pendingNoiseMeta, meta],
+          commitHashes: [],
+          isToolOnly: true
+        };
+        pendingNoiseMeta = [];
+      }
+      continue;
+    }
+    const role = compactRole(msg.role);
+    const textParts = extractTexts(msg.parts).map((t) => msg.role === "user" ? cleanUserText(t) : t).map(normalizeText).filter((value) => value.length > 0);
+    const toolSummaries = textParts.length === 0 ? extractToolCallSummaries(msg.parts) : [];
+    const allParts = [...textParts, ...toolSummaries];
+    const compacted = compactTextForSummary(allParts.join(" / "), msg.role);
+    const text = compacted.text;
+    if (!text) {
+      recordFilteredNoise(meta);
+      continue;
+    }
+    const msgHasNarrative = textParts.length > 0;
+    if (currentBlock && currentBlock.role === role) {
+      currentBlock.endOrdinal = msg.ordinal;
+      currentBlock.parts.push(text);
+      currentBlock.meta.push(...pendingNoiseMeta, meta);
+      currentBlock.commitHashes = mergeCommitHashes(currentBlock.commitHashes, compacted.commitHashes);
+      if (msgHasNarrative)
+        currentBlock.isToolOnly = false;
+      pendingNoiseMeta = [];
+      continue;
+    }
+    if (!flushCurrentBlock())
+      break;
+    currentBlock = {
+      role,
+      startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
+      endOrdinal: msg.ordinal,
+      parts: [text],
+      meta: [...pendingNoiseMeta, meta],
+      commitHashes: [...compacted.commitHashes],
+      isToolOnly: !msgHasNarrative
+    };
+    pendingNoiseMeta = [];
+  }
+  if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, pendingNoiseMeta[pendingNoiseMeta.length - 1]?.ordinal ?? highestScannedOrdinal);
+  }
+  const toolOnlyRanges = [];
+  for (const range of flushedToolOnlyBlocks) {
+    const last = toolOnlyRanges[toolOnlyRanges.length - 1];
+    if (last && range.start === last.end + 1) {
+      last.end = range.end;
+    } else {
+      toolOnlyRanges.push({ start: range.start, end: range.end });
+    }
+  }
+  const completedToolArcs = buildToolArcs(messages).flatMap((arc) => arc.resOrdinal === null ? [] : [{ start: arc.invOrdinal, end: arc.resOrdinal }]);
+  return {
+    startIndex: startOrdinal,
+    endIndex: lastOrdinal,
+    startMessageId: firstMessageId,
+    endMessageId: lastMessageId,
+    messageCount: messagesProcessed,
+    tokenEstimate: totalTokens,
+    hasMore: Math.max(lastOrdinal, highestScannedOrdinal) < (eligibleEndOrdinal !== undefined ? Math.min(eligibleEndOrdinal - 1, totalMessageCount) : totalMessageCount),
+    text: lines.join(`
+`),
+    lines: lineMeta,
+    commitClusterCount: commitClusters,
+    toolOnlyRanges,
+    completedToolArcs
+  };
+}
+
+// ../plugin/src/features/magic-context/message-index.ts
+var MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS = 24 * 60 * 60 * 1000;
+var MESSAGE_HISTORY_ORPHAN_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
+var MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS = 24 * 60 * 60 * 1000;
+var lastIndexedStatements = new WeakMap;
+var insertMessageStatements = new WeakMap;
+var upsertProgressStatements = new WeakMap;
+var upsertDirtyFloorStatements = new WeakMap;
+var deleteFtsStatements = new WeakMap;
+var deleteFtsRangeStatements = new WeakMap;
+var deleteIndexStatements = new WeakMap;
+var countIndexedMessageStatements = new WeakMap;
+var getMessageSourceStatements = new WeakMap;
+var upsertMessageSourceStatements = new WeakMap;
+var deleteMessageSourceStatements = new WeakMap;
+var deleteMessageSourceRangeStatements = new WeakMap;
+var deleteMessageFtsStatements = new WeakMap;
+function getLastIndexedStatement(db) {
+  let stmt = lastIndexedStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT last_indexed_ordinal, dirty_floor_ordinal FROM message_history_index WHERE session_id = ?");
+    lastIndexedStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getLastIndexedOrdinal(db, sessionId) {
+  const row = getLastIndexedStatement(db).get(sessionId);
+  return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
+}
+function getIndexedMessageCorpusSize(db, sessionId, maxOrdinal) {
+  const watermark = getLastIndexedOrdinal(db, sessionId);
+  return maxOrdinal === null ? watermark : Math.min(watermark, Math.max(0, maxOrdinal));
+}
+
+// ../plugin/src/features/magic-context/range-parser.ts
+function parseRangeString(input) {
+  const maxRangeElements = 1000;
+  const trimmed = input.replace(/§/g, "").trim();
+  if (trimmed === "") {
+    throw new Error("Range string must not be empty");
+  }
+  const segments = trimmed.split(",");
+  const numbers = new Set;
+  for (const segment of segments) {
+    const part = segment.trim();
+    if (part.includes("-")) {
+      const dashIndex = part.indexOf("-");
+      const startStr = part.slice(0, dashIndex).trim();
+      const endStr = part.slice(dashIndex + 1).trim();
+      const start = parseInteger(startStr);
+      const end = parseInteger(endStr);
+      if (start > end) {
+        throw new Error(`Invalid range "${part}": start (${start}) must be <= end (${end})`);
+      }
+      const rangeSize = end - start + 1;
+      if (rangeSize > maxRangeElements) {
+        throw new Error(`Range "${part}" exceeds maximum size of ${maxRangeElements} elements (got ${rangeSize})`);
+      }
+      for (let i = start;i <= end; i++) {
+        numbers.add(i);
+      }
+    } else {
+      numbers.add(parseInteger(part));
+    }
+  }
+  if (numbers.size > maxRangeElements) {
+    throw new Error(`Total range size exceeds maximum of ${maxRangeElements} elements (got ${numbers.size})`);
+  }
+  return Array.from(numbers).sort((a, b) => a - b);
+}
+function parseInteger(str) {
+  if (str === "" || !/^\d+$/.test(str)) {
+    throw new Error(`Invalid integer: "${str}"`);
+  }
+  const n = parseInt(str, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`Invalid integer: "${str}"`);
+  }
+  return n;
+}
+
+// ../plugin/src/features/magic-context/git-commits/git-log-reader.ts
+import { execFile as execFile2 } from "node:child_process";
+import { promisify as promisify2 } from "node:util";
+var execFileAsync2 = promisify2(execFile2);
+// ../plugin/src/features/magic-context/git-commits/indexer.ts
+var MS_PER_DAY = 24 * 60 * 60 * 1000;
+var EMBED_SWEEP_MAX_WALL_CLOCK_MS = 5 * 60 * 1000;
+var indexInProgress = new Set;
+var embedInProgress = new Set;
+// ../plugin/src/features/magic-context/git-commits/search-git-commits.ts
+var ftsStatements = new WeakMap;
+var ftsPlainStatements = new WeakMap;
+var getBySHAsStatements = new WeakMap;
+function rowToCommit(row) {
+  return {
+    sha: row.sha,
+    shortSha: row.short_sha,
+    projectPath: row.project_path,
+    message: row.message,
+    author: row.author,
+    committedAtMs: row.committed_at,
+    indexedAtMs: row.indexed_at
+  };
+}
+function getFtsStatement(db) {
+  let stmt = ftsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT c.sha AS sha, c.project_path AS project_path, c.short_sha AS short_sha,
+                    c.message AS message, c.author AS author,
+                    c.committed_at AS committed_at, c.indexed_at AS indexed_at
+             FROM git_commits_fts
+             INNER JOIN git_commits c ON c.sha = git_commits_fts.sha
+             WHERE c.project_path = ? AND git_commits_fts MATCH ?
+             ORDER BY bm25(git_commits_fts) LIMIT ?`);
+    ftsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getLikeFallbackStatement(db) {
+  let stmt = ftsPlainStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT sha, project_path, short_sha, message, author, committed_at, indexed_at
+             FROM git_commits
+             WHERE project_path = ? AND lower(message) LIKE '%' || lower(?) || '%'
+             ORDER BY committed_at DESC LIMIT ?`);
+    ftsPlainStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getBySHAsStatement(db) {
+  let stmt = getBySHAsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT sha, project_path, short_sha, message, author, committed_at, indexed_at
+               FROM git_commits
+              WHERE project_path = ?
+                AND sha IN (SELECT value FROM json_each(?))`);
+    getBySHAsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function clamp01(value) {
+  if (!Number.isFinite(value))
+    return 0;
+  return Math.min(1, Math.max(0, value));
+}
+function searchGitCommitsSync(db, projectPath, query, options) {
+  const trimmed = query.trim();
+  if (trimmed.length === 0 || options.limit <= 0)
+    return [];
+  const semanticWeight = options.semanticWeight ?? 0.7;
+  const ftsWeight = options.ftsWeight ?? 0.3;
+  const singleSourcePenalty = options.singleSourcePenalty ?? 0.8;
+  const fetchLimit = Math.max(options.limit * 3, 30);
+  const ftsCandidates = [];
+  const sanitized = sanitizeFtsQuery(trimmed);
+  if (sanitized.length > 0) {
+    try {
+      for (const row of getFtsStatement(db).all(projectPath, sanitized, fetchLimit)) {
+        ftsCandidates.push(rowToCommit(row));
+      }
+    } catch (error) {
+      log(`[git-commits] FTS query failed for "${trimmed}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (ftsCandidates.length === 0) {
+    for (const row of getLikeFallbackStatement(db).all(projectPath, trimmed, fetchLimit)) {
+      ftsCandidates.push(rowToCommit(row));
+    }
+  }
+  const ftsScores = new Map;
+  ftsCandidates.forEach((commit, rank) => {
+    ftsScores.set(commit.sha, 1 / (rank + 1));
+  });
+  const semanticScores = new Map;
+  if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
+    const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+    for (const [sha, embedding] of embeddings.entries()) {
+      const similarity = clamp01(cosineSimilarity(options.queryEmbedding, embedding));
+      if (similarity > 0) {
+        semanticScores.set(sha, similarity);
+      }
+    }
+  }
+  const bySha = new Map;
+  for (const commit of ftsCandidates)
+    bySha.set(commit.sha, commit);
+  const semanticOnlyShas = [...semanticScores.keys()].filter((sha) => !bySha.has(sha));
+  if (semanticOnlyShas.length > 0) {
+    const rows = getBySHAsStatement(db).all(projectPath, JSON.stringify(semanticOnlyShas));
+    for (const row of rows)
+      bySha.set(row.sha, rowToCommit(row));
+  }
+  const results = [];
+  for (const [sha, commit] of bySha.entries()) {
+    const sem = semanticScores.get(sha);
+    const fts = ftsScores.get(sha);
+    let score = 0;
+    let matchType = "fts";
+    if (sem !== undefined && fts !== undefined) {
+      score = semanticWeight * sem + ftsWeight * fts;
+      matchType = "hybrid";
+    } else if (sem !== undefined) {
+      score = sem * singleSourcePenalty;
+      matchType = "semantic";
+    } else if (fts !== undefined) {
+      score = fts * singleSourcePenalty;
+      matchType = "fts";
+    }
+    if (score <= 0)
+      continue;
+    results.push({ commit, score, matchType });
+  }
+  results.sort((left, right) => {
+    if (right.score !== left.score)
+      return right.score - left.score;
+    return right.commit.committedAtMs - left.commit.committedAtMs;
+  });
+  return results.slice(0, options.limit);
+}
+// ../plugin/src/features/magic-context/literal-probes.ts
+var MAX_PROBES = 5;
+var MIN_PROBE_LENGTH = 3;
+var SLASH_COMMAND_RE = /\/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/gi;
+var KEBAB_SNAKE_RE = /[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+/gi;
+var DOTTED_RE = /[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9_-]+)+/gi;
+var CAMEL_RE = /\b[a-zA-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g;
+var SHA_RE = /\b[0-9a-f]{7,40}\b/gi;
+var ERROR_CODE_RE = /\b(?:TS\d{4,}|ERR_[A-Z][A-Z0-9_]*)\b/g;
+var QUOTED_RE = /["`]([^"`]{3,80})["`]/g;
+function looksLikeSha(token) {
+  return /[0-9]/.test(token) && /^[0-9a-f]{7,40}$/i.test(token);
+}
+function extractLiteralProbes(query) {
+  const trimmed = query.trim();
+  if (trimmed.length === 0)
+    return [];
+  const ordered = [];
+  const seen = new Set;
+  const add = (raw) => {
+    if (!raw)
+      return;
+    const probe = raw.trim();
+    if (probe.length < MIN_PROBE_LENGTH)
+      return;
+    const key = probe.toLowerCase();
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    ordered.push(probe);
+  };
+  for (const m of trimmed.matchAll(QUOTED_RE))
+    add(m[1]);
+  for (const m of trimmed.matchAll(SLASH_COMMAND_RE))
+    add(m[0]);
+  for (const m of trimmed.matchAll(ERROR_CODE_RE))
+    add(m[0]);
+  for (const m of trimmed.matchAll(DOTTED_RE))
+    add(m[0]);
+  for (const m of trimmed.matchAll(KEBAB_SNAKE_RE))
+    add(m[0]);
+  for (const m of trimmed.matchAll(CAMEL_RE))
+    add(m[0]);
+  for (const m of trimmed.matchAll(SHA_RE)) {
+    if (looksLikeSha(m[0]))
+      add(m[0]);
+  }
+  return ordered.slice(0, MAX_PROBES);
+}
+function containsProbeVerbatim(text, probes) {
+  if (probes.length === 0)
+    return false;
+  const haystack = text.toLowerCase();
+  return probes.some((probe) => haystack.includes(probe.toLowerCase()));
+}
+
+// ../plugin/src/features/magic-context/search-measurement.ts
+import { createHash as createHash7 } from "node:crypto";
+function resultId(result) {
+  switch (result.source) {
+    case "memory":
+      return `memory:${result.memoryId}`;
+    case "message":
+      return `message:${result.messageId}`;
+    case "compartment":
+      return `chunk:${result.compartmentId}`;
+    case "git_commit":
+      return `commit:${result.sha}`;
+    case "primer":
+      return `primer:${result.primerId}`;
+    case "note":
+      return `note:${result.noteId}`;
+  }
+}
+async function recordShadowMeasurement(args) {
+  try {
+    const shadowCohort = getShadowEmbeddingMeasurementCohort(args.projectPath);
+    if (!shadowCohort)
+      return;
+    const primaryCohort = getPrimaryEmbeddingMeasurementCohort(args.projectPath);
+    const shadowStartedAt = Date.now();
+    let shadowFailed = false;
+    let shadowResults = [];
+    try {
+      const vector = await embedShadowTextForProject(args.projectPath, args.query);
+      if (!vector) {
+        shadowFailed = true;
+      } else {
+        shadowResults = await args.search(args.db, args.sessionId, args.projectPath, args.query, {
+          ...args.options,
+          embedQuery: async () => vector,
+          isEmbeddingRuntimeEnabled: () => true,
+          embeddingEnabled: true,
+          embeddingModelIdOverride: shadowCohort.modelId,
+          chunkModelIdOverride: shadowCohort.chunkModelId,
+          measurementDisabled: true,
+          countRetrievals: false
+        });
+      }
+    } catch {
+      shadowFailed = true;
+    }
+    const primaryModelId = args.primaryQuery?.modelId ?? primaryCohort?.modelId ?? "";
+    const primaryFingerprint = primaryCohort?.fingerprint ?? "";
+    const primaryEpoch = primaryCohort?.epoch ?? 0;
+    const cohortKey = JSON.stringify({
+      primaryFingerprint,
+      primaryEpoch,
+      shadowFingerprint: shadowCohort.fingerprint,
+      shadowEpoch: shadowCohort.epoch
+    });
+    const primaryIds = args.primaryResults.map(resultId);
+    const shadowIds = shadowResults.map(resultId);
+    const corpusHash = sha2562(JSON.stringify({ query: args.query, primaryIds, shadowIds }));
+    recordEmbeddingMeasurement(args.db, {
+      sessionId: args.sessionId,
+      projectPath: args.projectPath,
+      queryText: args.query,
+      cohortKey,
+      primaryResultIds: primaryIds,
+      shadowResultIds: shadowIds,
+      primaryLatencyMs: args.primaryLatencyMs,
+      shadowLatencyMs: Date.now() - shadowStartedAt,
+      primaryFailed: args.primaryQuery === null,
+      shadowFailed,
+      primaryModelId,
+      shadowModelId: shadowCohort.modelId,
+      primaryFingerprint,
+      shadowFingerprint: shadowCohort.fingerprint,
+      primaryEpoch,
+      shadowEpoch: shadowCohort.epoch,
+      corpusHash,
+      coverage: {
+        primaryResultCount: primaryIds.length,
+        shadowResultCount: shadowIds.length,
+        primaryAnswered: args.primaryQuery !== null,
+        shadowAnswered: !shadowFailed
+      }
+    });
+  } catch (error) {
+    log("[magic-context] shadow embedding measurement failed:", error);
+  }
+}
+function sha2562(value) {
+  return createHash7("sha256").update(value).digest("hex");
+}
+
+// ../plugin/src/features/magic-context/storage-notes.ts
+var NOTE_TYPES = new Set(["session", "smart"]);
+var NOTE_STATUSES = new Set(["active", "pending", "ready", "dismissed"]);
+var NOTE_CHECK_STATUSES = new Set([
+  "uncompiled",
+  "compiled",
+  "failing",
+  "fallback"
+]);
+var CONDITION_COMPILE_STATUSES = new Set([
+  "compiled",
+  "plain",
+  "refused"
+]);
+var DEFAULT_SMART_STATUSES = ["pending", "ready"];
+function toNullableString(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+function toNullableNumber(value) {
+  return typeof value === "number" ? value : null;
+}
+function isNoteRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.type === "string" && NOTE_TYPES.has(candidate.type) && typeof candidate.status === "string" && NOTE_STATUSES.has(candidate.status) && typeof candidate.content === "string" && (candidate.session_id === null || typeof candidate.session_id === "string") && (candidate.project_path === null || typeof candidate.project_path === "string") && (candidate.surface_condition === null || typeof candidate.surface_condition === "string") && typeof candidate.created_at === "number" && typeof candidate.updated_at === "number" && (candidate.last_checked_at === null || typeof candidate.last_checked_at === "number") && (candidate.ready_at === null || typeof candidate.ready_at === "number") && (candidate.ready_reason === null || typeof candidate.ready_reason === "string");
+}
+function toNote(row) {
+  return {
+    id: row.id,
+    type: row.type,
+    status: row.status,
+    content: row.content,
+    sessionId: toNullableString(row.session_id),
+    projectPath: toNullableString(row.project_path),
+    surfaceCondition: toNullableString(row.surface_condition),
+    compiledProvider: toNullableString(row.compiled_provider),
+    compiledConfig: toNullableString(row.compiled_config),
+    compiledAt: toNullableNumber(row.compiled_at),
+    compileStatus: typeof row.compile_status === "string" && CONDITION_COMPILE_STATUSES.has(row.compile_status) ? row.compile_status : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastCheckedAt: toNullableNumber(row.last_checked_at),
+    readyAt: toNullableNumber(row.ready_at),
+    readyReason: toNullableString(row.ready_reason),
+    anchorOrdinal: toNullableNumber(row.anchor_ordinal),
+    compiledCheck: toNullableString(row.compiled_check),
+    manifestJson: toNullableString(row.manifest_json),
+    checkHash: toNullableString(row.check_hash),
+    checkCron: toNullableString(row.check_cron),
+    checkVersion: toNullableNumber(row.check_version),
+    checkStatus: typeof row.check_status === "string" && NOTE_CHECK_STATUSES.has(row.check_status) ? row.check_status : null,
+    checkFailureCount: toNullableNumber(row.check_failure_count) ?? 0,
+    checkNetworkFailureCount: toNullableNumber(row.check_network_failure_count) ?? 0,
+    checkQuarantinedUntil: toNullableNumber(row.check_quarantined_until),
+    checkNextDueAt: toNullableNumber(row.check_next_due_at),
+    checkCompiledAt: toNullableNumber(row.check_compiled_at),
+    checkFalseSinceAt: toNullableNumber(row.check_false_since_at),
+    checkLastLivenessAt: toNullableNumber(row.check_last_liveness_at),
+    policyVersion: toNullableNumber(row.policy_version)
+  };
+}
+function noteCheckColumnsExist(db) {
+  try {
+    const rows = db.prepare("PRAGMA table_info(notes)").all();
+    return rows.some((row) => row.name === "compiled_check");
+  } catch {
+    return false;
+  }
+}
+function getNoteById(db, noteId) {
+  const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(noteId);
+  return isNoteRow(row) ? toNote(row) : null;
+}
+function noteBelongsToScope(note, scope) {
+  if (note.type === "session") {
+    return note.sessionId === scope.sessionId;
+  }
+  return note.projectPath === scope.projectPath;
+}
+function buildStatusClause(status) {
+  if (status === undefined) {
+    return null;
+  }
+  const statuses = Array.isArray(status) ? status : [status];
+  if (statuses.length === 0) {
+    return null;
+  }
+  const placeholders = statuses.map(() => "?").join(", ");
+  return {
+    sql: `status IN (${placeholders})`,
+    params: statuses
+  };
+}
+function getNotes(db, options = {}) {
+  const clauses = [];
+  const params = [];
+  if (options.sessionId !== undefined) {
+    clauses.push("session_id = ?");
+    params.push(options.sessionId);
+  }
+  if (options.projectPath !== undefined) {
+    clauses.push("project_path = ?");
+    params.push(options.projectPath);
+  }
+  if (options.type !== undefined) {
+    clauses.push("type = ?");
+    params.push(options.type);
+  }
+  const statusClause = buildStatusClause(options.status);
+  if (statusClause) {
+    clauses.push(statusClause.sql);
+    params.push(...statusClause.params);
+  }
+  const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+  return db.prepare(`SELECT * FROM notes${where} ORDER BY created_at ASC, id ASC`).all(...params).filter(isNoteRow).map(toNote);
+}
+function addNote(db, type, options) {
+  const now = Date.now();
+  const result = type === "session" ? db.prepare("INSERT INTO notes (type, status, content, session_id, created_at, updated_at, harness, anchor_ordinal) VALUES ('session', 'active', ?, ?, ?, ?, ?, ?) RETURNING *").get(options.content, options.sessionId, now, now, getHarness(), options.anchorOrdinal ?? null) : db.prepare("INSERT INTO notes (type, status, content, session_id, project_path, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, created_at, updated_at, harness, anchor_ordinal) VALUES ('smart', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *").get(options.content, options.sessionId ?? null, options.projectPath, options.surfaceCondition, options.compiledProvider ?? null, options.compiledConfig ?? null, options.compiledAt ?? null, options.compileStatus ?? null, now, now, getHarness(), options.anchorOrdinal ?? null);
+  if (!isNoteRow(result)) {
+    throw new Error("[notes] failed to insert note");
+  }
+  return toNote(result);
+}
+function getSessionNotes(db, sessionId) {
+  return getNotes(db, { sessionId, type: "session", status: "active" });
+}
+function getSmartNotes(db, projectPath, status) {
+  return getNotes(db, {
+    projectPath,
+    type: "smart",
+    status: status ?? DEFAULT_SMART_STATUSES
+  });
+}
+function getPendingSmartNotes(db, projectPath) {
+  return getSmartNotes(db, projectPath, "pending");
+}
+function getReadySmartNotes(db, projectPath) {
+  return getSmartNotes(db, projectPath, "ready");
+}
+function updateNote(db, noteId, updates, scope) {
+  const existing = getNoteById(db, noteId);
+  if (!existing || !noteBelongsToScope(existing, scope)) {
+    return null;
+  }
+  const now = Date.now();
+  const sets = ["updated_at = ?"];
+  const params = [now];
+  if (updates.content !== undefined) {
+    sets.push("content = ?");
+    params.push(updates.content);
+  }
+  if (updates.sessionId !== undefined) {
+    sets.push("session_id = ?");
+    params.push(updates.sessionId);
+  }
+  const smartConditionChanged = existing.type === "smart" && updates.surfaceCondition !== undefined && updates.surfaceCondition !== existing.surfaceCondition;
+  if (updates.status !== undefined && !smartConditionChanged) {
+    sets.push("status = ?");
+    params.push(updates.status);
+  }
+  if (existing.type === "smart") {
+    if (updates.projectPath !== undefined) {
+      sets.push("project_path = ?");
+      params.push(updates.projectPath);
+    }
+    if (updates.surfaceCondition !== undefined) {
+      sets.push("surface_condition = ?");
+      params.push(updates.surfaceCondition);
+    }
+    if (smartConditionChanged) {
+      sets.push("status = 'pending'", "last_checked_at = NULL", "ready_at = NULL", "ready_reason = NULL");
+      sets.push("compiled_provider = ?", "compiled_config = ?", "compiled_at = ?", "compile_status = ?");
+      params.push(updates.compiledProvider ?? null, updates.compiledConfig ?? null, updates.compiledAt ?? null, updates.compileStatus ?? null);
+      if (noteCheckColumnsExist(db)) {
+        sets.push("compiled_check = NULL", "manifest_json = NULL", "check_hash = NULL", "check_cron = NULL", "check_version = 0", "check_status = 'uncompiled'", "check_failure_count = 0", "check_network_failure_count = 0", "check_quarantined_until = NULL", "check_next_due_at = NULL", "check_compiled_at = NULL", "check_false_since_at = NULL", "check_last_liveness_at = NULL");
+      }
+    } else {
+      if (updates.lastCheckedAt !== undefined) {
+        sets.push("last_checked_at = ?");
+        params.push(updates.lastCheckedAt);
+      }
+      if (updates.readyAt !== undefined) {
+        sets.push("ready_at = ?");
+        params.push(updates.readyAt);
+      }
+      if (updates.readyReason !== undefined) {
+        sets.push("ready_reason = ?");
+        params.push(updates.readyReason);
+      }
+    }
+  }
+  if (sets.length === 1) {
+    return null;
+  }
+  params.push(noteId);
+  const result = db.prepare(`UPDATE notes SET ${sets.join(", ")} WHERE id = ? RETURNING *`).get(...params);
+  return isNoteRow(result) ? toNote(result) : null;
+}
+function dismissNote(db, noteId, scope) {
+  const existing = getNoteById(db, noteId);
+  if (!existing || !noteBelongsToScope(existing, scope)) {
+    return false;
+  }
+  const result = db.prepare("UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id = ? AND status != 'dismissed'").run(Date.now(), noteId);
+  return result.changes > 0;
+}
+function markNoteReady(db, noteId, reason) {
+  const now = Date.now();
+  db.prepare("UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ? WHERE id = ? AND type = 'smart'").run(now, reason ?? null, now, now, noteId);
+}
+function markNoteChecked(db, noteId) {
+  const now = Date.now();
+  db.prepare("UPDATE notes SET last_checked_at = ?, updated_at = ? WHERE id = ? AND type = 'smart'").run(now, now, noteId);
+}
+
+// ../plugin/src/features/magic-context/storage-primers.ts
+var PRIMER_CANDIDATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+var PRIMER_CANDIDATE_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+function normalizePrimerQuestion(question) {
+  return question.trim().toLowerCase().replace(/[“”]/g, '"').replace(/[’]/g, "'").replace(/\s+/g, " ").replace(/[?.!]+$/g, "").trim();
+}
+function primerOccurrenceKey(candidate) {
+  return [
+    candidate.projectPath,
+    candidate.harness,
+    candidate.sessionId,
+    candidate.sourceStartMessageId,
+    candidate.sourceEndMessageId
+  ].join("\x1F");
+}
+function primerOccurrenceUtcDay(sourceMessageTime) {
+  return new Date(sourceMessageTime).toISOString().slice(0, 10);
+}
+function vectorBlob2(vector) {
+  if (!vector)
+    return null;
+  return new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+}
+function blobToFloat32Array(value) {
+  if (!value)
+    return null;
+  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
+  return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+function parseCandidateIds(raw) {
+  if (!raw)
+    return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "number" && Number.isFinite(id)) : [];
+  } catch {
+    return [];
+  }
+}
+function toCandidate(row) {
+  return {
+    id: row.id,
+    projectPath: row.project_path,
+    harness: row.harness,
+    sessionId: row.session_id,
+    question: row.question,
+    normalizedQuestion: row.normalized_question,
+    sourceCompartmentStart: row.source_compartment_start,
+    sourceCompartmentEnd: row.source_compartment_end,
+    sourceStartMessageId: row.source_start_message_id,
+    sourceEndMessageId: row.source_end_message_id,
+    sourceMessageTime: row.source_message_time,
+    questionEmbedding: blobToFloat32Array(row.question_embedding),
+    questionEmbeddingModelId: row.question_embedding_model_id,
+    createdAt: row.created_at
+  };
+}
+function toPrimer(row) {
+  const status = row.status === "archived" ? "archived" : "active";
+  return {
+    id: row.id,
+    projectPath: row.project_path,
+    question: row.question,
+    questionEmbedding: blobToFloat32Array(row.question_embedding),
+    questionEmbeddingModelId: row.question_embedding_model_id,
+    answer: row.answer,
+    status,
+    totalSupport: row.total_support,
+    lastObservedAt: row.last_observed_at,
+    answerRefreshedAt: row.answer_refreshed_at,
+    sourceCandidateIds: parseCandidateIds(row.source_candidate_ids),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function insertPrimerCandidates(db, candidates) {
+  const ids = [];
+  const stmt = db.prepare(`
+        INSERT INTO primer_candidates (
+            project_path, harness, session_id, question, normalized_question,
+            source_compartment_start, source_compartment_end,
+            source_start_message_id, source_end_message_id, source_message_time,
+            question_embedding, question_embedding_model_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_path, harness, session_id, source_start_message_id, source_end_message_id)
+        DO UPDATE SET
+            question = excluded.question,
+            normalized_question = excluded.normalized_question,
+            source_compartment_start = excluded.source_compartment_start,
+            source_compartment_end = excluded.source_compartment_end,
+            source_message_time = excluded.source_message_time,
+            question_embedding = COALESCE(excluded.question_embedding, primer_candidates.question_embedding),
+            question_embedding_model_id = COALESCE(excluded.question_embedding_model_id, primer_candidates.question_embedding_model_id),
+            created_at = MIN(primer_candidates.created_at, excluded.created_at)
+    `);
+  const select = db.prepare(`
+        SELECT id FROM primer_candidates
+        WHERE project_path = ? AND harness = ? AND session_id = ?
+          AND source_start_message_id = ? AND source_end_message_id = ?
+    `);
+  db.transaction(() => {
+    for (const candidate of candidates) {
+      const question = candidate.question.trim();
+      if (!question)
+        continue;
+      const normalized = candidate.normalizedQuestion ?? normalizePrimerQuestion(question);
+      stmt.run(candidate.projectPath, candidate.harness || "opencode", candidate.sessionId, question, normalized, candidate.sourceCompartmentStart ?? null, candidate.sourceCompartmentEnd ?? null, candidate.sourceStartMessageId, candidate.sourceEndMessageId, candidate.sourceMessageTime, vectorBlob2(candidate.questionEmbedding), candidate.questionEmbeddingModelId ?? null, candidate.createdAt ?? Date.now());
+      const row = select.get(candidate.projectPath, candidate.harness || "opencode", candidate.sessionId, candidate.sourceStartMessageId, candidate.sourceEndMessageId);
+      if (typeof row?.id === "number")
+        ids.push(row.id);
+    }
+  })();
+  return ids;
+}
+function updatePrimerCandidateEmbedding(db, candidateId, vector, modelId) {
+  db.prepare("UPDATE primer_candidates SET question_embedding = ?, question_embedding_model_id = ? WHERE id = ?").run(vectorBlob2(vector), modelId, candidateId);
+}
+function getPrimerCandidatesByIds(db, ids) {
+  if (ids.length === 0)
+    return [];
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db.prepare(`SELECT * FROM primer_candidates WHERE id IN (${placeholders})`).all(...ids);
+  return rows.map(toCandidate);
+}
+function getPrimerCandidatesForPromotion(db, projectPath, now = Date.now(), ttlMs = PRIMER_CANDIDATE_TTL_MS) {
+  const cutoff = now - ttlMs;
+  const rows = db.prepare(`SELECT * FROM primer_candidates
+             WHERE project_path = ? AND source_message_time >= ?
+             ORDER BY project_path ASC, harness ASC, session_id ASC, source_start_message_id ASC, source_end_message_id ASC, id ASC`).all(projectPath, cutoff);
+  return rows.map(toCandidate);
+}
+function countPrimerCandidatesForProject(db, projectPath) {
+  const row = db.prepare("SELECT COUNT(*) AS count FROM primer_candidates WHERE project_path = ?").get(projectPath);
+  return row?.count ?? 0;
+}
+function getActivePrimers(db, projectPath) {
+  const rows = db.prepare(`SELECT * FROM primers
+             WHERE project_path = ? AND status = 'active'
+             ORDER BY COALESCE(last_observed_at, created_at) DESC, id ASC`).all(projectPath);
+  return rows.map(toPrimer);
+}
+function createPrimer(db, input) {
+  const now = input.now ?? Date.now();
+  const info = db.prepare(`INSERT INTO primers (
+                project_path, question, question_embedding, question_embedding_model_id, answer,
+                status, total_support, last_observed_at, answer_refreshed_at,
+                source_candidate_ids, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?)`).run(input.projectPath, input.question, vectorBlob2(input.questionEmbedding), input.questionEmbeddingModelId ?? null, input.answer ?? "", input.totalSupport, input.lastObservedAt, JSON.stringify([...new Set(input.sourceCandidateIds)].sort((a, b) => a - b)), now, now);
+  return Number(info.lastInsertRowid);
+}
+function updatePrimerSupport(db, input) {
+  db.prepare(`UPDATE primers
+         SET question_embedding = COALESCE(?, question_embedding),
+             question_embedding_model_id = COALESCE(?, question_embedding_model_id),
+             total_support = ?,
+             last_observed_at = ?,
+             source_candidate_ids = ?,
+             updated_at = ?
+         WHERE id = ?`).run(vectorBlob2(input.questionEmbedding), input.questionEmbeddingModelId ?? null, input.totalSupport, input.lastObservedAt, JSON.stringify([...new Set(input.sourceCandidateIds)].sort((a, b) => a - b)), input.now ?? Date.now(), input.primerId);
+}
+function updatePrimerAnswer(db, primerId, answer, refreshedAt = Date.now()) {
+  db.prepare("UPDATE primers SET answer = ?, answer_refreshed_at = ?, updated_at = ? WHERE id = ?").run(answer, refreshedAt, refreshedAt, primerId);
+}
+
+// ../plugin/src/features/magic-context/search.ts
+var DEFAULT_UNIFIED_SEARCH_LIMIT = 10;
+var FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
+var SEMANTIC_WEIGHT = 0.7;
+var FTS_WEIGHT = 0.3;
+var SINGLE_SOURCE_PENALTY = 0.8;
+var RESULT_PREVIEW_LIMIT = 220;
+var MEMORY_SOURCE_BOOST = 1.3;
+var MESSAGE_SOURCE_BOOST = 1.15;
+var GIT_COMMIT_SOURCE_BOOST = 1.2;
+var PRIMER_SOURCE_BOOST = 1.25;
+var messageSearchStatements = new WeakMap;
+var messageSearchStatementsWithCutoff = new WeakMap;
+var batchedMessageSearchStatements = new WeakMap;
+var batchedFtsCountStatements = new WeakMap;
+function normalizeLimit(limit) {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    return DEFAULT_UNIFIED_SEARCH_LIMIT;
+  }
+  return Math.max(1, Math.floor(limit));
+}
+var ID_SHAPED_QUERY_MAX_TOKENS = 5;
+var ID_SHAPED_TOKEN = /^#?\d+$/;
+function parseIdShapedQuery(query) {
+  const trimmed = query.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
+  if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
+    return null;
+  }
+  const ids = [];
+  for (const token of tokens) {
+    if (!ID_SHAPED_TOKEN.test(token)) {
+      return null;
+    }
+    const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return null;
+    }
+    ids.push(parsed);
+  }
+  return ids;
+}
+function normalizeCosineScore(score) {
+  if (!Number.isFinite(score)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, score));
+}
+function previewText(text) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= RESULT_PREVIEW_LIMIT) {
+    return normalized;
+  }
+  return `${normalized.slice(0, RESULT_PREVIEW_LIMIT - 1).trimEnd()}…`;
+}
+function resolveSearchWorkspaceContext(db, projectPath, identitySet) {
+  const resolved = identitySet ?? resolveWorkspaceIdentitySet(db, projectPath);
+  const isWorkspaced = resolved.identities.length > 1;
+  const expanded = expandWorkspaceIdentitySetWithAliases(db, resolved.identities);
+  const expandedIdentities = isWorkspaced ? expanded.expandedIdentities : resolved.identities;
+  const canonicalIdentityByStoredPath = isWorkspaced ? expanded.canonicalIdentityByStoredPath : new Map(resolved.identities.map((identity) => [identity, identity]));
+  const ownIdentities = expandedIdentities.filter((identity) => canonicalIdentityByStoredPath.get(identity) === projectPath);
+  return {
+    identities: resolved.identities,
+    expandedIdentities,
+    ownIdentities,
+    shareCategories: isWorkspaced ? resolveWorkspaceShareCategories(db, projectPath) : null,
+    namesByIdentity: resolved.namesByIdentity,
+    canonicalIdentityByStoredPath,
+    isWorkspaced
+  };
+}
+function memoryWorkspaceIdentity(memory, workspace) {
+  return resolveStoredPathWorkspaceIdentity(memory.projectPath, workspace.identities, workspace.canonicalIdentityByStoredPath);
+}
+function sourceNamesForSearchMemories(args) {
+  if (!args.workspace.isWorkspaced)
+    return;
+  const sourceNames = new Map;
+  for (const memory of args.memories) {
+    const source = sourceNameForMemory(memory.projectPath, args.projectPath, args.workspace.identities, args.workspace.namesByIdentity, args.workspace.canonicalIdentityByStoredPath);
+    if (source)
+      sourceNames.set(memory.id, source);
+  }
+  return sourceNames.size > 0 ? sourceNames : undefined;
+}
+function getMessageSearchStatement(db) {
+  let stmt = messageSearchStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, content FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?");
+    messageSearchStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMessageSearchStatementWithCutoff(db) {
+  let stmt = messageSearchStatementsWithCutoff.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, content FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?");
+    messageSearchStatementsWithCutoff.set(db, stmt);
+  }
+  return stmt;
+}
+function getBatchedFtsCountStatement(db, queryCount, cutoff) {
+  let statements = batchedFtsCountStatements.get(db);
+  if (!statements) {
+    statements = new Map;
+    batchedFtsCountStatements.set(db, statements);
+  }
+  const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}`;
+  let statement = statements.get(key);
+  if (!statement) {
+    const cutoffSql = cutoff === null ? "" : " AND CAST(message_ordinal AS INTEGER) <= ?";
+    statement = db.prepare(Array.from({ length: queryCount }, (_, index) => `SELECT ${index} AS queryIndex, COUNT(*) AS count
+                       FROM message_history_fts
+                      WHERE session_id = ? AND message_history_fts MATCH ?${cutoffSql}`).join(`
+UNION ALL
+`));
+    statements.set(key, statement);
+  }
+  return statement;
+}
+function countSessionFtsMatchesBatch(db, sessionId, ftsQueries, cutoff) {
+  if (ftsQueries.length === 0)
+    return [];
+  const bindings = [];
+  for (const query of ftsQueries) {
+    bindings.push(sessionId, query);
+    if (cutoff !== null)
+      bindings.push(cutoff);
+  }
+  try {
+    const rows = getBatchedFtsCountStatement(db, ftsQueries.length, cutoff).all(...bindings);
+    const counts = Array.from({ length: ftsQueries.length }, () => 0);
+    for (const row of rows) {
+      if (typeof row.queryIndex === "number" && row.queryIndex >= 0 && row.queryIndex < counts.length && typeof row.count === "number") {
+        counts[row.queryIndex] = row.count;
+      }
+    }
+    return counts;
+  } catch {
+    return Array.from({ length: ftsQueries.length }, () => 0);
+  }
+}
+function getMessageOrdinal(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+async function getSemanticScores(args) {
+  const semanticScores = new Map;
+  if (!args.queryEmbedding || args.memories.length === 0 || !args.queryModelId || args.queryModelId === "off") {
+    return semanticScores;
+  }
+  if (!args.workspace?.isWorkspaced) {
+    const cachedEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
+    const embeddings = await ensureMemoryEmbeddings({
+      db: args.db,
+      projectIdentity: args.projectPath,
+      memories: args.memories,
+      existingEmbeddings: cachedEmbeddings
+    });
+    for (const memory of args.memories) {
+      const memoryEmbedding = embeddings.get(memory.id);
+      if (!memoryEmbedding) {
+        continue;
+      }
+      semanticScores.set(memory.id, normalizeCosineScore(cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding)));
+    }
+    return semanticScores;
+  }
+  const workspace = args.workspace;
+  const memoriesByIdentity = new Map;
+  for (const memory of args.memories) {
+    const identity = memoryWorkspaceIdentity(memory, workspace);
+    if (!identity)
+      continue;
+    const list = memoriesByIdentity.get(identity) ?? [];
+    list.push(memory);
+    memoriesByIdentity.set(identity, list);
+  }
+  const ownMemories = memoriesByIdentity.get(args.projectPath) ?? [];
+  if (ownMemories.length > 0) {
+    const ownEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
+    await ensureMemoryEmbeddings({
+      db: args.db,
+      projectIdentity: args.projectPath,
+      memories: ownMemories,
+      existingEmbeddings: ownEmbeddings
+    });
+  }
+  for (const identity of workspace.identities) {
+    const memberMemories = memoriesByIdentity.get(identity) ?? [];
+    if (memberMemories.length === 0)
+      continue;
+    const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
+    for (const memory of memberMemories) {
+      const memoryEmbedding = cachedEmbeddings.get(memory.id);
+      if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId)
+        continue;
+      semanticScores.set(memory.id, normalizeCosineScore(cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding)));
+    }
+  }
+  return semanticScores;
+}
+function getFtsMatches(args) {
+  try {
+    return args.workspace?.isWorkspaced ? searchMemoriesFTSUnion(args.db, args.workspace.expandedIdentities, args.query, args.limit, args.workspace.ownIdentities, args.workspace.shareCategories) : searchMemoriesFTS(args.db, args.projectPath, args.query, args.limit);
+  } catch (error) {
+    log(`[search] FTS query failed for "${args.query}": ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+function getFtsScores(matches) {
+  return new Map(matches.map((memory, rank) => [memory.id, 1 / (rank + 1)]));
+}
+function selectSemanticCandidates(args) {
+  if (args.ftsMatches.length === 0) {
+    return args.memories;
+  }
+  const candidateIds = new Set(args.ftsMatches.map((memory) => memory.id));
+  if (args.queryModelId && args.queryModelId !== "off") {
+    const embeddingProjects = args.workspace?.isWorkspaced ? args.workspace.identities : [args.projectPath];
+    for (const projectPath of embeddingProjects) {
+      const cachedEmbeddings = peekProjectEmbeddings(projectPath, args.queryModelId);
+      if (!cachedEmbeddings)
+        continue;
+      for (const memoryId of cachedEmbeddings.keys()) {
+        candidateIds.add(memoryId);
+      }
+    }
+  }
+  return args.memories.filter((memory) => candidateIds.has(memory.id));
+}
+function mergeMemoryResults(args) {
+  const memoryById = new Map(args.memories.map((memory) => [memory.id, memory]));
+  const candidateIds = new Set([...args.semanticScores.keys(), ...args.ftsScores.keys()]);
+  const results = [];
+  for (const id of candidateIds) {
+    if (args.visibleMemoryIds?.has(id)) {
+      continue;
+    }
+    const memory = memoryById.get(id);
+    if (!memory) {
+      continue;
+    }
+    const semanticScore = args.semanticScores.get(id);
+    const ftsScore = args.ftsScores.get(id);
+    let score = 0;
+    let matchType = "fts";
+    if (semanticScore !== undefined && ftsScore !== undefined) {
+      score = SEMANTIC_WEIGHT * semanticScore + FTS_WEIGHT * ftsScore;
+      matchType = "hybrid";
+    } else if (semanticScore !== undefined) {
+      score = semanticScore * SINGLE_SOURCE_PENALTY;
+      matchType = "semantic";
+    } else if (ftsScore !== undefined) {
+      score = ftsScore * SINGLE_SOURCE_PENALTY;
+      matchType = "fts";
+    }
+    if (score <= 0) {
+      continue;
+    }
+    results.push({
+      source: "memory",
+      content: previewText(memory.content),
+      score,
+      memoryId: memory.id,
+      category: memory.category,
+      matchType,
+      sourceName: args.sourceNameByMemoryId?.get(memory.id)
+    });
+  }
+  return results.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    return left.memoryId - right.memoryId;
+  }).slice(0, args.limit);
+}
+async function searchMemories(args) {
+  if (!args.memoryEnabled) {
+    return [];
+  }
+  const memories = args.workspace?.isWorkspaced ? getMemoriesByProjects(args.db, args.workspace.expandedIdentities, ["active", "permanent"], Date.now(), args.workspace.ownIdentities, args.workspace.shareCategories) : getMemoriesByProject(args.db, args.projectPath);
+  if (memories.length === 0) {
+    return [];
+  }
+  const ftsMatches = getFtsMatches({
+    db: args.db,
+    projectPath: args.projectPath,
+    query: args.query,
+    limit: FTS_SEMANTIC_CANDIDATE_LIMIT,
+    workspace: args.workspace
+  });
+  const ftsScores = getFtsScores(ftsMatches);
+  const semanticCandidates = selectSemanticCandidates({
+    memories,
+    projectPath: args.projectPath,
+    ftsMatches,
+    queryModelId: args.queryModelId,
+    workspace: args.workspace
+  });
+  const semanticScores = await getSemanticScores({
+    db: args.db,
+    projectPath: args.projectPath,
+    memories: semanticCandidates,
+    queryEmbedding: args.queryEmbedding,
+    queryModelId: args.queryModelId,
+    workspace: args.workspace
+  });
+  return mergeMemoryResults({
+    memories,
+    semanticScores,
+    ftsScores,
+    limit: args.limit,
+    visibleMemoryIds: args.visibleMemoryIds,
+    sourceNameByMemoryId: sourceNamesForSearchMemories({
+      memories,
+      projectPath: args.projectPath,
+      workspace: args.workspace ?? {
+        identities: [args.projectPath],
+        expandedIdentities: [args.projectPath],
+        namesByIdentity: new Map,
+        canonicalIdentityByStoredPath: new Map([[args.projectPath, args.projectPath]]),
+        ownIdentities: [args.projectPath],
+        shareCategories: null,
+        isWorkspaced: false
+      }
+    })
+  });
+}
+function linearDecayScore(rank, total) {
+  if (total <= 0)
+    return 0;
+  return Math.max(0, 1 - rank / total);
+}
+function normalizeMessageSearchRow(row, cutoff) {
+  const messageOrdinal = getMessageOrdinal(row.messageOrdinal);
+  if (messageOrdinal === null || typeof row.messageId !== "string" || typeof row.role !== "string" || typeof row.content !== "string") {
+    return null;
+  }
+  if (cutoff !== null && messageOrdinal > cutoff)
+    return null;
+  return {
+    messageOrdinal,
+    messageId: row.messageId,
+    role: row.role,
+    content: row.content
+  };
+}
+function runMessageFtsQuery(db, sessionId, ftsQuery, fetchLimit, cutoff) {
+  if (ftsQuery.length === 0)
+    return [];
+  const rows = (cutoff !== null ? getMessageSearchStatementWithCutoff(db).all(sessionId, ftsQuery, cutoff, fetchLimit) : getMessageSearchStatement(db).all(sessionId, ftsQuery, fetchLimit)).map((row) => row);
+  const result = [];
+  for (const row of rows) {
+    const normalized = normalizeMessageSearchRow(row, cutoff);
+    if (normalized)
+      result.push(normalized);
+  }
+  return result;
+}
+function getBatchedMessageSearchStatement(db, queryCount, cutoff) {
+  let statements = batchedMessageSearchStatements.get(db);
+  if (!statements) {
+    statements = new Map;
+    batchedMessageSearchStatements.set(db, statements);
+  }
+  const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}`;
+  let statement = statements.get(key);
+  if (!statement) {
+    const cutoffSql = cutoff === null ? "" : " AND CAST(message_ordinal AS INTEGER) <= ?";
+    const branches = Array.from({ length: queryCount }, (_, index) => `SELECT * FROM (
+                SELECT ${index} AS queryIndex,
+                       message_ordinal AS messageOrdinal,
+                       message_id AS messageId,
+                       role,
+                       content,
+                       bm25(message_history_fts) AS ftsRank
+                  FROM message_history_fts
+                 WHERE session_id = ? AND message_history_fts MATCH ?${cutoffSql}
+                 ORDER BY ftsRank
+                 LIMIT ?
+            )`);
+    statement = db.prepare(`${branches.join(`
+UNION ALL
+`)}
+ORDER BY queryIndex ASC, ftsRank ASC`);
+    statements.set(key, statement);
+  }
+  return statement;
+}
+function runMessageFtsQueriesBatch(db, sessionId, ftsQueries, fetchLimit, cutoff) {
+  if (ftsQueries.length === 0)
+    return [];
+  const bindings = [];
+  for (const query of ftsQueries) {
+    bindings.push(sessionId, query);
+    if (cutoff !== null)
+      bindings.push(cutoff);
+    bindings.push(fetchLimit);
+  }
+  const rows = getBatchedMessageSearchStatement(db, ftsQueries.length, cutoff).all(...bindings);
+  const result = Array.from({ length: ftsQueries.length }, () => []);
+  for (const row of rows) {
+    if (typeof row.queryIndex !== "number" || row.queryIndex < 0 || row.queryIndex >= result.length) {
+      continue;
+    }
+    const normalized = normalizeMessageSearchRow(row, cutoff);
+    if (normalized)
+      result[row.queryIndex].push(normalized);
+  }
+  return result;
+}
+var RRF_K = 60;
+var VERBATIM_RANK_BONUS = 1 / RRF_K;
+var IDF_FALLOFF = 100;
+function probeDiscriminationWeight(df, corpusSize) {
+  if (corpusSize <= 0 || df <= 0)
+    return 1;
+  return 1 / (1 + IDF_FALLOFF * df / corpusSize);
+}
+function searchMessages(args) {
+  const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
+  const fetchLimit = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.limit * 3 : args.limit;
+  const baseQuery = sanitizeFtsQuery(args.query.trim());
+  const probes = args.probes ?? [];
+  if (probes.length === 0) {
+    const filtered = runMessageFtsQuery(args.db, args.sessionId, baseQuery, fetchLimit, cutoff).slice(0, args.limit);
+    return filtered.map((row, rank) => ({
+      source: "message",
+      content: previewText(row.content),
+      score: linearDecayScore(rank, filtered.length),
+      messageOrdinal: row.messageOrdinal,
+      messageId: row.messageId,
+      role: row.role
+    }));
+  }
+  const sanitizedProbes = probes.map((probe) => ({ probe, query: sanitizeFtsQuery(probe) })).filter((entry) => entry.query.length > 0);
+  const corpusSize = getIndexedMessageCorpusSize(args.db, args.sessionId, cutoff);
+  const probeCounts = countSessionFtsMatchesBatch(args.db, args.sessionId, sanitizedProbes.map((entry) => entry.query), cutoff);
+  const searchQueries = [
+    ...baseQuery.length > 0 ? [baseQuery] : [],
+    ...sanitizedProbes.map((entry) => entry.query)
+  ];
+  const rowsByQuery = runMessageFtsQueriesBatch(args.db, args.sessionId, searchQueries, fetchLimit, cutoff);
+  const queryLists = [];
+  let queryIndex = 0;
+  if (baseQuery.length > 0) {
+    queryLists.push({
+      rows: rowsByQuery[queryIndex] ?? [],
+      weight: 1
+    });
+    queryIndex += 1;
+  }
+  const probeWeights = new Map;
+  sanitizedProbes.forEach((entry, probeIndex) => {
+    const weight = probeDiscriminationWeight(probeCounts[probeIndex] ?? 0, corpusSize);
+    probeWeights.set(entry.probe, weight);
+    queryLists.push({ rows: rowsByQuery[queryIndex] ?? [], weight });
+    queryIndex += 1;
+  });
+  const fused = new Map;
+  for (const list of queryLists) {
+    list.rows.forEach((row, rank) => {
+      const rrf = list.weight / (RRF_K + rank);
+      const existing = fused.get(row.messageId);
+      if (existing) {
+        existing.score += rrf;
+      } else {
+        fused.set(row.messageId, { row, score: rrf });
+      }
+    });
+  }
+  for (const entry of fused.values()) {
+    let best = 0;
+    for (const probe of probes) {
+      const weight = probeWeights.get(probe) ?? 0;
+      if (weight > best && containsProbeVerbatim(entry.row.content, [probe])) {
+        best = weight;
+      }
+    }
+    if (best > 0) {
+      entry.score += best * VERBATIM_RANK_BONUS;
+    }
+  }
+  const ranked = [...fused.values()].sort((a, b) => b.score !== a.score ? b.score - a.score : a.row.messageOrdinal - b.row.messageOrdinal).slice(0, args.limit);
+  return ranked.map((entry, rank) => ({
+    source: "message",
+    content: previewText(entry.row.content),
+    score: linearDecayScore(rank, ranked.length),
+    messageOrdinal: entry.row.messageOrdinal,
+    messageId: entry.row.messageId,
+    role: entry.row.role
+  }));
+}
+var NOTE_SEARCHABLE_STATUSES = ["active", "pending", "ready", "dismissed"];
+function noteSearchText(note) {
+  const reason = note.readyReason?.trim();
+  return reason ? `${note.content}
+Reason: ${reason}` : note.content;
+}
+function tokenizeKeywordNeedle(text) {
+  const matches = text.toLowerCase().match(/[a-z0-9/._:-]+/g) ?? [];
+  const seen = new Set;
+  const tokens = [];
+  for (const match of matches) {
+    if (match.length <= 1 || !/[a-z0-9]/.test(match) || seen.has(match)) {
+      continue;
+    }
+    seen.add(match);
+    tokens.push(match);
+  }
+  return tokens;
+}
+function rankNotesForNeedle(notes, needle) {
+  const normalizedNeedle = needle.trim().toLowerCase();
+  if (normalizedNeedle.length === 0) {
+    return [];
+  }
+  const needleTokens = tokenizeKeywordNeedle(normalizedNeedle);
+  const ranked = [];
+  for (const note of notes) {
+    const text = noteSearchText(note);
+    const normalizedText = text.toLowerCase();
+    const noteTokens = new Set(tokenizeKeywordNeedle(normalizedText));
+    const exact = normalizedText.includes(normalizedNeedle);
+    const matchedTokens = needleTokens.filter((token) => noteTokens.has(token)).length;
+    if (!exact && matchedTokens === 0) {
+      continue;
+    }
+    const coverage = needleTokens.length > 0 ? matchedTokens / needleTokens.length : 0;
+    const score = (exact ? 2 : 0) + coverage + (needleTokens.length > 1 && matchedTokens === needleTokens.length ? 0.5 : 0);
+    ranked.push({ note, score, text });
+  }
+  return ranked.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    if (right.note.createdAt !== left.note.createdAt) {
+      return right.note.createdAt - left.note.createdAt;
+    }
+    return left.note.id - right.note.id;
+  });
+}
+function searchNotes(args) {
+  if (args.limit <= 0) {
+    return [];
+  }
+  const notes = [
+    ...getNotes(args.db, {
+      sessionId: args.sessionId,
+      type: "session",
+      status: NOTE_SEARCHABLE_STATUSES
+    }),
+    ...getNotes(args.db, {
+      projectPath: args.projectPath,
+      type: "smart",
+      status: NOTE_SEARCHABLE_STATUSES
+    })
+  ];
+  if (notes.length === 0) {
+    return [];
+  }
+  const baseList = rankNotesForNeedle(notes, args.query);
+  const probes = args.probes ?? [];
+  if (probes.length === 0) {
+    const ranked = baseList.slice(0, args.limit);
+    return ranked.map((entry, rank) => ({
+      source: "note",
+      content: previewText(entry.text),
+      score: linearDecayScore(rank, ranked.length),
+      noteId: entry.note.id,
+      status: entry.note.status,
+      createdAt: entry.note.createdAt,
+      anchorOrdinal: entry.note.anchorOrdinal,
+      sourceSessionId: entry.note.sessionId
+    }));
+  }
+  const queryLists = [];
+  if (baseList.length > 0) {
+    queryLists.push({ rows: baseList, weight: 1 });
+  }
+  const probeWeights = new Map;
+  for (const probe of probes) {
+    const rows = rankNotesForNeedle(notes, probe);
+    if (rows.length === 0) {
+      continue;
+    }
+    const weight = probeDiscriminationWeight(rows.length, notes.length);
+    probeWeights.set(probe, weight);
+    queryLists.push({ rows, weight });
+  }
+  const fused = new Map;
+  for (const list of queryLists) {
+    list.rows.forEach((row, rank) => {
+      const rrf = list.weight / (RRF_K + rank);
+      const existing = fused.get(row.note.id);
+      if (existing) {
+        existing.score += rrf;
+      } else {
+        fused.set(row.note.id, { entry: row, score: rrf });
+      }
+    });
+  }
+  for (const match of fused.values()) {
+    let best = 0;
+    for (const probe of probes) {
+      const weight = probeWeights.get(probe) ?? 0;
+      if (weight > best && containsProbeVerbatim(match.entry.text, [probe])) {
+        best = weight;
+      }
+    }
+    if (best > 0) {
+      match.score += best * VERBATIM_RANK_BONUS;
+    }
+  }
+  const ranked = [...fused.values()].sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    if (right.entry.note.createdAt !== left.entry.note.createdAt) {
+      return right.entry.note.createdAt - left.entry.note.createdAt;
+    }
+    return left.entry.note.id - right.entry.note.id;
+  }).slice(0, args.limit);
+  return ranked.map((entry, rank) => ({
+    source: "note",
+    content: previewText(entry.entry.text),
+    score: linearDecayScore(rank, ranked.length),
+    noteId: entry.entry.note.id,
+    status: entry.entry.note.status,
+    createdAt: entry.entry.note.createdAt,
+    anchorOrdinal: entry.entry.note.anchorOrdinal,
+    sourceSessionId: entry.entry.note.sessionId
+  }));
+}
+function searchCompartmentChunks(args) {
+  if (!args.queryEmbedding || args.limit <= 0 || !args.modelId || args.modelId === "off")
+    return [];
+  const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
+  const rows = loadCompartmentChunkEmbeddingsForSearch(args.db, args.sessionId, args.projectPath, args.modelId);
+  if (rows.length === 0)
+    return [];
+  const byCompartment = new Map;
+  for (const row of rows) {
+    if (cutoff !== null && row.endOrdinal > cutoff) {
+      continue;
+    }
+    const score = normalizeCosineScore(cosineSimilarity(args.queryEmbedding, row.vector));
+    if (score <= 0)
+      continue;
+    const existing = byCompartment.get(row.compartmentId);
+    if (!existing || score > existing.score) {
+      byCompartment.set(row.compartmentId, { row, score });
+    }
+  }
+  return [...byCompartment.values()].sort((left, right) => right.score !== left.score ? right.score - left.score : left.row.startOrdinal - right.row.startOrdinal).slice(0, args.limit).map(({ row, score }) => ({
+    source: "compartment",
+    content: previewText(row.title),
+    score: score * SINGLE_SOURCE_PENALTY,
+    compartmentId: row.compartmentId,
+    sessionId: row.sessionId,
+    title: row.title,
+    startOrdinal: row.startOrdinal,
+    endOrdinal: row.endOrdinal,
+    matchType: "semantic"
+  }));
+}
+function mergeMessageAndCompartmentResults(args) {
+  if (args.compartments.length === 0)
+    return args.messages;
+  if (args.messages.length === 0)
+    return args.compartments;
+  const fused = new Map;
+  const add = (key, result, score, tieOrdinal) => {
+    const existing = fused.get(key);
+    if (existing) {
+      existing.score += score;
+      return existing;
+    }
+    const entry = { result, score, tieOrdinal, snippetScore: -1 };
+    fused.set(key, entry);
+    return entry;
+  };
+  args.compartments.forEach((compartment, rank) => {
+    add(`compartment:${compartment.compartmentId}`, compartment, 1 / (RRF_K + rank), compartment.startOrdinal);
+  });
+  for (const [rank, message] of args.messages.entries()) {
+    const containing = args.compartments.find((compartment) => message.messageOrdinal >= compartment.startOrdinal && message.messageOrdinal <= compartment.endOrdinal);
+    const contribution = 1 / (RRF_K + rank);
+    if (!containing) {
+      add(`message:${message.messageId}`, message, contribution, message.messageOrdinal);
+      continue;
+    }
+    const entry = add(`compartment:${containing.compartmentId}`, containing, contribution, containing.startOrdinal);
+    if (message.score > entry.snippetScore && entry.result.source === "compartment") {
+      entry.snippetScore = message.score;
+      entry.result = {
+        ...entry.result,
+        matchType: "hybrid",
+        snippet: message.content
+      };
+    }
+  }
+  const ranked = [...fused.values()].sort((left, right) => right.score !== left.score ? right.score - left.score : left.tieOrdinal - right.tieOrdinal).slice(0, args.limit);
+  return ranked.map((entry, rank) => ({
+    ...entry.result,
+    score: linearDecayScore(rank, ranked.length)
+  }));
+}
+function getSourceBoost(result) {
+  switch (result.source) {
+    case "memory":
+      return MEMORY_SOURCE_BOOST;
+    case "message":
+    case "compartment":
+      return MESSAGE_SOURCE_BOOST;
+    case "git_commit":
+      return GIT_COMMIT_SOURCE_BOOST;
+    case "primer":
+      return PRIMER_SOURCE_BOOST;
+    case "note":
+      return 1;
+  }
+}
+function compareUnifiedResults(left, right) {
+  const leftEffective = left.score * getSourceBoost(left);
+  const rightEffective = right.score * getSourceBoost(right);
+  if (rightEffective !== leftEffective) {
+    return rightEffective - leftEffective;
+  }
+  if (left.source === "memory" && right.source === "memory") {
+    return left.memoryId - right.memoryId;
+  }
+  if (left.source === "message" && right.source === "message") {
+    return left.messageOrdinal - right.messageOrdinal;
+  }
+  if (left.source === "compartment" && right.source === "compartment") {
+    return left.startOrdinal - right.startOrdinal;
+  }
+  if (left.source === "git_commit" && right.source === "git_commit") {
+    return right.committedAtMs - left.committedAtMs;
+  }
+  if (left.source === "primer" && right.source === "primer") {
+    return right.support - left.support || left.primerId - right.primerId;
+  }
+  if (left.source === "note" && right.source === "note") {
+    return right.createdAt - left.createdAt || left.noteId - right.noteId;
+  }
+  return 0;
+}
+function toGitCommitResult(hit) {
+  return {
+    source: "git_commit",
+    content: previewText(hit.commit.message),
+    score: hit.score,
+    sha: hit.commit.sha,
+    shortSha: hit.commit.shortSha,
+    author: hit.commit.author,
+    committedAtMs: hit.commit.committedAtMs,
+    matchType: hit.matchType
+  };
+}
+function searchGitCommits(args) {
+  if (args.limit <= 0)
+    return [];
+  const hits = searchGitCommitsSync(args.db, args.projectPath, args.query, {
+    limit: args.limit,
+    queryEmbedding: args.queryEmbedding,
+    queryModelId: args.queryModelId
+  });
+  return hits.map(toGitCommitResult);
+}
+function primerText(primer) {
+  const answer = primer.answer.trim();
+  return answer ? `Q: ${primer.question}
+A: ${answer}` : `Q: ${primer.question}`;
+}
+function searchPrimers(args) {
+  const primers = getActivePrimers(args.db, args.projectPath);
+  if (primers.length === 0 || args.limit <= 0)
+    return [];
+  const ftsQuery = sanitizeFtsQuery(args.query);
+  const ftsRanks = new Map;
+  if (ftsQuery) {
+    const rows = args.db.prepare(`SELECT p.id AS id, bm25(primers_fts) AS rank
+                 FROM primers_fts
+                 JOIN primers p ON p.id = primers_fts.rowid
+                 WHERE primers_fts MATCH ? AND p.project_path = ? AND p.status = 'active'
+                 ORDER BY rank ASC
+                 LIMIT ?`).all(ftsQuery, args.projectPath, args.limit * 3);
+    rows.forEach((row, index) => {
+      ftsRanks.set(row.id, linearDecayScore(index, rows.length));
+    });
+  }
+  const scored = primers.map((primer) => {
+    const semantic = args.queryEmbedding && primer.questionEmbedding && primer.questionEmbeddingModelId === args.queryModelId ? normalizeCosineScore(cosineSimilarity(args.queryEmbedding, primer.questionEmbedding)) : 0;
+    const fts = ftsRanks.get(primer.id) ?? 0;
+    if (semantic <= 0 && fts <= 0)
+      return null;
+    const score = semantic > 0 && fts > 0 ? semantic * SEMANTIC_WEIGHT + fts * FTS_WEIGHT : Math.max(semantic, fts);
+    return {
+      source: "primer",
+      content: previewText(primerText(primer)),
+      score,
+      primerId: primer.id,
+      question: primer.question,
+      support: primer.totalSupport,
+      lastObservedAt: primer.lastObservedAt,
+      matchType: semantic > 0 && fts > 0 ? "hybrid" : semantic > 0 ? "semantic" : "fts"
+    };
+  }).filter((result) => result !== null).sort((a, b) => b.score - a.score || b.support - a.support || a.primerId - b.primerId).slice(0, args.limit);
+  return scored;
+}
+function resolveSources(sources) {
+  if (sources === undefined) {
+    return new Set(["memory", "message", "git_commit", "primer", "note"]);
+  }
+  const set = new Set;
+  for (const source of sources) {
+    if (source === "memory" || source === "message" || source === "git_commit" || source === "primer" || source === "note") {
+      set.add(source);
+    }
+  }
+  return set;
+}
+function memoriesToIdLookupResults(args) {
+  const ordered = args.memories.slice(0, args.limit);
+  return ordered.map((memory, rank) => ({
+    source: "memory",
+    content: previewText(memory.content),
+    score: 1 - rank * 0.01,
+    memoryId: memory.id,
+    category: memory.category,
+    matchType: "fts",
+    sourceName: args.sourceNameByMemoryId?.get(memory.id)
+  }));
+}
+function resolveMemoriesByIdsForSearch(args) {
+  if (args.ids.length === 0) {
+    return null;
+  }
+  const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+  const fetched = workspace.isWorkspaced ? getMemoriesByProjects(args.db, workspace.expandedIdentities, ["active", "permanent", "archived"], Date.now(), workspace.ownIdentities, workspace.shareCategories) : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent", "archived"]);
+  if (fetched.length === 0) {
+    return null;
+  }
+  const memoriesById = new Map(fetched.map((memory) => [memory.id, memory]));
+  const ordered = [];
+  for (const id of args.ids) {
+    const memory = memoriesById.get(id);
+    if (!memory)
+      continue;
+    if (args.visibleMemoryIds?.has(id))
+      continue;
+    ordered.push(memory);
+    if (ordered.length >= args.limit)
+      break;
+  }
+  if (ordered.length === 0) {
+    return null;
+  }
+  return memoriesToIdLookupResults({
+    memories: ordered,
+    limit: args.limit,
+    sourceNameByMemoryId: sourceNamesForSearchMemories({
+      memories: ordered,
+      projectPath: args.projectPath,
+      workspace
+    })
+  });
+}
+async function unifiedSearch(db, sessionId, projectPath, query, options = {}) {
+  const trimmedQuery = query.trim();
+  const measurementStartedAt = Date.now();
+  if (trimmedQuery.length === 0) {
+    return [];
+  }
+  const limit = normalizeLimit(options.limit);
+  const tierLimit = Math.max(limit * 3, DEFAULT_UNIFIED_SEARCH_LIMIT);
+  const embeddingEnabled = options.embeddingEnabled ?? true;
+  const embedQuery = options.embedQuery ?? embedText;
+  const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
+  const gitCommitsEnabled = options.gitCommitsEnabled ?? false;
+  const activeSources = resolveSources(options.sources);
+  const memoryFeatureEnabled = options.memoryEnabled ?? true;
+  const runMemory = activeSources.has("memory") && memoryFeatureEnabled;
+  const runMessages = activeSources.has("message");
+  const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
+  const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
+  const runNotes = activeSources.has("note");
+  const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
+  const needsEmbedding = (runMemory || runGitCommits || runCompartmentChunks || runPrimers) && embeddingEnabled && isEmbeddingRuntimeEnabled();
+  const queryEmbeddingPromise = needsEmbedding ? embedQuery(trimmedQuery, options.signal).catch((error) => {
+    log(`[search] query embedding failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }) : Promise.resolve(null);
+  await Promise.resolve();
+  const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
+  const messageResults = runMessages ? searchMessages({
+    db,
+    sessionId,
+    query: trimmedQuery,
+    limit: tierLimit,
+    maxOrdinal: options.maxMessageOrdinal,
+    probes: messageProbes
+  }) : [];
+  const capturedQuery = await queryEmbeddingPromise;
+  const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
+  const queryContract = capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
+  const generationIsCurrent = queryContract === null || embeddingSnapshot !== null && embeddingSnapshot.generation === queryContract.generation;
+  const queryEmbedding = generationIsCurrent ? queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null) : null;
+  const workspace = resolveSearchWorkspaceContext(db, projectPath);
+  const embeddingModelId = queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
+  const chunkModelId = queryContract?.chunkModelId ?? options.chunkModelIdOverride ?? embeddingSnapshot?.chunkModelId;
+  const compartmentResults = runCompartmentChunks ? searchCompartmentChunks({
+    db,
+    sessionId,
+    projectPath,
+    queryEmbedding,
+    limit: tierLimit,
+    maxOrdinal: options.maxMessageOrdinal,
+    modelId: chunkModelId && chunkModelId !== "off" ? chunkModelId : null
+  }) : [];
+  const messageLikeResults = mergeMessageAndCompartmentResults({
+    messages: messageResults,
+    compartments: compartmentResults,
+    limit: tierLimit
+  });
+  const [memoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+    runMemory ? searchMemories({
+      db,
+      projectPath,
+      query: trimmedQuery,
+      limit: tierLimit,
+      memoryEnabled: true,
+      queryEmbedding,
+      queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+      workspace,
+      visibleMemoryIds: options.visibleMemoryIds
+    }) : Promise.resolve([]),
+    runGitCommits ? Promise.resolve(searchGitCommits({
+      db,
+      projectPath,
+      query: trimmedQuery,
+      limit: tierLimit,
+      queryEmbedding,
+      queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null
+    })) : Promise.resolve([]),
+    runPrimers ? Promise.resolve(searchPrimers({
+      db,
+      projectPath,
+      query: trimmedQuery,
+      limit: tierLimit,
+      queryEmbedding,
+      queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null
+    })) : Promise.resolve([]),
+    runNotes ? Promise.resolve(searchNotes({
+      db,
+      sessionId,
+      projectPath,
+      query: trimmedQuery,
+      limit: tierLimit,
+      probes: messageProbes
+    })) : Promise.resolve([])
+  ]);
+  const results = [
+    ...memoryResults,
+    ...primerResults,
+    ...messageLikeResults,
+    ...gitCommitResults,
+    ...noteResults
+  ].sort(compareUnifiedResults).slice(0, limit);
+  if (!options.measurementDisabled) {
+    recordShadowMeasurement({
+      db,
+      sessionId,
+      projectPath,
+      query: trimmedQuery,
+      options,
+      primaryResults: results,
+      primaryQuery: queryContract,
+      primaryLatencyMs: Date.now() - measurementStartedAt,
+      search: unifiedSearch
+    });
+  }
+  const countRetrievals = options.countRetrievals ?? true;
+  if (countRetrievals) {
+    const memoryIds = results.filter((result) => result.source === "memory").map((result) => result.memoryId);
+    if (memoryIds.length > 0) {
+      db.transaction(() => {
+        for (const memoryId of memoryIds) {
+          try {
+            updateMemoryRetrievalCount(db, memoryId);
+          } catch (error) {
+            if (error instanceof ModuleMemoryAuthorityError)
+              continue;
+            throw error;
+          }
+        }
+      })();
+    }
+  }
+  return results;
+}
+// ../plugin/src/features/magic-context/project-docs-hash.ts
+import { createHash as createHash8 } from "node:crypto";
+import { lstatSync, readFileSync, statSync as statSync2 } from "node:fs";
+import path2 from "node:path";
+var PROJECT_DOC_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"];
+var PROJECT_DOCS_DELIMITER = `
+
+---
+
+`;
+var MAX_PROJECT_DOC_BYTES = 256 * 1024;
+var docsCache = new Map;
+function canonicalizeDocContent(raw) {
+  return raw.replace(/^\uFEFF/, "").replace(/\r\n/g, `
+`).split(`
+`).map((line) => line.replace(/[ \t]+$/, "")).join(`
+`).replace(/\n+$/, "");
+}
+function fingerprintFile(filePath) {
+  try {
+    const stat = lstatSync(filePath);
+    const isReadableDoc = stat.isFile() && stat.size <= MAX_PROJECT_DOC_BYTES;
+    return {
+      exists: isReadableDoc,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size
+    };
+  } catch {
+    return { exists: false, mtimeMs: 0, size: 0 };
+  }
+}
+function readDirectoryMtimeMs(projectDirectory) {
+  try {
+    return statSync2(projectDirectory).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+function fingerprintsEqual(a, b) {
+  return a?.exists === b.exists && a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+function cacheFilesEqual(cachedFiles, currentFiles) {
+  for (const [filePath, current] of currentFiles) {
+    if (!fingerprintsEqual(cachedFiles.get(filePath), current)) {
+      return false;
+    }
+  }
+  return true;
+}
+function readCurrentFingerprints(projectDirectory) {
+  const files = new Map;
+  for (const filename of PROJECT_DOC_FILES) {
+    const filePath = path2.join(projectDirectory, filename);
+    files.set(filePath, fingerprintFile(filePath));
+  }
+  return { directoryMtimeMs: readDirectoryMtimeMs(projectDirectory), files };
+}
+function readCanonicalPieces(projectDirectory, files) {
+  const hashPieces = [];
+  const renderedSections = [];
+  for (const filename of PROJECT_DOC_FILES) {
+    const filePath = path2.join(projectDirectory, filename);
+    const fingerprint = files.get(filePath);
+    if (!fingerprint?.exists) {
+      continue;
+    }
+    let safeToRead = false;
+    try {
+      const st = lstatSync(filePath);
+      safeToRead = st.isFile() && st.size <= MAX_PROJECT_DOC_BYTES;
+    } catch {
+      safeToRead = false;
+    }
+    if (!safeToRead) {
+      continue;
+    }
+    const canonicalContent = canonicalizeDocContent(readFileSync(filePath, "utf8"));
+    hashPieces.push(`file:${filename}
+${canonicalContent}`);
+    renderedSections.push(`<file name="${escapeXmlAttr(filename)}">
+${escapeXmlContent(canonicalContent)}
+</file>`);
+  }
+  return { hashPieces, renderedSections };
+}
+function buildRenderedBlock(renderedSections) {
+  if (renderedSections.length === 0) {
+    return "";
+  }
+  return `<project-docs>
+${renderedSections.join(`
+
+`)}
+</project-docs>`;
+}
+function hashCanonicalPieces(hashPieces) {
+  if (hashPieces.length === 0) {
+    return "";
+  }
+  return createHash8("sha256").update(hashPieces.join(PROJECT_DOCS_DELIMITER), "utf8").digest("hex");
+}
+function readProjectDocsCanonical(projectDirectory) {
+  const canonicalDirectory = path2.resolve(projectDirectory);
+  const current = readCurrentFingerprints(canonicalDirectory);
+  const cached = docsCache.get(canonicalDirectory);
+  if (cached && cacheFilesEqual(cached.files, current.files)) {
+    cached.directoryMtimeMs = current.directoryMtimeMs;
+    return {
+      renderedBlock: cached.cachedRendered,
+      canonicalHash: cached.cachedHash
+    };
+  }
+  const { hashPieces, renderedSections } = readCanonicalPieces(canonicalDirectory, current.files);
+  const canonicalHash = hashCanonicalPieces(hashPieces);
+  const renderedBlock = buildRenderedBlock(renderedSections);
+  docsCache.set(canonicalDirectory, {
+    directoryMtimeMs: current.directoryMtimeMs,
+    files: current.files,
+    cachedHash: canonicalHash,
+    cachedRendered: renderedBlock
+  });
+  return { renderedBlock, canonicalHash };
+}
+function computeProjectDocsHash(projectDirectory) {
+  return readProjectDocsCanonical(projectDirectory).canonicalHash;
+}
+// ../plugin/src/features/magic-context/storage-m0-mutation-log.ts
+var M0_MUTATION_TYPES = new Set([
+  "compartment_delete",
+  "compartment_merge",
+  "recomp_boundary_change",
+  "compartment_upgrade"
+]);
+function assertMutationType(mutationType) {
+  if (!M0_MUTATION_TYPES.has(mutationType)) {
+    throw new Error(`Invalid m0 mutation type: ${mutationType}`);
+  }
+}
+function toM0Mutation(row) {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    mutationType: row.mutation_type,
+    targetId: row.target_id,
+    queuedAt: row.queued_at
+  };
+}
+function queueM0Mutation(db, input) {
+  assertMutationType(input.mutationType);
+  const result = db.prepare(`INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
+             VALUES (?, ?, ?, ?)`).run(input.sessionId, input.mutationType, input.targetId ?? null, input.queuedAt ?? Date.now());
+  const row = getM0Mutation(db, Number(result.lastInsertRowid));
+  if (!row) {
+    throw new Error("Failed to load queued m0 mutation");
+  }
+  return row;
+}
+function getM0Mutation(db, id) {
+  const row = db.prepare(`SELECT id, session_id, mutation_type, target_id, queued_at
+             FROM m0_mutation_log
+             WHERE id = ?`).get(id);
+  return row ? toM0Mutation(row) : null;
+}
+function getMaxM0MutationId(db, sessionId) {
+  const row = db.prepare("SELECT MAX(id) AS max_id FROM m0_mutation_log WHERE session_id = ?").get(sessionId);
+  return row?.max_id ?? null;
+}
+// ../plugin/src/features/magic-context/storage-memory-mutation-log.ts
+var MEMORY_MUTATION_TYPES = new Set(["archive", "delete", "update", "superseded"]);
+var MEMORY_VISIBILITY_MUTATION_CATEGORY = "__mc_visibility__";
+var MAX_MEMORY_REPLACEMENT_DEPTH = 8;
+var TERMINAL_MUTATION_TYPES = new Set(["archive", "delete", "superseded"]);
+function isTerminalMutation(row) {
+  return TERMINAL_MUTATION_TYPES.has(row.mutationType);
+}
+function assertMemoryMutationType(mutationType) {
+  if (!MEMORY_MUTATION_TYPES.has(mutationType)) {
+    throw new Error(`Invalid memory mutation type: ${mutationType}`);
+  }
+}
+function toMemoryMutation(row) {
+  return {
+    id: row.id,
+    projectPath: row.project_path,
+    mutationType: row.mutation_type,
+    targetMemoryId: row.target_memory_id,
+    supersededById: row.superseded_by_id,
+    category: row.category,
+    newContent: row.new_content,
+    visibilityChanged: row.category === MEMORY_VISIBILITY_MUTATION_CATEGORY,
+    queuedAt: row.queued_at
+  };
+}
+function queueMemoryMutation(db, input) {
+  assertMemoryMutationType(input.mutationType);
+  const result = db.prepare(`INSERT INTO memory_mutation_log
+                (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`).run(input.projectPath, input.mutationType, input.targetMemoryId, input.supersededById ?? null, input.category ?? null, input.newContent ?? null, input.queuedAt ?? Date.now());
+  const row = getMemoryMutation(db, Number(result.lastInsertRowid));
+  if (!row) {
+    throw new Error("Failed to load queued memory mutation");
+  }
+  return row;
+}
+function getMemoryMutation(db, id) {
+  const row = db.prepare(`SELECT id, project_path, mutation_type, target_memory_id,
+                    superseded_by_id, category, new_content, queued_at
+               FROM memory_mutation_log
+              WHERE id = ?`).get(id);
+  return row ? toMemoryMutation(row) : null;
+}
+function uniqueProjectPaths2(projectPaths) {
+  return [...new Set(projectPaths.filter((path) => path.length > 0))];
+}
+function placeholders2(values) {
+  return values.map(() => "?").join(", ");
+}
+function coalesceMutations(rows) {
+  const chosenByTarget = new Map;
+  for (const dbRow of rows) {
+    const candidate = toMemoryMutation(dbRow);
+    const current = chosenByTarget.get(candidate.targetMemoryId);
+    if (!current) {
+      chosenByTarget.set(candidate.targetMemoryId, candidate);
+      continue;
+    }
+    const visibilityChanged = current.visibilityChanged || candidate.visibilityChanged;
+    const currentTerminal = isTerminalMutation(current);
+    const candidateTerminal = isTerminalMutation(candidate);
+    if (currentTerminal && !candidateTerminal) {
+      chosenByTarget.set(candidate.targetMemoryId, { ...current, visibilityChanged });
+      continue;
+    }
+    chosenByTarget.set(candidate.targetMemoryId, { ...candidate, visibilityChanged });
+  }
+  return [...chosenByTarget.values()].sort((left, right) => left.id - right.id);
+}
+function getMemoryMutationsForRenderByIdentitySet(db, projectPaths, afterId, renderedMemoryIds) {
+  const identities = uniqueProjectPaths2(projectPaths);
+  if (identities.length === 0)
+    return [];
+  const cursor = afterId ?? 0;
+  const visibilityTargets = db.prepare(`SELECT DISTINCT target_memory_id
+               FROM memory_mutation_log
+              WHERE project_path IN (${placeholders2(identities)})
+                AND id > ?
+                AND category = ?`).all(...identities, cursor, MEMORY_VISIBILITY_MUTATION_CATEGORY);
+  const requestedTargets = new Set(renderedMemoryIds);
+  for (const row of visibilityTargets)
+    requestedTargets.add(row.target_memory_id);
+  if (requestedTargets.size === 0)
+    return [];
+  const queried = new Set;
+  let frontier = [...requestedTargets].sort((left, right) => left - right);
+  const loaded = [];
+  for (let depth = 0;depth <= MAX_MEMORY_REPLACEMENT_DEPTH; depth += 1) {
+    frontier = frontier.filter((target) => {
+      if (queried.has(target))
+        return false;
+      queried.add(target);
+      return true;
+    });
+    if (frontier.length === 0)
+      break;
+    const batch = db.prepare(`SELECT id, project_path, mutation_type, target_memory_id,
+                        superseded_by_id, category, new_content, queued_at
+                   FROM memory_mutation_log
+                  WHERE project_path IN (${placeholders2(identities)})
+                    AND id > ?
+                    AND target_memory_id IN (${placeholders2(frontier)})
+                  ORDER BY id ASC`).all(...identities, cursor, ...frontier);
+    loaded.push(...batch);
+    frontier = coalesceMutations(batch).filter((mutation) => mutation.mutationType === "superseded").flatMap((mutation) => mutation.supersededById === null ? [] : [mutation.supersededById]);
+  }
+  const byTarget = new Map(coalesceMutations(loaded).map((mutation) => [mutation.targetMemoryId, mutation]));
+  const resolved = [];
+  for (const target of [...requestedTargets].sort((left, right) => left - right)) {
+    const mutation = byTarget.get(target);
+    if (!mutation)
+      continue;
+    if (mutation.mutationType !== "superseded") {
+      resolved.push(mutation);
+      continue;
+    }
+    let terminal = mutation.supersededById;
+    const visited = new Set([target]);
+    let depth = 0;
+    while (terminal !== null) {
+      if (visited.has(terminal)) {
+        terminal = null;
+        break;
+      }
+      visited.add(terminal);
+      const next = byTarget.get(terminal);
+      if (next?.mutationType !== "superseded")
+        break;
+      if (depth >= MAX_MEMORY_REPLACEMENT_DEPTH - 1) {
+        terminal = null;
+        break;
+      }
+      terminal = next.supersededById;
+      depth += 1;
+    }
+    resolved.push({ ...mutation, supersededById: terminal });
+  }
+  return resolved.sort((left, right) => left.id - right.id);
+}
+function getMemoryMutationsForRender(db, projectPath, afterId, renderedMemoryIds) {
+  return getMemoryMutationsForRenderByIdentitySet(db, [projectPath], afterId, renderedMemoryIds);
+}
+function getMemoryMutationsForRenderByProjects(db, projectPaths, afterId, renderedMemoryIds) {
+  return getMemoryMutationsForRenderByIdentitySet(db, projectPaths, afterId, renderedMemoryIds);
+}
+function getMaxMemoryMutationId(db, projectPath) {
+  const row = db.prepare("SELECT MAX(id) AS max_id FROM memory_mutation_log WHERE project_path = ?").get(projectPath);
+  return row?.max_id ?? null;
+}
+function getMaxMemoryMutationIdForProjects(db, projectPaths) {
+  const identities = uniqueProjectPaths2(projectPaths);
+  if (identities.length === 0)
+    return null;
+  if (identities.length === 1)
+    return getMaxMemoryMutationId(db, identities[0]);
+  const row = db.prepare(`SELECT MAX(id) AS max_id
+               FROM memory_mutation_log
+              WHERE project_path IN (${placeholders2(identities)})`).get(...identities);
+  return row?.max_id ?? null;
+}
+// ../plugin/src/shared/context-limit-provenance.ts
+function normalizeContextLimitProvenance(value) {
+  if (value === "prompt_only" || value === "combined")
+    return value;
+  return "unknown";
+}
+
+// ../plugin/src/shared/escalation-bands.ts
+var MAX_EXECUTE_THRESHOLD = 90;
+var ABSOLUTE_EMERGENCY_PERCENTAGE = 95;
+function escalationBands(effectiveThresholdPercentage) {
+  const threshold = Number.isFinite(effectiveThresholdPercentage) ? Math.min(effectiveThresholdPercentage, MAX_EXECUTE_THRESHOLD) : 65;
+  return {
+    forceMaterializationPercentage: Math.max(85, threshold + 2),
+    emergencyPercentage: ABSOLUTE_EMERGENCY_PERCENTAGE
+  };
+}
+
+// ../plugin/src/features/magic-context/storage-meta-persisted.ts
+var emergencyRecoveryArmedSessions = new Set;
+var emergencyRecoveryArmedAtBySession = new Map;
+var providerOverflowReconfirmedSessions = new Set;
+var CAS_RETRY_LIMIT = 5;
+var AUTO_SEARCH_NO_HINT_REASONS = new Set([
+  "below-threshold",
+  "timeout",
+  "empty",
+  "error",
+  "stacked",
+  "too-short"
+]);
+function isPersistedNoteNudgeRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.note_nudge_trigger_pending === "number" && typeof r.note_nudge_trigger_message_id === "string" && typeof r.note_nudge_sticky_text === "string" && typeof r.note_nudge_sticky_message_id === "string";
+}
+function isValidNoteNudgeAnchor(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const row = value;
+  return typeof row.messageId === "string" && row.messageId.length > 0 && typeof row.text === "string" && row.text.length > 0;
+}
+function isValidAutoSearchHintDecision(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const row = value;
+  if (typeof row.messageId !== "string" || row.messageId.length === 0)
+    return false;
+  if (row.decision === "hint") {
+    return typeof row.text === "string" && row.text.length > 0;
+  }
+  if (row.decision === "no-hint") {
+    return typeof row.reason === "string" && AUTO_SEARCH_NO_HINT_REASONS.has(row.reason);
+  }
+  return false;
+}
+function parseJsonArray(json, validator) {
+  if (!json)
+    return [];
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed))
+      return [];
+    return parsed.filter(validator);
+  } catch {
+    return [];
+  }
+}
+function isPersistedHistorianFailureRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.historian_failure_count === "number" && (typeof r.historian_last_error === "string" || r.historian_last_error === null) && (typeof r.historian_last_failure_at === "number" || r.historian_last_failure_at === null);
+}
+function getDefaultPersistedNoteNudge() {
+  return {
+    triggerPending: false,
+    triggerMessageId: null,
+    stickyText: null,
+    stickyMessageId: null
+  };
+}
+function getDefaultHistorianFailureState() {
+  return {
+    failureCount: 0,
+    lastError: null,
+    lastFailureAt: null
+  };
+}
+var DEFAULT_PROTECTED_TAIL_META = {
+  priorBoundaryOrdinal: 1,
+  protectedTailPolicyVersion: 0,
+  protectedTailDrainWindowStartedAt: 0,
+  protectedTailDrainTokens: 0,
+  recoveryNoEligibleHeadCount: 0,
+  forceEmergencyBypassWindowStart: 0,
+  forceEmergencyBypassUsed: 0,
+  emergencyDrainActive: 0,
+  historianDrainFailureAt: 0
+};
+function toProtectedTailMeta(row) {
+  if (row === null || typeof row !== "object")
+    return { ...DEFAULT_PROTECTED_TAIL_META };
+  const r = row;
+  const numberOr = (value, fallback) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    priorBoundaryOrdinal: Math.max(1, numberOr(r.prior_boundary_ordinal, 1)),
+    protectedTailPolicyVersion: numberOr(r.protected_tail_policy_version, 0),
+    protectedTailDrainWindowStartedAt: numberOr(r.protected_tail_drain_window_started_at, 0),
+    protectedTailDrainTokens: numberOr(r.protected_tail_drain_tokens, 0),
+    recoveryNoEligibleHeadCount: numberOr(r.recovery_no_eligible_head_count, 0),
+    forceEmergencyBypassWindowStart: numberOr(r.force_emergency_bypass_window_start, 0),
+    forceEmergencyBypassUsed: numberOr(r.force_emergency_bypass_used, 0),
+    emergencyDrainActive: numberOr(r.emergency_drain_active, 0),
+    historianDrainFailureAt: numberOr(r.historian_drain_failure_at, 0)
+  };
+}
+function loadProtectedTailMeta(db, sessionId) {
+  ensureSessionMetaRow(db, sessionId);
+  const row = db.prepare(`SELECT prior_boundary_ordinal, protected_tail_policy_version,
+                    protected_tail_drain_window_started_at, protected_tail_drain_tokens,
+                    recovery_no_eligible_head_count, force_emergency_bypass_window_start,
+                    force_emergency_bypass_used, emergency_drain_active, historian_drain_failure_at
+             FROM session_meta WHERE session_id = ?`).get(sessionId);
+  return toProtectedTailMeta(row);
+}
+function markProtectedTailPolicyV3Seeded(db, sessionId, priorBoundaryOrdinal) {
+  let seeded = false;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const existing = loadProtectedTailMeta(db, sessionId);
+    if (existing.protectedTailPolicyVersion < 3) {
+      db.prepare(`UPDATE session_meta
+                 SET prior_boundary_ordinal = ?, protected_tail_policy_version = 3
+                 WHERE session_id = ? AND protected_tail_policy_version < 3`).run(Math.max(1, Math.floor(priorBoundaryOrdinal)), sessionId);
+      seeded = true;
+    }
+  })();
+  return { ...loadProtectedTailMeta(db, sessionId), seeded };
+}
+function recordProtectedTailPublicationFloor(db, sessionId, floorOrdinal) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare(`UPDATE session_meta
+             SET prior_boundary_ordinal = MAX(COALESCE(prior_boundary_ordinal, 1), ?),
+                 recovery_no_eligible_head_count = 0
+             WHERE session_id = ?`).run(Math.max(1, Math.floor(floorOrdinal)), sessionId);
+  })();
+}
+function recordProtectedTailNoEligibleHead(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare(`UPDATE session_meta
+             SET recovery_no_eligible_head_count = COALESCE(recovery_no_eligible_head_count, 0) + 1
+             WHERE session_id = ?`).run(sessionId);
+  })();
+  return loadProtectedTailMeta(db, sessionId).recoveryNoEligibleHeadCount;
+}
+var DRAIN_WINDOW_MS = 10 * 60 * 1000;
+var WRAPUP_IN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+function parseWrapupState(value) {
+  if (typeof value !== "string" || value.trim().length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object")
+      return null;
+    if (typeof parsed.holderId !== "string" || parsed.holderId.length === 0)
+      return null;
+    const numberFields = [
+      "acquiredAt",
+      "expiresAt",
+      "messagesToKeep",
+      "anchorRawMessageCount",
+      "targetEligibleEndOrdinal",
+      "lastCompartmentEnd",
+      "chunkIndex",
+      "expectedChunks",
+      "updatedAt"
+    ];
+    for (const field of numberFields) {
+      if (typeof parsed[field] !== "number" || !Number.isFinite(parsed[field]))
+        return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function readRawWrapupState(db, sessionId) {
+  const row = db.prepare("SELECT wrapup_in_progress_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  return parseWrapupState(row?.wrapup_in_progress_state);
+}
+function getWrapupInProgressState(db, sessionId, now = Date.now()) {
+  const state = readRawWrapupState(db, sessionId);
+  if (!state)
+    return null;
+  if (state.expiresAt > now)
+    return state;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch {
+    return null;
+  }
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (current && current.expiresAt <= now) {
+      db.prepare("UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?").run(sessionId);
+    }
+    db.exec("COMMIT");
+    finished = true;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+  return null;
+}
+function isWrapupInProgress(db, sessionId, now = Date.now()) {
+  return getWrapupInProgressState(db, sessionId, now) !== null;
+}
+function acquireWrapupInProgress(db, sessionId, state, now = Date.now()) {
+  const acquiredAt = now;
+  const next = {
+    ...state,
+    acquiredAt,
+    expiresAt: acquiredAt + WRAPUP_IN_PROGRESS_TTL_MS,
+    updatedAt: acquiredAt
+  };
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    ensureSessionMetaRow(db, sessionId);
+    const current = readRawWrapupState(db, sessionId);
+    if (current && current.expiresAt > now && current.holderId !== state.holderId) {
+      db.exec("COMMIT");
+      finished = true;
+      return { ok: false, state: current };
+    }
+    db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(stableStringify(next), sessionId);
+    db.exec("COMMIT");
+    finished = true;
+    return { ok: true, state: next };
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function updateWrapupInProgress(db, sessionId, holderId, updates, now = Date.now()) {
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (!current || current.holderId !== holderId || current.expiresAt <= now) {
+      db.exec("ROLLBACK");
+      finished = true;
+      return null;
+    }
+    const next = {
+      ...current,
+      ...updates,
+      holderId,
+      expiresAt: now + WRAPUP_IN_PROGRESS_TTL_MS,
+      updatedAt: now
+    };
+    db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(stableStringify(next), sessionId);
+    db.exec("COMMIT");
+    finished = true;
+    return next;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function releaseWrapupInProgress(db, sessionId, holderId) {
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (current?.holderId === holderId) {
+      db.prepare("UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?").run(sessionId);
+    }
+    db.exec("COMMIT");
+    finished = true;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+var COMPACTION_MODE_RECORD_VALUES = new Set([
+  "on",
+  "off",
+  "on_notice_pending",
+  "off_notice_pending",
+  "off_cleanup_pending"
+]);
+function protectedTailWindowBudget(usagePercentage, usable, perRunCap) {
+  if (usagePercentage >= 95)
+    return Math.min(1e6, Math.max(4 * perRunCap, Math.round(0.5 * usable)));
+  if (usagePercentage >= 80)
+    return Math.min(750000, Math.max(3 * perRunCap, Math.round(0.35 * usable)));
+  return Math.min(500000, Math.max(perRunCap, Math.round(0.2 * usable)));
+}
+var EMERGENCY_DRAIN_EXIT_MARGIN = 10;
+var EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE = 55;
+var EMERGENCY_DRAIN_FAILURE_BACKOFF_MS = 60000;
+var EMERGENCY_DRAIN_MAX_LATCH_MS = 30 * 60 * 1000;
+function emergencyDrainExitThreshold(executeThresholdPercentage) {
+  if (!Number.isFinite(executeThresholdPercentage) || executeThresholdPercentage <= 0) {
+    return EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE;
+  }
+  return Math.max(0, executeThresholdPercentage - EMERGENCY_DRAIN_EXIT_MARGIN);
+}
+function reserveProtectedTailDrainTokens(args) {
+  const now = args.now ?? Date.now();
+  const requested = Math.max(0, Math.floor(args.trueRawTokens));
+  if (requested === 0) {
+    return { ok: true, reservedTokens: 0, overQuotaBypass: false, reservation: null };
+  }
+  let result = {
+    ok: false,
+    reservedTokens: 0,
+    overQuotaBypass: false,
+    reservation: null,
+    skippedReason: "quota exhausted"
+  };
+  args.db.transaction(() => {
+    ensureSessionMetaRow(args.db, args.sessionId);
+    let meta = loadProtectedTailMeta(args.db, args.sessionId);
+    if (now - meta.protectedTailDrainWindowStartedAt > DRAIN_WINDOW_MS) {
+      args.db.prepare(`UPDATE session_meta
+                     SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 0
+                     WHERE session_id = ?`).run(now, args.sessionId);
+      meta = loadProtectedTailMeta(args.db, args.sessionId);
+    }
+    const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
+    let latchActiveSince = meta.emergencyDrainActive;
+    const { forceMaterializationPercentage } = escalationBands(args.executeThresholdPercentage);
+    if (args.usagePercentage >= forceMaterializationPercentage) {
+      if (latchActiveSince <= 0)
+        latchActiveSince = now;
+    } else if (latchActiveSince > 0) {
+      const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
+      if (args.usagePercentage < exitThreshold || expired)
+        latchActiveSince = 0;
+    }
+    if (latchActiveSince !== meta.emergencyDrainActive) {
+      args.db.prepare("UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ?").run(latchActiveSince, args.sessionId);
+    }
+    const latchActive = latchActiveSince > 0;
+    const budget = protectedTailWindowBudget(args.usagePercentage, args.usable, args.perRunCap);
+    const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
+    let reserved = Math.min(requested, args.perRunCap, remaining);
+    let bypass = false;
+    const inFailureBackoff = meta.historianDrainFailureAt > 0 && now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
+    if (reserved <= 0 && latchActive && !inFailureBackoff) {
+      reserved = Math.min(requested, args.perRunCap);
+      bypass = true;
+    }
+    if (reserved <= 0)
+      return;
+    args.db.prepare(`UPDATE session_meta
+                 SET protected_tail_drain_window_started_at = CASE WHEN protected_tail_drain_window_started_at = 0 THEN ? ELSE protected_tail_drain_window_started_at END,
+                     protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
+                 WHERE session_id = ?`).run(now, reserved, args.sessionId);
+    result = {
+      ok: true,
+      reservedTokens: reserved,
+      overQuotaBypass: bypass,
+      reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved }
+    };
+  })();
+  return result;
+}
+function clearEmergencyDrainLatch(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET emergency_drain_active = 0 WHERE session_id = ?").run(sessionId);
+  })();
+}
+function recordHistorianDrainFailure(db, sessionId, now) {
+  const ts = now ?? Date.now();
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_drain_failure_at = ? WHERE session_id = ?").run(ts, sessionId);
+  })();
+}
+function clearHistorianDrainFailure(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_drain_failure_at = 0 WHERE session_id = ?").run(sessionId);
+  })();
+}
+function rollbackProtectedTailDrainReservation(db, reservation) {
+  if (!reservation || reservation.tokens <= 0)
+    return;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, reservation.sessionId);
+    db.prepare(`UPDATE session_meta
+             SET protected_tail_drain_tokens = MAX(0, COALESCE(protected_tail_drain_tokens, 0) - ?)
+             WHERE session_id = ?`).run(reservation.tokens, reservation.sessionId);
+  })();
+}
+function isEmergencyInputSampleRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_emergency_input_sample === "number";
+}
+function getEmergencyInputSample(db, sessionId) {
+  const result = db.prepare("SELECT last_emergency_input_sample FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isEmergencyInputSampleRow(result) ? result.last_emergency_input_sample : 0;
+}
+function setEmergencyDropSample(db, sessionId, inputSample) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_emergency_input_sample = ? WHERE session_id = ?").run(Math.max(0, Math.round(inputSample)), sessionId);
+  })();
+}
+function isLastNudgeUndroppedRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_nudge_undropped === "number";
+}
+function isLastNudgeLevelRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_nudge_level === "string";
+}
+function normalizeLastNudgeLevel(value) {
+  return value === "gentle" || value === "firm" || value === "urgent" ? value : "";
+}
+function getLastNudgeUndropped(db, sessionId) {
+  const result = db.prepare("SELECT last_nudge_undropped FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isLastNudgeUndroppedRow(result) ? result.last_nudge_undropped : 0;
+}
+function setLastNudgeUndropped(db, sessionId, value) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_nudge_undropped = ? WHERE session_id = ?").run(Math.max(0, Math.round(value)), sessionId);
+  })();
+}
+function getLastNudgeLevel(db, sessionId) {
+  const result = db.prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isLastNudgeLevelRow(result) ? normalizeLastNudgeLevel(result.last_nudge_level) : "";
+}
+function setLastNudgeLevel(db, sessionId, value) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(normalizeLastNudgeLevel(value), sessionId);
+  })();
+}
+function isChannel2StateRow(row) {
+  return typeof row === "object" && row !== null && typeof row.channel2_nudge_state === "string";
+}
+function getChannel2NudgeState(db, sessionId) {
+  const result = db.prepare("SELECT channel2_nudge_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isChannel2StateRow(result))
+    return "";
+  const raw = result.channel2_nudge_state;
+  return raw === "pending" || raw === "claimed" || raw === "delivered" ? raw : "";
+}
+function setChannel2NudgeState(db, sessionId, state) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const claimedAt = state === "claimed" ? Date.now() : 0;
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?").run(state, claimedAt, sessionId);
+  })();
+}
+function getPersistedNoteNudge(db, sessionId) {
+  const result = db.prepare("SELECT note_nudge_trigger_pending, note_nudge_trigger_message_id, note_nudge_sticky_text, note_nudge_sticky_message_id FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isPersistedNoteNudgeRow(result)) {
+    return getDefaultPersistedNoteNudge();
+  }
+  return {
+    triggerPending: result.note_nudge_trigger_pending === 1,
+    triggerMessageId: result.note_nudge_trigger_message_id.length > 0 ? result.note_nudge_trigger_message_id : null,
+    stickyText: result.note_nudge_sticky_text.length > 0 ? result.note_nudge_sticky_text : null,
+    stickyMessageId: result.note_nudge_sticky_message_id.length > 0 ? result.note_nudge_sticky_message_id : null
+  };
+}
+function setPersistedNoteNudgeTrigger(db, sessionId, triggerMessageId = "") {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 1, note_nudge_trigger_message_id = ? WHERE session_id = ?").run(triggerMessageId, sessionId);
+  })();
+}
+function setPersistedNoteNudgeTriggerMessageId(db, sessionId, triggerMessageId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET note_nudge_trigger_message_id = ? WHERE session_id = ?").run(triggerMessageId, sessionId);
+  })();
+}
+function getAutoSearchHintDecisions(db, sessionId) {
+  const row = db.prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?").get(sessionId);
+  return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
+}
+function casUpdateJsonArrayColumn(db, sessionId, column, validator, mutate, options) {
+  if (column !== "note_nudge_anchors" && column !== "auto_search_hint_decisions") {
+    throw new Error(`casUpdateJsonArrayColumn: refusing unknown column "${column}"`);
+  }
+  if (options?.ensureRow === false) {
+    const exists = db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get(sessionId);
+    if (!exists)
+      return true;
+  } else {
+    ensureSessionMetaRow(db, sessionId);
+  }
+  for (let attempt = 0;attempt < CAS_RETRY_LIMIT; attempt += 1) {
+    const row = db.prepare(`SELECT ${column} FROM session_meta WHERE session_id = ?`).get(sessionId);
+    const rawCurrent = row?.[column] ?? null;
+    const currentBlob = rawCurrent ?? "[]";
+    const current = parseJsonArray(currentBlob, validator);
+    const next = mutate(current);
+    if (next === null)
+      return true;
+    const nextBlob = stableStringify(next);
+    if (nextBlob === currentBlob)
+      return true;
+    const result = db.prepare(`UPDATE session_meta SET ${column} = ? WHERE session_id = ? AND ${column} IS ?`).run(nextBlob, sessionId, rawCurrent);
+    if (result.changes > 0)
+      return true;
+  }
+  sessionLog(sessionId, `${column} CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
+  return false;
+}
+function deliverNoteNudgeAtomic(db, sessionId, messageId, text) {
+  let plan = null;
+  const casOk = casUpdateJsonArrayColumn(db, sessionId, "note_nudge_anchors", isValidNoteNudgeAnchor, (current) => {
+    if (current.some((anchor) => anchor.messageId === messageId && anchor.text === text)) {
+      plan = { kind: "already-present" };
+      return null;
+    }
+    if (current.some((anchor) => anchor.messageId === messageId)) {
+      plan = { kind: "conflict" };
+      sessionLog(sessionId, "note-nudge: messageId conflict, refusing append");
+      return null;
+    }
+    plan = { kind: "appended" };
+    return [...current, { messageId, text }];
+  });
+  if (!casOk) {
+    sessionLog(sessionId, `note-nudge: CAS exhausted for ${messageId}; skipping wire append`);
+    return { ok: false, kind: "cas-exhausted" };
+  }
+  const committedPlan = plan;
+  if (!committedPlan) {
+    sessionLog(sessionId, "note-nudge: CAS reported success with no plan staged; treating as failure");
+    return { ok: false, kind: "cas-exhausted" };
+  }
+  if (committedPlan.kind === "conflict") {
+    return { ok: false, kind: "conflict" };
+  }
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+  return { ok: true, kind: committedPlan.kind };
+}
+function appendAutoSearchHintDecision(db, sessionId, entry) {
+  if (!entry.messageId)
+    return { ok: false, kind: "cas-exhausted" };
+  let staged = null;
+  const casOk = casUpdateJsonArrayColumn(db, sessionId, "auto_search_hint_decisions", isValidAutoSearchHintDecision, (current) => {
+    const existing = current.find((decision) => decision.messageId === entry.messageId);
+    if (existing) {
+      staged = { kind: "already-present", decision: existing };
+      return null;
+    }
+    staged = { kind: "appended", decision: entry };
+    return [...current, entry];
+  });
+  if (!casOk)
+    return { ok: false, kind: "cas-exhausted" };
+  const committed = staged;
+  if (!committed) {
+    sessionLog(sessionId, "auto-search: CAS reported success with no staged outcome");
+    return { ok: false, kind: "cas-exhausted" };
+  }
+  return { ok: true, kind: committed.kind, decision: committed.decision };
+}
+function getNoteLastReadAt(db, sessionId) {
+  try {
+    const result = db.prepare("SELECT note_last_read_at FROM session_meta WHERE session_id = ?").get(sessionId);
+    if (!result || typeof result !== "object")
+      return 0;
+    const value = result.note_last_read_at;
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+function setNoteLastReadAt(db, sessionId, at = Date.now()) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET note_last_read_at = ? WHERE session_id = ?").run(at, sessionId);
+  })();
+}
+function getHistorianFailureState(db, sessionId) {
+  const result = db.prepare("SELECT historian_failure_count, historian_last_error, historian_last_failure_at FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isPersistedHistorianFailureRow(result)) {
+    return getDefaultHistorianFailureState();
+  }
+  return {
+    failureCount: result.historian_failure_count,
+    lastError: typeof result.historian_last_error === "string" && result.historian_last_error.length > 0 ? result.historian_last_error : null,
+    lastFailureAt: typeof result.historian_last_failure_at === "number" ? result.historian_last_failure_at : null
+  };
+}
+function incrementHistorianFailure(db, sessionId, error) {
+  let nextCount = 1;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const current = getHistorianFailureState(db, sessionId);
+    nextCount = current.failureCount + 1;
+    db.prepare("UPDATE session_meta SET historian_failure_count = ?, historian_last_error = ?, historian_last_failure_at = ? WHERE session_id = ?").run(nextCount, error, Date.now(), sessionId);
+    const reason = error.replace(/\s+/g, " ").trim().slice(0, 300);
+    sessionLog(sessionId, `historian failure recorded: count=${nextCount} reason="${reason}"`);
+  })();
+  return nextCount;
+}
+function clearHistorianFailureState(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_failure_count = 0, historian_last_error = NULL, historian_last_failure_at = NULL WHERE session_id = ?").run(sessionId);
+  })();
+}
+function normalizeDetectedLimitModelKey(modelKey) {
+  return typeof modelKey === "string" && modelKey.length > 0 ? modelKey : null;
+}
+function normalizeEmergencyRecoveryOrigin(value) {
+  return value === "provider_overflow" || value === "proactive_model_shrink" ? value : null;
+}
+function getOverflowState(db, sessionId, modelKey) {
+  const result = db.prepare("SELECT detected_context_limit, detected_context_limit_model_key, detected_context_limit_provenance, needs_emergency_recovery, emergency_recovery_origin FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!result) {
+    return {
+      detectedContextLimit: 0,
+      detectedContextLimitModelKey: null,
+      detectedContextLimitProvenance: "unknown",
+      needsEmergencyRecovery: false,
+      emergencyRecoveryOrigin: null
+    };
+  }
+  const storedModelKey = normalizeDetectedLimitModelKey(result.detected_context_limit_model_key);
+  const requestedModelKey = normalizeDetectedLimitModelKey(modelKey);
+  const provenance = normalizeContextLimitProvenance(result.detected_context_limit_provenance);
+  const limit = typeof result.detected_context_limit === "number" && result.detected_context_limit > 0 ? result.detected_context_limit : 0;
+  const modelMatches = limit > 0 && requestedModelKey && storedModelKey ? requestedModelKey === storedModelKey : true;
+  const needs = typeof result.needs_emergency_recovery === "number" && result.needs_emergency_recovery > 0;
+  const persistedOrigin = normalizeEmergencyRecoveryOrigin(result.emergency_recovery_origin);
+  const recoveryOrigin = needs ? persistedOrigin ?? (limit > 0 ? "provider_overflow" : null) : null;
+  return {
+    detectedContextLimit: modelMatches ? limit : 0,
+    detectedContextLimitModelKey: storedModelKey,
+    detectedContextLimitProvenance: provenance,
+    needsEmergencyRecovery: needs,
+    emergencyRecoveryOrigin: recoveryOrigin
+  };
+}
+function clearEmergencyRecovery(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    try {
+      db.prepare("UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '', recovery_no_eligible_head_count = 0 WHERE session_id = ?").run(sessionId);
+    } catch {
+      db.prepare("UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '' WHERE session_id = ?").run(sessionId);
+    }
+  })();
+  emergencyRecoveryArmedSessions.delete(sessionId);
+  emergencyRecoveryArmedAtBySession.delete(sessionId);
+  providerOverflowReconfirmedSessions.delete(sessionId);
+}
+function getPersistedCompactionMarkerState(db, sessionId) {
+  const row = db.prepare("SELECT compaction_marker_state, compaction_marker_target_end_message_id FROM session_meta WHERE session_id = ?").get(sessionId);
+  const raw = row?.compaction_marker_state;
+  if (!raw || raw.length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.boundaryMessageId === "string" && typeof parsed.summaryMessageId === "string" && typeof parsed.compactionPartId === "string" && typeof parsed.summaryPartId === "string" && typeof parsed.boundaryOrdinal === "number") {
+      const targetEndMessageId = typeof row?.compaction_marker_target_end_message_id === "string" && row.compaction_marker_target_end_message_id.length > 0 ? row.compaction_marker_target_end_message_id : typeof parsed.targetEndMessageId === "string" && parsed.targetEndMessageId.length > 0 ? parsed.targetEndMessageId : null;
+      return {
+        ...parsed,
+        targetEndMessageId
+      };
+    }
+  } catch {}
+  return null;
+}
+function setPersistedCompactionMarkerState(db, sessionId, state) {
+  ensureSessionMetaRow(db, sessionId);
+  const json = state ? JSON.stringify(state) : "";
+  db.prepare("UPDATE session_meta SET compaction_marker_state = ?, compaction_marker_target_end_message_id = ? WHERE session_id = ?").run(json, state?.targetEndMessageId ?? null, sessionId);
+}
+function isPendingCompactionMarker(value) {
+  return typeof value === "object" && value !== null && typeof value.ordinal === "number" && typeof value.endMessageId === "string" && typeof value.publishedAt === "number";
+}
+function getPendingCompactionMarkerState(db, sessionId) {
+  const row = db.prepare("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  const raw = row?.pending_compaction_marker_state;
+  if (raw === null || raw === undefined || raw === "")
+    return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (isPendingCompactionMarker(parsed)) {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+function setPendingCompactionMarkerState(db, sessionId, state) {
+  ensureSessionMetaRow(db, sessionId);
+  const blob = state ? stableStringify(state) : null;
+  db.prepare("UPDATE session_meta SET pending_compaction_marker_state = ? WHERE session_id = ?").run(blob, sessionId);
+}
+function clearPendingCompactionMarkerStateIf(db, sessionId, expected) {
+  const expectedBlob = stableStringify(expected);
+  const result = db.prepare(`UPDATE session_meta SET pending_compaction_marker_state = NULL
+             WHERE session_id = ? AND pending_compaction_marker_state = ?`).run(sessionId, expectedBlob);
+  return result.changes > 0;
+}
+// ../plugin/src/features/magic-context/storage-meta-session.ts
+import { Buffer as Buffer3 } from "node:buffer";
+
+// ../plugin/src/features/magic-context/resolve-subagent-fallback.ts
+function resolveIsSubagentFromOpenCodeDb(sessionId) {
+  try {
+    return withReadOnlySessionDb((openCodeDb) => {
+      const row = openCodeDb.prepare("SELECT parent_id FROM session WHERE id = ?").get(sessionId);
+      if (!row)
+        return null;
+      return typeof row.parent_id === "string" && row.parent_id.length > 0;
+    });
+  } catch (error) {
+    log(`[magic-context] resolveIsSubagentFromOpenCodeDb failed for ${sessionId}:`, error);
+    return null;
+  }
+}
+
+// ../plugin/src/features/magic-context/storage-meta-session.ts
+var SESSION_META_FALLBACK_SELECTS = {
+  cache_ttl: "'5m' AS cache_ttl",
+  last_nudge_band: "'' AS last_nudge_band",
+  last_transform_error: "'' AS last_transform_error",
+  system_prompt_hash: "'' AS system_prompt_hash",
+  last_todo_state: "'' AS last_todo_state",
+  tool_reclaim_watermark: "0 AS tool_reclaim_watermark",
+  cached_m0_bytes: "NULL AS cached_m0_bytes",
+  cached_m0_mural_data_url: "NULL AS cached_m0_mural_data_url",
+  cached_m0_mural_hash: "NULL AS cached_m0_mural_hash",
+  cached_m1_bytes: "NULL AS cached_m1_bytes",
+  cached_m0_project_memory_epoch: "NULL AS cached_m0_project_memory_epoch",
+  cached_m0_project_user_profile_version: "NULL AS cached_m0_project_user_profile_version",
+  cached_m0_max_compartment_seq: "NULL AS cached_m0_max_compartment_seq",
+  cached_m0_max_memory_id: "NULL AS cached_m0_max_memory_id",
+  cached_m0_max_mutation_id: "NULL AS cached_m0_max_mutation_id",
+  cached_m0_max_memory_mutation_id: "NULL AS cached_m0_max_memory_mutation_id",
+  cached_m0_project_docs_hash: "NULL AS cached_m0_project_docs_hash",
+  cached_m0_materialized_at: "NULL AS cached_m0_materialized_at",
+  cached_m0_session_facts_version: "NULL AS cached_m0_session_facts_version",
+  cached_m0_upgrade_state: "NULL AS cached_m0_upgrade_state",
+  cached_m0_system_hash: "NULL AS cached_m0_system_hash",
+  cached_m0_tool_set_hash: "NULL AS cached_m0_tool_set_hash",
+  cached_m0_model_key: "NULL AS cached_m0_model_key",
+  cached_m0_project_identity: "NULL AS cached_m0_project_identity",
+  last_observed_model_key: "NULL AS last_observed_model_key",
+  upgrade_reminded_at: "NULL AS upgrade_reminded_at",
+  upgrade_reminder_last_sent_at: "NULL AS upgrade_reminder_last_sent_at",
+  upgrade_reminder_count: "0 AS upgrade_reminder_count"
+};
+var sessionMetaSelectColumnsCache = new WeakMap;
+function getSessionMetaSelectColumns(db) {
+  const cached = sessionMetaSelectColumnsCache.get(db);
+  if (cached !== undefined)
+    return cached;
+  const existingColumns = new Set(db.prepare("PRAGMA table_info(session_meta)").all().map((column) => column.name));
+  const projection = SESSION_META_SELECT_COLUMNS.map((column) => {
+    if (existingColumns.has(column))
+      return column;
+    return SESSION_META_FALLBACK_SELECTS[column] ?? `0 AS ${column}`;
+  }).join(", ");
+  sessionMetaSelectColumnsCache.set(db, projection);
+  return projection;
+}
+function getOrCreateSessionMeta(db, sessionId) {
+  const result = db.prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`).get(sessionId);
+  if (isSessionMetaRow(result)) {
+    return toSessionMeta(result);
+  }
+  const defaults = getDefaultSessionMeta(sessionId);
+  const fallbackSubagent = getHarness() === "opencode" ? resolveIsSubagentFromOpenCodeDb(sessionId) : null;
+  if (fallbackSubagent === true) {
+    defaults.isSubagent = true;
+  }
+  ensureSessionMetaRow(db, sessionId);
+  if (fallbackSubagent === true) {
+    db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run(sessionId);
+  }
+  return defaults;
+}
+function updateSessionMeta(db, sessionId, updates) {
+  const setClauses = [];
+  const values = [];
+  for (const [key, column] of Object.entries(META_COLUMNS)) {
+    const value = updates[key];
+    if (value === undefined)
+      continue;
+    if (value === null) {
+      setClauses.push(`${column} = ?`);
+      values.push(NULL_BIND_META_KEYS.has(key) ? null : "");
+    } else if ((key === "cachedM0Bytes" || key === "cachedM1Bytes") && value instanceof Uint8Array) {
+      setClauses.push(`${column} = ?`);
+      values.push(Buffer3.from(value.buffer, value.byteOffset, value.byteLength));
+    } else if (BOOLEAN_META_KEYS.has(key)) {
+      setClauses.push(`${column} = ?`);
+      values.push(value ? 1 : 0);
+    } else if (typeof value === "string" || typeof value === "number") {
+      setClauses.push(`${column} = ?`);
+      values.push(value);
+    }
+  }
+  if (setClauses.length === 0) {
+    return;
+  }
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(...values, sessionId);
+  })();
+}
+// ../plugin/src/features/magic-context/storage-ops.ts
+var queuePendingOpStatements = new WeakMap;
+var getPendingOpsStatements = new WeakMap;
+var clearPendingOpsStatements = new WeakMap;
+var removePendingOpStatements = new WeakMap;
+function getQueuePendingOpStatement(db) {
+  let stmt = queuePendingOpStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, ?, ?, ?)");
+    queuePendingOpStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getPendingOpsStatement(db) {
+  let stmt = getPendingOpsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT id, session_id, tag_id, operation, queued_at FROM pending_ops WHERE session_id = ? ORDER BY queued_at ASC, id ASC");
+    getPendingOpsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getRemovePendingOpStatement(db) {
+  let stmt = removePendingOpStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ?");
+    removePendingOpStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function isPendingOpRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.id === "number" && typeof r.session_id === "string" && typeof r.tag_id === "number" && typeof r.operation === "string" && typeof r.queued_at === "number";
+}
+function toPendingOp(row) {
+  if (row.operation !== "drop") {
+    sessionLog(row.session_id, `unknown pending operation "${row.operation}"; ignoring`);
+    return null;
+  }
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    tagId: row.tag_id,
+    operation: row.operation,
+    queuedAt: row.queued_at
+  };
+}
+function queuePendingOp(db, sessionId, tagId, operation, queuedAt = Date.now()) {
+  getQueuePendingOpStatement(db).run(sessionId, tagId, operation, queuedAt, getHarness());
+}
+function getPendingOps(db, sessionId) {
+  const rows = getPendingOpsStatement(db).all(sessionId).filter(isPendingOpRow);
+  return rows.map(toPendingOp).filter((op) => op !== null);
+}
+function removePendingOp(db, sessionId, tagId) {
+  getRemovePendingOpStatement(db).run(sessionId, tagId);
+}
+// ../plugin/src/features/magic-context/storage-project-state.ts
+var GLOBAL_USER_PROFILE_PROJECT_PATH = "__global__";
+function toProjectState(row) {
+  return {
+    projectPath: row.project_path,
+    projectMemoryEpoch: row.project_memory_epoch,
+    projectUserProfileVersion: row.project_user_profile_version,
+    updatedAt: row.updated_at
+  };
+}
+var getProjectStateStatements = new WeakMap;
+function getProjectState(db, projectPath) {
+  let statement = getProjectStateStatements.get(db);
+  if (!statement) {
+    statement = db.prepare(`SELECT project_path, project_memory_epoch, project_user_profile_version, updated_at
+             FROM project_state
+             WHERE project_path = ?`);
+    getProjectStateStatements.set(db, statement);
+  }
+  const row = statement.get(projectPath);
+  return row ? toProjectState(row) : null;
+}
+function bumpProjectUserProfileVersion(db, projectPath = GLOBAL_USER_PROFILE_PROJECT_PATH, now = Date.now()) {
+  db.prepare(`INSERT INTO project_state
+            (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+         VALUES (?, 0, 1, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            project_user_profile_version = project_user_profile_version + 1,
+            updated_at = excluded.updated_at`).run(projectPath, now);
+  const state = getProjectState(db, projectPath);
+  if (!state) {
+    throw new Error(`Failed to bump project user profile version for ${projectPath}`);
+  }
+  return state;
+}
+// ../plugin/src/features/magic-context/storage-source.ts
+function isSourceContentRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.tag_id === "number" && typeof r.content === "string";
+}
+function saveSourceContent(db, sessionId, tagId, content) {
+  db.prepare("INSERT OR IGNORE INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)").run(tagId, sessionId, content, Date.now(), getHarness());
+}
+function replaceSourceContent(db, sessionId, tagId, content) {
+  db.prepare(`INSERT INTO source_contents (tag_id, session_id, content, created_at, harness)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(session_id, tag_id)
+     DO UPDATE SET content = excluded.content, created_at = excluded.created_at`).run(tagId, sessionId, content, Date.now(), getHarness());
+}
+function getSourceContents(db, sessionId, tagIds) {
+  if (tagIds.length === 0) {
+    return new Map;
+  }
+  const placeholders = tagIds.map(() => "?").join(", ");
+  const rows = db.prepare(`SELECT tag_id, content FROM source_contents WHERE session_id = ? AND tag_id IN (${placeholders})`).all(sessionId, ...tagIds).filter(isSourceContentRow);
+  const sources = new Map;
+  for (const row of rows) {
+    sources.set(row.tag_id, row.content);
+  }
+  return sources;
+}
+// ../plugin/src/features/magic-context/storage-subagent-invocations.ts
+function clampToken(value) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+function recordSubagentInvocation(db, input) {
+  const result = db.prepare(`INSERT INTO subagent_invocations (
+                session_id, harness, subagent, task, provider_id, model_id,
+                started_at, ended_at, status,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                error, parent_invocation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagent, input.task ?? null, input.providerId ?? null, input.modelId ?? null, input.startedAt, input.endedAt, input.status, clampToken(input.inputTokens), clampToken(input.outputTokens), clampToken(input.cacheReadTokens), clampToken(input.cacheWriteTokens), input.error ?? null, input.parentInvocationId ?? null);
+  return Number(result.lastInsertRowid);
+}
+function getLatestHistorianInvocationId(db, sessionId) {
+  try {
+    const row = db.prepare(`SELECT id FROM subagent_invocations
+                 WHERE session_id = ? AND subagent = 'historian'
+                 ORDER BY id DESC LIMIT 1`).get(sessionId);
+    return typeof row?.id === "number" ? row.id : null;
+  } catch {
+    return null;
+  }
+}
+// ../plugin/src/features/magic-context/storage-tags.ts
+var insertTagStatements = new WeakMap;
+var updateTagStatusStatements = new WeakMap;
+var updateTagDropModeStatements = new WeakMap;
+var updateTagMessageIdStatements = new WeakMap;
+var getTagNumbersByMessageIdStatements = new WeakMap;
+var deleteTagsByMessageIdStatements = new WeakMap;
+var getMaxTagNumberBySessionStatements = new WeakMap;
+var getTagNumberByMessageIdStatements = new WeakMap;
+var hasPiFallbackMessageTagStatements = new WeakMap;
+function getInsertTagStatement(db) {
+  let stmt = insertTagStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO tags (session_id, message_id, type, byte_size, reasoning_byte_size, tag_number, tool_name, input_byte_size, harness, tool_owner_message_id, entry_fingerprint, token_count, input_token_count, reasoning_token_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    insertTagStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateTagStatusStatement(db) {
+  let stmt = updateTagStatusStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET status = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagStatusStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateTagDropModeStatement(db) {
+  let stmt = updateTagDropModeStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET drop_mode = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagDropModeStatements.set(db, stmt);
+  }
+  return stmt;
+}
+var updateTagByteSizeStatements = new WeakMap;
+var updateTagInputByteSizeStatements = new WeakMap;
+function getUpdateTagByteSizeStatement(db) {
+  let stmt = updateTagByteSizeStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET byte_size = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagByteSizeStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateTagInputByteSizeStatement(db) {
+  let stmt = updateTagInputByteSizeStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET input_byte_size = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagInputByteSizeStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function updateTagByteSize(db, sessionId, tagNumber, newByteSize) {
+  getUpdateTagByteSizeStatement(db).run(newByteSize, sessionId, tagNumber);
+}
+var CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
+function ownerMessageIdForTagRow(row) {
+  if (row.type === "tool") {
+    return row.tool_owner_message_id ?? row.message_id;
+  }
+  return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+}
+function getActiveTagTokenAggregate(db, sessionId, protectedTags = 0) {
+  const toolOutputExpr = protectedTags > 0 ? `COALESCE(SUM(CASE WHEN type = 'tool' AND tag_number < (
+                    SELECT tag_number FROM tags
+                    WHERE session_id = ? AND status = 'active'
+                    ORDER BY tag_number DESC LIMIT 1 OFFSET ?
+                ) THEN COALESCE(token_count, 0) ELSE 0 END), 0)` : `COALESCE(SUM(CASE WHEN type = 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)`;
+  const sql = `SELECT
+                COALESCE(SUM(CASE WHEN type != 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)
+                    + COALESCE(SUM(COALESCE(reasoning_token_count, 0)), 0) AS conversation,
+                COALESCE(SUM(CASE WHEN type = 'tool' THEN COALESCE(token_count, 0) + COALESCE(input_token_count, 0) ELSE 0 END), 0) AS tool_call,
+                ${toolOutputExpr} AS tool_output,
+                COALESCE(SUM(CASE WHEN token_count IS NULL THEN 1 ELSE 0 END), 0) AS null_count
+             FROM tags
+             WHERE session_id = ? AND status = 'active'`;
+  const params = protectedTags > 0 ? [sessionId, protectedTags - 1, sessionId] : [sessionId];
+  const row = db.prepare(sql).get(...params);
+  return {
+    conversation: row?.conversation ?? 0,
+    toolCall: row?.tool_call ?? 0,
+    toolOutput: row?.tool_output ?? 0,
+    nullCount: row?.null_count ?? 0
+  };
+}
+var RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"];
+var RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map((name) => `'${name.replace(/'/g, "''")}'`).join(", ");
+var getActiveToolTagsForAgeReclaimStatements = new WeakMap;
+function updateTagInputByteSize(db, sessionId, tagNumber, newInputByteSize) {
+  getUpdateTagInputByteSizeStatement(db).run(newInputByteSize, sessionId, tagNumber);
+}
+var updateTagTokenCountStatements = new WeakMap;
+var updateTagInputTokenCountStatements = new WeakMap;
+function getUpdateTagTokenCountStatement(db) {
+  let stmt = updateTagTokenCountStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET token_count = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagTokenCountStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpdateTagInputTokenCountStatement(db) {
+  let stmt = updateTagInputTokenCountStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("UPDATE tags SET input_token_count = ? WHERE session_id = ? AND tag_number = ?");
+    updateTagInputTokenCountStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function updateTagTokenCount(db, sessionId, tagNumber, newTokenCount) {
+  getUpdateTagTokenCountStatement(db).run(newTokenCount, sessionId, tagNumber);
+}
+function getAllStatusTagTokenTotalsFlat(db, sessionId, floor = 0) {
+  const rows = floor > 0 ? db.prepare(`SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+                       FROM tags
+                       WHERE session_id = ? AND tag_number >= ?`).all(sessionId, floor) : db.prepare(`SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+                       FROM tags
+                       WHERE session_id = ?`).all(sessionId);
+  const totals = new Map;
+  const nullMessageIds = new Set;
+  for (const row of rows) {
+    if (row.type === "tool" && row.tool_owner_message_id === null)
+      continue;
+    const owner = ownerMessageIdForTagRow(row);
+    if (row.token_count === null) {
+      nullMessageIds.add(owner);
+      totals.delete(owner);
+      continue;
+    }
+    if (nullMessageIds.has(owner))
+      continue;
+    const weight = (row.token_count ?? 0) + (row.input_token_count ?? 0) + (row.reasoning_token_count ?? 0);
+    totals.set(owner, (totals.get(owner) ?? 0) + weight);
+  }
+  return { totals, nullMessageIds };
+}
+function updateTagInputTokenCount(db, sessionId, tagNumber, newInputTokenCount) {
+  getUpdateTagInputTokenCountStatement(db).run(newInputTokenCount, sessionId, tagNumber);
+}
+function tagTokenCountIsNull(db, sessionId, tagNumber) {
+  const row = db.prepare("SELECT token_count FROM tags WHERE session_id = ? AND tag_number = ?").get(sessionId, tagNumber);
+  return row != null && row.token_count === null;
+}
+function backfillTagTokenCounts(db, sessionId, tagNumber, counts) {
+  db.prepare(`UPDATE tags
+            SET token_count = ?, input_token_count = ?, reasoning_token_count = ?
+            WHERE session_id = ? AND tag_number = ? AND token_count IS NULL`).run(counts.tokenCount ?? null, counts.inputTokenCount ?? null, counts.reasoningTokenCount ?? null, sessionId, tagNumber);
+}
+function getMaxTagNumberBySessionStatement(db) {
+  let stmt = getMaxTagNumberBySessionStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT COALESCE(MAX(tag_number), 0) AS max_tag_number FROM tags WHERE session_id = ?");
+    getMaxTagNumberBySessionStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getTagNumberByMessageIdStatement(db) {
+  let stmt = getTagNumberByMessageIdStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1");
+    getTagNumberByMessageIdStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function isTagRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.id === "number" && typeof r.message_id === "string" && typeof r.type === "string" && typeof r.status === "string" && typeof r.byte_size === "number" && typeof r.session_id === "string" && typeof r.tag_number === "number";
+}
+function toTagEntry(row) {
+  const type = row.type === "tool" ? "tool" : row.type === "file" ? "file" : "message";
+  const status = row.status === "dropped" || row.status === "compacted" ? row.status : "active";
+  return {
+    tagNumber: row.tag_number,
+    messageId: row.message_id,
+    type,
+    status,
+    dropMode: row.drop_mode === "truncated" ? "truncated" : row.drop_mode === "edit_marker" ? "edit_marker" : "full",
+    toolName: row.tool_name ?? null,
+    inputByteSize: row.input_byte_size ?? 0,
+    byteSize: row.byte_size,
+    reasoningByteSize: row.reasoning_byte_size ?? 0,
+    sessionId: row.session_id,
+    cavemanDepth: typeof row.caveman_depth === "number" && Number.isFinite(row.caveman_depth) ? row.caveman_depth : 0,
+    toolOwnerMessageId: typeof row.tool_owner_message_id === "string" ? row.tool_owner_message_id : null
+  };
+}
+function isTagNumberRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.tag_number === "number";
+}
+function isMaxTagNumberRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.max_tag_number === "number";
+}
+function insertTag(db, sessionId, messageId, type, byteSize, tagNumber, reasoningByteSize = 0, toolName = null, inputByteSize = 0, toolOwnerMessageId = null, entryFingerprint = null, tokenCounts = null) {
+  getInsertTagStatement(db).run(sessionId, messageId, type, byteSize, reasoningByteSize, tagNumber, toolName, inputByteSize, getHarness(), toolOwnerMessageId, entryFingerprint, tokenCounts?.tokenCount ?? null, tokenCounts?.inputTokenCount ?? null, tokenCounts?.reasoningTokenCount ?? null);
+  return tagNumber;
+}
+function updateTagStatus(db, sessionId, tagId, status) {
+  getUpdateTagStatusStatement(db).run(status, sessionId, tagId);
+}
+function updateTagDropMode(db, sessionId, tagNumber, dropMode) {
+  getUpdateTagDropModeStatement(db).run(dropMode, sessionId, tagNumber);
+}
+function updateCavemanDepth(db, sessionId, tagNumber, depth) {
+  db.prepare("UPDATE tags SET caveman_depth = ? WHERE session_id = ? AND tag_number = ?").run(depth, sessionId, tagNumber);
+}
+var getOwnerScopedToolTagNumbersStatements = new WeakMap;
+function getMaxTagNumberBySession(db, sessionId) {
+  const row = getMaxTagNumberBySessionStatement(db).get(sessionId);
+  return isMaxTagNumberRow(row) ? row.max_tag_number : 0;
+}
+function getTagNumberByMessageId(db, sessionId, messageId) {
+  const row = getTagNumberByMessageIdStatement(db).get(sessionId, messageId);
+  return isTagNumberRow(row) ? row.tag_number : null;
+}
+var getMinMessageTagNumberForRawIdStatements = new WeakMap;
+var TAG_SELECT_COLUMNS = "id, message_id, type, status, drop_mode, tool_name, input_byte_size, byte_size, reasoning_byte_size, session_id, tag_number, caveman_depth, tool_owner_message_id";
+function getTagsBySession(db, sessionId) {
+  const rows = db.prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? ORDER BY tag_number ASC, id ASC`).all(sessionId).filter(isTagRow);
+  return rows.map(toTagEntry);
+}
+var getActiveTagsBySessionStatements = new WeakMap;
+var getDroppedTagsBySessionStatements = new WeakMap;
+var getMaxDroppedTagNumberStatements = new WeakMap;
+function getActiveTagsBySessionStatement(db) {
+  let stmt = getActiveTagsBySessionStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'active' ORDER BY tag_number ASC, id ASC`);
+    getActiveTagsBySessionStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getActiveTagsBySession(db, sessionId) {
+  const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
+  return rows.map(toTagEntry);
+}
+var getToolTagNumberByOwnerStatements = new WeakMap;
+var getNullOwnerToolTagStatements = new WeakMap;
+var adoptNullOwnerToolTagStatements = new WeakMap;
+var deleteToolTagsByOwnerStatements = new WeakMap;
+function getGetToolTagNumberByOwnerStatement(db) {
+  let stmt = getToolTagNumberByOwnerStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT tag_number FROM tags
+             WHERE session_id = ? AND message_id = ?
+               AND type = 'tool' AND tool_owner_message_id = ?
+             LIMIT 1`);
+    getToolTagNumberByOwnerStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId) {
+  const row = getGetToolTagNumberByOwnerStatement(db).get(sessionId, callId, ownerMsgId);
+  return isTagNumberRow(row) ? row.tag_number : null;
+}
+function isNullOwnerToolTagRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.id === "number" && typeof r.tag_number === "number";
+}
+function getGetNullOwnerToolTagStatement(db) {
+  let stmt = getNullOwnerToolTagStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT id, tag_number FROM tags
+             WHERE session_id = ? AND message_id = ?
+               AND type = 'tool' AND tool_owner_message_id IS NULL
+             ORDER BY tag_number ASC
+             LIMIT 1`);
+    getNullOwnerToolTagStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getNullOwnerToolTag(db, sessionId, callId) {
+  const row = getGetNullOwnerToolTagStatement(db).get(sessionId, callId);
+  if (!isNullOwnerToolTagRow(row))
+    return null;
+  return { id: row.id, tagNumber: row.tag_number };
+}
+function getAdoptNullOwnerToolTagStatement(db) {
+  let stmt = adoptNullOwnerToolTagStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`UPDATE tags
+             SET tool_owner_message_id = ?
+             WHERE id = ? AND tool_owner_message_id IS NULL`);
+    adoptNullOwnerToolTagStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function adoptNullOwnerToolTag(db, rowId, ownerMsgId) {
+  const result = getAdoptNullOwnerToolTagStatement(db).run(ownerMsgId, rowId);
+  return (result.changes ?? 0) === 1;
+}
+// ../plugin/src/features/magic-context/storage-v22-backfill-failures.ts
+var ERROR_CLASSES = new Set([
+  "not_git_repo",
+  "git_missing",
+  "git_timeout",
+  "permission_denied",
+  "unknown"
+]);
+// ../plugin/src/hooks/magic-context/inject-compartments.ts
+import { Buffer as Buffer4 } from "node:buffer";
+
+// ../plugin/src/features/magic-context/mural/render-trigger.ts
+import { createHash as createHash9 } from "node:crypto";
+
+// ../plugin/src/shared/harness-provider-map.ts
+var PI_TO_CANONICAL_PROVIDER = {
+  "openai-codex": "openai",
+  "google-antigravity": "google"
+};
+function remapProviderPrefix2(ref, map) {
+  if (typeof ref !== "string")
+    return ref;
+  const slash = ref.indexOf("/");
+  if (slash <= 0)
+    return ref;
+  const provider = ref.slice(0, slash);
+  if (!Object.hasOwn(map, provider))
+    return ref;
+  return `${map[provider]}${ref.slice(slash)}`;
+}
+function piModelRefToCanonical(ref) {
+  return remapProviderPrefix2(ref, PI_TO_CANONICAL_PROVIDER);
+}
+
+// ../plugin/src/shared/models-dev-cache.ts
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, renameSync, writeFileSync } from "node:fs";
+import { join as join3 } from "node:path";
+var MIN_SANE_LIMIT = 20000;
+var MAX_SANE_LIMIT = 3000000;
+function isSaneLimit(limit) {
+  return typeof limit === "number" && limit >= MIN_SANE_LIMIT && limit <= MAX_SANE_LIMIT;
+}
+var SEPARATE_OUTPUT_QUOTA_PROVIDERS = new Set(["google", "google-antigravity"]);
+var MIN_PLAUSIBLE_CONTEXT_LIMIT = 1024;
+var OUTPUT_RESERVE_CAP_RATIO = 0.25;
+var outputReserveConfig;
+var reserveClampLogSeen = new Set;
+var apiCache = null;
+var persistSeedLoaded = false;
+function persistFilePath() {
+  return join3(getMagicContextStorageDir(), `model-context-limits-${getHarness()}.json`);
+}
+function loadPersistedApiCacheOnce() {
+  if (persistSeedLoaded || apiCache !== null)
+    return;
+  persistSeedLoaded = true;
+  try {
+    const raw = readFileSync2(persistFilePath(), "utf-8");
+    const obj = JSON.parse(raw);
+    const map = new Map;
+    for (const [key, persisted] of Object.entries(obj)) {
+      const limit = typeof persisted === "number" ? persisted : persisted.limit;
+      const contextLimit = typeof persisted === "number" ? undefined : persisted.contextLimit;
+      const inputLimit = typeof persisted === "number" ? undefined : persisted.inputLimit;
+      const outputLimit = typeof persisted === "number" ? undefined : persisted.outputLimit;
+      const vision = typeof persisted === "number" ? false : persisted.vision === true;
+      if (isSaneLimit(contextLimit) || isSaneLimit(limit)) {
+        map.set(key, {
+          limit: isSaneLimit(limit) ? limit : undefined,
+          contextLimit: isSaneLimit(contextLimit) ? contextLimit : undefined,
+          inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
+          outputLimit: isFinitePositive(outputLimit) ? outputLimit : undefined,
+          vision
+        });
+      }
+    }
+    if (map.size > 0) {
+      apiCache = map;
+      sessionLog("global", `models-dev-cache: seeded ${map.size} entries from persisted cache (cold start)`);
+    }
+  } catch {}
+}
+function isFinitePositive(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function modelKeyLookupOrder2(providerID, modelID) {
+  const full = `${providerID}/${modelID}`;
+  const canonicalFull = piModelRefToCanonical(full);
+  const candidates = [full, canonicalFull, modelID];
+  const colon = modelID.lastIndexOf(":");
+  if (colon > 0) {
+    const bareModel = modelID.slice(0, colon);
+    const providerBare = `${providerID}/${bareModel}`;
+    candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+  }
+  return [...new Set(candidates)];
+}
+function configuredOutputReserve(config, providerID, modelID) {
+  if (typeof config === "number")
+    return Number.isFinite(config) && config >= 0 ? config : undefined;
+  if (!config)
+    return;
+  for (const candidate of modelKeyLookupOrder2(providerID, modelID)) {
+    const value = config[candidate];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0)
+      return value;
+  }
+  return Number.isFinite(config.default) && config.default >= 0 ? config.default : undefined;
+}
+function logReserveClampOnce(key, message) {
+  if (reserveClampLogSeen.has(key))
+    return;
+  reserveClampLogSeen.add(key);
+  sessionLog("global", `models-dev-cache: ${message}`);
+}
+function setOutputReserveConfig(config) {
+  outputReserveConfig = config;
+}
+function resolveLimit(limit, providerID, modelID, reserveConfig = outputReserveConfig) {
+  if (!limit)
+    return;
+  const context = isFinitePositive(limit.context) ? limit.context : undefined;
+  const input = isFinitePositive(limit.input) ? limit.input : undefined;
+  if (input !== undefined && (context === undefined || input < context))
+    return input;
+  if (context === undefined)
+    return;
+  const configuredReserve = configuredOutputReserve(reserveConfig, providerID, modelID);
+  let reserve;
+  if (configuredReserve !== undefined) {
+    reserve = configuredReserve;
+  } else if (SEPARATE_OUTPUT_QUOTA_PROVIDERS.has(providerID)) {
+    reserve = 0;
+  } else {
+    const output = isFinitePositive(limit.output) ? limit.output : 0;
+    const cap = context * OUTPUT_RESERVE_CAP_RATIO;
+    reserve = Math.min(output, cap);
+    if (output > cap) {
+      logReserveClampOnce(`cap|${providerID}/${modelID}|${context}|${output}`, `output reserve capped at 25% for ${providerID}/${modelID}: ${output} → ${cap}`);
+    }
+  }
+  const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, context * 0.5);
+  const maxReserve = Math.max(0, context - floor);
+  if (reserve > maxReserve) {
+    logReserveClampOnce(`floor|${providerID}/${modelID}|${context}|${reserve}`, `output reserve clamped for ${providerID}/${modelID}: ${reserve} → ${maxReserve} (usable floor ${floor})`);
+    reserve = maxReserve;
+  }
+  return Math.floor(context - reserve);
+}
+function getSdkContextLimit(providerID, modelID, detectedContextLimit, options) {
+  loadPersistedApiCacheOnce();
+  const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
+  if (!metadata)
+    return;
+  const rawContext = metadata.contextLimit ?? metadata.limit;
+  const promptOnlyDetected = options?.detectedLimitProvenance === "prompt_only" && isFinitePositive(detectedContextLimit) ? detectedContextLimit : undefined;
+  const context = promptOnlyDetected === undefined && isFinitePositive(detectedContextLimit) && isFinitePositive(rawContext) ? Math.min(rawContext, detectedContextLimit) : promptOnlyDetected === undefined && isFinitePositive(detectedContextLimit) ? detectedContextLimit : rawContext;
+  const inputCandidates = [metadata.inputLimit, promptOnlyDetected].filter(isFinitePositive);
+  const input = inputCandidates.length > 0 ? Math.min(...inputCandidates) : undefined;
+  return resolveLimit({
+    context,
+    input,
+    output: metadata.outputLimit
+  }, providerID, modelID, options?.reservation === "none" ? 0 : undefined);
+}
+function modelSupportsVision(providerID, modelID) {
+  loadPersistedApiCacheOnce();
+  if (!apiCache)
+    return false;
+  const exact = apiCache.get(`${providerID}/${modelID}`);
+  if (exact?.vision === true)
+    return true;
+  const colon = modelID.lastIndexOf(":");
+  return colon > 0 ? apiCache.get(`${providerID}/${modelID.slice(0, colon)}`)?.vision === true : false;
+}
+function lookupMetadataWithTagFallback(cache, providerID, modelID) {
+  if (!cache)
+    return;
+  const exact = cache.get(`${providerID}/${modelID}`);
+  if (exact)
+    return exact;
+  const colonIdx = modelID.lastIndexOf(":");
+  if (colonIdx > 0) {
+    return cache.get(`${providerID}/${modelID.slice(0, colonIdx)}`);
+  }
+  return;
+}
+
+// ../plugin/src/features/magic-context/mural/mural-selection.ts
+var DEFAULT_MURAL_MEMORY_BUDGET = 8000;
+function muralOverflowMemories(memories, budgetTokens = DEFAULT_MURAL_MEMORY_BUDGET) {
+  const selected = trimMemoriesToBudgetV2("mural-selection", [...memories], budgetTokens).selected;
+  const selectedIds = new Set(selected.map((memory) => memory.id));
+  return memories.filter((memory) => !selectedIds.has(memory.id));
+}
+
+// ../plugin/src/features/magic-context/mural/render-mural.ts
+import { deflateSync } from "node:zlib";
+
+// ../plugin/src/features/magic-context/mural/mural-font.generated.ts
+var MURAL_FONT_CELL_WIDTH = 5;
+var MURAL_FONT_CELL_HEIGHT = 8;
+var MURAL_FONT_LINE_PITCH = 9;
+var MURAL_FONT_GLYPHS = {
+  " ": { rows: [0, 0, 0, 0, 0, 0, 0, 0], width: 5, advance: 5 },
+  "!": { rows: [4, 4, 4, 4, 4, 0, 4, 0], width: 5, advance: 5 },
+  '"': { rows: [10, 10, 10, 0, 0, 0, 0, 0], width: 5, advance: 5 },
+  "#": { rows: [0, 10, 31, 10, 10, 31, 10, 0], width: 5, advance: 5 },
+  $: { rows: [4, 14, 20, 12, 6, 6, 28, 4], width: 5, advance: 5 },
+  "%": { rows: [2, 18, 20, 4, 8, 10, 18, 16], width: 5, advance: 5 },
+  "&": { rows: [4, 10, 10, 12, 21, 18, 13, 0], width: 5, advance: 5 },
+  "'": { rows: [4, 4, 4, 0, 0, 0, 0, 0], width: 5, advance: 5 },
+  "(": { rows: [2, 4, 8, 8, 8, 8, 4, 2], width: 5, advance: 5 },
+  ")": { rows: [8, 4, 2, 2, 2, 2, 4, 8], width: 5, advance: 5 },
+  "*": { rows: [0, 0, 18, 12, 30, 12, 18, 0], width: 5, advance: 5 },
+  "+": { rows: [0, 0, 4, 4, 31, 4, 4, 0], width: 5, advance: 5 },
+  ",": { rows: [0, 0, 0, 0, 0, 4, 4, 8], width: 5, advance: 5 },
+  "-": { rows: [0, 0, 0, 0, 30, 0, 0, 0], width: 5, advance: 5 },
+  ".": { rows: [0, 0, 0, 0, 0, 0, 4, 0], width: 5, advance: 5 },
+  "/": { rows: [2, 2, 4, 4, 8, 8, 16, 16], width: 5, advance: 5 },
+  "0": { rows: [0, 12, 18, 22, 26, 18, 12, 0], width: 5, advance: 5 },
+  "1": { rows: [0, 4, 12, 4, 4, 4, 14, 0], width: 5, advance: 5 },
+  "2": { rows: [0, 12, 18, 2, 12, 16, 30, 0], width: 5, advance: 5 },
+  "3": { rows: [0, 12, 18, 4, 2, 18, 12, 0], width: 5, advance: 5 },
+  "4": { rows: [0, 16, 20, 20, 30, 4, 4, 0], width: 5, advance: 5 },
+  "5": { rows: [0, 30, 16, 28, 2, 2, 28, 0], width: 5, advance: 5 },
+  "6": { rows: [0, 12, 16, 28, 18, 18, 12, 0], width: 5, advance: 5 },
+  "7": { rows: [0, 30, 18, 2, 4, 8, 8, 0], width: 5, advance: 5 },
+  "8": { rows: [0, 12, 18, 12, 18, 18, 12, 0], width: 5, advance: 5 },
+  "9": { rows: [0, 12, 18, 18, 14, 2, 12, 0], width: 5, advance: 5 },
+  ":": { rows: [0, 0, 0, 4, 0, 0, 4, 0], width: 5, advance: 5 },
+  ";": { rows: [0, 0, 0, 4, 0, 4, 4, 8], width: 5, advance: 5 },
+  "<": { rows: [0, 2, 4, 8, 8, 4, 2, 0], width: 5, advance: 5 },
+  "=": { rows: [0, 0, 0, 30, 0, 30, 0, 0], width: 5, advance: 5 },
+  ">": { rows: [0, 8, 4, 2, 2, 4, 8, 0], width: 5, advance: 5 },
+  "?": { rows: [12, 18, 2, 4, 8, 0, 8, 0], width: 5, advance: 5 },
+  "@": { rows: [0, 12, 18, 22, 22, 16, 14, 0], width: 5, advance: 5 },
+  A: { rows: [0, 12, 18, 18, 30, 18, 18, 0], width: 5, advance: 5 },
+  B: { rows: [0, 28, 18, 28, 18, 18, 28, 0], width: 5, advance: 5 },
+  C: { rows: [0, 14, 16, 16, 16, 16, 14, 0], width: 5, advance: 5 },
+  D: { rows: [0, 28, 18, 18, 18, 18, 28, 0], width: 5, advance: 5 },
+  E: { rows: [0, 14, 16, 28, 16, 16, 14, 0], width: 5, advance: 5 },
+  F: { rows: [0, 14, 16, 16, 28, 16, 16, 0], width: 5, advance: 5 },
+  G: { rows: [0, 14, 16, 22, 18, 18, 14, 0], width: 5, advance: 5 },
+  H: { rows: [0, 18, 18, 30, 18, 18, 18, 0], width: 5, advance: 5 },
+  I: { rows: [0, 14, 4, 4, 4, 4, 14, 0], width: 5, advance: 5 },
+  J: { rows: [0, 14, 4, 4, 4, 4, 24, 0], width: 5, advance: 5 },
+  K: { rows: [0, 18, 18, 28, 18, 18, 18, 0], width: 5, advance: 5 },
+  L: { rows: [0, 16, 16, 16, 16, 16, 14, 0], width: 5, advance: 5 },
+  M: { rows: [0, 18, 30, 30, 18, 18, 18, 0], width: 5, advance: 5 },
+  N: { rows: [0, 18, 26, 26, 22, 22, 18, 0], width: 5, advance: 5 },
+  O: { rows: [0, 12, 18, 18, 18, 18, 12, 0], width: 5, advance: 5 },
+  P: { rows: [0, 28, 18, 18, 28, 16, 16, 0], width: 5, advance: 5 },
+  Q: { rows: [0, 12, 18, 18, 18, 18, 12, 6], width: 5, advance: 5 },
+  R: { rows: [0, 28, 18, 18, 28, 18, 18, 0], width: 5, advance: 5 },
+  S: { rows: [0, 14, 16, 12, 2, 2, 28, 0], width: 5, advance: 5 },
+  T: { rows: [0, 31, 4, 4, 4, 4, 4, 0], width: 5, advance: 5 },
+  U: { rows: [0, 18, 18, 18, 18, 18, 14, 0], width: 5, advance: 5 },
+  V: { rows: [0, 18, 18, 18, 18, 12, 12, 0], width: 5, advance: 5 },
+  W: { rows: [0, 18, 18, 18, 30, 30, 18, 0], width: 5, advance: 5 },
+  X: { rows: [0, 18, 18, 12, 12, 18, 18, 0], width: 5, advance: 5 },
+  Y: { rows: [0, 18, 18, 18, 14, 2, 28, 0], width: 5, advance: 5 },
+  Z: { rows: [0, 30, 2, 4, 8, 16, 30, 0], width: 5, advance: 5 },
+  "[": { rows: [14, 8, 8, 8, 8, 8, 8, 14], width: 5, advance: 5 },
+  "\\": { rows: [16, 16, 8, 8, 4, 4, 2, 2], width: 5, advance: 5 },
+  "]": { rows: [14, 2, 2, 2, 2, 2, 2, 14], width: 5, advance: 5 },
+  "^": { rows: [0, 4, 10, 17, 0, 0, 0, 0], width: 5, advance: 5 },
+  _: { rows: [0, 0, 0, 0, 0, 0, 0, 30], width: 5, advance: 5 },
+  "`": { rows: [8, 4, 0, 0, 0, 0, 0, 0], width: 5, advance: 5 },
+  a: { rows: [0, 0, 12, 2, 14, 18, 14, 0], width: 5, advance: 5 },
+  b: { rows: [16, 16, 28, 18, 18, 18, 28, 0], width: 5, advance: 5 },
+  c: { rows: [0, 0, 14, 16, 16, 16, 14, 0], width: 5, advance: 5 },
+  d: { rows: [2, 2, 14, 18, 18, 18, 14, 0], width: 5, advance: 5 },
+  e: { rows: [0, 0, 14, 18, 30, 16, 14, 0], width: 5, advance: 5 },
+  f: { rows: [6, 8, 8, 28, 8, 8, 8, 0], width: 5, advance: 5 },
+  g: { rows: [0, 0, 14, 18, 18, 12, 2, 28], width: 5, advance: 5 },
+  h: { rows: [16, 16, 28, 18, 18, 18, 18, 0], width: 5, advance: 5 },
+  i: { rows: [0, 4, 0, 12, 4, 4, 6, 0], width: 5, advance: 5 },
+  j: { rows: [0, 4, 0, 4, 4, 4, 4, 24], width: 5, advance: 5 },
+  k: { rows: [16, 16, 18, 20, 24, 20, 18, 0], width: 5, advance: 5 },
+  l: { rows: [8, 8, 8, 8, 8, 8, 6, 0], width: 5, advance: 5 },
+  m: { rows: [0, 0, 18, 30, 30, 18, 18, 0], width: 5, advance: 5 },
+  n: { rows: [0, 0, 28, 18, 18, 18, 18, 0], width: 5, advance: 5 },
+  o: { rows: [0, 0, 12, 18, 18, 18, 12, 0], width: 5, advance: 5 },
+  p: { rows: [0, 0, 28, 18, 18, 28, 16, 16], width: 5, advance: 5 },
+  q: { rows: [0, 0, 14, 18, 18, 14, 2, 2], width: 5, advance: 5 },
+  r: { rows: [0, 0, 14, 18, 16, 16, 16, 0], width: 5, advance: 5 },
+  s: { rows: [0, 0, 14, 16, 12, 2, 28, 0], width: 5, advance: 5 },
+  t: { rows: [8, 8, 28, 8, 8, 8, 6, 0], width: 5, advance: 5 },
+  u: { rows: [0, 0, 18, 18, 18, 18, 14, 0], width: 5, advance: 5 },
+  v: { rows: [0, 0, 18, 18, 18, 12, 12, 0], width: 5, advance: 5 },
+  w: { rows: [0, 0, 18, 18, 30, 30, 18, 0], width: 5, advance: 5 },
+  x: { rows: [0, 0, 18, 12, 12, 18, 18, 0], width: 5, advance: 5 },
+  y: { rows: [0, 0, 18, 18, 18, 14, 2, 28], width: 5, advance: 5 },
+  z: { rows: [0, 0, 30, 2, 4, 8, 30, 0], width: 5, advance: 5 },
+  "{": { rows: [6, 8, 8, 24, 24, 8, 8, 6], width: 5, advance: 5 },
+  "|": { rows: [4, 4, 4, 4, 4, 4, 4, 4], width: 5, advance: 5 },
+  "}": { rows: [24, 4, 4, 6, 6, 4, 4, 24], width: 5, advance: 5 },
+  "~": { rows: [0, 0, 0, 9, 22, 0, 0, 0], width: 5, advance: 5 },
+  "—": { rows: [0, 0, 0, 0, 31, 31, 0, 0], width: 5, advance: 5 },
+  "•": { rows: [0, 0, 4, 14, 14, 4, 0, 0], width: 5, advance: 5 },
+  "←": { rows: [0, 0, 4, 31, 14, 31, 4, 0], width: 5, advance: 5 },
+  "→": { rows: [0, 0, 4, 14, 31, 14, 4, 0], width: 5, advance: 5 },
+  "⊘": { rows: [14, 17, 21, 27, 27, 21, 17, 14], width: 5, advance: 5 },
+  "─": { rows: [0, 0, 0, 31, 0, 0, 0, 0], width: 5, advance: 5 },
+  "▰": { rows: [31, 31, 31, 31, 31, 31, 31, 31], width: 5, advance: 5 }
+};
+var MURAL_FONT_REPLACEMENT_GLYPH = {
+  rows: [31, 17, 21, 17, 21, 17, 31, 0],
+  width: 5,
+  advance: 5
+};
+
+// ../plugin/src/features/magic-context/mural/render-mural.ts
+var MURAL_WIDTH = 1092;
+var MURAL_HEIGHT = 1092;
+var MURAL_VISION_TILE = 28;
+var MURAL_CELL_WIDTH = MURAL_FONT_CELL_WIDTH;
+var MURAL_CELL_HEIGHT = MURAL_FONT_CELL_HEIGHT;
+var MURAL_LINE_PITCH = MURAL_FONT_LINE_PITCH;
+var MURAL_COLUMNS = 3;
+var MURAL_COLUMN_GAP = 1;
+var MURAL_MIN_ROOM_WIDTH = 40;
+var MURAL_ROOM_WIDTH = 72;
+var MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
+var MURAL_LINE_CAPACITY = MURAL_COLUMNS * MURAL_ROWS;
+var CATEGORY_COLORS = {
+  PROJECT_RULES: [24, 58, 112],
+  ARCHITECTURE: [0, 88, 92],
+  CONSTRAINTS: [126, 76, 16],
+  CONFIG_VALUES: [88, 52, 132],
+  NAMING: [28, 98, 58]
+};
+var BODY_INK = [18, 20, 24];
+var PROHIBITION_INK = [148, 28, 35];
+function codepoints(value) {
+  return [...value].length;
+}
+function escapeText(value) {
+  return value.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function banner(category, roomWidth) {
+  const label = ` <${category}> `;
+  if (codepoints(label) > roomWidth) {
+    return [...label].slice(0, roomWidth).join("");
+  }
+  const remaining = roomWidth - codepoints(label);
+  return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
+}
+function breakLongToken(token, width) {
+  const chars = [...token];
+  if (chars.length <= width)
+    return [token];
+  const slices = [];
+  for (let i = 0;i < chars.length; i += width) {
+    slices.push(chars.slice(i, i + width).join(""));
+  }
+  return slices;
+}
+function wrapCue(cue, width) {
+  const continuationIndent = "  ";
+  const words = escapeText(cue).split(/\s+/).filter(Boolean).flatMap((word) => breakLongToken(word, Math.max(1, width - continuationIndent.length)));
+  if (words.length === 0)
+    return ["•"];
+  const lines = [];
+  let line = "•";
+  for (const word of words) {
+    const separator = line === "•" ? "" : " ";
+    const candidate = `${line}${separator}${word}`;
+    if (codepoints(candidate) <= width) {
+      line = candidate;
+      continue;
+    }
+    lines.push(line);
+    line = `${continuationIndent}${word}`;
+  }
+  lines.push(line);
+  return lines;
+}
+function canShareCues(cue, nextCue, roomWidth) {
+  const shortEntryLimit = Math.floor((roomWidth - 4) / 2);
+  const shared = `•${cue} • ${nextCue}`;
+  return !cue.includes("⊘") && !nextCue.includes("⊘") && codepoints(cue) <= shortEntryLimit && codepoints(nextCue) <= shortEntryLimit && codepoints(shared) <= roomWidth;
+}
+function naturalLineLengths(entries, roomWidth) {
+  const lengths = [];
+  let currentCategory = null;
+  for (let index = 0;index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry)
+      continue;
+    if (entry.category !== currentCategory) {
+      currentCategory = entry.category;
+      lengths.push(codepoints(` <${entry.category}> `));
+    }
+    const cue = escapeText(entry.cue);
+    const next = entries[index + 1];
+    const sameCategoryNext = next && next.category === entry.category;
+    const nextCue = sameCategoryNext ? escapeText(next.cue) : "";
+    if (sameCategoryNext && canShareCues(cue, nextCue, roomWidth)) {
+      lengths.push(codepoints(`•${cue} • ${nextCue}`));
+      index++;
+    } else {
+      lengths.push(1 + codepoints(cue));
+    }
+  }
+  return lengths;
+}
+function chooseRoomWidth(entries) {
+  for (let width = MURAL_MIN_ROOM_WIDTH;width <= MURAL_ROOM_WIDTH; width++) {
+    const lengths = naturalLineLengths(entries, width);
+    const allowedWrappedLines = Math.ceil(lengths.length * 0.05);
+    const wrappedLines = lengths.filter((length) => length > width).length;
+    if (wrappedLines <= allowedWrappedLines)
+      return width;
+  }
+  return MURAL_ROOM_WIDTH;
+}
+function planLines(entries, roomWidth) {
+  const lines = [];
+  let currentCategory = null;
+  for (let index = 0;index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry)
+      continue;
+    if (entry.category !== currentCategory) {
+      currentCategory = entry.category;
+      lines.push({
+        text: banner(entry.category, roomWidth),
+        entryIds: [],
+        isBanner: true,
+        category: entry.category
+      });
+    }
+    const cue = escapeText(entry.cue);
+    const next = entries[index + 1];
+    const sameCategoryNext = next && next.category === entry.category;
+    const nextCue = sameCategoryNext ? escapeText(next.cue) : "";
+    if (sameCategoryNext && canShareCues(cue, nextCue, roomWidth)) {
+      lines.push({
+        text: `•${cue} • ${nextCue}`,
+        entryIds: [entry.id, next.id],
+        isBanner: false,
+        category: entry.category
+      });
+      index++;
+      continue;
+    }
+    const wrapped = wrapCue(cue, roomWidth);
+    wrapped.forEach((text, wrappedIndex) => {
+      lines.push({
+        text,
+        entryIds: wrappedIndex === 0 ? [entry.id] : [],
+        isBanner: false,
+        category: entry.category
+      });
+    });
+  }
+  return lines;
+}
+function splitPlan(plan, columnCount) {
+  const columns = Array.from({ length: columnCount }, () => []);
+  let offset = 0;
+  for (let column = 0;column < columnCount && offset < plan.length; column++) {
+    const remainingLines = plan.length - offset;
+    const remainingColumns = columnCount - column;
+    let take = Math.min(MURAL_ROWS, Math.ceil(remainingLines / remainingColumns));
+    while (offset + take < plan.length && take < MURAL_ROWS && plan[offset + take - 1]?.isBanner) {
+      take++;
+    }
+    if (take === MURAL_ROWS && plan[offset + take - 1]?.isBanner)
+      take--;
+    if (take <= 0)
+      break;
+    columns[column] = plan.slice(offset, offset + take);
+    offset += take;
+  }
+  return columns;
+}
+function renderLayout(entries, plan, roomWidth, columnCount) {
+  const grid = Array.from({ length: columnCount }, () => Array.from({ length: MURAL_ROWS }, () => ""));
+  const placements = new Map;
+  const layoutItems = [];
+  const renderedIds = [];
+  const placedIds = new Set;
+  const usage = {};
+  let filledLineCount = 0;
+  for (const [column, columnPlan] of splitPlan(plan, columnCount).entries()) {
+    const columnGrid = grid[column];
+    if (!columnGrid)
+      continue;
+    for (const [row, line] of columnPlan.entries()) {
+      columnGrid[row] = line.text;
+      filledLineCount += 1;
+      usage[line.category] = (usage[line.category] ?? 0) + 1;
+      const placementLine = row + 1;
+      if (line.isBanner) {
+        layoutItems.push({
+          kind: "category",
+          category: line.category,
+          column,
+          startLine: placementLine,
+          endLine: placementLine
+        });
+      }
+      for (const id of line.entryIds) {
+        placements.set(id, {
+          category: line.category,
+          column,
+          line: placementLine
+        });
+        if (!placedIds.has(id)) {
+          placedIds.add(id);
+          renderedIds.push(id);
+        }
+        layoutItems.push({
+          kind: "entry",
+          category: line.category,
+          column,
+          startLine: placementLine,
+          endLine: placementLine
+        });
+      }
+    }
+  }
+  const droppedIds = entries.filter((entry) => !placedIds.has(entry.id)).map((entry) => entry.id);
+  const usedColumnCount = grid.reduce((last, column, index) => column.some(Boolean) ? index + 1 : last, 0);
+  const rowCount = grid.reduce((last, column) => {
+    for (let row = column.length - 1;row >= 0; row--) {
+      if (column[row])
+        return Math.max(last, row + 1);
+    }
+    return last;
+  }, 0);
+  const textLines = Array.from({ length: rowCount }, (_, row) => Array.from({ length: usedColumnCount }, (_, column) => (grid[column]?.[row] ?? "").padEnd(roomWidth)).join(" "));
+  return {
+    text: `${textLines.join(`
+`)}
+`,
+    grid,
+    placements,
+    layoutItems,
+    renderedIds,
+    droppedIds,
+    usage,
+    filledLineCount,
+    columnCount: usedColumnCount,
+    rowCount
+  };
+}
+function crc32(bytes) {
+  let crc = 4294967295;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0;bit < 8; bit++)
+      crc = crc >>> 1 ^ 3988292384 & -(crc & 1);
+  }
+  return (crc ^ 4294967295) >>> 0;
+}
+function pngChunk(type, data) {
+  const typeBytes = new TextEncoder().encode(type);
+  const output = new Uint8Array(12 + data.length);
+  const view = new DataView(output.buffer);
+  view.setUint32(0, data.length);
+  output.set(typeBytes, 4);
+  output.set(data, 8);
+  view.setUint32(8 + data.length, crc32(output.subarray(4, 8 + data.length)));
+  return output;
+}
+function encodeRgbPng(pixels, width, height) {
+  const raw = new Uint8Array((width * 3 + 1) * height);
+  for (let y = 0;y < height; y++) {
+    const rawStart = y * (width * 3 + 1);
+    raw[rawStart] = 0;
+    raw.set(pixels.subarray(y * width * 3, (y + 1) * width * 3), rawStart + 1);
+  }
+  const ihdr = new Uint8Array(13);
+  const header = new DataView(ihdr.buffer);
+  header.setUint32(0, width);
+  header.setUint32(4, height);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const signature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const compressed = new Uint8Array(deflateSync(raw, { level: 9 }));
+  const chunks = [
+    signature,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", new Uint8Array)
+  ];
+  const output = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+function glyph(character) {
+  return MURAL_FONT_GLYPHS[character] ?? MURAL_FONT_REPLACEMENT_GLYPH;
+}
+function drawGlyph(pixels, width, height, x, y, character, color) {
+  const glyphData = glyph(character);
+  const [red, green, blue] = color;
+  for (let row = 0;row < MURAL_CELL_HEIGHT; row++) {
+    const pattern = glyphData.rows[row] ?? 0;
+    for (let column = 0;column < glyphData.width; column++) {
+      if ((pattern & 1 << glyphData.width - column - 1) === 0)
+        continue;
+      const px = x + column;
+      const py = y + row;
+      if (px < 0 || py < 0 || px >= width || py >= height)
+        continue;
+      const offset = (py * width + px) * 3;
+      pixels[offset] = red;
+      pixels[offset + 1] = green;
+      pixels[offset + 2] = blue;
+    }
+  }
+}
+function drawText(pixels, width, height, x, y, text, color) {
+  let offset = 0;
+  for (const character of [...text]) {
+    drawGlyph(pixels, width, height, x + offset, y, character, color);
+    offset += glyph(character).advance;
+  }
+}
+function fillRect(pixels, canvasWidth, canvasHeight, x, y, width, height, color) {
+  const [red, green, blue] = color;
+  const left = Math.max(0, x);
+  const top = Math.max(0, y);
+  const right = Math.min(canvasWidth, x + width);
+  const bottom = Math.min(canvasHeight, y + height);
+  for (let py = top;py < bottom; py++) {
+    for (let px = left;px < right; px++) {
+      const offset = (py * canvasWidth + px) * 3;
+      pixels[offset] = red;
+      pixels[offset + 1] = green;
+      pixels[offset + 2] = blue;
+    }
+  }
+}
+function snapDimensionToVisionTile(contentPixels, maximum) {
+  return Math.min(maximum, Math.max(MURAL_VISION_TILE, Math.ceil(contentPixels / MURAL_VISION_TILE) * MURAL_VISION_TILE));
+}
+function renderMural(entries) {
+  const roomWidth = chooseRoomWidth(entries);
+  const plan = planLines(entries, roomWidth);
+  const candidates = Array.from({ length: MURAL_COLUMNS }, (_, index) => {
+    const requestedColumnCount = index + 1;
+    const layout = renderLayout(entries, plan, roomWidth, requestedColumnCount);
+    const contentWidth = layout.columnCount === 0 ? 0 : layout.columnCount * roomWidth * MURAL_CELL_WIDTH + MURAL_COLUMN_GAP * (layout.columnCount - 1) * MURAL_CELL_WIDTH;
+    const contentHeight = layout.rowCount * MURAL_LINE_PITCH;
+    const width = snapDimensionToVisionTile(contentWidth, MURAL_WIDTH);
+    const height = snapDimensionToVisionTile(contentHeight, MURAL_HEIGHT);
+    return {
+      requestedColumnCount,
+      layout,
+      width,
+      height,
+      tileArea: muralImageTokenEstimateForDimensions(width, height)
+    };
+  });
+  const fittingCandidates = candidates.filter((candidate) => candidate.layout.droppedIds.length === 0);
+  const candidatesToCompare = fittingCandidates.length > 0 ? fittingCandidates : candidates;
+  const firstCandidate = candidatesToCompare[0];
+  if (!firstCandidate)
+    throw new Error("mural layout candidate list is empty");
+  const selected = candidatesToCompare.reduce((best, candidate) => {
+    if (!best)
+      return candidate;
+    if (fittingCandidates.length === 0 && candidate.layout.renderedIds.length !== best.layout.renderedIds.length) {
+      return candidate.layout.renderedIds.length > best.layout.renderedIds.length ? candidate : best;
+    }
+    if (candidate.tileArea !== best.tileArea) {
+      return candidate.tileArea < best.tileArea ? candidate : best;
+    }
+    return candidate.requestedColumnCount < best.requestedColumnCount ? candidate : best;
+  }, firstCandidate);
+  const { layout, width, height } = selected;
+  const pixels = new Uint8Array(width * height * 3).fill(255);
+  const contentWidth = layout.columnCount === 0 ? 0 : layout.columnCount * roomWidth * MURAL_CELL_WIDTH + MURAL_COLUMN_GAP * (layout.columnCount - 1) * MURAL_CELL_WIDTH;
+  const left = Math.floor((width - contentWidth) / 2);
+  for (let column = 0;column < layout.columnCount; column++) {
+    for (let row = 0;row < layout.rowCount; row++) {
+      const text = layout.grid[column]?.[row] ?? "";
+      const isCategory = text.includes("<") && text.includes(">");
+      const category = isCategory ? text.match(/<([^>]+)>/)?.[1] : undefined;
+      if (isCategory)
+        fillRect(pixels, width, height, left + column * (roomWidth + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH, row * MURAL_LINE_PITCH, roomWidth * MURAL_CELL_WIDTH, MURAL_CELL_HEIGHT, CATEGORY_COLORS[category ?? ""] ?? [72, 78, 86]);
+      const ink = isCategory ? [255, 255, 255] : text.includes("⊘") ? PROHIBITION_INK : BODY_INK;
+      drawText(pixels, width, height, left + column * (roomWidth + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH, row * MURAL_LINE_PITCH, text, ink);
+    }
+  }
+  const png = encodeRgbPng(pixels, width, height);
+  const dataUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+  return {
+    png,
+    dataUrl,
+    muralText: layout.text,
+    sha256Input: layout.text,
+    placements: layout.placements,
+    layoutItems: layout.layoutItems,
+    renderedIds: layout.renderedIds,
+    droppedIds: layout.droppedIds,
+    categoryLineUsage: layout.usage,
+    filledLineCount: layout.filledLineCount,
+    width,
+    height
+  };
+}
+function muralImageTokenEstimateForDimensions(width, height) {
+  return Math.ceil(width / MURAL_VISION_TILE) * Math.ceil(height / MURAL_VISION_TILE);
+}
+var muralImageTokenEstimate = muralImageTokenEstimateForDimensions(MURAL_WIDTH, MURAL_HEIGHT);
+
+// ../plugin/src/features/magic-context/mural/resolve-mural.ts
+function getMuralCoverage(db, projectIdentity) {
+  const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+  const cueState = getMuralCueState(db, memories.map((memory) => memory.id));
+  let cuedMemoryCount = 0;
+  for (const memory of memories) {
+    const state = cueState.get(memory.id);
+    if (state && typeof state.cue === "string" && state.cue.trim() !== "" && state.hash !== null && state.hash === computeCueContentHash(memory.content)) {
+      cuedMemoryCount += 1;
+    }
+  }
+  return { activeMemoryCount: memories.length, cuedMemoryCount };
+}
+function resolveMural(db, projectIdentity, budgetTokens = DEFAULT_MURAL_MEMORY_BUDGET) {
+  const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+  const overflow = muralOverflowMemories(memories, budgetTokens);
+  if (overflow.length === 0)
+    return [];
+  const cueState = getMuralCueState(db, overflow.map((memory) => memory.id));
+  const entries = [];
+  for (const memory of overflow) {
+    const state = cueState.get(memory.id);
+    if (!state || state.cue === null || state.hash === null)
+      continue;
+    if (state.hash !== computeCueContentHash(memory.content))
+      continue;
+    entries.push({
+      id: memory.id,
+      category: memory.category,
+      importance: memory.importance ?? 50,
+      cue: state.cue
+    });
+  }
+  entries.sort(compareMuralEntries);
+  return entries;
+}
+function compareMuralEntries(a, b) {
+  const categoryDelta = getMemoryCategoryOrder(a.category) - getMemoryCategoryOrder(b.category);
+  if (categoryDelta !== 0)
+    return categoryDelta;
+  if (a.importance !== b.importance)
+    return b.importance - a.importance;
+  return a.id - b.id;
+}
+
+// ../plugin/src/features/magic-context/mural/storage-mural.ts
+function getMural(db, projectPath) {
+  try {
+    const row = db.prepare("SELECT project_path, image, content_hash, rendered_at, model, memory_ids_json, width, height FROM mural_manifest WHERE project_path = ?").get(projectPath);
+    if (!row)
+      return null;
+    let memoryIds = [];
+    try {
+      const parsed = JSON.parse(row.memory_ids_json);
+      if (Array.isArray(parsed))
+        memoryIds = parsed.filter((id) => typeof id === "number");
+    } catch {}
+    return {
+      projectPath: row.project_path,
+      image: Buffer.from(row.image),
+      contentHash: row.content_hash,
+      renderedAt: row.rendered_at,
+      model: row.model,
+      memoryIds,
+      width: row.width,
+      height: row.height
+    };
+  } catch (error) {
+    if (String(error).includes("no such table"))
+      return null;
+    throw error;
+  }
+}
+function upsertMural(db, input) {
+  db.prepare("INSERT INTO mural_manifest (project_path, image, content_hash, rendered_at, model, memory_ids_json, width, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_path) DO UPDATE SET image = excluded.image, content_hash = excluded.content_hash, rendered_at = excluded.rendered_at, model = excluded.model, memory_ids_json = excluded.memory_ids_json, width = excluded.width, height = excluded.height").run(input.projectPath, input.image, input.contentHash, input.renderedAt, input.model, JSON.stringify(input.memoryIds), input.width, input.height);
+}
+
+// ../plugin/src/features/magic-context/mural/render-trigger.ts
+var DETERMINISTIC_MURAL_MODEL = "deterministic";
+var MIN_MURAL_CUED_MEMORIES = 15;
+var MIN_MURAL_COVERAGE = 0.5;
+function muralCoverageGate(cuedMemoryCount, activeMemoryCount) {
+  return cuedMemoryCount >= MIN_MURAL_CUED_MEMORIES || cuedMemoryCount >= MIN_MURAL_COVERAGE * activeMemoryCount;
+}
+function ensureMuralRendered(db, projectIdentity, budgetTokens = DEFAULT_MURAL_MEMORY_BUDGET) {
+  const coverage = getMuralCoverage(db, projectIdentity);
+  if (coverage.activeMemoryCount === 0 || !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)) {
+    const skipReason = coverage.activeMemoryCount === 0 ? "no active memories" : `only ${coverage.cuedMemoryCount}/${coverage.activeMemoryCount} active memories have current cues (requires ${MIN_MURAL_CUED_MEMORIES} cues or ${MIN_MURAL_COVERAGE * 100}% coverage)`;
+    log(`[mural] skipped for ${projectIdentity}: ${skipReason}`);
+    return { hasMural: false, rerendered: false, skipReason };
+  }
+  const entries = resolveMural(db, projectIdentity, budgetTokens);
+  if (entries.length === 0) {
+    return { hasMural: false, rerendered: false };
+  }
+  const rendered = renderMural(entries);
+  const textHash = createHash9("sha256").update(rendered.sha256Input).digest("hex");
+  const existing = getMural(db, projectIdentity);
+  if (existing && existing.contentHash === textHash && existing.width === rendered.width && existing.height === rendered.height) {
+    return {
+      hasMural: true,
+      dataUrl: `data:image/png;base64,${existing.image.toString("base64")}`,
+      contentHash: existing.contentHash,
+      rerendered: false,
+      width: existing.width,
+      height: existing.height
+    };
+  }
+  upsertMural(db, {
+    projectPath: projectIdentity,
+    image: Buffer.from(rendered.png),
+    contentHash: textHash,
+    renderedAt: Date.now(),
+    model: DETERMINISTIC_MURAL_MODEL,
+    memoryIds: rendered.renderedIds,
+    width: rendered.width,
+    height: rendered.height
+  });
+  return {
+    hasMural: true,
+    dataUrl: rendered.dataUrl,
+    contentHash: textHash,
+    rerendered: true,
+    width: rendered.width,
+    height: rendered.height
+  };
+}
+function modelKeyAcceptsImages(modelKey) {
+  if (!modelKey)
+    return false;
+  const canonical = piModelRefToCanonical(modelKey);
+  const separator = canonical.indexOf("/");
+  if (separator <= 0)
+    return false;
+  return modelSupportsVision(canonical.slice(0, separator), canonical.slice(separator + 1));
+}
+function resolveMuralWire(db, projectIdentity, modelKey, enabled, budgetTokens = DEFAULT_MURAL_MEMORY_BUDGET) {
+  if (!enabled || !projectIdentity || !modelKeyAcceptsImages(modelKey)) {
+    return { enabled, supportsVision: false };
+  }
+  const result = ensureMuralRendered(db, projectIdentity, budgetTokens);
+  if (!result.hasMural)
+    return { enabled: true, supportsVision: true };
+  return {
+    enabled: true,
+    supportsVision: true,
+    dataUrl: result.dataUrl,
+    contentHash: result.contentHash
+  };
+}
+
+// ../plugin/src/features/magic-context/user-memory/storage-user-memory.ts
+var USER_MEMORY_CANDIDATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+function insertUserMemoryCandidates(db, candidates) {
+  if (candidates.length === 0)
+    return;
+  const now = Date.now();
+  const stmt = db.prepare("INSERT INTO user_memory_candidates (content, session_id, source_compartment_start, source_compartment_end, created_at) VALUES (?, ?, ?, ?, ?)");
+  db.transaction(() => {
+    for (const c of candidates) {
+      stmt.run(c.content, c.sessionId, c.sourceCompartmentStart ?? null, c.sourceCompartmentEnd ?? null, now);
+    }
+  })();
+}
+function getUserMemoryCandidates(db) {
+  const rows = db.prepare("SELECT id, content, session_id, source_compartment_start, source_compartment_end, created_at FROM user_memory_candidates ORDER BY created_at ASC").all();
+  return rows.map((r) => ({
+    id: r.id,
+    content: r.content,
+    sessionId: r.session_id,
+    sourceCompartmentStart: r.source_compartment_start,
+    sourceCompartmentEnd: r.source_compartment_end,
+    createdAt: r.created_at
+  }));
+}
+function deleteUserMemoryCandidates(db, ids) {
+  if (ids.length === 0)
+    return;
+  const placeholders = ids.map(() => "?").join(",");
+  db.prepare(`DELETE FROM user_memory_candidates WHERE id IN (${placeholders})`).run(...ids);
+}
+function pruneExpiredUserMemoryCandidates(db, ttlMs, now = Date.now()) {
+  const cutoff = now - ttlMs;
+  const result = db.prepare("DELETE FROM user_memory_candidates WHERE created_at < ?").run(cutoff);
+  return Number(result.changes ?? 0);
+}
+function insertUserMemory(db, content, sourceCandidateIds) {
+  const now = Date.now();
+  const result = db.prepare("INSERT INTO user_memories (content, status, promoted_at, source_candidate_ids, created_at, updated_at) VALUES (?, 'active', ?, ?, ?, ?)").run(content, now, JSON.stringify(sourceCandidateIds), now, now);
+  return Number(result.lastInsertRowid);
+}
+function getActiveUserMemories(db) {
+  const rows = db.prepare("SELECT id, content, status, promoted_at, source_candidate_ids, created_at, updated_at FROM user_memories WHERE status = 'active' ORDER BY promoted_at ASC, id ASC").all();
+  return rows.map(parseUserMemoryRow);
+}
+function updateUserMemoryContent(db, id, content) {
+  db.prepare("UPDATE user_memories SET content = ?, updated_at = ? WHERE id = ?").run(content, Date.now(), id);
+}
+function dismissUserMemory(db, id) {
+  db.prepare("UPDATE user_memories SET status = 'dismissed', updated_at = ? WHERE id = ?").run(Date.now(), id);
+}
+function parseUserMemoryRow(row) {
+  let candidateIds = [];
+  try {
+    candidateIds = JSON.parse(row.source_candidate_ids);
+  } catch {}
+  return {
+    id: row.id,
+    content: row.content,
+    status: row.status === "dismissed" ? "dismissed" : "active",
+    promotedAt: row.promoted_at,
+    sourceCandidateIds: candidateIds,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+// ../plugin/src/shared/bounded-session-map.ts
+class BoundedSessionMap {
+  maxEntries;
+  store = new Map;
+  constructor(maxEntries) {
+    if (!Number.isFinite(maxEntries) || maxEntries < 1) {
+      throw new Error(`BoundedSessionMap: maxEntries must be >= 1, got ${maxEntries}`);
+    }
+    this.maxEntries = maxEntries;
+  }
+  get(sessionId) {
+    const value = this.store.get(sessionId);
+    if (value === undefined)
+      return;
+    this.store.delete(sessionId);
+    this.store.set(sessionId, value);
+    return value;
+  }
+  peek(sessionId) {
+    return this.store.get(sessionId);
+  }
+  has(sessionId) {
+    return this.store.has(sessionId);
+  }
+  set(sessionId, value) {
+    if (this.store.has(sessionId)) {
+      this.store.delete(sessionId);
+    } else if (this.store.size >= this.maxEntries) {
+      const oldest = this.store.keys().next().value;
+      if (oldest !== undefined)
+        this.store.delete(oldest);
+    }
+    this.store.set(sessionId, value);
+  }
+  delete(sessionId) {
+    return this.store.delete(sessionId);
+  }
+  clear() {
+    this.store.clear();
+  }
+  get size() {
+    return this.store.size;
+  }
+}
+
+// ../plugin/src/features/magic-context/compaction-marker.ts
+import { createHash as createHash10 } from "node:crypto";
+import { existsSync as existsSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+var BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+var ID_PREFIX_HEX_LENGTH = 12;
+var ID_SUFFIX_LENGTH = 14;
+var ID_PREFIX_MASK = (1n << BigInt(ID_PREFIX_HEX_LENGTH * 4)) - 1n;
+function deterministicBase62(seed, length) {
+  let value = BigInt(`0x${createHash10("sha256").update(seed).digest("hex")}`);
+  const chars = Array(length);
+  for (let index = length - 1;index >= 0; index -= 1) {
+    chars[index] = BASE62_CHARS[Number(value % 62n)];
+    value /= 62n;
+  }
+  return chars.join("");
+}
+function generateId(prefix, timestampMs, counter, identity) {
+  const encoded = BigInt(Math.max(0, Math.floor(timestampMs))) * 0x1000n + counter & ID_PREFIX_MASK;
+  const hex = encoded.toString(16).padStart(ID_PREFIX_HEX_LENGTH, "0");
+  return `${prefix}_${hex}${deterministicBase62(`${prefix}\x00${identity}`, ID_SUFFIX_LENGTH)}`;
+}
+function generateMessageId(timestampMs, counter = 0n, identity = "") {
+  return generateId("msg", timestampMs, counter, identity);
+}
+function generatePartId(timestampMs, counter = 0n, identity = "") {
+  return generateId("prt", timestampMs, counter, identity);
+}
+function getOpenCodeDbPath2() {
+  return join4(getDataDir(), "opencode", "opencode.db");
+}
+var cachedWriteDb = null;
+var REQUIRED_MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"];
+var REQUIRED_PART_COLUMNS = [
+  "id",
+  "message_id",
+  "session_id",
+  "time_created",
+  "time_updated",
+  "data"
+];
+var cachedSchemaCompatible = null;
+function isOpenCodeSchemaCompatible(db, dbPath) {
+  if (cachedSchemaCompatible?.path === dbPath) {
+    return cachedSchemaCompatible.compatible;
+  }
+  try {
+    const messageCols = new Set(db.prepare("PRAGMA table_info(message)").all().map((r) => r.name ?? "").filter((n) => n.length > 0));
+    const partCols = new Set(db.prepare("PRAGMA table_info(part)").all().map((r) => r.name ?? "").filter((n) => n.length > 0));
+    const missingMessage = REQUIRED_MESSAGE_COLUMNS.filter((c) => !messageCols.has(c));
+    const missingPart = REQUIRED_PART_COLUMNS.filter((c) => !partCols.has(c));
+    if (missingMessage.length > 0 || missingPart.length > 0) {
+      log(`[magic-context] compaction-marker: OpenCode DB schema missing required columns ` + `(message: [${missingMessage.join(", ")}], part: [${missingPart.join(", ")}]). ` + `Marker injection disabled for this process. ` + `This usually means OpenCode was updated and magic-context is out of date.`);
+      cachedSchemaCompatible = { path: dbPath, compatible: false };
+      return false;
+    }
+    cachedSchemaCompatible = { path: dbPath, compatible: true };
+    return true;
+  } catch (error) {
+    log(`[magic-context] compaction-marker: schema probe failed: ${error instanceof Error ? error.message : String(error)}. ` + `Marker injection disabled until next process restart.`);
+    cachedSchemaCompatible = { path: dbPath, compatible: false };
+    return false;
+  }
+}
+function getWritableOpenCodeDb() {
+  const dbPath = getOpenCodeDbPath2();
+  if (cachedWriteDb?.path === dbPath) {
+    return cachedWriteDb.db;
+  }
+  if (cachedWriteDb) {
+    try {
+      closeQuietly(cachedWriteDb.db);
+    } catch {}
+  }
+  if (!existsSync3(dbPath)) {
+    throw new Error(`OpenCode database not found at ${dbPath} (is OpenCode installed?)`);
+  }
+  const db = new Database(dbPath);
+  db.exec("PRAGMA busy_timeout=5000");
+  db.exec("PRAGMA journal_mode=WAL");
+  cachedWriteDb = { path: dbPath, db };
+  return db;
+}
+function getNonSummaryMessageSortKey(sessionId, messageId) {
+  const db = getWritableOpenCodeDb();
+  const row = db.prepare(`SELECT time_created, id
+             FROM message
+             WHERE session_id = ?
+               AND id = ?
+               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
+             LIMIT 1`).get(sessionId, messageId);
+  if (typeof row?.time_created !== "number" || typeof row.id !== "string") {
+    return null;
+  }
+  return { id: row.id, timeCreated: row.time_created };
+}
+function findBoundaryUserMessage(sessionId, endMessageId) {
+  const db = getWritableOpenCodeDb();
+  const target = getNonSummaryMessageSortKey(sessionId, endMessageId);
+  if (!target)
+    return null;
+  const boundary = db.prepare(`SELECT id, time_created, data
+             FROM message
+             WHERE session_id = ?
+               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
+               AND COALESCE(json_extract(data, '$.role'), '') = 'user'
+               AND (time_created < ? OR (time_created = ? AND id <= ?))
+             ORDER BY time_created DESC, id DESC
+             LIMIT 1`).get(sessionId, target.timeCreated, target.timeCreated, target.id);
+  if (typeof boundary?.id !== "string" || typeof boundary.time_created !== "number") {
+    return null;
+  }
+  return { id: boundary.id, timeCreated: boundary.time_created };
+}
+function compareOpenCodeMessagesByCanonicalOrder(sessionId, leftMessageId, rightMessageId) {
+  const left = getNonSummaryMessageSortKey(sessionId, leftMessageId);
+  const right = getNonSummaryMessageSortKey(sessionId, rightMessageId);
+  if (!left || !right)
+    return null;
+  if (left.timeCreated < right.timeCreated)
+    return -1;
+  if (left.timeCreated > right.timeCreated)
+    return 1;
+  if (left.id < right.id)
+    return -1;
+  if (left.id > right.id)
+    return 1;
+  return 0;
+}
+function removeLegacyMarkerLineageRows(db, args) {
+  const legacySummaries = db.prepare(`SELECT m.id
+             FROM message m
+             WHERE m.session_id = ?
+               AND m.id <> ?
+               AND COALESCE(json_extract(m.data, '$.summary'), 0) = 1
+               AND COALESCE(json_extract(m.data, '$.finish'), '') = 'stop'
+               AND COALESCE(json_extract(m.data, '$.parentID'), '') = ?
+               AND EXISTS (
+                   SELECT 1
+                   FROM part p
+                   WHERE p.session_id = m.session_id
+                     AND p.message_id = m.id
+                     AND COALESCE(json_extract(p.data, '$.type'), '') = 'text'
+                     AND COALESCE(json_extract(p.data, '$.text'), '') = ?
+               )`).all(args.sessionId, args.summaryMessageId, args.boundaryMessageId, args.summaryText);
+  const legacySummaryIds = legacySummaries.flatMap((row) => typeof row.id === "string" ? [row.id] : []);
+  if (legacySummaryIds.length === 0)
+    return;
+  const deleteSummaryParts = db.prepare("DELETE FROM part WHERE session_id = ? AND message_id = ?");
+  const deleteSummary = db.prepare("DELETE FROM message WHERE session_id = ? AND id = ?");
+  for (const summaryMessageId of legacySummaryIds) {
+    deleteSummaryParts.run(args.sessionId, summaryMessageId);
+    deleteSummary.run(args.sessionId, summaryMessageId);
+  }
+  db.prepare(`DELETE FROM part
+         WHERE session_id = ?
+           AND message_id = ?
+           AND id <> ?
+           AND COALESCE(json_extract(data, '$.type'), '') = 'compaction'
+           AND COALESCE(json_extract(data, '$.auto'), 0) = 1`).run(args.sessionId, args.boundaryMessageId, args.compactionPartId);
+}
+function injectCompactionMarker(args) {
+  const db = getWritableOpenCodeDb();
+  if (!isOpenCodeSchemaCompatible(db, getOpenCodeDbPath2())) {
+    return null;
+  }
+  const boundary = args.resolvedBoundary ?? findBoundaryUserMessage(args.sessionId, args.endMessageId);
+  if (!boundary) {
+    log(`[magic-context] compaction-marker: no user message found at or before endMessageId ${args.endMessageId} (ordinal ${args.endOrdinal})`);
+    return null;
+  }
+  const boundaryTime = boundary.timeCreated;
+  const markerIdentity = `${args.sessionId}\x00${args.endMessageId}`;
+  const summaryMsgId = generateMessageId(boundaryTime + 1, 1n, `${markerIdentity}\x00summary-message`);
+  const compactionPartId = generatePartId(boundaryTime, 1n, `${markerIdentity}\x00compaction-part`);
+  const summaryPartId = generatePartId(boundaryTime + 1, 2n, `${markerIdentity}\x00summary-part`);
+  const summaryMsgData = JSON.stringify({
+    role: "assistant",
+    parentID: boundary.id,
+    summary: true,
+    finish: "stop",
+    mode: "compaction",
+    agent: "compaction",
+    path: { cwd: args.directory, root: args.directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: "magic-context",
+    providerID: "magic-context",
+    time: { created: boundaryTime + 1 }
+  });
+  try {
+    db.transaction(() => {
+      removeLegacyMarkerLineageRows(db, {
+        sessionId: args.sessionId,
+        boundaryMessageId: boundary.id,
+        summaryText: args.summaryText,
+        summaryMessageId: summaryMsgId,
+        compactionPartId
+      });
+      db.prepare(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(compactionPartId, boundary.id, args.sessionId, boundaryTime, boundaryTime, '{"type":"compaction","auto":true}');
+      db.prepare(`INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
+      db.prepare(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(summaryPartId, summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, JSON.stringify({ type: "text", text: args.summaryText }));
+    })();
+    log(`[magic-context] compaction-marker: injected boundary at user msg ${boundary.id} (ordinal ~${args.endOrdinal}), summary msg ${summaryMsgId}`);
+    return {
+      boundaryMessageId: boundary.id,
+      summaryMessageId: summaryMsgId,
+      compactionPartId,
+      summaryPartId
+    };
+  } catch (error) {
+    log(`[magic-context] compaction-marker: injection failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+function removeCompactionMarker(state) {
+  try {
+    const db = getWritableOpenCodeDb();
+    db.transaction(() => {
+      db.prepare("DELETE FROM part WHERE id = ?").run(state.summaryPartId);
+      db.prepare("DELETE FROM message WHERE id = ?").run(state.summaryMessageId);
+      db.prepare("DELETE FROM part WHERE id = ?").run(state.compactionPartId);
+    })();
+    return true;
+  } catch (error) {
+    log(`[magic-context] compaction-marker: removal failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+// ../plugin/src/hooks/magic-context/compaction-marker-manager.ts
+var MARKER_SUMMARY_TEXT = "[Compacted by magic-context — session history is managed by the plugin]";
+function dropMarkerSummaryTag(db, sessionId, summaryMessageId) {
+  const tagNumber = getTagNumberByMessageId(db, sessionId, `${summaryMessageId}:p0`);
+  if (tagNumber !== null)
+    updateTagStatus(db, sessionId, tagNumber, "dropped");
+}
+function persistMarkerStateAndDropReplacedTag(db, sessionId, state, replacedSummaryMessageId) {
+  db.transaction(() => {
+    setPersistedCompactionMarkerState(db, sessionId, state);
+    if (replacedSummaryMessageId !== null) {
+      dropMarkerSummaryTag(db, sessionId, replacedSummaryMessageId);
+    }
+  })();
+}
+function getCompartmentEndMessageIdForOrdinal(db, sessionId, endOrdinal) {
+  const row = db.prepare(`SELECT end_message_id
+             FROM compartments
+             WHERE session_id = ? AND end_message = ?
+             ORDER BY sequence DESC
+             LIMIT 1`).get(sessionId, endOrdinal);
+  return typeof row?.end_message_id === "string" && row.end_message_id.length > 0 ? row.end_message_id : null;
+}
+function existingMarkerAlreadyCoversTarget(sessionId, existing, targetOrdinal, targetEndMessageId) {
+  if (existing.boundaryOrdinal < targetOrdinal) {
+    return false;
+  }
+  if (existing.boundaryOrdinal === targetOrdinal) {
+    const boundaryCompare = compareOpenCodeMessagesByCanonicalOrder(sessionId, existing.boundaryMessageId, targetEndMessageId);
+    if (boundaryCompare === null || boundaryCompare > 0) {
+      return false;
+    }
+    if (existing.targetEndMessageId !== null && existing.targetEndMessageId !== targetEndMessageId) {
+      return false;
+    }
+    return true;
+  }
+  if (existing.targetEndMessageId !== null) {
+    const targetCompare = compareOpenCodeMessagesByCanonicalOrder(sessionId, existing.targetEndMessageId, targetEndMessageId);
+    if (targetCompare !== null && targetCompare <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+function updateCompactionMarkerAfterPublication(db, sessionId, lastCompartmentEnd, directory) {
+  if (getHarness() !== "opencode") {
+    return true;
+  }
+  const targetEndMessageId = getCompartmentEndMessageIdForOrdinal(db, sessionId, lastCompartmentEnd);
+  if (!targetEndMessageId) {
+    sessionLog(sessionId, `compaction-marker: no compartment endMessageId for ordinal ${lastCompartmentEnd}; preserving existing marker`);
+    return false;
+  }
+  const existing = getPersistedCompactionMarkerState(db, sessionId);
+  const removedSummaryMessageId = existing?.summaryMessageId ?? null;
+  if (existing) {
+    if (existingMarkerAlreadyCoversTarget(sessionId, existing, lastCompartmentEnd, targetEndMessageId)) {
+      return true;
+    }
+  }
+  const boundary = findBoundaryUserMessage(sessionId, targetEndMessageId);
+  if (!boundary) {
+    sessionLog(sessionId, `compaction-marker: no user boundary found at or before endMessageId ${targetEndMessageId} (ordinal ${lastCompartmentEnd}); preserving existing marker`);
+    return false;
+  }
+  if (existing) {
+    const removed = removeCompactionMarker(existing);
+    if (!removed) {
+      sessionLog(sessionId, `compaction-marker: failed to remove old boundary at ordinal ${existing.boundaryOrdinal}; preserving persisted state for retry (not injecting new marker this pass)`);
+      return false;
+    }
+    persistMarkerStateAndDropReplacedTag(db, sessionId, null, removedSummaryMessageId);
+    sessionLog(sessionId, `compaction-marker: removed old boundary at ordinal ${existing.boundaryOrdinal}, moving to ${lastCompartmentEnd}`);
+  }
+  const result = injectCompactionMarker({
+    sessionId,
+    endOrdinal: lastCompartmentEnd,
+    endMessageId: targetEndMessageId,
+    summaryText: MARKER_SUMMARY_TEXT,
+    directory: directory ?? process.cwd(),
+    resolvedBoundary: boundary
+  });
+  if (result) {
+    persistMarkerStateAndDropReplacedTag(db, sessionId, {
+      ...result,
+      boundaryOrdinal: lastCompartmentEnd,
+      targetEndMessageId
+    }, removedSummaryMessageId);
+    sessionLog(sessionId, `compaction-marker: injected at ordinal ${lastCompartmentEnd}, boundary user msg ${result.boundaryMessageId}`);
+    return true;
+  }
+  return false;
+}
+
+// ../plugin/src/hooks/magic-context/compartment-render-epoch.ts
+var COMPARTMENT_RENDER_EPOCH = "cre2";
+var EPOCH_COMPONENT_PREFIX = "|compartment-render:";
+var MURAL_COMPONENT_PREFIX = "|mural-enabled:";
+var BUDGET_COMPONENT_PREFIX = "|render-budgets:";
+function encodeCachedM0UpgradeIdentity(upgradeState, compartmentRenderEpoch = COMPARTMENT_RENDER_EPOCH, muralEnabled = null, renderBudgetIdentity = null) {
+  let encoded = upgradeState ?? "";
+  if (compartmentRenderEpoch !== null) {
+    encoded += `${EPOCH_COMPONENT_PREFIX}${compartmentRenderEpoch}`;
+  }
+  if (muralEnabled !== null) {
+    encoded += `${MURAL_COMPONENT_PREFIX}${muralEnabled ? "1" : "0"}`;
+  }
+  if (renderBudgetIdentity !== null) {
+    encoded += `${BUDGET_COMPONENT_PREFIX}${renderBudgetIdentity}`;
+  }
+  return encoded.length > 0 ? encoded : null;
+}
+function component(value, prefix) {
+  const start = value.lastIndexOf(prefix);
+  if (start < 0)
+    return null;
+  const valueStart = start + prefix.length;
+  const end = value.indexOf("|", valueStart);
+  const result = value.slice(valueStart, end < 0 ? value.length : end);
+  return result.length > 0 ? result : null;
+}
+function decodeCachedM0UpgradeIdentity(value) {
+  if (value === null) {
+    return {
+      upgradeState: null,
+      compartmentRenderEpoch: null,
+      muralEnabled: null,
+      renderBudgetIdentity: null
+    };
+  }
+  const componentIndexes = [
+    value.indexOf(EPOCH_COMPONENT_PREFIX),
+    value.indexOf(MURAL_COMPONENT_PREFIX),
+    value.indexOf(BUDGET_COMPONENT_PREFIX)
+  ].filter((index) => index >= 0);
+  const identityEnd = componentIndexes.length > 0 ? Math.min(...componentIndexes) : value.length;
+  const upgradeState = value.slice(0, identityEnd);
+  const muralComponent = component(value, MURAL_COMPONENT_PREFIX);
+  return {
+    upgradeState: upgradeState.length > 0 ? upgradeState : null,
+    compartmentRenderEpoch: component(value, EPOCH_COMPONENT_PREFIX),
+    muralEnabled: muralComponent === "1" ? true : muralComponent === "0" ? false : null,
+    renderBudgetIdentity: component(value, BUDGET_COMPONENT_PREFIX)
+  };
+}
+
+// ../plugin/src/hooks/magic-context/decay-curve.ts
+var H50 = 24;
+var D = 25;
+var G = 2;
+var Z1 = 0.201;
+var Z2 = 0.729;
+var Z3 = 1.322;
+var Z4 = 2.587;
+var P_FLOOR = 0.1;
+var TIER_COST = [0, 322, 109, 35, 20, 5];
+function tier(compartmentIndex, importance, budgetPressure) {
+  const a = Math.max(compartmentIndex, 1) - 1;
+  const imp = Math.max(1, Math.min(100, importance));
+  const p = Math.max(budgetPressure, P_FLOOR);
+  const F = 2 ** ((imp - 50) / D);
+  const H = H50 * F / p;
+  const z = a / H;
+  if (z < Z1)
+    return 1;
+  if (z < Z2)
+    return 2;
+  if (z < Z3)
+    return 3;
+  if (z < Z4)
+    return 4;
+  return 5;
+}
+function shouldArchive(compartmentIndex, importance, budgetPressure, anchorOverlap = 0) {
+  const a = Math.max(compartmentIndex, 1) - 1;
+  const imp = Math.max(1, Math.min(100, importance));
+  const p = Math.max(budgetPressure, P_FLOOR);
+  const o = Math.max(0, Math.min(1, anchorOverlap));
+  const F = 2 ** ((imp - 50) / D);
+  const H = H50 * F / p;
+  const z = a / H;
+  return z >= Z4 + G * o;
+}
+function renderedTier(compartmentIndex, importance, budgetPressure, anchorOverlap = 0) {
+  if (shouldArchive(compartmentIndex, importance, budgetPressure, anchorOverlap)) {
+    return 5;
+  }
+  const base = tier(compartmentIndex, importance, budgetPressure);
+  return Math.min(base, 4);
+}
+function computeBudgetPressure(compartments, historyBudget) {
+  if (historyBudget <= 0)
+    return 1;
+  let naturalCost = 0;
+  for (const c of compartments) {
+    const naturalTier = tier(c.index, c.importance, 1);
+    naturalCost += naturalTier >= 5 ? 0 : TIER_COST[naturalTier];
+  }
+  return Math.max(P_FLOOR, naturalCost / historyBudget);
+}
+
+// ../plugin/src/hooks/magic-context/decay-render.ts
+function escapeXmlContent2(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function formatDateRange(startDate, endDate) {
+  if (!startDate || !endDate)
+    return "";
+  if (startDate === endDate)
+    return startDate;
+  if (startDate.slice(0, 7) === endDate.slice(0, 7))
+    return `${startDate}→${endDate.slice(8)}`;
+  return `${startDate}→${endDate}`;
+}
+function sanitizeCompartmentTitle(title) {
+  return escapeXmlContent2(title.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " "));
+}
+function compartmentHeading(c) {
+  const dateRange = formatDateRange(c.startDate, c.endDate);
+  const dateSegment = dateRange ? ` · ${dateRange}` : "";
+  return `## ${c.startMessage}-${c.endMessage}${dateSegment} · ${sanitizeCompartmentTitle(c.title)}`;
+}
+function guardCompartmentBody(body) {
+  return body.replace(/^## /gm, " ## ");
+}
+function isTieredRow(c) {
+  return typeof c.p1 === "string" && c.p1.length > 0;
+}
+function tierBody(c, tier) {
+  const tiers = [c.p1, c.p2, c.p3, c.p4];
+  const requested = tiers[tier - 1];
+  if (typeof requested === "string")
+    return requested.trim();
+  for (let i = tier - 2;i >= 0; i--) {
+    const t = tiers[i];
+    if (typeof t === "string" && t.length > 0)
+      return t.trim();
+  }
+  return (c.content ?? "").trim();
+}
+function legacyBodyForTier(content, tier) {
+  if (tier <= 1)
+    return content;
+  if (tier === 2)
+    return content.length > 1200 ? `${content.slice(0, 1200).trimEnd()}…` : content;
+  return content.length > 420 ? `${content.slice(0, 420).trimEnd()}…` : content;
+}
+function legacyTier(c) {
+  return /^U:/m.test(c.content) ? 3 : 4;
+}
+function renderCompartmentAtTier(c, tier) {
+  return renderOneCompartment(c, tier);
+}
+function renderOneCompartment(c, tier) {
+  if (tier >= 5)
+    return "";
+  const heading = compartmentHeading(c);
+  if (c.legacy === 1 || !isTieredRow(c)) {
+    const flat = (c.content ?? "").trim();
+    if (tier >= 4 || flat.length === 0)
+      return heading;
+    const body = guardCompartmentBody(escapeXmlContent2(legacyBodyForTier(flat, tier)));
+    return `${heading}
+${body}`;
+  }
+  const body = tierBody(c, tier);
+  if (body.length === 0)
+    return heading;
+  return `${heading}
+${guardCompartmentBody(escapeXmlContent2(body))}`;
+}
+function computeTiers(compartments, historyBudgetTokens) {
+  const v2Compartments = compartments.map((c, originalIndex) => ({ c, originalIndex })).filter(({ c }) => c.legacy !== 1);
+  const v2Total = v2Compartments.length;
+  const v2IndexByOriginalIndex = new Map;
+  const curveInputs = v2Compartments.map(({ c, originalIndex }, v2Ordinal) => {
+    const curveIndex = v2Total - v2Ordinal;
+    v2IndexByOriginalIndex.set(originalIndex, curveIndex);
+    return {
+      index: curveIndex,
+      importance: Math.max(1, Math.min(100, c.importance ?? 50))
+    };
+  });
+  const pressure = historyBudgetTokens > 0 ? computeBudgetPressure(curveInputs, historyBudgetTokens) : 1;
+  return compartments.map((c, index) => {
+    if (c.legacy === 1)
+      return legacyTier(c);
+    return renderedTier(v2IndexByOriginalIndex.get(index) ?? 1, c.importance ?? 50, pressure, 0);
+  });
+}
+function renderDecayedCompartments(args) {
+  const { compartments, historyBudgetTokens } = args;
+  if (compartments.length === 0)
+    return "";
+  const tiers = computeTiers(compartments, historyBudgetTokens);
+  const renderedByTier = compartments.map(() => new Array(6));
+  const tokensByTier = compartments.map(() => new Array(6));
+  const renderedAt = (index, tier) => {
+    const cached = renderedByTier[index][tier];
+    if (cached !== undefined)
+      return cached;
+    const rendered = renderOneCompartment(compartments[index], tier);
+    renderedByTier[index][tier] = rendered;
+    return rendered;
+  };
+  const tokensAt = (index, tier) => {
+    const cached = tokensByTier[index][tier];
+    if (cached !== undefined)
+      return cached;
+    const rendered = renderedAt(index, tier);
+    const tokens = rendered.length === 0 ? 0 : estimateTokens(rendered);
+    tokensByTier[index][tier] = tokens;
+    return tokens;
+  };
+  const render = () => {
+    const parts = [];
+    for (let i = 0;i < compartments.length; i++) {
+      const rendered = renderedAt(i, tiers[i]);
+      if (rendered.length > 0)
+        parts.push(rendered);
+    }
+    return parts.join(`
+
+`);
+  };
+  let body = render();
+  if (historyBudgetTokens <= 0)
+    return body;
+  let runningTokens = 0;
+  for (let i = 0;i < tiers.length; i++) {
+    runningTokens += tokensAt(i, tiers[i]);
+  }
+  let guard = compartments.length * 5;
+  let oldestDemotableIndex = 0;
+  const demoteOldest = () => {
+    while (oldestDemotableIndex < tiers.length && tiers[oldestDemotableIndex] >= 5) {
+      oldestDemotableIndex += 1;
+    }
+    if (oldestDemotableIndex >= tiers.length)
+      return false;
+    const index = oldestDemotableIndex;
+    const previousTier = tiers[index];
+    const nextTier = previousTier + 1;
+    runningTokens += tokensAt(index, nextTier) - tokensAt(index, previousTier);
+    tiers[index] = nextTier;
+    return true;
+  };
+  while (runningTokens > historyBudgetTokens && guard > 0) {
+    if (!demoteOldest())
+      break;
+    guard -= 1;
+  }
+  body = render();
+  let exactTokens = estimateTokens(body);
+  while (exactTokens > historyBudgetTokens && guard > 0) {
+    if (!demoteOldest())
+      break;
+    guard -= 1;
+    body = render();
+    exactTokens = estimateTokens(body);
+  }
+  return body;
+}
+function extractM0Block(m0Text, tag) {
+  const m = m0Text.match(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`));
+  return m ? m[0] : null;
+}
+
+// ../plugin/src/hooks/magic-context/temporal-awareness.ts
+var TEMPORAL_AWARENESS_THRESHOLD_SECONDS = 300;
+var SECONDS_PER_MINUTE = 60;
+var SECONDS_PER_HOUR = 60 * 60;
+var SECONDS_PER_DAY = 24 * 60 * 60;
+var SECONDS_PER_WEEK = 7 * 24 * 60 * 60;
+function formatGap(seconds) {
+  if (!Number.isFinite(seconds) || seconds < TEMPORAL_AWARENESS_THRESHOLD_SECONDS) {
+    return null;
+  }
+  if (seconds < SECONDS_PER_HOUR) {
+    const minutes = Math.floor(seconds / SECONDS_PER_MINUTE);
+    return `+${minutes}m`;
+  }
+  if (seconds < SECONDS_PER_DAY) {
+    const hours = Math.floor(seconds / SECONDS_PER_HOUR);
+    const minutes = Math.floor((seconds - hours * SECONDS_PER_HOUR) / SECONDS_PER_MINUTE);
+    return minutes === 0 ? `+${hours}h` : `+${hours}h ${minutes}m`;
+  }
+  if (seconds < SECONDS_PER_WEEK) {
+    const days = Math.floor(seconds / SECONDS_PER_DAY);
+    const hours = Math.floor((seconds - days * SECONDS_PER_DAY) / SECONDS_PER_HOUR);
+    return hours === 0 ? `+${days}d` : `+${days}d ${hours}h`;
+  }
+  const weeks = Math.floor(seconds / SECONDS_PER_WEEK);
+  const days = Math.floor((seconds - weeks * SECONDS_PER_WEEK) / SECONDS_PER_DAY);
+  return days === 0 ? `+${weeks}w` : `+${weeks}w ${days}d`;
+}
+function formatDate(ms) {
+  const d = new Date(ms);
+  const yyyy = d.getFullYear().toString().padStart(4, "0");
+  const mm = (d.getMonth() + 1).toString().padStart(2, "0");
+  const dd = d.getDate().toString().padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+var TEMPORAL_MARKER_PATTERN = /^<!-- \+[\d]+[mhdw](?: [\d]+[mhdw])? -->\n/;
+function temporalMarkerPrefix(seconds) {
+  const marker = formatGap(seconds);
+  if (!marker)
+    return null;
+  return `<!-- ${marker} -->
+`;
+}
+
+// ../plugin/src/hooks/magic-context/inject-compartments.ts
+var INJECTION_CACHE_MAX = 100;
+var injectionCache = new BoundedSessionMap(INJECTION_CACHE_MAX);
+function clearInjectionCache(sessionId) {
+  injectionCache.delete(sessionId);
+  resetDegradedReanchorState(sessionId);
+}
+var degradedRebuildCountBySession = new BoundedSessionMap(INJECTION_CACHE_MAX);
+var reAnchorLoggedBySession = new BoundedSessionMap(INJECTION_CACHE_MAX);
+function resetDegradedReanchorState(sessionId) {
+  degradedRebuildCountBySession.delete(sessionId);
+  reAnchorLoggedBySession.delete(sessionId);
+}
+function getVisibleMemoryIds(db, sessionId) {
+  try {
+    const row = db.prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?").get(sessionId);
+    if (!row?.memory_block_ids)
+      return null;
+    const parsed = JSON.parse(row.memory_block_ids);
+    if (!Array.isArray(parsed))
+      return null;
+    const ids = new Set;
+    for (const value of parsed) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        ids.add(value);
+      }
+    }
+    return ids.size > 0 ? ids : null;
+  } catch {
+    return null;
+  }
+}
+function renderMemoryBlock(memories) {
+  return renderMemoryBlockV2(memories) || null;
+}
+var EMPTY_HARD_SIGNALS = {
+  systemHash: "",
+  modelKey: "",
+  cacheExpired: false,
+  lastResponseTime: 0
+};
+
+class MaterializeContentionError extends Error {
+  retries;
+  reason;
+  constructor(args = {}) {
+    super(args.reason ?? "m[0] materialization contention");
+    this.name = "MaterializeContentionError";
+    this.retries = args.retries ?? 0;
+    this.reason = args.reason ?? "contention";
+  }
+}
+
+class RenderM1InvalidMarkersError extends Error {
+  constructor(sessionId) {
+    super(`Cannot render m[1] for ${sessionId}: missing cached m[0] snapshot markers`);
+    this.name = "RenderM1InvalidMarkersError";
+  }
+}
+function lastCompartmentBoundaryId(compartments) {
+  const last = compartments.at(-1);
+  return last?.endMessageId && last.endMessageId.length > 0 ? last.endMessageId : null;
+}
+var DEFAULT_HISTORY_BUDGET_TOKENS = 60000;
+var DEFAULT_MEMORY_BUDGET_TOKENS = 8000;
+function renderBudgetIdentity(memoryBudget, historyBudget) {
+  return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+}
+var DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4000;
+var MAX_FORCED_MEMORIES_PER_DELTA = 10;
+var M0_EMPTY_BODY = "<session-history></session-history>";
+var M1_EMPTY_PLACEHOLDER = "<session-history-since>(no new content since last materialization)</session-history-since>";
+var EMPTY_PROJECT_DOCS = { renderedBlock: "", canonicalHash: "" };
+function readProjectDocsForM0(projectDirectory, injectDocs) {
+  return projectDirectory && injectDocs !== false ? readProjectDocsCanonical(projectDirectory) : EMPTY_PROJECT_DOCS;
+}
+function resolveWorkspaceRenderContext(args) {
+  if (!args.projectPath) {
+    return {
+      identities: [],
+      expandedIdentities: [],
+      ownIdentities: [],
+      shareCategories: null,
+      namesByIdentity: new Map,
+      canonicalIdentityByStoredPath: new Map,
+      isWorkspaced: false
+    };
+  }
+  const identitySet = args.workspaceIdentitySet ?? resolveWorkspaceIdentitySet(args.db, args.projectPath);
+  const isWorkspaced = identitySet.identities.length > 1;
+  const expanded = expandWorkspaceIdentitySetWithAliases(args.db, identitySet.identities);
+  const expandedIdentities = isWorkspaced ? expanded.expandedIdentities : identitySet.identities;
+  const canonicalIdentityByStoredPath = isWorkspaced ? expanded.canonicalIdentityByStoredPath : new Map(identitySet.identities.map((identity) => [identity, identity]));
+  let ownIdentities = expandedIdentities.filter((identity) => canonicalIdentityByStoredPath.get(identity) === args.projectPath);
+  if (ownIdentities.length === 0 && expandedIdentities.includes(args.projectPath)) {
+    ownIdentities = [args.projectPath];
+  }
+  return {
+    identities: identitySet.identities,
+    expandedIdentities,
+    ownIdentities,
+    shareCategories: isWorkspaced ? resolveWorkspaceShareCategories(args.db, args.projectPath) : null,
+    namesByIdentity: identitySet.namesByIdentity,
+    canonicalIdentityByStoredPath,
+    isWorkspaced
+  };
+}
+function sourceNamesForMemories(args) {
+  if (!args.projectPath || !args.workspace.isWorkspaced)
+    return;
+  const names = new Map;
+  for (const memory of args.memories) {
+    const source = sourceNameForMemory(memory.projectPath, args.projectPath, args.workspace.identities, args.workspace.namesByIdentity, args.workspace.canonicalIdentityByStoredPath);
+    if (source)
+      names.set(memory.id, source);
+  }
+  return names.size > 0 ? names : undefined;
+}
+function memoryCanonicalIdentity(memory, workspace) {
+  return resolveStoredPathWorkspaceIdentity(memory.projectPath, workspace.identities, workspace.canonicalIdentityByStoredPath);
+}
+function memorySelectionOrder(left, right) {
+  if (left.status === "permanent" && right.status !== "permanent")
+    return -1;
+  if (right.status === "permanent" && left.status !== "permanent")
+    return 1;
+  const leftImportance = left.importance ?? Number.NEGATIVE_INFINITY;
+  const rightImportance = right.importance ?? Number.NEGATIVE_INFINITY;
+  const importanceDiff = rightImportance - leftImportance;
+  if (importanceDiff !== 0)
+    return importanceDiff;
+  return left.id - right.id;
+}
+function memoryRenderOrder(left, right) {
+  const leftPriority = V2_MEMORY_CATEGORIES.indexOf(left.category);
+  const rightPriority = V2_MEMORY_CATEGORIES.indexOf(right.category);
+  if (leftPriority >= 0 || rightPriority >= 0) {
+    if (leftPriority < 0)
+      return 1;
+    if (rightPriority < 0)
+      return -1;
+    if (leftPriority !== rightPriority)
+      return leftPriority - rightPriority;
+  } else if (left.category !== right.category) {
+    return left.category < right.category ? -1 : 1;
+  }
+  return left.id - right.id;
+}
+var maxCompartmentSeqStatements = new WeakMap;
+var maxMemoryIdStatements = new WeakMap;
+var legacyCompartmentCountStatements = new WeakMap;
+var markerChangeProbeStatements = new WeakMap;
+var markerReadCaches = new WeakMap;
+var m0CompartmentStatements = new WeakMap;
+var newCompartmentStatements = new WeakMap;
+function cachedStatement(cache, db, sql) {
+  let stmt = cache.get(db);
+  if (!stmt) {
+    stmt = db.prepare(sql);
+    cache.set(db, stmt);
+  }
+  return stmt;
+}
+function numberFromRow(row, key) {
+  if (!row || typeof row !== "object")
+    return 0;
+  const value = row[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function getMaxCompartmentSeq(db, sessionId) {
+  const row = cachedStatement(maxCompartmentSeqStatements, db, "SELECT COALESCE(MAX(sequence), -1) AS s FROM compartments WHERE session_id = ?").get(sessionId);
+  return numberFromRow(row, "s");
+}
+function getMaxMemoryId(db, projectPath, expiryCutoff = Date.now()) {
+  if (!projectPath)
+    return 0;
+  const row = cachedStatement(maxMemoryIdStatements, db, `SELECT COALESCE(MAX(id), 0) AS max_id
+           FROM memories
+          WHERE project_path = ?
+            AND status IN ('active', 'permanent')
+            AND (expires_at IS NULL OR expires_at > ?)`).get(projectPath, expiryCutoff);
+  return numberFromRow(row, "max_id");
+}
+function getSessionFactsVersion(_db, _sessionId) {
+  return 0;
+}
+function getUpgradeState(db, sessionId) {
+  const row = cachedStatement(legacyCompartmentCountStatements, db, "SELECT COUNT(*) AS count FROM compartments WHERE session_id = ? AND legacy = 1").get(sessionId);
+  return numberFromRow(row, "count") > 0 ? "legacy" : "ready";
+}
+function getProjectMemoryEpoch(db, projectPath) {
+  if (!projectPath)
+    return 0;
+  return getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
+}
+function getGlobalUserProfileVersion(db) {
+  return getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ?? 0;
+}
+var MARKER_CHANGE_PROBE_SQL = `
+    WITH
+      expanded(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      own(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      shared(category) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      canonical(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))
+    SELECT
+      COALESCE((
+        SELECT project_memory_epoch FROM project_state WHERE project_path = ?
+      ), 0) AS project_memory_epoch,
+      COALESCE((
+        SELECT project_user_profile_version FROM project_state WHERE project_path = ?
+      ), 0) AS project_user_profile_version,
+      COALESCE((
+        SELECT MAX(sequence) FROM compartments WHERE session_id = ?
+      ), -1) AS max_compartment_seq,
+      (
+        SELECT COUNT(*) FROM compartments WHERE session_id = ? AND legacy = 1
+      ) AS legacy_compartment_count,
+      COALESCE((
+        SELECT MAX(memory.id)
+          FROM memories AS memory
+         WHERE memory.project_path IN (SELECT project_path FROM expanded)
+           AND memory.status IN ('active', 'permanent')
+           AND (memory.expires_at IS NULL OR memory.expires_at > ?)
+           AND (
+             memory.project_path IN (SELECT project_path FROM own)
+             OR (
+               memory.shareable = 1
+               AND memory.scope IN ('project', 'ecosystem', 'universe')
+               AND memory.category IN (SELECT category FROM shared)
+             )
+           )
+      ), 0) AS max_memory_id,
+      COALESCE((
+        SELECT MAX(id) FROM m0_mutation_log WHERE session_id = ?
+      ), 0) AS max_mutation_id,
+      COALESCE((
+        SELECT MAX(id)
+          FROM memory_mutation_log
+         WHERE project_path IN (SELECT project_path FROM expanded)
+      ), 0) AS max_memory_mutation_id,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT member.workspace_id || char(31) || member.project_path || char(31) ||
+                   member.display_name || char(31) || member.display_path || char(31) ||
+                   workspace.share_categories AS signature
+              FROM workspace_members AS anchor
+              JOIN workspace_members AS member ON member.workspace_id = anchor.workspace_id
+              JOIN workspaces AS workspace ON workspace.id = member.workspace_id
+             WHERE anchor.project_path = ?
+             ORDER BY member.workspace_id, member.project_path
+          )
+      ), '') AS workspace_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT canonical.project_path || char(31) ||
+                   COALESCE(state.project_memory_epoch, 0) AS signature
+              FROM canonical
+              LEFT JOIN project_state AS state ON state.project_path = canonical.project_path
+             ORDER BY canonical.project_path
+          )
+      ), '') AS workspace_epoch_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT alias.old_project_path || char(31) || alias.new_project_path AS signature
+              FROM v22_identity_rekey_map AS alias
+             WHERE alias.new_project_path IN (SELECT project_path FROM canonical)
+             ORDER BY alias.old_project_path, alias.new_project_path
+          )
+      ), '') AS alias_signature`;
+function workspaceIdentity(workspace) {
+  return JSON.stringify({
+    identities: workspace.identities,
+    expandedIdentities: workspace.expandedIdentities,
+    ownIdentities: workspace.ownIdentities,
+    shareCategories: workspace.shareCategories,
+    names: [...workspace.namesByIdentity].sort(([left], [right]) => left.localeCompare(right))
+  });
+}
+function markerReadCacheKey(args) {
+  const suppliedWorkspace = args.workspaceIdentitySet ? JSON.stringify({
+    identities: args.workspaceIdentitySet.identities,
+    names: [...args.workspaceIdentitySet.namesByIdentity].sort(([left], [right]) => left.localeCompare(right))
+  }) : "auto";
+  return `${args.sessionId}\x00${args.projectPath ?? ""}\x00${suppliedWorkspace}`;
+}
+function getMarkerReadCache(db) {
+  let cache = markerReadCaches.get(db);
+  if (!cache) {
+    cache = new BoundedSessionMap(100);
+    markerReadCaches.set(db, cache);
+  }
+  return cache;
+}
+function readMarkerChangeProbe(args, workspace) {
+  const statement = cachedStatement(markerChangeProbeStatements, args.db, MARKER_CHANGE_PROBE_SQL);
+  const row = statement.get(JSON.stringify(workspace.expandedIdentities), JSON.stringify(workspace.ownIdentities), JSON.stringify(workspace.shareCategories ?? []), JSON.stringify(workspace.identities), args.projectPath ?? "", GLOBAL_USER_PROFILE_PROJECT_PATH, args.sessionId, args.sessionId, Date.now(), args.sessionId, args.projectPath ?? "");
+  return {
+    projectMemoryEpoch: row.project_memory_epoch,
+    projectUserProfileVersion: row.project_user_profile_version,
+    maxCompartmentSeq: row.max_compartment_seq,
+    legacyCompartmentCount: row.legacy_compartment_count,
+    maxMemoryId: row.max_memory_id,
+    maxMutationId: row.max_mutation_id,
+    maxMemoryMutationId: row.max_memory_mutation_id,
+    workspaceSignature: row.workspace_signature,
+    workspaceEpochSignature: row.workspace_epoch_signature,
+    aliasSignature: row.alias_signature
+  };
+}
+function markerChangeProbeEquals(left, right) {
+  return left.projectMemoryEpoch === right.projectMemoryEpoch && left.projectUserProfileVersion === right.projectUserProfileVersion && left.maxCompartmentSeq === right.maxCompartmentSeq && left.legacyCompartmentCount === right.legacyCompartmentCount && left.maxMemoryId === right.maxMemoryId && left.maxMutationId === right.maxMutationId && left.maxMemoryMutationId === right.maxMemoryMutationId && left.workspaceSignature === right.workspaceSignature && left.workspaceEpochSignature === right.workspaceEpochSignature && left.aliasSignature === right.aliasSignature;
+}
+function readCurrentM0SnapshotMarkersUncached(args) {
+  const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
+  const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+  const materializedAt = Date.now();
+  const workspace = resolveWorkspaceRenderContext({
+    db: args.db,
+    projectPath: args.projectPath,
+    workspaceIdentitySet: args.workspaceIdentitySet
+  });
+  return {
+    workspace,
+    markers: {
+      projectMemoryEpoch: getProjectMemoryEpoch(args.db, args.projectPath),
+      workspaceFingerprint: workspace.isWorkspaced ? computeWorkspaceEpochFingerprint(args.db, workspace.identities) : null,
+      projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
+      maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
+      maxMemoryId: workspace.isWorkspaced ? getMaxMemoryIdForProjects(args.db, workspace.expandedIdentities, workspace.ownIdentities, workspace.shareCategories, materializedAt) : getMaxMemoryId(args.db, args.projectPath, materializedAt),
+      maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
+      maxMemoryMutationId: workspace.isWorkspaced ? getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0 : args.projectPath ? getMaxMemoryMutationId(args.db, args.projectPath) ?? 0 : 0,
+      projectDocsHash: projectDirectory && args.injectDocs !== false ? computeProjectDocsHash(projectDirectory) : "",
+      materializedAt,
+      sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
+      upgradeState: getUpgradeState(args.db, args.sessionId),
+      compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+      systemHash: hard.systemHash,
+      modelKey: hard.modelKey,
+      projectIdentity: args.projectPath ?? null,
+      muralEnabled: args.muralEnabled === true,
+      renderBudgetIdentity: renderBudgetIdentity(args.memoryInjectionBudgetTokens, args.historyBudgetTokens)
+    }
+  };
+}
+function refreshVolatileMarkerInputs(markers, args) {
+  const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
+  const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+  return {
+    ...markers,
+    projectDocsHash: projectDirectory && args.injectDocs !== false ? computeProjectDocsHash(projectDirectory) : "",
+    materializedAt: Date.now(),
+    systemHash: hard.systemHash,
+    modelKey: hard.modelKey,
+    projectIdentity: args.projectPath ?? null,
+    muralEnabled: args.muralEnabled === true,
+    renderBudgetIdentity: renderBudgetIdentity(args.memoryInjectionBudgetTokens, args.historyBudgetTokens)
+  };
+}
+function readCurrentM0SnapshotMarkers(args) {
+  const cache = getMarkerReadCache(args.db);
+  const cacheKey = markerReadCacheKey(args);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    const probe = readMarkerChangeProbe(args, cached.workspace);
+    if (markerChangeProbeEquals(probe, cached.probe)) {
+      return refreshVolatileMarkerInputs(cached.markers, args);
+    }
+    const fresh = readCurrentM0SnapshotMarkersUncached(args);
+    const freshWorkspaceIdentity = workspaceIdentity(fresh.workspace);
+    const freshProbe = freshWorkspaceIdentity === cached.workspaceIdentity ? probe : readMarkerChangeProbe(args, fresh.workspace);
+    cache.set(cacheKey, {
+      markers: fresh.markers,
+      probe: freshProbe,
+      workspace: fresh.workspace,
+      workspaceIdentity: freshWorkspaceIdentity
+    });
+    return fresh.markers;
+  }
+  const fresh = readCurrentM0SnapshotMarkersUncached(args);
+  cache.set(cacheKey, {
+    markers: fresh.markers,
+    probe: readMarkerChangeProbe(args, fresh.workspace),
+    workspace: fresh.workspace,
+    workspaceIdentity: workspaceIdentity(fresh.workspace)
+  });
+  return fresh.markers;
+}
+function mustMaterialize(args) {
+  if (!args.state.cachedM0Bytes)
+    return { value: true, reason: "first_render" };
+  if (!args.state.cachedM1Bytes)
+    return { value: true, reason: "cached_m1_missing" };
+  const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+  const current = readCurrentM0SnapshotMarkers(args);
+  const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(args.state.cachedM0UpgradeState);
+  if (cachedUpgradeIdentity.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
+    return { value: true, reason: "compartment_render_epoch" };
+  }
+  if (cachedUpgradeIdentity.muralEnabled !== null && cachedUpgradeIdentity.muralEnabled !== current.muralEnabled || cachedUpgradeIdentity.renderBudgetIdentity !== null && cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity) {
+    return { value: true, reason: "render_config" };
+  }
+  if (hard.modelKey !== "" && hard.modelKey !== (args.state.cachedM0ModelKey ?? "")) {
+    return { value: true, reason: "model_change" };
+  }
+  if (hard.systemHash !== "" && hard.systemHash !== (args.state.cachedM0SystemHash ?? "")) {
+    return { value: true, reason: "system_hash" };
+  }
+  if (hard.cacheExpired && hard.lastResponseTime > 0 && hard.lastResponseTime > (args.state.cachedM0MaterializedAt ?? 0)) {
+    return { value: true, reason: "ttl_idle" };
+  }
+  if (current.projectIdentity !== null) {
+    const cachedProjectIdentity = args.state.cachedM0ProjectIdentity ?? null;
+    if (cachedProjectIdentity === null) {
+      args.state.cachedM0ProjectIdentity = current.projectIdentity;
+      args.db.prepare("UPDATE session_meta SET cached_m0_project_identity = ? WHERE session_id = ?").run(current.projectIdentity, args.sessionId);
+    } else if (cachedProjectIdentity !== current.projectIdentity) {
+      return { value: true, reason: "project_change" };
+    }
+  }
+  if (current.workspaceFingerprint !== null || (args.state.cachedM0WorkspaceFingerprint ?? null) !== null) {
+    if ((args.state.cachedM0WorkspaceFingerprint ?? null) !== current.workspaceFingerprint) {
+      return { value: true, reason: "project_memory_epoch" };
+    }
+  } else if (args.state.cachedM0ProjectMemoryEpoch !== current.projectMemoryEpoch) {
+    return { value: true, reason: "project_memory_epoch" };
+  }
+  if (args.state.cachedM0MaxMutationId !== current.maxMutationId) {
+    return { value: true, reason: "max_mutation_id" };
+  }
+  if (cachedUpgradeIdentity.upgradeState !== current.upgradeState) {
+    return { value: true, reason: "upgrade_state" };
+  }
+  return { value: false, reason: null };
+}
+function trimMemoriesToBudgetV2(sessionId, memories, budgetTokens, renderOptions = {}) {
+  const selectionOrder = [...memories].sort(memorySelectionOrder);
+  const selected = [];
+  const accounting = createMemoryBlockAccounting(renderOptions);
+  for (const memory of selectionOrder) {
+    const cost = accounting.candidateCost(memory);
+    if (accounting.usedTokens + cost > budgetTokens)
+      continue;
+    accounting.admit(memory, cost);
+    selected.push(memory);
+  }
+  if (selected.length < memories.length) {
+    sessionLog(sessionId, `v2 trimmed memories from ${memories.length} to ${selected.length} to fit injection budget of ${budgetTokens} tokens`);
+  }
+  const renderOrder = [...selected].sort(memoryRenderOrder);
+  return { selected, renderOrder };
+}
+function trimWorkspaceMemoriesToBudgetV2(sessionId, memories, budgetTokens, workspace, renderOptions = {}) {
+  if (!workspace.isWorkspaced) {
+    return trimMemoriesToBudgetV2(sessionId, memories, budgetTokens, renderOptions);
+  }
+  const selected = [];
+  const selectedIds = new Set;
+  const accounting = createMemoryBlockAccounting(renderOptions);
+  const trySelect = (memory) => {
+    if (selectedIds.has(memory.id))
+      return false;
+    const cost = accounting.candidateCost(memory);
+    if (accounting.usedTokens + cost > budgetTokens)
+      return false;
+    selected.push(memory);
+    selectedIds.add(memory.id);
+    accounting.admit(memory, cost);
+    return true;
+  };
+  for (const memory of memories.filter((candidate) => candidate.status === "permanent").sort(memorySelectionOrder)) {
+    trySelect(memory);
+  }
+  const remainingAfterPermanent = Math.max(0, budgetTokens - accounting.usedTokens);
+  const floorTokens = remainingAfterPermanent / Math.max(1, workspace.identities.length);
+  const byIdentity = new Map;
+  for (const memory of memories) {
+    if (memory.status === "permanent")
+      continue;
+    const identity = memoryCanonicalIdentity(memory, workspace);
+    if (!identity)
+      continue;
+    const list = byIdentity.get(identity) ?? [];
+    list.push(memory);
+    byIdentity.set(identity, list);
+  }
+  for (const identity of workspace.identities) {
+    let memberTokens = 0;
+    const candidates = (byIdentity.get(identity) ?? []).sort(memorySelectionOrder);
+    for (const memory of candidates) {
+      if (selectedIds.has(memory.id))
+        continue;
+      const cost = accounting.candidateCost(memory);
+      if (memberTokens + cost > floorTokens)
+        continue;
+      if (accounting.usedTokens + cost > budgetTokens)
+        continue;
+      selected.push(memory);
+      selectedIds.add(memory.id);
+      accounting.admit(memory, cost);
+      memberTokens += cost;
+    }
+  }
+  const remaining = memories.filter((memory) => !selectedIds.has(memory.id)).sort(memorySelectionOrder);
+  for (const memory of remaining) {
+    trySelect(memory);
+  }
+  if (selected.length < memories.length) {
+    sessionLog(sessionId, `v2 trimmed memories from ${memories.length} to ${selected.length} to fit injection budget of ${budgetTokens} tokens`);
+  }
+  return { selected, renderOrder: [...selected].sort(memoryRenderOrder) };
+}
+function safeGetActiveUserMemories(db) {
+  try {
+    return getActiveUserMemories(db);
+  } catch (error) {
+    if (String(error).includes("no such table: user_memories"))
+      return [];
+    throw error;
+  }
+}
+function trimUserMemoriesToBudget(memories, budgetTokens) {
+  const selected = [];
+  let usedTokens = 0;
+  for (const memory of memories) {
+    const tokens = estimateTokens(`- ${memory.content}`) + 4;
+    if (usedTokens + tokens > budgetTokens)
+      continue;
+    selected.push(memory);
+    usedTokens += tokens;
+  }
+  return selected;
+}
+function readM0Compartments(db, sessionId) {
+  const rows = cachedStatement(m0CompartmentStatements, db, `SELECT id, session_id, sequence, start_message, end_message, start_message_id,
+                end_message_id, title, content, p1, p2, p3, p4, episode_type,
+                created_at, importance, legacy
+           FROM compartments
+          WHERE session_id = ?
+          ORDER BY sequence ASC`).all(sessionId);
+  return rows.map(rowToM0Compartment);
+}
+function nullableString(value) {
+  return typeof value === "string" ? value : null;
+}
+function withCompartmentDates(sessionId, compartments, temporalAwareness) {
+  if (!temporalAwareness || compartments.length === 0)
+    return compartments;
+  const messageIds = new Set;
+  for (const compartment of compartments) {
+    if (compartment.startMessageId)
+      messageIds.add(compartment.startMessageId);
+    if (compartment.endMessageId)
+      messageIds.add(compartment.endMessageId);
+  }
+  const times = getMessageTimesFromOpenCodeDb(sessionId, Array.from(messageIds));
+  return compartments.map((compartment) => {
+    const startMs = times.get(compartment.startMessageId);
+    const endMs = times.get(compartment.endMessageId);
+    if (startMs === undefined || endMs === undefined)
+      return compartment;
+    return {
+      ...compartment,
+      startDate: formatDate(startMs),
+      endDate: formatDate(endMs)
+    };
+  });
+}
+function rowToM0Compartment(row) {
+  return {
+    id: Number(row.id ?? 0),
+    sessionId: String(row.session_id ?? ""),
+    sequence: Number(row.sequence ?? 0),
+    startMessage: Number(row.start_message ?? 0),
+    endMessage: Number(row.end_message ?? 0),
+    startMessageId: String(row.start_message_id ?? ""),
+    endMessageId: String(row.end_message_id ?? ""),
+    title: String(row.title ?? ""),
+    content: String(row.content ?? ""),
+    p1: nullableString(row.p1),
+    p2: nullableString(row.p2),
+    p3: nullableString(row.p3),
+    p4: nullableString(row.p4),
+    importance: Number(row.importance ?? 50),
+    episodeType: nullableString(row.episode_type),
+    legacy: Number(row.legacy ?? 0),
+    createdAt: Number(row.created_at ?? 0)
+  };
+}
+function readNewCompartments(db, sessionId, afterSequence) {
+  const rows = cachedStatement(newCompartmentStatements, db, `SELECT id, session_id, sequence, start_message, end_message, start_message_id,
+                end_message_id, title, content, p1, p2, p3, p4, episode_type,
+                created_at, importance, legacy
+           FROM compartments
+          WHERE session_id = ? AND sequence > ?
+          ORDER BY sequence ASC`).all(sessionId, afterSequence);
+  return rows.map(rowToM0Compartment);
+}
+function createMemoryBlockAccounting(renderOptions) {
+  const seenCategories = new Set;
+  const categoryCost = new Map;
+  return {
+    usedTokens: estimateTokens(`<project-memory>
+</project-memory>`),
+    candidateCost(memory) {
+      const line = renderMemoryLineV2(memory, renderOptions.sourceNameByMemoryId?.get(memory.id));
+      let cost = estimateTokens(`${line}
+`);
+      if (!seenCategories.has(memory.category)) {
+        let tags = categoryCost.get(memory.category);
+        if (tags === undefined) {
+          tags = estimateTokens(`<${escapeXmlAttr(memory.category)}>
+</${escapeXmlAttr(memory.category)}>
+`);
+          categoryCost.set(memory.category, tags);
+        }
+        cost += tags;
+      }
+      return cost;
+    },
+    admit(memory, cost) {
+      this.usedTokens += cost;
+      seenCategories.add(memory.category);
+    }
+  };
+}
+function renderMemoryLineV2(memory, sourceName) {
+  const source = sourceName ? ` [${escapeXmlContent(sourceName)}]` : "";
+  return `#${memory.id}${source}: ${escapeXmlContent(memory.content)}`;
+}
+function renderMemoryBlockV2(memories, wrapper = "project-memory", renderOptions = {}) {
+  if (memories.length === 0)
+    return "";
+  const ordered = [...memories].sort(memoryRenderOrder);
+  const lines = [`<${wrapper}>`];
+  let openCategory;
+  for (const memory of ordered) {
+    if (memory.category !== openCategory) {
+      if (openCategory !== undefined)
+        lines.push(`</${escapeXmlAttr(openCategory)}>`);
+      openCategory = memory.category;
+      lines.push(`<${escapeXmlAttr(openCategory)}>`);
+    }
+    lines.push(renderMemoryLineV2(memory, renderOptions.sourceNameByMemoryId?.get(memory.id)));
+  }
+  if (openCategory !== undefined)
+    lines.push(`</${escapeXmlAttr(openCategory)}>`);
+  lines.push(`</${wrapper}>`);
+  return lines.join(`
+`);
+}
+function renderUserProfileBlock(memories, wrapper = "user-profile") {
+  if (memories.length === 0)
+    return "";
+  const lines = [`<${wrapper}>`];
+  for (const memory of memories) {
+    lines.push(`- ${escapeXmlContent(memory.content)}`);
+  }
+  lines.push(`</${wrapper}>`);
+  return lines.join(`
+`);
+}
+function renderSessionHistoryWithDecay(args) {
+  return renderDecayedCompartments({
+    compartments: args.compartments,
+    historyBudgetTokens: args.historyBudgetTokens
+  });
+}
+var MEMORY_MURAL_BLOCK = `<memory-mural>
+The project memory mural image follows.
+</memory-mural>`;
+function renderM0(args) {
+  const sections = [];
+  if (args.projectDocs.length > 0)
+    sections.push(args.projectDocs);
+  const userProfile = renderUserProfileBlock(trimUserMemoriesToBudget(args.userProfileBaseline, args.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS));
+  if (userProfile)
+    sections.push(userProfile);
+  const baseBudget = args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+  const effectiveBudget = baseBudget / Math.max(1, args.decayPressureMultiplier ?? 1);
+  const sessionHistory = renderSessionHistoryWithDecay({
+    compartments: args.compartments,
+    historyBudgetTokens: effectiveBudget
+  });
+  sections.push(sessionHistory.length > 0 ? `<session-history>
+${sessionHistory}
+</session-history>` : M0_EMPTY_BODY);
+  const memoriesBlock = renderMemoryBlockV2(args.memories, "project-memory", args.memoryRenderOptions);
+  if (memoriesBlock)
+    sections.push(memoriesBlock);
+  if (args.mural?.enabled && args.mural.supportsVision && args.mural.dataUrl) {
+    sections.push(MEMORY_MURAL_BLOCK);
+  }
+  return sections.join(`
+
+`).trim();
+}
+function historySliceTokens(m0Text) {
+  const slice = extractM0Block(m0Text, "session-history");
+  return slice ? estimateTokens(slice) : 0;
+}
+function resolveMuralForM0(options, projectPath, modelKey, budgetTokens) {
+  if (!options.muralEnabled)
+    return;
+  return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens);
+}
+function materializeM0(options) {
+  const projectPath = options.projectPath;
+  const projectDirectory = options.projectDirectory ?? projectPath ?? "";
+  let snapshotMarkers;
+  let compartments = [];
+  let facts = [];
+  let memories = [];
+  let userMemories = [];
+  let workspace = resolveWorkspaceRenderContext({
+    db: options.db,
+    projectPath,
+    workspaceIdentitySet: options.workspaceIdentitySet
+  });
+  let docs = {
+    renderedBlock: "",
+    canonicalHash: ""
+  };
+  const foldMaterializedAt = Date.now();
+  options.db.exec("BEGIN");
+  try {
+    workspace = resolveWorkspaceRenderContext({
+      db: options.db,
+      projectPath,
+      workspaceIdentitySet: options.workspaceIdentitySet
+    });
+    snapshotMarkers = readCurrentM0SnapshotMarkers({
+      db: options.db,
+      sessionId: options.sessionId,
+      projectPath,
+      projectDirectory,
+      injectDocs: options.injectDocs,
+      muralEnabled: options.muralEnabled,
+      memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+      historyBudgetTokens: options.historyBudgetTokens,
+      hardSignals: options.hardSignals,
+      workspaceIdentitySet: {
+        identities: workspace.identities,
+        namesByIdentity: workspace.namesByIdentity
+      }
+    });
+    docs = readProjectDocsForM0(projectDirectory, options.injectDocs);
+    snapshotMarkers.projectDocsHash = docs.canonicalHash;
+    compartments = options.compactionOff ? [] : readM0Compartments(options.db, options.sessionId);
+    facts = [];
+    memories = projectPath ? workspace.isWorkspaced ? getMemoriesByProjects(options.db, workspace.expandedIdentities, ["active", "permanent"], foldMaterializedAt, workspace.ownIdentities, workspace.shareCategories) : getMemoriesByProject(options.db, projectPath, ["active", "permanent"], foldMaterializedAt) : [];
+    userMemories = safeGetActiveUserMemories(options.db);
+    options.db.exec("COMMIT");
+  } catch (error) {
+    try {
+      options.db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+  compartments = withCompartmentDates(options.sessionId, compartments, options.temporalAwareness);
+  const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
+  const memoryRenderOptions = {
+    sourceNameByMemoryId: sourceNamesForMemories({
+      memories,
+      projectPath,
+      workspace
+    })
+  };
+  const trimmed = workspace.isWorkspaced ? trimWorkspaceMemoriesToBudgetV2(options.sessionId, memories, memoryBudget, workspace, memoryRenderOptions) : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
+  const mural = options.mural ?? resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
+  let decayPressureMultiplier = 1;
+  let m0Text = renderM0({
+    projectDocs: docs.renderedBlock,
+    userProfileBaseline: userMemories,
+    compartments,
+    memories: trimmed.renderOrder,
+    facts,
+    memoryRenderOptions,
+    historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+    userProfileBudgetTokens: options.userProfileBudgetTokens,
+    decayPressureMultiplier,
+    mural
+  });
+  let attempts = 0;
+  const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+  while (budget > 0 && historySliceTokens(m0Text) > budget * 1.05 && attempts < 3) {
+    decayPressureMultiplier *= 1.15;
+    m0Text = renderM0({
+      projectDocs: docs.renderedBlock,
+      userProfileBaseline: userMemories,
+      compartments,
+      memories: trimmed.renderOrder,
+      facts,
+      memoryRenderOptions,
+      historyBudgetTokens: budget,
+      userProfileBudgetTokens: options.userProfileBudgetTokens,
+      decayPressureMultiplier,
+      mural
+    });
+    attempts += 1;
+  }
+  if (m0Text.length === 0)
+    m0Text = M0_EMPTY_BODY;
+  const m0Bytes = Buffer4.from(m0Text, "utf8");
+  const frozenMuralDataUrl = mural?.enabled && mural.supportsVision ? mural.dataUrl ?? null : null;
+  const frozenMuralHash = mural?.enabled && mural.supportsVision ? mural.contentHash ?? null : null;
+  snapshotMarkers.muralHash = frozenMuralHash;
+  snapshotMarkers.materializedAt = foldMaterializedAt;
+  const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
+  const phase3ProjectDocsHash = readProjectDocsForM0(projectDirectory, options.injectDocs).canonicalHash;
+  options.beforePhase3ForTest?.();
+  let m1Text = M1_EMPTY_PLACEHOLDER;
+  let m1Bytes = Buffer4.from(m1Text, "utf8");
+  options.db.exec("BEGIN IMMEDIATE");
+  try {
+    const currentWorkspace = resolveWorkspaceRenderContext({
+      db: options.db,
+      projectPath,
+      workspaceIdentitySet: options.workspaceIdentitySet
+    });
+    const current = {
+      projectMemoryEpoch: getProjectMemoryEpoch(options.db, projectPath),
+      workspaceFingerprint: currentWorkspace.isWorkspaced ? computeWorkspaceEpochFingerprint(options.db, currentWorkspace.identities) : null,
+      projectUserProfileVersion: getGlobalUserProfileVersion(options.db),
+      maxCompartmentSeq: getMaxCompartmentSeq(options.db, options.sessionId),
+      maxMemoryId: currentWorkspace.isWorkspaced ? getMaxMemoryIdForProjects(options.db, currentWorkspace.expandedIdentities, currentWorkspace.ownIdentities, currentWorkspace.shareCategories, foldMaterializedAt) : getMaxMemoryId(options.db, projectPath, foldMaterializedAt),
+      maxMutationId: getMaxM0MutationId(options.db, options.sessionId) ?? 0,
+      maxMemoryMutationId: currentWorkspace.isWorkspaced ? getMaxMemoryMutationIdForProjects(options.db, currentWorkspace.expandedIdentities) ?? 0 : projectPath ? getMaxMemoryMutationId(options.db, projectPath) ?? 0 : 0,
+      projectDocsHash: phase3ProjectDocsHash,
+      materializedAt: foldMaterializedAt,
+      sessionFactsVersion: getSessionFactsVersion(options.db, options.sessionId),
+      upgradeState: getUpgradeState(options.db, options.sessionId),
+      compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+      systemHash: snapshotMarkers.systemHash,
+      modelKey: snapshotMarkers.modelKey,
+      projectIdentity: projectPath ?? null,
+      muralEnabled: snapshotMarkers.muralEnabled,
+      renderBudgetIdentity: snapshotMarkers.renderBudgetIdentity
+    };
+    const memoryEpochStale = current.workspaceFingerprint !== null || snapshotMarkers.workspaceFingerprint !== null ? current.workspaceFingerprint !== snapshotMarkers.workspaceFingerprint : current.projectMemoryEpoch !== snapshotMarkers.projectMemoryEpoch;
+    const stale = memoryEpochStale || current.projectUserProfileVersion !== snapshotMarkers.projectUserProfileVersion || current.maxCompartmentSeq !== snapshotMarkers.maxCompartmentSeq || current.maxMutationId !== snapshotMarkers.maxMutationId || current.maxMemoryMutationId !== snapshotMarkers.maxMemoryMutationId || current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion || current.upgradeState !== snapshotMarkers.upgradeState || (current.projectIdentity ?? null) !== (snapshotMarkers.projectIdentity ?? null);
+    if (stale) {
+      options.db.exec("ROLLBACK");
+      throw new MaterializeContentionError({ reason: "snapshot changed before Phase 3" });
+    }
+    const m1Render = renderM1WithMetadata({
+      ...options,
+      workspaceIdentitySet: {
+        identities: workspace.identities,
+        namesByIdentity: workspace.namesByIdentity
+      }
+    }, snapshotMarkers, renderedMemoryIds);
+    m1Text = m1Render.text;
+    m1Bytes = Buffer4.from(m1Text, "utf8");
+    const visibleMemoryIds = [
+      ...new Set([...renderedMemoryIds, ...m1Render.renderedMemoryIds])
+    ];
+    persistCachedM0(options.db, options.sessionId, {
+      m0Bytes,
+      muralDataUrl: frozenMuralDataUrl,
+      muralHash: frozenMuralHash,
+      projectMemoryEpoch: snapshotMarkers.projectMemoryEpoch,
+      workspaceFingerprint: snapshotMarkers.workspaceFingerprint,
+      projectUserProfileVersion: snapshotMarkers.projectUserProfileVersion,
+      maxCompartmentSeq: snapshotMarkers.maxCompartmentSeq,
+      maxMemoryId: snapshotMarkers.maxMemoryId,
+      maxMutationId: snapshotMarkers.maxMutationId,
+      maxMemoryMutationId: snapshotMarkers.maxMemoryMutationId,
+      m1Bytes,
+      projectDocsHash: snapshotMarkers.projectDocsHash,
+      materializedAt: snapshotMarkers.materializedAt,
+      sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
+      upgradeState: encodeCachedM0UpgradeIdentity(snapshotMarkers.upgradeState, snapshotMarkers.compartmentRenderEpoch, snapshotMarkers.muralEnabled, snapshotMarkers.renderBudgetIdentity),
+      systemHash: snapshotMarkers.systemHash,
+      modelKey: snapshotMarkers.modelKey,
+      projectIdentity: snapshotMarkers.projectIdentity
+    });
+    options.db.prepare("UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?").run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
+    const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
+    options.db.prepare("UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?").run(baselineEndMessageId, options.sessionId);
+    options.db.exec("COMMIT");
+    options.state.cachedM0MuralDataUrl = frozenMuralDataUrl;
+    options.state.cachedM0MuralHash = frozenMuralHash;
+  } catch (error) {
+    try {
+      options.db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+  return { m0Bytes, m0Text, m1Bytes, m1Text, snapshotMarkers, renderedMemoryIds };
+}
+function materializeWithRetry(options, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 0;attempt < maxRetries; attempt++) {
+    try {
+      return materializeM0(options);
+    } catch (error) {
+      if (!(error instanceof MaterializeContentionError))
+        throw error;
+      lastError = error;
+    }
+  }
+  throw new MaterializeContentionError({
+    retries: maxRetries,
+    reason: lastError?.reason ?? "m[0] materialization contention exhausted"
+  });
+}
+function renderMemoryUpdatesBlock(args) {
+  if (!args.projectPath) {
+    return { block: "", count: 0, forcedMemoryIds: [] };
+  }
+  const baselineIds = new Set(args.renderedMemoryIds);
+  const mutations = args.workspace.isWorkspaced ? getMemoryMutationsForRenderByProjects(args.db, args.workspace.expandedIdentities, args.afterId, args.renderedMemoryIds) : getMemoryMutationsForRender(args.db, args.projectPath, args.afterId, args.renderedMemoryIds);
+  if (mutations.length === 0)
+    return { block: "", count: 0, forcedMemoryIds: [] };
+  const forcedIds = new Set;
+  const lines = ["These memories changed since the snapshot below — trust these:"];
+  for (const mutation of mutations) {
+    if (mutation.mutationType === "superseded") {
+      const replacementId = mutation.supersededById;
+      if (replacementId !== null && !baselineIds.has(replacementId) && args.eligibleMemoryIds.has(replacementId)) {
+        forcedIds.add(replacementId);
+      }
+      if (!baselineIds.has(mutation.targetMemoryId))
+        continue;
+      if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
+        lines.push(`  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`);
+      } else {
+        lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+      }
+      continue;
+    }
+    if (!baselineIds.has(mutation.targetMemoryId)) {
+      if (mutation.visibilityChanged && args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
+        forcedIds.add(mutation.targetMemoryId);
+      }
+      continue;
+    }
+    if (!args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
+      lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+      continue;
+    }
+    if (mutation.visibilityChanged && mutation.newContent === null)
+      continue;
+    if (mutation.mutationType === "update") {
+      lines.push(`  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`);
+      continue;
+    }
+    lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+  }
+  const forcedMemoryIds = [...forcedIds].sort((left, right) => left - right).slice(0, MAX_FORCED_MEMORIES_PER_DELTA);
+  if (lines.length === 1)
+    return { block: "", count: 0, forcedMemoryIds };
+  return {
+    block: `<memory-updates>
+${lines.join(`
+`)}
+</memory-updates>`,
+    count: lines.length - 1,
+    forcedMemoryIds
+  };
+}
+function renderM1WithMetadata(options, markers, renderedMemoryIds) {
+  if (!markers || markers.maxCompartmentSeq === undefined) {
+    throw new RenderM1InvalidMarkersError(options.sessionId);
+  }
+  const blocks = [];
+  const workspace = resolveWorkspaceRenderContext({
+    db: options.db,
+    projectPath: options.projectPath,
+    workspaceIdentitySet: options.workspaceIdentitySet
+  });
+  const eligibleMemories = options.projectPath ? workspace.isWorkspaced ? getMemoriesByProjects(options.db, workspace.expandedIdentities, ["active", "permanent"], markers.materializedAt, workspace.ownIdentities, workspace.shareCategories) : getMemoriesByProject(options.db, options.projectPath, ["active", "permanent"], markers.materializedAt) : [];
+  const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
+  const memoryUpdates = renderMemoryUpdatesBlock({
+    db: options.db,
+    projectPath: options.projectPath,
+    workspace,
+    afterId: markers.maxMemoryMutationId,
+    renderedMemoryIds,
+    eligibleMemoryIds
+  });
+  if (memoryUpdates.block)
+    blocks.push(memoryUpdates.block);
+  const newCompartments = withCompartmentDates(options.sessionId, readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq), options.temporalAwareness);
+  if (newCompartments.length > 0) {
+    blocks.push(`<new-compartments>
+${newCompartments.map((compartment) => renderCompartmentAtTier(compartment, 1)).join(`
+
+`)}
+</new-compartments>`);
+  }
+  const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
+  const newMemories = eligibleMemories.filter((memory) => memory.id > markers.maxMemoryId && !forcedMemoryIds.has(memory.id));
+  const newMemoryRenderOptions = {
+    sourceNameByMemoryId: sourceNamesForMemories({
+      memories: eligibleMemories,
+      projectPath: options.projectPath,
+      workspace
+    })
+  };
+  const trimmedNewMemories = trimMemoriesToBudgetV2(options.sessionId, newMemories, Math.max(1, Math.floor((options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS) * 0.25)), newMemoryRenderOptions).renderOrder;
+  const deltaMemories = [
+    ...trimmedNewMemories,
+    ...eligibleMemories.filter((memory) => forcedMemoryIds.has(memory.id))
+  ];
+  const newMemoriesBlock = renderMemoryBlockV2(deltaMemories, "new-memories", newMemoryRenderOptions);
+  if (newMemoriesBlock)
+    blocks.push(newMemoriesBlock);
+  const currentUserProfileVersion = getGlobalUserProfileVersion(options.db);
+  if (currentUserProfileVersion !== markers.projectUserProfileVersion) {
+    const profileBlock = renderUserProfileBlock(trimUserMemoriesToBudget(safeGetActiveUserMemories(options.db), Math.max(1, Math.floor((options.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS) * 0.25))), "new-user-profile");
+    if (profileBlock)
+      blocks.push(profileBlock);
+  }
+  const renderedNewMemoryIds = newMemoriesBlock ? trimmedNewMemories.map((memory) => memory.id) : [];
+  if (blocks.length === 0) {
+    return {
+      text: M1_EMPTY_PLACEHOLDER,
+      memoryUpdateCount: memoryUpdates.count,
+      renderedMemoryIds: renderedNewMemoryIds
+    };
+  }
+  return {
+    text: `<session-history-since>
+${blocks.join(`
+`)}
+</session-history-since>`,
+    memoryUpdateCount: memoryUpdates.count,
+    renderedMemoryIds: renderedNewMemoryIds
+  };
+}
+function renderM1(options, markers, renderedMemoryIds = []) {
+  return renderM1WithMetadata(options, markers, renderedMemoryIds).text;
+}
+
+// ../plugin/src/hooks/magic-context/todo-view.ts
+import { createHash as createHash11 } from "node:crypto";
+var TODO_STATUS_PENDING = "pending";
+var TODO_STATUS_IN_PROGRESS = "in_progress";
+var TODO_STATUS_COMPLETED = "completed";
+var TODO_STATUS_CANCELLED = "cancelled";
+var TODO_PRIORITY_HIGH = "high";
+var TODO_PRIORITY_MEDIUM = "medium";
+var TODO_PRIORITY_LOW = "low";
+var TODO_STATUSES = [
+  TODO_STATUS_PENDING,
+  TODO_STATUS_IN_PROGRESS,
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+];
+var TODO_PRIORITIES = [
+  TODO_PRIORITY_HIGH,
+  TODO_PRIORITY_MEDIUM,
+  TODO_PRIORITY_LOW
+];
+var TODO_STATUS_SET = new Set(TODO_STATUSES);
+var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
+var TERMINAL_STATUSES = new Set([
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+]);
+var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
+var SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
+function normalizeTodoStateJson(todos) {
+  if (!Array.isArray(todos))
+    return null;
+  const normalized = [];
+  for (const todo of todos) {
+    if (!isTodoItem(todo))
+      return null;
+    normalized.push({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
+    });
+  }
+  return JSON.stringify(normalized);
+}
+function buildSyntheticTodoPart(stateJson) {
+  const todos = parseTodoState(stateJson);
+  if (todos === null || todos.length === 0)
+    return null;
+  if (todos.every((t) => TERMINAL_STATUSES.has(t.status)))
+    return null;
+  const callID = computeSyntheticCallId(stateJson);
+  const activeCount = todos.filter((t) => !TITLE_DONE_STATUSES.has(t.status)).length;
+  const output = JSON.stringify(todos, null, 2);
+  const ts = 0;
+  return {
+    type: "tool",
+    callID,
+    tool: "todowrite",
+    state: {
+      status: "completed",
+      input: { todos },
+      output,
+      title: `${activeCount} todos`,
+      metadata: { todos, truncated: false },
+      time: { start: ts, end: ts }
+    },
+    syntheticTodoMarker: true
+  };
+}
+function computeSyntheticCallId(stateJson) {
+  const hash = createHash11("sha256").update(stateJson).digest("hex").slice(0, 16);
+  return `${SYNTHETIC_CALL_ID_PREFIX}${hash}`;
+}
+function parseTodoState(stateJson) {
+  if (stateJson.length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(stateJson);
+    if (!Array.isArray(parsed))
+      return null;
+    const result = [];
+    for (const item of parsed) {
+      if (!isTodoItem(item))
+        return null;
+      result.push({
+        content: item.content,
+        status: item.status,
+        priority: item.priority ?? TODO_PRIORITY_MEDIUM
+      });
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+function isTodoStatus(value) {
+  return typeof value === "string" && TODO_STATUS_SET.has(value);
+}
+function isTodoPriority(value) {
+  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
+}
+function isTodoItem(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const todo = value;
+  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
+}
+
+// ../plugin/src/tools/ctx-expand/constants.ts
+var CTX_EXPAND_DESCRIPTION = `Recover the original conversation from your compacted history.
+
+Older parts of this session are summarized under \`## start-end · date · title\` headings inside <session-history> — e.g. \`## 120-245 · … · Fixed tagger collision\`. Each heading replaces the raw messages in that ordinal range with a summary. When the summary isn't enough — you need exact wording, a specific value, an error message, or the reasoning behind a decision — expand the range:
+
+ctx_expand(start=120, end=245)  ← the heading's start/end range
+
+Returns the raw transcript as [N] U:/A: lines, capped at ~15K tokens; an oversized range returns the head and tells you where to continue. Also works with ordinals from ctx_search message results — expand a window around a hit (e.g. start=N-10, end=N+5). Ranges after the last compartment are your live tail — already visible in context, not expandable.
+
+Two recovery modes for finer detail:
+- ctx_expand(start=120, end=245, verbose=true) — lists each message SEPARATELY with its ordinal [N] and a per-part preview (each tool call shown with its output size). Use this to find the exact message or tool call you want, then recover it in full by ordinal.
+- ctx_expand(message=138) — returns the FULL untruncated content of the message at that ordinal: every text part, and every tool call's complete input + output, read from stored history. This is the cheap way to get back a tool output you dropped with ctx_reduce — the original is still in storage even though the wire shows [dropped §N§]. If the message was deleted from history (session prune/revert), it says so.`;
+var CTX_EXPAND_TOKEN_BUDGET = 15000;
+
+// ../plugin/src/tools/ctx-expand/render.ts
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function roleLabel(role) {
+  if (role === "assistant")
+    return "A (assistant)";
+  if (role === "user")
+    return "U (user)";
+  return role;
+}
+function truncate(value, max) {
+  const t = value.trim();
+  return t.length <= max ? t : `${t.slice(0, max)}…`;
+}
+function keyArg(input) {
+  if (!input)
+    return "";
+  for (const k of ["filePath", "path", "pattern", "query", "symbol", "module", "action"]) {
+    const v = input[k];
+    if (typeof v === "string" && v.length > 0)
+      return truncate(v, 60);
+  }
+  if (typeof input.description === "string")
+    return truncate(input.description, 60);
+  return "";
+}
+function asToolPart(part) {
+  const type = typeof part.type === "string" ? part.type : "";
+  if (type === "tool") {
+    const state = isRecord2(part.state) ? part.state : null;
+    const output = state && typeof state.output === "string" ? state.output : state && state.output != null ? JSON.stringify(state.output) : null;
+    const metadata = state && isRecord2(state.metadata) ? state.metadata : null;
+    const title = state && typeof state.title === "string" && state.title || metadata && typeof metadata.title === "string" && metadata.title || null;
+    return {
+      name: typeof part.tool === "string" ? part.tool : "tool",
+      callId: typeof part.callID === "string" ? part.callID : "",
+      title,
+      input: state && isRecord2(state.input) ? state.input : null,
+      output
+    };
+  }
+  if (type === "tool_use") {
+    return {
+      name: typeof part.name === "string" ? part.name : "tool",
+      callId: typeof part.id === "string" ? part.id : "",
+      title: null,
+      input: isRecord2(part.input) ? part.input : null,
+      output: null
+    };
+  }
+  if (type === "tool_result") {
+    const content = part.content;
+    const output = typeof content === "string" ? content : content != null ? JSON.stringify(content) : null;
+    return {
+      name: "tool_result",
+      callId: typeof part.tool_use_id === "string" ? part.tool_use_id : "",
+      title: null,
+      input: null,
+      output
+    };
+  }
+  return null;
+}
+function textOf(part) {
+  if (part.type === "text" && typeof part.text === "string")
+    return part.text;
+  return null;
+}
+function reasoningOf(part) {
+  if ((part.type === "reasoning" || part.type === "thinking") && typeof part.text === "string") {
+    return part.text;
+  }
+  return null;
+}
+function renderPartPreview(part) {
+  if (!isRecord2(part))
+    return null;
+  const text = textOf(part);
+  if (text !== null) {
+    const t = truncate(text, 200);
+    return t.length > 0 ? `    • ${t}` : null;
+  }
+  const tool = asToolPart(part);
+  if (tool) {
+    const arg = keyArg(tool.input);
+    const head = arg ? `${tool.name}(${arg})` : tool.name;
+    return tool.output !== null ? `    • tool ${head} → output ~${estimateTokens(tool.output)} tok` : `    • tool ${head}`;
+  }
+  const reasoning = reasoningOf(part);
+  if (reasoning !== null)
+    return `    • [reasoning] ${truncate(reasoning, 120)}`;
+  const type = typeof part.type === "string" ? part.type : "part";
+  if (type === "file")
+    return "    • [file]";
+  if (type === "step-start" || type === "step-finish")
+    return null;
+  return `    • [${type}]`;
+}
+function renderPartFull(part) {
+  if (!isRecord2(part))
+    return null;
+  const text = textOf(part);
+  if (text !== null) {
+    return text.trim().length > 0 ? `  [text]
+${text}` : null;
+  }
+  const tool = asToolPart(part);
+  if (tool) {
+    const lines = [];
+    const idSuffix = tool.callId ? ` #${tool.callId}` : "";
+    lines.push(`  [tool: ${tool.name}${idSuffix}]`);
+    if (tool.title && tool.title.trim().length > 0) {
+      lines.push(`  description: ${tool.title.trim()}`);
+    }
+    if (tool.input)
+      lines.push(`  input: ${JSON.stringify(tool.input)}`);
+    if (tool.output !== null)
+      lines.push(`  output:
+${tool.output}`);
+    return lines.join(`
+`);
+  }
+  const type = typeof part.type === "string" ? part.type : "part";
+  if (type === "file") {
+    const name = typeof part.filename === "string" && part.filename || typeof part.url === "string" && part.url || "";
+    return `  [file]${name ? ` ${name}` : ""}`;
+  }
+  return null;
+}
+function renderMessageByOrdinal(sessionId, ordinal) {
+  const msg = readRawSessionMessages(sessionId).find((m) => m.ordinal === ordinal);
+  if (!msg) {
+    return `No message at ordinal ${ordinal} in this session's stored history — it was deleted ` + `(session prune/revert) or the ordinal is wrong, so it can't be recovered. ` + `Re-run the tool if you still need the data.`;
+  }
+  const rendered = msg.parts.map(renderPartFull).filter((l) => l !== null);
+  const lines = [`[${msg.ordinal}] ${roleLabel(msg.role)} — full recovery:`, ""];
+  if (rendered.length === 0) {
+    lines.push("  (no recoverable content — message had only structural/reasoning parts)");
+  } else {
+    lines.push(...rendered);
+  }
+  return lines.join(`
+`);
+}
+function renderVerboseRange(sessionId, start, end, tokenBudget) {
+  const messages = readRawSessionMessages(sessionId).filter((m) => m.ordinal >= start && m.ordinal <= end);
+  const out = [];
+  let usedTokens = 0;
+  let lastOrdinal = start - 1;
+  let truncated = false;
+  for (const msg of messages) {
+    const header = `[${msg.ordinal}] ${roleLabel(msg.role)}`;
+    const partLines = msg.parts.map(renderPartPreview).filter((l) => l !== null);
+    const block = partLines.length > 0 ? `${header}
+${partLines.join(`
+`)}` : header;
+    const blockTokens = estimateTokens(block);
+    if (usedTokens + blockTokens > tokenBudget && out.length > 0) {
+      truncated = true;
+      break;
+    }
+    out.push(block);
+    usedTokens += blockTokens;
+    lastOrdinal = msg.ordinal;
+  }
+  return { text: out.join(`
+
+`), lastOrdinal, truncated };
+}
+
+// ../plugin/src/tools/ctx-memory/constants.ts
+var CTX_MEMORY_DESCRIPTION = `Durable project knowledge shared across every session on this project.
+
+Your active memories are already visible in <project-memory> (each with its id), and every future session starts with them — write one when you learn something future sessions must know: a project rule, an architectural fact, a hard-won constraint, a config value, or a naming convention. Keep each memory one standalone fact, phrased to make sense without this session's context.
+
+Actions:
+- write: save a new memory (content + category).
+- update: rewrite one memory whose fact changed (ids: [one], content).
+- archive: retire wrong or obsolete memories (ids: [one or more], optional reason).
+- merge: collapse duplicates into one memory (ids: [two or more], content).
+- get: fetch memories by id (ids: [1-20]); readable in every status. \`list\` remains dreamer-only.
+
+Example: ctx_memory(action="write", category="CONSTRAINTS", content="Pi stores sessions as JSONL under ~/.pi/agent/sessions/, not SQLite")`;
+
+// ../plugin/src/tools/ctx-memory/verification-recording.ts
+function runImmediateTransaction(db, fn) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+// ../plugin/src/tools/ctx-note/constants.ts
+var CTX_NOTE_DESCRIPTION = `Working notes for this session's future — reminders, follow-ups, and things to revisit later.
+
+Use a note when something matters LATER but not in the next few steps: "revisit the retry logic after the release", "user wants the dashboard polish batched", "flaky test to investigate when touching CI". Don't use notes for active multi-step work (use todos) or for durable project knowledge that should outlive this session (use ctx_memory). Notes resurface automatically at natural work boundaries and whenever you read them.
+
+Actions:
+- write: save a note (content). Add surface_condition to make it a smart note (below).
+- read: list notes, newest first. Default: latest active session notes + ready smart notes; page older ones with limit/offset, or inspect other states with filter.
+- update / dismiss: change or retire a note by note_id.
+
+Smart notes: pass surface_condition and the note stays hidden until a background checker confirms the condition — using ONLY externally verifiable signals (GitHub state via gh, files on disk, git history, web pages). It cannot see this conversation, so the condition must be checkable from outside:
+✓ "When PR #42 in cortexkit/magic-context is merged"
+✓ "When the latest release tag is >= v0.22.0"
+✓ "When packages/plugin/src/foo.ts contains a function named bar"
+✗ "When the user mentions X" / "when we revisit Y" / "after we finish this refactor" — no external signal; write a regular note instead.
+
+Example: ctx_note(action="write", content="Re-run the perf benchmark once the boundary rework ships", surface_condition="When the latest release tag is >= v0.23.0")`;
+
+// ../plugin/src/tools/ctx-reduce/constants.ts
+var CTX_REDUCE_DESCRIPTION = `Mark spent tagged content as discardable to reclaim context space. This is NOT an immediate delete. Use §N§ identifiers visible in the conversation. The \`drop\` param accepts ranges: "3-5", "1,2,9", "1-5,8".
+
+How it works:
+- Marking QUEUES content for release. It stays fully visible to you until context space is actually needed — which may be as soon as the next turn if you are already under pressure, or many turns later if not. So mark spent outputs as soon as you finish with them; don't hoard the call for the end of the turn.
+- The newest tags are protected: marking one just queues it until it ages out of the recent window, so marking recent output is harmless.
+- When content is finally released it becomes a short placeholder, and re-running the tool is the only way to get it back. So mark only what you are genuinely DONE with — the test is "have I extracted what I need from this?", not "is it safe / do I have time before it drops?".
+
+Mark discardable once processed: large outputs you've summarized, repeated or redundant dumps, data written to disk, status/log output that only confirmed an expected state.
+Keep: user messages, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may matter later.
+Never blanket-mark large ranges (e.g. "1-50") — review what each tag holds first.`;
+
+// ../plugin/src/tools/ctx-search/constants.ts
+var CTX_SEARCH_DESCRIPTION = `Your long-term recall for this project — search everything that ever happened here, not just what's currently visible.
+
+Reach for it when something feels familiar but isn't in view: "did we solve this before?", "what did we decide about X?", "when did this break?", "where does Y live?". Results only contain things you CANNOT currently see — memories already shown in <project-memory> and the live conversation tail are filtered out. A query that is just one or more memory ids (e.g. \`#7234\` or \`12, 34\`) bypasses text search and resolves those ids directly.
+
+Sources (omit for a broad search across all):
+- memory: curated cross-session project knowledge — rules, constraints, conventions.
+- message: the raw conversation behind your compacted history. Hits include message ordinals — expand the surrounding exchange with ctx_expand(start=N-10, end=N+5).
+- git_commit: this repository's commit history.
+- note: parked decisions, follow-ups, and dismissed notes with their recorded text.
+
+Picking sources:
+- "when did this change / was this working before" → ["git_commit", "message"]
+- "did we discuss this earlier" → ["message"]
+- "did we decide something about this / leave a follow-up" → ["note"]
+- "what's our convention / rule for X" → ["memory"]`;
+
+// ../plugin/src/hooks/magic-context/note-nudger.ts
+var NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000;
+var lastDeliveredAt = new Map;
+function getPersistedNoteNudgeDeliveredAt(_db, sessionId) {
+  return lastDeliveredAt.get(sessionId) ?? 0;
+}
+function recordNoteNudgeDeliveryTime(sessionId) {
+  lastDeliveredAt.set(sessionId, Date.now());
+}
+function onNoteTrigger(db, sessionId, trigger) {
+  setPersistedNoteNudgeTrigger(db, sessionId);
+  sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
+}
+function peekNoteNudgeText(db, sessionId, currentUserMessageId, projectIdentity, noteReadStillVisible) {
+  const state = getPersistedNoteNudge(db, sessionId);
+  if (!state.triggerPending)
+    return null;
+  if (!state.triggerMessageId && currentUserMessageId) {
+    setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
+    state.triggerMessageId = currentUserMessageId;
+  }
+  if (state.triggerMessageId && currentUserMessageId && state.triggerMessageId === currentUserMessageId) {
+    sessionLog(sessionId, `note-nudge: deferring — current user message ${currentUserMessageId} is same as trigger-time message`);
+    return null;
+  }
+  const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
+  if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
+    sessionLog(sessionId, `note-nudge: suppressing — last delivered ${Math.round((Date.now() - deliveredAt) / 1000)}s ago (cooldown ${NOTE_NUDGE_COOLDOWN_MS / 60000}m)`);
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const notes = getSessionNotes(db, sessionId);
+  const readySmartNotes = projectIdentity ? getReadySmartNotes(db, projectIdentity) : [];
+  const totalCount = notes.length + readySmartNotes.length;
+  if (totalCount === 0) {
+    sessionLog(sessionId, "note-nudge: triggerPending but no notes found, skipping");
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const lastReadAt = getNoteLastReadAt(db, sessionId);
+  if (lastReadAt > 0 && noteReadStillVisible) {
+    const mostRecentNoteActivity = maxNoteActivityTime([...notes, ...readySmartNotes]);
+    if (mostRecentNoteActivity > 0 && lastReadAt > mostRecentNoteActivity) {
+      sessionLog(sessionId, `note-nudge: suppressing — agent ran ctx_note(read) at ${new Date(lastReadAt).toISOString()} and the read is still visible; no new notes since ${new Date(mostRecentNoteActivity).toISOString()}`);
+      clearNoteNudgeTriggerOnly(db, sessionId);
+      return null;
+    }
+  }
+  const parts = [];
+  if (notes.length > 0) {
+    parts.push(`${notes.length} deferred note${notes.length === 1 ? "" : "s"}`);
+  }
+  if (readySmartNotes.length > 0) {
+    parts.push(`${readySmartNotes.length} ready smart note${readySmartNotes.length === 1 ? "" : "s"}`);
+  }
+  sessionLog(sessionId, `note-nudge: delivering nudge for ${parts.join(" and ")}`);
+  return `You have ${parts.join(" and ")}. Review with ctx_note read — some may be actionable now.`;
+}
+function maxNoteActivityTime(notes) {
+  let max = 0;
+  for (const note of notes) {
+    if (note.updatedAt > max)
+      max = note.updatedAt;
+    if (note.readyAt !== null && note.readyAt > max)
+      max = note.readyAt;
+  }
+  return max;
+}
+function markNoteNudgeDelivered(db, sessionId, text, messageId) {
+  if (!messageId) {
+    clearNoteNudgeTriggerAndCooldown(db, sessionId);
+    sessionLog(sessionId, "note-nudge: marked delivered without anchor");
+    return { ok: true, kind: "already-present" };
+  }
+  const outcome = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
+  if (outcome.ok) {
+    recordNoteNudgeDeliveryTime(sessionId);
+  }
+  sessionLog(sessionId, outcome.ok ? `note-nudge: marked delivered, sticky anchor=${messageId} (${outcome.kind})` : `note-nudge: delivery not persisted for anchor=${messageId} (${outcome.kind})`);
+  return outcome;
+}
+function clearNoteNudgeTriggerAndCooldown(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+  lastDeliveredAt.delete(sessionId);
+}
+function clearNoteNudgeTriggerOnly(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+}
+
+// ../plugin/src/tools/unwrap-imitated-reduced-args.ts
+var MAX_DECODED_STRING_LENGTH = 1024 * 1024;
+var MAX_DECODED_ARRAY_ITEMS = 100;
+function validField(value, rule) {
+  if (rule === "string") {
+    return typeof value === "string" && value.length <= MAX_DECODED_STRING_LENGTH;
+  }
+  if (rule === "number")
+    return typeof value === "number" && Number.isFinite(value);
+  if (rule === "boolean")
+    return typeof value === "boolean";
+  if (rule.type === "enum")
+    return typeof value === "string" && rule.values.includes(value);
+  if (!Array.isArray(value) || value.length > (rule.maxItems ?? MAX_DECODED_ARRAY_ITEMS)) {
+    return false;
+  }
+  return value.every((item) => {
+    if (rule.items === "number")
+      return typeof item === "number" && Number.isFinite(item);
+    return typeof item === "string" && item.length <= MAX_DECODED_STRING_LENGTH && (rule.values === undefined || rule.values.includes(item));
+  });
+}
+function validDecodedArgs(value, schema) {
+  for (const [field, fieldValue] of Object.entries(value)) {
+    if (field === "reduced") {
+      if (typeof fieldValue !== "boolean")
+        return false;
+      continue;
+    }
+    if (field === "summary") {
+      if (typeof fieldValue !== "string" || fieldValue.length > MAX_DECODED_STRING_LENGTH) {
+        return false;
+      }
+      continue;
+    }
+    const rule = schema[field];
+    if (!rule || !validField(fieldValue, rule))
+      return false;
+  }
+  return true;
+}
+function unwrapImitatedReducedArgs(args, primaryFields, schema) {
+  const record = args;
+  if (primaryFields.some((field) => record[field] !== undefined) || record.reduced !== true || typeof record.summary !== "string") {
+    return args;
+  }
+  try {
+    const parsed = JSON.parse(record.summary);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && validDecodedArgs(parsed, schema)) {
+      return parsed;
+    }
+  } catch {}
+  return args;
+}
+
+// src/compat/dsh-0.1/tools.ts
+import {
+  defineTool
+} from "@deepseek-ai/dsh-tools";
+function registerTool(ctx, tool) {
+  const tools = ctx.get("tools");
+  if (tools === undefined)
+    throw new Error("tools service unavailable");
+  return tools.register(tool);
+}
+
+// src/agent/transcript.ts
+import { createHash as createHash13, randomUUID as randomUUID2 } from "node:crypto";
+
+// ../plugin/src/hooks/magic-context/apply-operations.ts
+var RECENT_TOOL_SKELETON_WINDOW = 20;
+function buildReplacementContent(tagId) {
+  return `[dropped §${tagId}§]`;
+}
+function applyPendingOperations(sessionId, db, targets, protectedTags = 0, preloadedTags, preloadedPendingOps, syntheticPendingOps = [], editMarkerTagIds = new Set) {
+  let didMutateMessage = false;
+  db.transaction(() => {
+    const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+    const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status]));
+    const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type]));
+    const protectedTagIds = protectedTags > 0 ? new Set(tags.filter((tag) => tag.status === "active").map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, protectedTags)) : new Set;
+    const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+    const opsToApply = [
+      ...pendingOps.map((op) => ({ op, synthetic: false })),
+      ...syntheticPendingOps.map((op) => ({ op, synthetic: true }))
+    ];
+    const skeletonWindow = new Set(tags.filter((tag) => tag.type === "tool").map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, RECENT_TOOL_SKELETON_WINDOW));
+    for (const { op: pendingOp, synthetic } of opsToApply) {
+      const tagStatus = tagStatusById.get(pendingOp.tagId);
+      if (tagStatus === "compacted" || tagStatus === "dropped") {
+        if (!synthetic)
+          removePendingOp(db, sessionId, pendingOp.tagId);
+        continue;
+      }
+      if (protectedTagIds.has(pendingOp.tagId)) {
+        continue;
+      }
+      const target = targets.get(pendingOp.tagId);
+      const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
+      if (synthetic) {
+        if (!isToolTag || target?.canDrop?.() !== true)
+          continue;
+      }
+      let shouldPersistDrop = false;
+      if (isToolTag) {
+        if (editMarkerTagIds.has(pendingOp.tagId)) {
+          const markResult = target?.editMarker?.() ?? "absent";
+          if (markResult === "incomplete" || markResult === "absent") {
+            continue;
+          }
+          didMutateMessage = true;
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "edit_marker");
+          shouldPersistDrop = true;
+        } else if (skeletonWindow.has(pendingOp.tagId)) {
+          const truncResult = target?.truncate?.() ?? "absent";
+          if (truncResult === "incomplete" || synthetic && truncResult !== "truncated") {
+            continue;
+          }
+          if (truncResult === "truncated") {
+            didMutateMessage = true;
+          }
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "truncated");
+          shouldPersistDrop = true;
+        } else {
+          const dropResult = target?.drop?.() ?? "absent";
+          if (dropResult === "incomplete" || synthetic && dropResult !== "removed") {
+            continue;
+          }
+          if (dropResult === "removed") {
+            didMutateMessage = true;
+          }
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "full");
+          shouldPersistDrop = true;
+        }
+      } else if (target) {
+        const changed = target.setContent(buildReplacementContent(pendingOp.tagId));
+        if (changed)
+          didMutateMessage = true;
+        shouldPersistDrop = true;
+      } else if (!synthetic) {
+        shouldPersistDrop = true;
+      }
+      if (!shouldPersistDrop)
+        continue;
+      updateTagStatus(db, sessionId, pendingOp.tagId, "dropped");
+      if (!synthetic)
+        removePendingOp(db, sessionId, pendingOp.tagId);
+    }
+  })();
+  return didMutateMessage;
+}
+function applyFlushedStatuses(sessionId, db, targets, preloadedTags) {
+  let didMutateMessage = false;
+  const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+  for (const tag of tags) {
+    if (tag.status === "dropped") {
+      const target = targets.get(tag.tagNumber);
+      if (tag.type === "tool") {
+        if (tag.dropMode === "edit_marker") {
+          const markResult = target?.editMarker?.() ?? "absent";
+          if (markResult === "truncated") {
+            didMutateMessage = true;
+          }
+        } else if (tag.dropMode === "truncated") {
+          const truncResult = target?.truncate?.() ?? "absent";
+          if (truncResult === "truncated") {
+            didMutateMessage = true;
+          }
+        } else {
+          const dropResult = target?.drop?.() ?? "absent";
+          if (dropResult === "removed") {
+            didMutateMessage = true;
+          }
+        }
+      } else if (target) {
+        const changed = target.setContent(buildReplacementContent(tag.tagNumber));
+        if (changed)
+          didMutateMessage = true;
+      }
+    }
+  }
+  return didMutateMessage;
+}
+// ../plugin/src/features/magic-context/overflow-detection.ts
+var OVERFLOW_PATTERNS = [
+  /prompt is too long/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /maximum model length is \d+/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /request entity too large/i,
+  /context length is only \d+ tokens/i,
+  /input length.*exceeds.*context length/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /too large for model with \d+ maximum context length/i,
+  /model_context_window_exceeded/i,
+  /context size has been exceeded/i
+];
+var LIMIT_EXTRACTION_PATTERNS = [
+  { pattern: /maximum prompt length is (\d+)/i, provenance: "prompt_only" },
+  {
+    pattern: /maximum context length is (\d+) tokens?/i,
+    provenance: "combined"
+  },
+  { pattern: /maximum model length is (\d+)/i, provenance: "combined" },
+  { pattern: /context length is only (\d+) tokens?/i, provenance: "combined" },
+  { pattern: /exceeds the limit of (\d+)/i, provenance: "unknown" },
+  {
+    pattern: /too large for model with (\d+) maximum context length/i,
+    provenance: "combined"
+  },
+  { pattern: /context size.*(\d+) tokens?/i, provenance: "combined" },
+  { pattern: /exceeds? the context length of (\d+)/i, provenance: "combined" },
+  {
+    pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
+    provenance: "prompt_only"
+  },
+  { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }
+];
+var MIN_PLAUSIBLE_LIMIT = 1024;
+var MAX_PLAUSIBLE_LIMIT = 1e7;
+function extractErrorMessage(error) {
+  if (!error)
+    return "";
+  if (typeof error === "string")
+    return error;
+  if (typeof error === "object") {
+    const obj = error;
+    const nested = obj.error;
+    if (nested && typeof nested.message === "string" && nested.message.length > 0) {
+      return nested.message;
+    }
+  }
+  if (error instanceof Error)
+    return error.message;
+  if (typeof error === "object") {
+    const obj = error;
+    if (typeof obj.message === "string")
+      return obj.message;
+    if (typeof obj.responseBody === "string")
+      return obj.responseBody;
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error);
+}
+function detectOverflow(error) {
+  const message = extractErrorMessage(error);
+  if (!message) {
+    return { isOverflow: false };
+  }
+  const hasStatus413 = /\b413\b/.test(message) && /(entity|payload|context|prompt)/i.test(message);
+  let matched;
+  for (const pattern of OVERFLOW_PATTERNS) {
+    if (pattern.test(message)) {
+      matched = pattern;
+      break;
+    }
+  }
+  if (!matched && !hasStatus413) {
+    return { isOverflow: false };
+  }
+  const reportedLimit = parseReportedLimit(message);
+  return {
+    isOverflow: true,
+    reportedLimit: reportedLimit?.value,
+    reportedLimitProvenance: reportedLimit?.provenance,
+    matchedPattern: matched?.source
+  };
+}
+function parseReportedLimit(message) {
+  if (!message)
+    return;
+  for (const { pattern, provenance } of LIMIT_EXTRACTION_PATTERNS) {
+    const match = message.match(pattern);
+    if (!match)
+      continue;
+    const raw = match[1];
+    if (!raw)
+      continue;
+    const value = Number.parseInt(raw, 10);
+    if (!Number.isFinite(value))
+      continue;
+    if (value < MIN_PLAUSIBLE_LIMIT || value > MAX_PLAUSIBLE_LIMIT)
+      continue;
+    return { value, provenance };
+  }
+  return;
+}
+
+// ../plugin/src/shared/resolve-fallbacks.ts
+function resolveFallbackChain(userFallbacks) {
+  const userList = normalizeUserFallbacks(userFallbacks);
+  return dedupe(userList.filter(isValidModelSpec));
+}
+function normalizeUserFallbacks(userFallbacks) {
+  if (!userFallbacks)
+    return [];
+  if (typeof userFallbacks === "string") {
+    const trimmed = userFallbacks.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  return userFallbacks.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+function isValidModelSpec(spec) {
+  const slash = spec.indexOf("/");
+  return slash > 0 && slash < spec.length - 1;
+}
+function dedupe(list) {
+  const seen = new Set;
+  const out = [];
+  for (const item of list) {
+    if (seen.has(item))
+      continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+function parseProviderModel(spec) {
+  const slash = spec.indexOf("/");
+  if (slash < 1 || slash >= spec.length - 1)
+    return null;
+  return {
+    providerID: spec.slice(0, slash).trim(),
+    modelID: spec.slice(slash + 1).trim()
+  };
+}
+function modelBodyField(spec) {
+  if (!spec)
+    return {};
+  const parsed = parseProviderModel(spec);
+  return parsed ? { model: parsed } : {};
+}
+
+// ../plugin/src/shared/model-suggestion-retry.ts
+var ABORT_CALL_TIMEOUT_MS = 3000;
+function copyPromptArgs(args, body) {
+  return { ...args, body: { ...body } };
+}
+function extractMessage(error) {
+  if (typeof error === "string")
+    return error;
+  if (error instanceof Error)
+    return error.message;
+  if (typeof error === "object" && error !== null) {
+    const obj = error;
+    if (typeof obj.message === "string")
+      return obj.message;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch (_error) {
+    return String(error);
+  }
+}
+function parseModelSuggestion(error) {
+  if (!error)
+    return null;
+  if (typeof error === "object" && error !== null) {
+    const errObj = error;
+    if (errObj.name === "ProviderModelNotFoundError" && typeof errObj.data === "object" && errObj.data !== null) {
+      const data = errObj.data;
+      const suggestions = data.suggestions;
+      if (Array.isArray(suggestions) && typeof suggestions[0] === "string") {
+        return {
+          providerID: String(data.providerID ?? ""),
+          modelID: String(data.modelID ?? ""),
+          suggestion: suggestions[0]
+        };
+      }
+    }
+    for (const key of ["data", "error", "cause"]) {
+      const nested = errObj[key];
+      if (nested && typeof nested === "object") {
+        const result = parseModelSuggestion(nested);
+        if (result)
+          return result;
+      }
+    }
+  }
+  const message = extractMessage(error);
+  const modelMatch = message.match(/model not found:\s*([^/\s]+)\s*\/\s*([^.,\s]+)/i);
+  const suggestionMatch = message.match(/did you mean:\s*([^,?]+)/i);
+  if (!modelMatch || !suggestionMatch) {
+    return null;
+  }
+  return {
+    providerID: modelMatch[1].trim(),
+    modelID: modelMatch[2].trim(),
+    suggestion: suggestionMatch[1].trim()
+  };
+}
+async function promptWithTimeout(client, args, timeoutMs, signal) {
+  if (signal?.aborted) {
+    throw new Error("prompt aborted by external signal");
+  }
+  const controller = new AbortController;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  signal?.addEventListener("abort", onExternalAbort);
+  try {
+    await client.session.prompt({
+      ...args,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (signal?.aborted) {
+      await abortChildRun(client, args.path.id);
+      throw new Error("prompt aborted by external signal");
+    }
+    if (controller.signal.aborted) {
+      await abortChildRun(client, args.path.id);
+      throw new Error(`prompt timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+async function abortChildRun(client, sessionId) {
+  try {
+    await Promise.race([
+      client.session.abort({ path: { id: sessionId } }),
+      new Promise((resolve) => setTimeout(resolve, ABORT_CALL_TIMEOUT_MS))
+    ]);
+  } catch (error) {
+    log(`[model-retry] child session abort failed for ${sessionId}: ${String(error)}`);
+  }
+}
+function isNonRetryable(error, externalSignal) {
+  if (externalSignal?.aborted)
+    return true;
+  if (error instanceof Error) {
+    if (error.name === "AbortError")
+      return true;
+    if (error.message === "prompt aborted by external signal")
+      return true;
+    if (/^prompt timed out after \d+ms$/.test(error.message))
+      return true;
+  }
+  if (detectOverflow(error).isOverflow)
+    return true;
+  return false;
+}
+function shortErr(error) {
+  if (error instanceof Error) {
+    return error.name && error.name !== "Error" ? `${error.name}: ${error.message}` : error.message;
+  }
+  return extractMessage(error);
+}
+async function attemptOnce(client, args, timeoutMs, signal, callContext, label) {
+  const originalBody = { ...args.body };
+  const attemptArgs = copyPromptArgs(args, originalBody);
+  try {
+    await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
+    return;
+  } catch (error) {
+    if (isNonRetryable(error, signal))
+      throw error;
+    const suggestion = parseModelSuggestion(error);
+    if (!suggestion || !originalBody.model) {
+      throw error;
+    }
+    log(`[${callContext}] ${label}: model not found, retrying with suggestion`, {
+      original: `${suggestion.providerID}/${suggestion.modelID}`,
+      suggested: suggestion.suggestion
+    });
+    await promptWithTimeout(client, copyPromptArgs(args, {
+      ...originalBody,
+      model: {
+        providerID: suggestion.providerID,
+        modelID: suggestion.suggestion
+      }
+    }), timeoutMs, signal);
+  }
+}
+async function promptSyncWithModelSuggestionRetry(client, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 300000;
+  const callContext = options.callContext ?? "subagent";
+  const fallbacks = options.fallbackModels ?? [];
+  const baseBody = { ...args.body };
+  const baseArgs = copyPromptArgs(args, baseBody);
+  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
+  let lastError = null;
+  try {
+    await attemptOnce(client, baseArgs, timeoutMs, options.signal, callContext, explicitPrimaryLabel);
+    return;
+  } catch (error) {
+    lastError = error;
+    if (isNonRetryable(error, options.signal))
+      throw error;
+    if (fallbacks.length === 0) {
+      throw error;
+    }
+    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed: ${shortErr(error)}; trying ${fallbacks.length} fallback(s)`);
+  }
+  for (let i = 0;i < fallbacks.length; i += 1) {
+    const parsed = parseProviderModel(fallbacks[i]);
+    if (!parsed) {
+      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
+      continue;
+    }
+    const label = `${parsed.providerID}/${parsed.modelID}`;
+    const attemptArgs = copyPromptArgs(baseArgs, {
+      ...baseBody,
+      model: parsed
+    });
+    try {
+      await attemptOnce(client, attemptArgs, timeoutMs, options.signal, callContext, label);
+      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (isNonRetryable(error, options.signal))
+        throw error;
+      const remaining = fallbacks.length - i - 1;
+      if (remaining > 0) {
+        log(`[${callContext}] ${label} failed: ${shortErr(error)}; ${remaining} fallback(s) left`);
+      }
+    }
+  }
+  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; last error: ${shortErr(lastError)}`);
+  throw lastError ?? new Error("All fallback models failed");
+}
+async function attemptAndValidate(client, args, timeoutMs, signal, callContext, attempt, options) {
+  await attemptOnce(client, args, timeoutMs, signal, callContext, attempt.label);
+  const output = await options.fetchOutput(args, attempt);
+  const validated = await options.validateOutput(output, attempt);
+  return { output, validated, attempt };
+}
+async function promptSyncWithValidatedOutputRetry(client, args, options) {
+  const timeoutMs = options.timeoutMs ?? 300000;
+  const callContext = options.callContext ?? "subagent";
+  const fallbacks = options.fallbackModels ?? [];
+  const baseBody = { ...args.body };
+  const baseArgs = copyPromptArgs(args, baseBody);
+  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
+  const totalAttempts = fallbacks.length + 1;
+  let firstError = null;
+  let lastError = null;
+  try {
+    return await attemptAndValidate(client, baseArgs, timeoutMs, options.signal, callContext, {
+      label: explicitPrimaryLabel,
+      attemptIndex: 0,
+      isFallback: false,
+      totalAttempts,
+      model: baseBody.model
+    }, options);
+  } catch (error) {
+    firstError = error;
+    lastError = error;
+    if (isNonRetryable(error, options.signal))
+      throw error;
+    if (fallbacks.length === 0) {
+      throw error;
+    }
+    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(error)}; trying ${fallbacks.length} fallback(s)`);
+  }
+  for (let i = 0;i < fallbacks.length; i += 1) {
+    const parsed = parseProviderModel(fallbacks[i]);
+    if (!parsed) {
+      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
+      continue;
+    }
+    const label = `${parsed.providerID}/${parsed.modelID}`;
+    const attemptArgs = copyPromptArgs(baseArgs, {
+      ...baseBody,
+      model: parsed
+    });
+    const attempt = {
+      label,
+      attemptIndex: i + 1,
+      isFallback: true,
+      totalAttempts,
+      model: parsed
+    };
+    try {
+      const result = await attemptAndValidate(client, attemptArgs, timeoutMs, options.signal, callContext, attempt, options);
+      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
+      return result;
+    } catch (error) {
+      if (firstError === null)
+        firstError = error;
+      lastError = error;
+      if (isNonRetryable(error, options.signal))
+        throw error;
+      const remaining = fallbacks.length - i - 1;
+      if (remaining > 0) {
+        log(`[${callContext}] ${label} failed validation/prompt: ${shortErr(error)}; ${remaining} fallback(s) left`);
+      }
+    }
+  }
+  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; original error: ${shortErr(firstError)}; last error: ${shortErr(lastError)}`);
+  throw firstError ?? lastError ?? new Error("All fallback models failed validation");
+}
+// ../plugin/src/shared/normalize-sdk-response.ts
+function normalizeSDKResponse(response, fallback, options) {
+  if (response === null || response === undefined) {
+    return fallback;
+  }
+  if (Array.isArray(response)) {
+    return response;
+  }
+  if (typeof response === "object" && "data" in response) {
+    const data = response.data;
+    if (data !== null && data !== undefined) {
+      return data;
+    }
+    if (options?.preferResponseOnMissingData === true) {
+      return response;
+    }
+    return fallback;
+  }
+  if (options?.preferResponseOnMissingData === true) {
+    return response;
+  }
+  return fallback;
+}
+// ../plugin/src/shared/jsonc-parser.ts
+import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
+function stripJsonComments(content) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let index = 0;index < content.length; index += 1) {
+    const char = content[index];
+    const next = content[index + 1];
+    if (inLineComment) {
+      if (char === `
+`) {
+        inLineComment = false;
+        result += char;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (char === "*" && next === "/") {
+        inBlockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      result += char;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      inLineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      inBlockComment = true;
+      index += 1;
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+function stripTrailingCommas(content) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0;index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      result += char;
+      continue;
+    }
+    if (char === ",") {
+      let lookahead = index + 1;
+      while (lookahead < content.length && /\s/.test(content[lookahead] ?? "")) {
+        lookahead += 1;
+      }
+      const next = content[lookahead];
+      if (next === "}" || next === "]") {
+        continue;
+      }
+    }
+    result += char;
+  }
+  return result;
+}
+var PROTOTYPE_POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function isPrototypePollutionKey(key) {
+  return PROTOTYPE_POLLUTION_KEYS.has(key);
+}
+function sanitizeParsedJson(value, options = {}, path = []) {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => sanitizeParsedJson(entry, options, [...path, index]));
+  }
+  if (value === null || typeof value !== "object")
+    return value;
+  const source = value;
+  const sourcePrototype = Object.getPrototypeOf(source);
+  if (sourcePrototype !== null && sourcePrototype !== Object.prototype) {
+    options.onRejectedKey?.([...path, "__proto__"]);
+  }
+  const sanitized = {};
+  for (const key of Object.keys(source)) {
+    if (isPrototypePollutionKey(key)) {
+      options.onRejectedKey?.([...path, key]);
+      continue;
+    }
+    Object.defineProperty(sanitized, key, {
+      value: sanitizeParsedJson(source[key], options, [...path, key]),
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  }
+  return sanitized;
+}
+function parseJsonc(content, options = {}) {
+  const normalized = stripTrailingCommas(stripJsonComments(content));
+  return sanitizeParsedJson(JSON.parse(normalized), options);
+}
+function detectConfigFile(basePath) {
+  const jsoncPath = `${basePath}.jsonc`;
+  const jsonPath = `${basePath}.json`;
+  if (existsSync4(jsoncPath)) {
+    return { format: "jsonc", path: jsoncPath };
+  }
+  if (existsSync4(jsonPath)) {
+    return { format: "json", path: jsonPath };
+  }
+  return { format: "none", path: jsoncPath };
+}
+
+// ../plugin/src/shared/prompt-surface-runtime.ts
+var ACTIVE_TOOL_IDS = [
+  "ctx_reduce",
+  "ctx_expand",
+  "ctx_note",
+  "ctx_memory",
+  "ctx_search"
+];
+var PROMPT_SURFACE_TOOL_ID_SET = new Set(ACTIVE_TOOL_IDS);
+// ../plugin/src/hooks/magic-context/caveman.ts
+var PRESERVATION_PATTERNS = [
+  /```[\s\S]*?```/g,
+  /`[^`\n]+`/g,
+  /https?:\/\/\S+/g,
+  /§\d+§/g,
+  /\b(?:msg|ses|toolu)_[A-Za-z0-9]+/g,
+  /(?:\.{1,2}\/)?(?:[\w.-]+\/)+[\w.-]+\.\w{1,6}/g,
+  /(?<![a-z0-9])[0-9a-f]{7,40}(?![a-z0-9])/gi
+];
+function protectRegions(text) {
+  const preserved = [];
+  let working = text;
+  for (const pattern of PRESERVATION_PATTERNS) {
+    working = working.replace(pattern, (match) => {
+      const placeholder = `\x00MC_PRES_${preserved.length}\x00`;
+      preserved.push({ placeholder, original: match });
+      return placeholder;
+    });
+  }
+  return { text: working, preserved };
+}
+function restoreRegions(text, preserved) {
+  let working = text;
+  for (let i = preserved.length - 1;i >= 0; i--) {
+    working = working.split(preserved[i].placeholder).join(preserved[i].original);
+  }
+  return working;
+}
+var FILLER_WORDS = [
+  "just",
+  "really",
+  "basically",
+  "actually",
+  "essentially",
+  "simply",
+  "clearly",
+  "obviously",
+  "quite",
+  "very",
+  "somewhat",
+  "rather",
+  "fairly",
+  "sort of",
+  "kind of",
+  "a bit"
+];
+var HEDGING_PHRASES = [
+  "i think",
+  "i believe",
+  "i feel",
+  "probably",
+  "perhaps",
+  "maybe",
+  "it seems",
+  "it appears",
+  "arguably",
+  "i suppose",
+  "i guess"
+];
+var PLEASANTRIES = ["please", "thanks", "thank you", "kindly", "if possible"];
+var AUXILIARIES = [
+  "was",
+  "were",
+  "is",
+  "are",
+  "am",
+  "be",
+  "been",
+  "being",
+  "has been",
+  "had been",
+  "have been",
+  "will be",
+  "would be",
+  "could be",
+  "should be",
+  "might be",
+  "may be"
+];
+var PHRASE_SHORTENINGS = [
+  [/\bin order to\b/gi, "to"],
+  [/\bdue to the fact that\b/gi, "because"],
+  [/\bat this point in time\b/gi, "now"],
+  [/\bat the moment\b/gi, "now"],
+  [/\bin the event that\b/gi, "if"],
+  [/\bfor the purpose of\b/gi, "for"],
+  [/\bwith regard to\b/gi, "about"],
+  [/\bin spite of the fact that\b/gi, "though"],
+  [/\bon the grounds that\b/gi, "because"],
+  [/\bfor the reason that\b/gi, "because"]
+];
+var ULTRA_CONNECTIVE_REPLACEMENTS = [
+  [/\b(?:and then|then after|afterwards)\b/gi, "→"],
+  [/\bbecause of\b/gi, "//"],
+  [/\btherefore\b/gi, "→"],
+  [/\bbecause\b/gi, "//"],
+  [/\bhowever\b/gi, "but"],
+  [/\bfurthermore\b/gi, "+"],
+  [/\badditionally\b/gi, "+"],
+  [/\bas well as\b/gi, "+"],
+  [/ and /gi, " + "],
+  [/ or /gi, " | "]
+];
+var ULTRA_ABBREVIATIONS = {
+  historian: "hist",
+  compartment: "cmpt",
+  compartments: "cmpts",
+  compressor: "cmp",
+  compression: "cmp",
+  context: "ctx",
+  message: "msg",
+  messages: "msgs",
+  session: "ses",
+  configuration: "cfg",
+  config: "cfg",
+  implementation: "impl",
+  implemented: "impl",
+  repository: "repo",
+  database: "db",
+  directory: "dir"
+};
+function buildPhraseDropRegex(phrases) {
+  const escaped = phrases.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`(\\s+)?\\b(?:${escaped.join("|")})\\b`, "gi");
+}
+function dropPhrases(text, phrases) {
+  return text.replace(buildPhraseDropRegex(phrases), "");
+}
+function dropArticles(text) {
+  let working = text.replace(/\b(?:the|a|an)\b\s+/gi, "");
+  working = working.replace(/ +/g, " ");
+  return working;
+}
+function dropAuxiliaries(text) {
+  const sorted = [...AUXILIARIES].sort((a, b) => b.length - a.length);
+  const escaped = sorted.map((a) => a.replace(/\s+/g, "\\s+"));
+  const pattern = new RegExp(`\\s+\\b(?:${escaped.join("|")})\\b\\s+(?=\\w+(?:ed|en|ing|ized|ised)\\b)`, "gi");
+  let working = text.replace(pattern, " ");
+  working = working.replace(/ +/g, " ");
+  return working;
+}
+function applyPhraseShortenings(text) {
+  let working = text;
+  for (const [pattern, replacement] of PHRASE_SHORTENINGS) {
+    working = working.replace(pattern, replacement);
+  }
+  return working;
+}
+function applyUltraConnectives(text) {
+  let working = text;
+  for (const [pattern, replacement] of ULTRA_CONNECTIVE_REPLACEMENTS) {
+    working = working.replace(pattern, replacement);
+  }
+  return working;
+}
+function countWordOccurrences(text, term) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matches = text.match(new RegExp(`\\b${escaped}\\b`, "gi"));
+  return matches ? matches.length : 0;
+}
+function applyUltraAbbreviations(text) {
+  let working = text;
+  for (const [term, abbreviation] of Object.entries(ULTRA_ABBREVIATIONS)) {
+    if (countWordOccurrences(working, term) < 3)
+      continue;
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    working = working.replace(new RegExp(`\\b${escaped}\\b`, "gi"), (match) => {
+      return match[0] === match[0].toUpperCase() ? abbreviation[0].toUpperCase() + abbreviation.slice(1) : abbreviation;
+    });
+  }
+  return working;
+}
+function transformPreservingUserLines(text, transform) {
+  const lines = text.split(`
+`);
+  const output = [];
+  let buffer = [];
+  const flushBuffer = () => {
+    if (buffer.length === 0)
+      return;
+    const joined = buffer.join(`
+`);
+    output.push(transform(joined));
+    buffer = [];
+  };
+  for (const line of lines) {
+    if (line.startsWith("U: ")) {
+      flushBuffer();
+      output.push(line);
+    } else {
+      buffer.push(line);
+    }
+  }
+  flushBuffer();
+  return output.join(`
+`);
+}
+function normalizeWhitespace(text) {
+  return text.split(`
+`).map((line) => line.replace(/[ \t]+/g, " ").replace(/[ \t]+$/, "")).join(`
+`).replace(/\n{3,}/g, `
+
+`);
+}
+function cavemanCompress(text, level) {
+  if (text.length === 0)
+    return text;
+  const { text: protectedText, preserved } = protectRegions(text);
+  const transformed = transformPreservingUserLines(protectedText, (chunk) => {
+    let working = chunk;
+    working = dropPhrases(working, FILLER_WORDS);
+    working = dropPhrases(working, HEDGING_PHRASES);
+    working = dropPhrases(working, PLEASANTRIES);
+    working = applyPhraseShortenings(working);
+    if (level === "full" || level === "ultra") {
+      working = dropAuxiliaries(working);
+      working = dropArticles(working);
+    }
+    if (level === "ultra") {
+      working = applyUltraConnectives(working);
+      working = applyUltraAbbreviations(working);
+    }
+    return working;
+  });
+  const restored = restoreRegions(transformed, preserved);
+  return normalizeWhitespace(restored).trim();
+}
+
+// ../plugin/src/hooks/magic-context/caveman-cleanup.ts
+var DEPTH_UNTOUCHED = 0;
+var DEPTH_LITE = 1;
+var DEPTH_FULL = 2;
+var DEPTH_ULTRA = 3;
+var DEPTH_TO_LEVEL = {
+  [DEPTH_LITE]: "lite",
+  [DEPTH_FULL]: "full",
+  [DEPTH_ULTRA]: "ultra"
+};
+function computeTargetDepth(positionIndex, totalEligible) {
+  if (totalEligible <= 0)
+    return DEPTH_UNTOUCHED;
+  const fraction = positionIndex / totalEligible;
+  if (fraction < 0.2)
+    return DEPTH_ULTRA;
+  if (fraction < 0.4)
+    return DEPTH_FULL;
+  if (fraction < 0.6)
+    return DEPTH_LITE;
+  return DEPTH_UNTOUCHED;
+}
+function applyCavemanCleanup(sessionId, db, targets, tags, config) {
+  const result = {
+    compressedToLite: 0,
+    compressedToFull: 0,
+    compressedToUltra: 0,
+    mutatedTextTags: 0
+  };
+  if (!config.enabled)
+    return result;
+  const maxTag = tags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
+  const protectedCutoff = maxTag - config.protectedTags;
+  const eligible = tags.filter((tag) => tag.type === "message" && tag.status === "active" && tag.tagNumber <= protectedCutoff && tag.byteSize >= config.minChars).sort((a, b) => a.tagNumber - b.tagNumber);
+  if (eligible.length === 0)
+    return result;
+  const tagsNeedingCompression = eligible.filter((tag, index) => {
+    const target = targets.get(tag.tagNumber);
+    if (!target?.getContent || !target.setContent)
+      return false;
+    const targetDepth = computeTargetDepth(index, eligible.length);
+    return targetDepth > tag.cavemanDepth;
+  });
+  if (tagsNeedingCompression.length === 0)
+    return result;
+  const originalByTag = getSourceContents(db, sessionId, tagsNeedingCompression.map((t) => t.tagNumber));
+  const positionByTag = new Map;
+  for (let i = 0;i < eligible.length; i += 1) {
+    positionByTag.set(eligible[i].tagNumber, i);
+  }
+  db.transaction(() => {
+    for (const tag of tagsNeedingCompression) {
+      const originalText = originalByTag.get(tag.tagNumber);
+      if (typeof originalText !== "string" || originalText.length === 0)
+        continue;
+      const positionIndex = positionByTag.get(tag.tagNumber) ?? 0;
+      const targetDepth = computeTargetDepth(positionIndex, eligible.length);
+      if (targetDepth <= tag.cavemanDepth)
+        continue;
+      const level = DEPTH_TO_LEVEL[targetDepth];
+      if (!level)
+        continue;
+      const compressed = cavemanCompress(originalText, level);
+      if (compressed.length === 0)
+        continue;
+      const target = targets.get(tag.tagNumber);
+      if (!target)
+        continue;
+      const didMutate = target.setContent(compressed);
+      if (didMutate)
+        result.mutatedTextTags += 1;
+      updateCavemanDepth(db, sessionId, tag.tagNumber, targetDepth);
+      if (targetDepth === DEPTH_LITE)
+        result.compressedToLite += 1;
+      else if (targetDepth === DEPTH_FULL)
+        result.compressedToFull += 1;
+      else if (targetDepth === DEPTH_ULTRA)
+        result.compressedToUltra += 1;
+    }
+  })();
+  const total = result.compressedToLite + result.compressedToFull + result.compressedToUltra;
+  if (total > 0) {
+    sessionLog(sessionId, `caveman cleanup: compressed ${total} text tags (lite=${result.compressedToLite}, full=${result.compressedToFull}, ultra=${result.compressedToUltra})`);
+  }
+  return result;
+}
+
+// ../plugin/src/hooks/magic-context/ctx-reduce-nudge.ts
+var TOKENS_PER_BYTE = 0.25;
+var CHANNEL1_FLOOR_TOKENS = 1e4;
+var CHANNEL1_REFIRE_FLOOR_TOKENS = 1e4;
+function channel1RefireTokens(workingWindowTokens) {
+  const scaled = Math.round(0.05 * Math.max(0, workingWindowTokens));
+  return Math.max(CHANNEL1_REFIRE_FLOOR_TOKENS, scaled);
+}
+var S_GENTLE = 0.2;
+var S_FIRM = 0.4;
+var S_URGENT = 0.65;
+var CHANNEL1_PRESSURE_FLOOR = 0.8;
+var LEVEL_RANK = { gentle: 1, firm: 2, urgent: 3 };
+function decideChannel1(input) {
+  const { undroppedTokens, workingWindowTokens, hasRecentReduce } = input;
+  const pressure = Math.min(1, Math.max(0, input.pressure));
+  const resetCycle = hasRecentReduce || undroppedTokens < input.lastNudgeUndropped;
+  const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
+  const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
+  const quiet = () => ({
+    fire: false,
+    level: "gentle",
+    undroppedTokens,
+    nextLastNudge: lastNudge,
+    nextLastNudgeLevel: lastLevel
+  });
+  if (hasRecentReduce)
+    return quiet();
+  if (undroppedTokens < CHANNEL1_FLOOR_TOKENS)
+    return quiet();
+  if (pressure < CHANNEL1_PRESSURE_FLOOR)
+    return quiet();
+  const denom = Math.max(input.estimatedInputTokens, 1);
+  const severity = Math.min(1, undroppedTokens / denom);
+  if (severity < S_GENTLE)
+    return quiet();
+  let level;
+  if (severity >= S_URGENT)
+    level = "urgent";
+  else if (severity >= S_FIRM)
+    level = "firm";
+  else
+    level = "gentle";
+  if (lastLevel === "") {
+    if (undroppedTokens < lastNudge + channel1RefireTokens(workingWindowTokens)) {
+      return quiet();
+    }
+  } else if (LEVEL_RANK[level] <= LEVEL_RANK[lastLevel]) {
+    return quiet();
+  }
+  return {
+    fire: true,
+    level,
+    undroppedTokens,
+    nextLastNudge: undroppedTokens,
+    nextLastNudgeLevel: level
+  };
+}
+function approxThousands(tokens) {
+  return `${Math.round(tokens / 1000)}k`;
+}
+function formatOldestReclaimableHint(hint) {
+  if (!hint || hint.length === 0)
+    return "";
+  const rendered = hint.slice(0, 4).map((tag) => `§${tag.tagNumber}§ ${tag.toolName ?? "tool"}`).join(" · ");
+  return rendered.length > 0 ? `
+oldest reclaimable: ${rendered}.` : "";
+}
+var CHANNEL2_USABLE_FRACTION = 1 / 3;
+var CHANNEL2_MIN_RECLAIMABLE = 1e4;
+function shouldTriggerChannel2(input) {
+  if (input.reclaimableTokens < CHANNEL2_MIN_RECLAIMABLE)
+    return false;
+  if (input.usableTokens <= 0)
+    return true;
+  return input.reclaimableTokens >= input.usableTokens * CHANNEL2_USABLE_FRACTION;
+}
+function buildChannel2Reminder(undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  return `<system-reminder>
+` + `Routine context housekeeping is near: a large span of this session will be comparted soon, ` + `and ~${amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce ` + `first so the archived span is the part that matters.${hintText}
+` + `</system-reminder>`;
+}
+function buildChannel1Reminder(level, undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  let body;
+  switch (level) {
+    case "gentle":
+      body = `You have ~${amount} tokens of tool output you have not reduced. ` + `When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean.`;
+      break;
+    case "firm":
+      body = `~${amount} tokens of unreduced tool output has built up. ` + `At your next natural stopping point, consider dropping what you have already processed with ctx_reduce.`;
+      break;
+    case "urgent":
+      body = `~${amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. ` + `Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters.`;
+      break;
+  }
+  return `
+
+<system-reminder>
+${body}${hintText}
+</system-reminder>`;
+}
+
+// ../plugin/src/hooks/magic-context/emergency-drop.ts
+var TARGET_FRACTION = 0.3;
+var TIER_RECENCY_RESERVE = 0.2;
+var EMERGENCY_REARM_MIN_TOKENS = 2000;
+var T1_TOOLS = new Set(["read", "todowrite", "task", "aft_outline", "aft_zoom"]);
+var T2_TOOLS = new Set(["edit", "write", "apply_patch", "grep", "glob", "aft_search"]);
+function normalizeToolName(toolName) {
+  if (!toolName)
+    return "";
+  let name = toolName.toLowerCase();
+  if (name.startsWith("mcp_"))
+    name = name.slice(4);
+  return name;
+}
+function resolveToolTier(toolName) {
+  const name = normalizeToolName(toolName);
+  if (T1_TOOLS.has(name))
+    return 1;
+  if (T2_TOOLS.has(name))
+    return 2;
+  return 3;
+}
+function tagReclaimBytes(tag) {
+  return tag.byteSize + tag.inputByteSize + tag.reasoningByteSize;
+}
+function estimateEmergencyDropReclaimTokens(tag) {
+  return Math.round(tagReclaimBytes(tag) * TOKENS_PER_BYTE);
+}
+function planEmergencyDrop(input) {
+  const {
+    tags,
+    floorTags,
+    maxTag,
+    protectedTags,
+    currentTotalInputTokens,
+    ceilingTokens,
+    priorInputSample,
+    hasPriorDrop
+  } = input;
+  const noop = (reason) => ({
+    shouldDrop: false,
+    tagNumbers: [],
+    reclaimTokens: 0,
+    reason
+  });
+  if (!Number.isFinite(ceilingTokens) || ceilingTokens <= 0) {
+    return noop("unknown-ceiling");
+  }
+  if (!Number.isFinite(currentTotalInputTokens) || currentTotalInputTokens <= 0) {
+    return noop("unknown-usage");
+  }
+  if (hasPriorDrop && currentTotalInputTokens === priorInputSample) {
+    return noop("same-input-sample (awaiting fresh usage after prior drop)");
+  }
+  let tailTokens = 0;
+  for (const tag of floorTags) {
+    if (tag.status !== "active")
+      continue;
+    tailTokens += estimateEmergencyDropReclaimTokens(tag);
+  }
+  const fixedFloor = Math.max(currentTotalInputTokens - tailTokens, 0);
+  const workingSpan = Math.max(ceilingTokens - fixedFloor, 0);
+  const target = fixedFloor + TARGET_FRACTION * workingSpan;
+  const reclaimTokens = Math.round(currentTotalInputTokens - target);
+  if (reclaimTokens <= EMERGENCY_REARM_MIN_TOKENS) {
+    return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})`);
+  }
+  const protectedCutoff = maxTag - protectedTags;
+  const tierActive = { 1: [], 2: [] };
+  for (const tag of tags) {
+    if (tag.status !== "active" || tag.type !== "tool")
+      continue;
+    const tier = resolveToolTier(tag.toolName);
+    if (tier === 1 || tier === 2)
+      tierActive[tier].push(tag.tagNumber);
+  }
+  const reserved = new Set;
+  for (const tier of [1, 2]) {
+    const nums = tierActive[tier];
+    if (nums.length === 0)
+      continue;
+    nums.sort((a, b) => b - a);
+    const reserveCount = Math.ceil(TIER_RECENCY_RESERVE * nums.length);
+    for (let i = 0;i < reserveCount && i < nums.length; i++) {
+      reserved.add(nums[i]);
+    }
+  }
+  const byTier = { 1: [], 2: [], 3: [] };
+  for (const tag of tags) {
+    if (tag.status !== "active" || tag.type !== "tool")
+      continue;
+    if (tag.tagNumber > protectedCutoff)
+      continue;
+    const tier = resolveToolTier(tag.toolName);
+    if ((tier === 1 || tier === 2) && reserved.has(tag.tagNumber))
+      continue;
+    byTier[tier].push(tag);
+  }
+  const selected = [];
+  let reclaimed = 0;
+  outer:
+    for (const tier of [3, 2, 1]) {
+      const group = byTier[tier];
+      group.sort((a, b) => a.tagNumber - b.tagNumber);
+      for (const tag of group) {
+        selected.push(tag.tagNumber);
+        reclaimed += estimateEmergencyDropReclaimTokens(tag);
+        if (reclaimed >= reclaimTokens)
+          break outer;
+      }
+    }
+  if (selected.length === 0) {
+    return noop("no-candidates");
+  }
+  return {
+    shouldDrop: true,
+    tagNumbers: selected,
+    reclaimTokens,
+    reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})`
+  };
+}
+
+// ../plugin/src/hooks/magic-context/system-injection-stripper.ts
+var SYSTEM_INJECTION_MARKERS = [
+  "<!-- OMO_INTERNAL_INITIATOR -->",
+  "[SYSTEM DIRECTIVE: MAGIC-CONTEXT",
+  "[SYSTEM DIRECTIVE: OH-MY-OPENCODE",
+  "[Category+Skill Reminder]",
+  "[EDIT ERROR - IMMEDIATE ACTION REQUIRED]",
+  "[task CALL FAILED - IMMEDIATE RETRY REQUIRED]",
+  "[EMERGENCY CONTEXT WINDOW WARNING]",
+  "Unstable background agent appears idle",
+  "**THE SUBAGENT JUST CLAIMED THIS TASK IS DONE."
+];
+var SYSTEM_REMINDER_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder>/gi;
+var OMO_MARKER_REGEX = /<!-- OMO_INTERNAL_INITIATOR -->/g;
+function stripSystemInjection(text) {
+  let hasInjection = false;
+  for (const marker of SYSTEM_INJECTION_MARKERS) {
+    if (text.includes(marker)) {
+      hasInjection = true;
+      break;
+    }
+  }
+  if (SYSTEM_REMINDER_REGEX.test(text))
+    hasInjection = true;
+  SYSTEM_REMINDER_REGEX.lastIndex = 0;
+  if (!hasInjection)
+    return null;
+  let cleaned = text;
+  cleaned = cleaned.replace(SYSTEM_REMINDER_REGEX, "");
+  cleaned = cleaned.replace(OMO_MARKER_REGEX, "");
+  cleaned = cleaned.replace(/\[SYSTEM DIRECTIVE: OH-MY-(?:OPENCODE|CLAUDE)[^\]]*\][\s\S]*?(?=\n\n(?!\s*[-*])|$)/g, "");
+  for (const marker of SYSTEM_INJECTION_MARKERS) {
+    if (marker.startsWith("<!-- ") || marker.startsWith("[SYSTEM DIRECTIVE"))
+      continue;
+    const idx = cleaned.indexOf(marker);
+    if (idx === -1)
+      continue;
+    const blockEnd = cleaned.indexOf(`
+
+`, idx + marker.length);
+    cleaned = blockEnd !== -1 ? cleaned.slice(0, idx) + cleaned.slice(blockEnd) : cleaned.slice(0, idx);
+  }
+  return cleaned.trim();
+}
+
+// ../plugin/src/hooks/magic-context/heuristic-cleanup.ts
+var DEDUP_SAFE_TOOLS = new Set([
+  "mcp_grep",
+  "mcp_read",
+  "mcp_glob",
+  "mcp_ast_grep_search",
+  "mcp_lsp_diagnostics",
+  "mcp_lsp_symbols",
+  "mcp_lsp_find_references",
+  "mcp_lsp_goto_definition",
+  "mcp_lsp_prepare_rename"
+]);
+function applyHeuristicCleanup(sessionId, db, targets, messageTagNumbers, config, preloadedTags) {
+  const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
+  const maxTag = getMaxTagNumberBySession(db, sessionId);
+  const protectedCutoff = maxTag - config.protectedTags;
+  let droppedTools = 0;
+  let emergencyDroppedTools = 0;
+  let emergencyReclaimedTokens = 0;
+  let deduplicatedTools = 0;
+  let droppedInjections = 0;
+  if (config.emergency) {
+    const emergency = config.emergency;
+    const priorInputSample = getEmergencyInputSample(db, sessionId);
+    const droppableTags = tags.filter((t) => t.status === "active" && t.type === "tool" && targets.get(t.tagNumber)?.canDrop?.());
+    const activeTags = tags.filter((t) => t.status === "active");
+    const plan = planEmergencyDrop({
+      tags: droppableTags,
+      floorTags: activeTags,
+      maxTag,
+      protectedTags: config.protectedTags,
+      currentTotalInputTokens: emergency.currentTotalInputTokens,
+      ceilingTokens: emergency.ceilingTokens,
+      priorInputSample,
+      hasPriorDrop: priorInputSample > 0
+    });
+    if (plan.shouldDrop) {
+      const toDrop = new Set(plan.tagNumbers);
+      const newestEmergencyTags = new Set(droppableTags.slice().sort((left, right) => right.tagNumber - left.tagNumber).slice(0, 20).map((tag) => tag.tagNumber));
+      db.transaction(() => {
+        for (const tag of tags) {
+          if (!toDrop.has(tag.tagNumber))
+            continue;
+          if (tag.status !== "active" || tag.type !== "tool")
+            continue;
+          const target = targets.get(tag.tagNumber);
+          const recent = newestEmergencyTags.has(tag.tagNumber);
+          const result = recent ? target?.truncate?.() ?? target?.drop?.() ?? "absent" : target?.drop?.() ?? "absent";
+          if (result === "removed" || result === "truncated") {
+            updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+            updateTagDropMode(db, sessionId, tag.tagNumber, recent ? "truncated" : "full");
+            droppedTools++;
+            emergencyDroppedTools++;
+            emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
+          }
+        }
+      })();
+      sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
+    } else {
+      sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
+    }
+    setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
+  }
+  db.transaction(() => {
+    for (const tag of tags) {
+      if (tag.status !== "active")
+        continue;
+      if (tag.tagNumber > protectedCutoff)
+        continue;
+      if (tag.type !== "message")
+        continue;
+      const target = targets.get(tag.tagNumber);
+      if (!target)
+        continue;
+      const content = target.getContent?.();
+      if (!content)
+        continue;
+      const stripped = stripSystemInjection(content);
+      if (stripped === null)
+        continue;
+      const strippedSource = stripTagPrefix(stripped);
+      if (strippedSource.trim().length === 0) {
+        const dropResult = target.drop?.() ?? "absent";
+        const didReplace = dropResult === "absent" ? target.setContent(`[dropped §${tag.tagNumber}§]`) : false;
+        if (dropResult === "removed" || dropResult === "absent") {
+          replaceSourceContent(db, sessionId, tag.tagNumber, "");
+          updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+          if (dropResult === "removed" || didReplace) {
+            droppedInjections++;
+          }
+        }
+      } else {
+        const didSet = target.setContent(stripped);
+        if (didSet) {
+          replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
+          droppedInjections++;
+        }
+      }
+    }
+  })();
+  const allMessages = Array.from(messageTagNumbers.keys());
+  const toolFingerprints = buildToolFingerprints(allMessages);
+  if (toolFingerprints.size > 0) {
+    const tagsByCompositeKey = new Map;
+    for (const tag of tags) {
+      if (tag.type === "tool" && tag.status === "active" && tag.messageId) {
+        const key = tag.toolOwnerMessageId ? `${tag.toolOwnerMessageId}\x00${tag.messageId}` : tag.messageId;
+        tagsByCompositeKey.set(key, tag);
+      }
+    }
+    const fingerprintGroups = new Map;
+    for (const [compositeKey, fingerprint] of toolFingerprints) {
+      const tag = tagsByCompositeKey.get(compositeKey);
+      if (!tag || tag.tagNumber > protectedCutoff)
+        continue;
+      const group = fingerprintGroups.get(fingerprint) ?? [];
+      group.push(tag);
+      fingerprintGroups.set(fingerprint, group);
+    }
+    db.transaction(() => {
+      for (const [, group] of fingerprintGroups) {
+        if (group.length <= 1)
+          continue;
+        group.sort((a, b) => a.tagNumber - b.tagNumber);
+        for (let i = 0;i < group.length - 1; i++) {
+          const tag = group[i];
+          const target = targets.get(tag.tagNumber);
+          const result = target?.drop?.() ?? "absent";
+          if (result === "incomplete")
+            continue;
+          updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+          updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+          if (result === "removed" || result === "truncated") {
+            deduplicatedTools++;
+          }
+        }
+      }
+    })();
+  }
+  if (droppedTools > 0 || deduplicatedTools > 0 || droppedInjections > 0) {
+    sessionLog(sessionId, `heuristic cleanup: dropped ${droppedTools} tool tags, deduplicated ${deduplicatedTools} tool calls, dropped ${droppedInjections} system injections`);
+  }
+  let compressedTextTags = 0;
+  let mutatedTextTags = 0;
+  if (config.caveman?.enabled) {
+    const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
+      enabled: true,
+      minChars: config.caveman.minChars,
+      protectedTags: config.protectedTags
+    });
+    compressedTextTags = cavemanResult.compressedToLite + cavemanResult.compressedToFull + cavemanResult.compressedToUltra;
+    mutatedTextTags = cavemanResult.mutatedTextTags;
+  }
+  return {
+    droppedTools,
+    deduplicatedTools,
+    droppedInjections,
+    emergencyDroppedTools,
+    emergencyReclaimedTokens,
+    compressedTextTags,
+    mutatedTextTags
+  };
+}
+function extractToolInfo(part) {
+  if (part.type === "tool" && typeof part.tool === "string" && DEDUP_SAFE_TOOLS.has(part.tool)) {
+    const state = typeof part.state === "object" && part.state !== null ? part.state : {};
+    return { toolName: part.tool, args: state.input ?? {} };
+  }
+  if (part.type === "tool-invocation" && typeof part.toolName === "string" && DEDUP_SAFE_TOOLS.has(part.toolName)) {
+    return { toolName: part.toolName, args: part.args ?? {} };
+  }
+  if (part.type === "tool_use" && typeof part.name === "string" && DEDUP_SAFE_TOOLS.has(part.name)) {
+    return { toolName: part.name, args: part.input ?? {} };
+  }
+  return null;
+}
+function buildToolFingerprints(messages) {
+  const fingerprints = new Map;
+  for (const message of messages) {
+    if (message.info.role !== "assistant")
+      continue;
+    const ownerMsgId = typeof message.info.id === "string" ? message.info.id : null;
+    if (!ownerMsgId)
+      continue;
+    for (const part of message.parts) {
+      const record = part;
+      const info = extractToolInfo(record);
+      if (!info)
+        continue;
+      const callId = extractCallId(record);
+      if (!callId)
+        continue;
+      try {
+        const fingerprint = `${ownerMsgId}:${info.toolName}:${JSON.stringify(info.args)}`;
+        const compositeKey = `${ownerMsgId}\x00${callId}`;
+        fingerprints.set(compositeKey, fingerprint);
+      } catch {}
+    }
+  }
+  return fingerprints;
+}
+function extractCallId(part) {
+  if (part.type === "tool" && typeof part.callID === "string")
+    return part.callID;
+  if (part.type === "tool-invocation" && typeof part.callID === "string")
+    return part.callID;
+  if (part.type === "tool_use" && typeof part.id === "string")
+    return part.id;
+  return null;
+}
+
+// ../plugin/src/features/magic-context/tagger.ts
+var TOOL_COMPOSITE_KEY_SEP = "\x00";
+function makeToolCompositeKey(ownerMsgId, callId) {
+  return `${ownerMsgId}${TOOL_COMPOSITE_KEY_SEP}${callId}`;
+}
+var GET_COUNTER_SQL = `SELECT counter FROM session_meta WHERE session_id = ?`;
+var GET_ASSIGNMENTS_SQL = "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? ORDER BY tag_number ASC";
+var GET_ASSIGNMENTS_SCOPED_SQL = "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? AND tag_number >= ? ORDER BY tag_number ASC";
+var PROBE_DATA_VERSION_SQL = "PRAGMA main.data_version";
+var probeDataVersionStatements = new WeakMap;
+function getProbeDataVersionStatement(db) {
+  let stmt = probeDataVersionStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(PROBE_DATA_VERSION_SQL);
+    probeDataVersionStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function isAssignmentRow(row) {
+  if (row === null || typeof row !== "object") {
+    return false;
+  }
+  const candidate = row;
+  if (typeof candidate.message_id !== "string")
+    return false;
+  if (typeof candidate.tag_number !== "number")
+    return false;
+  if (candidate.type !== "message" && candidate.type !== "tool" && candidate.type !== "file")
+    return false;
+  if (candidate.tool_owner_message_id !== null && typeof candidate.tool_owner_message_id !== "string")
+    return false;
+  if (typeof candidate.byte_size !== "number")
+    return false;
+  if (candidate.token_count !== null && typeof candidate.token_count !== "number")
+    return false;
+  if (typeof candidate.input_byte_size !== "number")
+    return false;
+  if (candidate.input_token_count !== null && typeof candidate.input_token_count !== "number")
+    return false;
+  return true;
+}
+var UPSERT_COUNTER_SQL = `
+  INSERT INTO session_meta (session_id, counter, harness)
+  VALUES (?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET counter = MAX(session_meta.counter, excluded.counter)
+`;
+var upsertCounterStatements = new WeakMap;
+function getUpsertCounterStatement(db) {
+  let stmt = upsertCounterStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(UPSERT_COUNTER_SQL);
+    upsertCounterStatements.set(db, stmt);
+  }
+  return stmt;
+}
+var RESET_COUNTER_SQL = `
+  INSERT INTO session_meta (session_id, counter, harness)
+  VALUES (?, 0, ?)
+  ON CONFLICT(session_id) DO UPDATE SET counter = 0
+`;
+var resetCounterStatements = new WeakMap;
+function getResetCounterStatement(db) {
+  let stmt = resetCounterStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(RESET_COUNTER_SQL);
+    resetCounterStatements.set(db, stmt);
+  }
+  return stmt;
+}
+var MAX_TAG_ALLOC_RETRIES = 5;
+function createTagger() {
+  const counters = new Map;
+  const assignments = new Map;
+  const toolAccountingBySession = new Map;
+  const loadSignatures = new Map;
+  function getSessionAssignments(sessionId) {
+    let map = assignments.get(sessionId);
+    if (!map) {
+      map = new Map;
+      assignments.set(sessionId, map);
+    }
+    return map;
+  }
+  function getSessionToolAccounting(sessionId) {
+    let map = toolAccountingBySession.get(sessionId);
+    if (!map) {
+      map = new Map;
+      toolAccountingBySession.set(sessionId, map);
+    }
+    return map;
+  }
+  function isUniqueConstraintError(error) {
+    return error instanceof Error && "code" in error && error.code === "SQLITE_CONSTRAINT_UNIQUE";
+  }
+  function syncCounterAtLeast(sessionId, db, value) {
+    if (value <= 0)
+      return;
+    const next = Math.max(counters.get(sessionId) ?? 0, value);
+    counters.set(sessionId, next);
+    getUpsertCounterStatement(db).run(sessionId, next, getHarness());
+  }
+  function allocateTag(sessionId, messageId, type, byteSize, db, reasoningByteSize, toolName, inputByteSize, toolOwnerMessageId, mapKey, dbExistingLookup, entryFingerprint = null, tokenThunk) {
+    const sessionAssignments = getSessionAssignments(sessionId);
+    const existing = sessionAssignments.get(mapKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const dbExisting = dbExistingLookup();
+    if (dbExisting !== null) {
+      sessionAssignments.set(mapKey, dbExisting);
+      syncCounterAtLeast(sessionId, db, dbExisting);
+      if (tokenThunk && tagTokenCountIsNull(db, sessionId, dbExisting)) {
+        try {
+          backfillTagTokenCounts(db, sessionId, dbExisting, tokenThunk());
+        } catch {}
+      }
+      return dbExisting;
+    }
+    const tokenCounts = tokenThunk?.() ?? null;
+    for (let attempt = 0;attempt < MAX_TAG_ALLOC_RETRIES; attempt += 1) {
+      const memCounter = counters.get(sessionId) ?? 0;
+      const dbMax = getMaxTagNumberBySession(db, sessionId);
+      const next = Math.max(memCounter, dbMax) + 1;
+      try {
+        db.transaction(() => {
+          insertTag(db, sessionId, messageId, type, byteSize, next, reasoningByteSize, toolName, inputByteSize, toolOwnerMessageId, entryFingerprint, tokenCounts);
+          getUpsertCounterStatement(db).run(sessionId, next, getHarness());
+        })();
+      } catch (error) {
+        if (!isUniqueConstraintError(error)) {
+          throw error;
+        }
+        const racedRow = dbExistingLookup();
+        if (racedRow !== null) {
+          sessionAssignments.set(mapKey, racedRow);
+          syncCounterAtLeast(sessionId, db, racedRow);
+          return racedRow;
+        }
+        const advancedDbMax = getMaxTagNumberBySession(db, sessionId);
+        counters.set(sessionId, Math.max(memCounter, advancedDbMax));
+        continue;
+      }
+      counters.set(sessionId, next);
+      sessionAssignments.set(mapKey, next);
+      if (type === "tool") {
+        getSessionToolAccounting(sessionId).set(next, {
+          byteSize,
+          tokenCount: tokenCounts?.tokenCount ?? null,
+          inputByteSize,
+          inputTokenCount: tokenCounts?.inputTokenCount ?? null
+        });
+      }
+      return next;
+    }
+    throw new Error(`tagger.allocateTag: failed to allocate tag for session=${sessionId} key=${mapKey} after ${MAX_TAG_ALLOC_RETRIES} retries`);
+  }
+  function assignTag(sessionId, messageId, type, byteSize, db, reasoningByteSize = 0, toolName = null, inputByteSize = 0, entryFingerprint = null, tokenThunk) {
+    if (type === "tool") {
+      throw new Error("tagger.assignTag: type='tool' is forbidden — use assignToolTag(sessionId, callId, ownerMsgId, ...)");
+    }
+    return allocateTag(sessionId, messageId, type, byteSize, db, reasoningByteSize, toolName, inputByteSize, null, messageId, () => getTagNumberByMessageId(db, sessionId, messageId), entryFingerprint, tokenThunk);
+  }
+  function backfillToolTokensIfNull(db, sessionId, tagNumber, tokenThunk) {
+    if (!tokenThunk)
+      return;
+    try {
+      if (tagTokenCountIsNull(db, sessionId, tagNumber)) {
+        backfillTagTokenCounts(db, sessionId, tagNumber, tokenThunk());
+      }
+    } catch {}
+  }
+  function assignToolTag(sessionId, callId, ownerMsgId, byteSize, db, reasoningByteSize = 0, toolName = null, inputByteSize = 0, tokenThunk) {
+    const compositeKey = makeToolCompositeKey(ownerMsgId, callId);
+    const sessionAssignments = getSessionAssignments(sessionId);
+    const existing = sessionAssignments.get(compositeKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const dbHit = getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId);
+    if (dbHit !== null) {
+      sessionAssignments.set(compositeKey, dbHit);
+      syncCounterAtLeast(sessionId, db, dbHit);
+      backfillToolTokensIfNull(db, sessionId, dbHit, tokenThunk);
+      return dbHit;
+    }
+    for (let attempt = 0;attempt < MAX_TAG_ALLOC_RETRIES; attempt += 1) {
+      const orphan = getNullOwnerToolTag(db, sessionId, callId);
+      if (orphan === null)
+        break;
+      const claimed = adoptNullOwnerToolTag(db, orphan.id, ownerMsgId);
+      if (claimed) {
+        sessionAssignments.set(compositeKey, orphan.tagNumber);
+        syncCounterAtLeast(sessionId, db, orphan.tagNumber);
+        backfillToolTokensIfNull(db, sessionId, orphan.tagNumber, tokenThunk);
+        return orphan.tagNumber;
+      }
+      const recheck = getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId);
+      if (recheck !== null) {
+        sessionAssignments.set(compositeKey, recheck);
+        syncCounterAtLeast(sessionId, db, recheck);
+        backfillToolTokensIfNull(db, sessionId, recheck, tokenThunk);
+        return recheck;
+      }
+    }
+    return allocateTag(sessionId, callId, "tool", byteSize, db, reasoningByteSize, toolName, inputByteSize, ownerMsgId, compositeKey, () => getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId), null, tokenThunk);
+  }
+  function getTag(sessionId, messageId, _type) {
+    return assignments.get(sessionId)?.get(messageId);
+  }
+  function getToolTag(sessionId, callId, ownerMsgId) {
+    return assignments.get(sessionId)?.get(makeToolCompositeKey(ownerMsgId, callId));
+  }
+  function getToolTagAccounting(sessionId, callId, ownerMsgId) {
+    const tagNumber = getToolTag(sessionId, callId, ownerMsgId);
+    return tagNumber === undefined ? undefined : toolAccountingBySession.get(sessionId)?.get(tagNumber);
+  }
+  function setToolTagAccounting(sessionId, tagNumber, accounting) {
+    getSessionToolAccounting(sessionId).set(tagNumber, accounting);
+  }
+  function bindTag(sessionId, messageId, tagNumber) {
+    getSessionAssignments(sessionId).set(messageId, tagNumber);
+  }
+  function unbindTag(sessionId, messageId) {
+    getSessionAssignments(sessionId).delete(messageId);
+  }
+  function bindToolTag(sessionId, callId, ownerMsgId, tagNumber) {
+    getSessionAssignments(sessionId).set(makeToolCompositeKey(ownerMsgId, callId), tagNumber);
+  }
+  function unbindToolTag(sessionId, ownerMsgId, callId) {
+    getSessionAssignments(sessionId).delete(makeToolCompositeKey(ownerMsgId, callId));
+  }
+  function getAssignments(sessionId) {
+    return getSessionAssignments(sessionId);
+  }
+  function resetCounter(sessionId, db) {
+    counters.set(sessionId, 0);
+    assignments.delete(sessionId);
+    toolAccountingBySession.delete(sessionId);
+    loadSignatures.delete(sessionId);
+    getResetCounterStatement(db).run(sessionId, getHarness());
+  }
+  function getCounter(sessionId) {
+    return counters.get(sessionId) ?? 0;
+  }
+  function probeSignature(db) {
+    const dvRow = getProbeDataVersionStatement(db).get();
+    return {
+      dataVersion: dvRow?.data_version ?? 0
+    };
+  }
+  function initFromDb(sessionId, db, floor = 0) {
+    const probe = probeSignature(db);
+    const cached = loadSignatures.get(sessionId);
+    if (cached !== undefined && cached.db === db && cached.dataVersion === probe.dataVersion && cached.floor === floor) {
+      return;
+    }
+    const row = db.prepare(GET_COUNTER_SQL).get(sessionId);
+    const assignmentRows = (floor > 0 ? db.prepare(GET_ASSIGNMENTS_SCOPED_SQL).all(sessionId, floor) : db.prepare(GET_ASSIGNMENTS_SQL).all(sessionId)).filter(isAssignmentRow);
+    const sessionAssignments = getSessionAssignments(sessionId);
+    sessionAssignments.clear();
+    const sessionToolAccounting = getSessionToolAccounting(sessionId);
+    sessionToolAccounting.clear();
+    let maxTagNumber = 0;
+    for (const assignment of assignmentRows) {
+      if (assignment.type === "tool") {
+        if (assignment.tool_owner_message_id !== null) {
+          sessionAssignments.set(makeToolCompositeKey(assignment.tool_owner_message_id, assignment.message_id), assignment.tag_number);
+          sessionToolAccounting.set(assignment.tag_number, {
+            byteSize: assignment.byte_size,
+            tokenCount: assignment.token_count,
+            inputByteSize: assignment.input_byte_size,
+            inputTokenCount: assignment.input_token_count
+          });
+        }
+      } else {
+        sessionAssignments.set(assignment.message_id, assignment.tag_number);
+      }
+      if (assignment.tag_number > maxTagNumber) {
+        maxTagNumber = assignment.tag_number;
+      }
+    }
+    const counter = Math.max(row?.counter ?? 0, maxTagNumber, counters.get(sessionId) ?? 0);
+    counters.set(sessionId, counter);
+    loadSignatures.set(sessionId, {
+      db,
+      dataVersion: probe.dataVersion,
+      floor
+    });
+  }
+  function cleanup(sessionId) {
+    counters.delete(sessionId);
+    assignments.delete(sessionId);
+    toolAccountingBySession.delete(sessionId);
+    loadSignatures.delete(sessionId);
+  }
+  return {
+    assignTag,
+    assignToolTag,
+    getTag,
+    getToolTag,
+    getToolTagAccounting,
+    setToolTagAccounting,
+    bindTag,
+    unbindTag,
+    bindToolTag,
+    unbindToolTag,
+    getAssignments,
+    resetCounter,
+    getCounter,
+    initFromDb,
+    cleanup
+  };
+}
+
+// ../plugin/src/shared/tag-transcript.ts
+import { createHash as createHash12 } from "node:crypto";
+
+// ../plugin/src/hooks/magic-context/image-token-estimate.ts
+var IMAGE_TOKEN_DIVISOR = 750;
+var IMAGE_FALLBACK_TOKENS = 1200;
+var IMAGE_TOKEN_CAP = 4500;
+function estimateImageTokensFromDataUrl(url) {
+  const comma = url.indexOf(",");
+  if (comma < 0)
+    return IMAGE_FALLBACK_TOKENS;
+  const header = url.slice(0, comma);
+  const payload = url.slice(comma + 1);
+  const sliceLen = Math.min(512, payload.length);
+  const preview = payload.slice(0, sliceLen);
+  let bytes;
+  try {
+    bytes = base64Decode(preview);
+  } catch {
+    return IMAGE_FALLBACK_TOKENS;
+  }
+  if (header.includes("image/png")) {
+    const dims = parsePngDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/jpeg") || header.includes("image/jpg")) {
+    const dims = parseJpegDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/webp")) {
+    const dims = parseWebpDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/gif")) {
+    const dims = parseGifDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  }
+  return IMAGE_FALLBACK_TOKENS;
+}
+function clampImageTokens(n) {
+  if (n < 1)
+    return 1;
+  if (n > IMAGE_TOKEN_CAP)
+    return IMAGE_TOKEN_CAP;
+  return n;
+}
+function base64Decode(b64) {
+  const pad = b64.length % 4;
+  const padded = pad === 0 ? b64 : b64 + "=".repeat(4 - pad);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0;i < binary.length; i++)
+    out[i] = binary.charCodeAt(i);
+  return out;
+}
+function parsePngDimensions(b) {
+  if (b.length < 24)
+    return null;
+  if (b[0] !== 137 || b[1] !== 80 || b[2] !== 78 || b[3] !== 71 || b[4] !== 13 || b[5] !== 10 || b[6] !== 26 || b[7] !== 10)
+    return null;
+  const w = readUint32BE(b, 16);
+  const h = readUint32BE(b, 20);
+  if (!w || !h)
+    return null;
+  return { w, h };
+}
+function parseJpegDimensions(b) {
+  if (b.length < 4 || b[0] !== 255 || b[1] !== 216)
+    return null;
+  let i = 2;
+  while (i < b.length - 8) {
+    if (b[i] !== 255) {
+      i++;
+      continue;
+    }
+    const marker = b[i + 1];
+    if (marker === undefined)
+      break;
+    if (isSofMarker(marker)) {
+      const h = b[i + 5] << 8 | b[i + 6];
+      const w = b[i + 7] << 8 | b[i + 8];
+      if (w && h)
+        return { w, h };
+      return null;
+    }
+    if (marker === 216 || marker === 217 || marker === 1) {
+      i += 2;
+      continue;
+    }
+    const segLen = b[i + 2] << 8 | b[i + 3];
+    if (segLen < 2)
+      return null;
+    i += 2 + segLen;
+  }
+  return null;
+}
+function isSofMarker(m) {
+  if (m >= 192 && m <= 195)
+    return true;
+  if (m >= 197 && m <= 199)
+    return true;
+  if (m >= 201 && m <= 203)
+    return true;
+  if (m >= 205 && m <= 207)
+    return true;
+  return false;
+}
+function parseWebpDimensions(b) {
+  if (b.length < 30)
+    return null;
+  if (b[0] !== 82 || b[1] !== 73 || b[2] !== 70 || b[3] !== 70)
+    return null;
+  if (b[8] !== 87 || b[9] !== 69 || b[10] !== 66 || b[11] !== 80)
+    return null;
+  const variant = String.fromCharCode(b[12], b[13], b[14], b[15]);
+  if (variant === "VP8 ") {
+    const w = (b[26] | b[27] << 8) & 16383;
+    const h = (b[28] | b[29] << 8) & 16383;
+    if (w && h)
+      return { w, h };
+  } else if (variant === "VP8L") {
+    const b0 = b[21];
+    const b1 = b[22];
+    const b2 = b[23];
+    const b3 = b[24];
+    const w = 1 + ((b0 | b1 << 8) & 16383);
+    const h = 1 + ((b1 >> 6 | b2 << 2 | b3 << 10) & 16383);
+    if (w && h)
+      return { w, h };
+  } else if (variant === "VP8X") {
+    const w = 1 + (b[24] | b[25] << 8 | b[26] << 16);
+    const h = 1 + (b[27] | b[28] << 8 | b[29] << 16);
+    if (w && h)
+      return { w, h };
+  }
+  return null;
+}
+function parseGifDimensions(b) {
+  if (b.length < 10)
+    return null;
+  if (b[0] !== 71 || b[1] !== 73 || b[2] !== 70)
+    return null;
+  const w = b[6] | b[7] << 8;
+  const h = b[8] | b[9] << 8;
+  if (!w || !h)
+    return null;
+  return { w, h };
+}
+function readUint32BE(b, offset) {
+  return (b[offset] << 24 | b[offset + 1] << 16 | b[offset + 2] << 8 | b[offset + 3]) >>> 0;
+}
+
+// ../plugin/src/shared/tag-transcript.ts
+var TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
+function textIdentityDigest(value) {
+  return createHash12("sha256").update(value).digest("hex");
+}
+function buildContentDerivedTextIds(messageId, parts) {
+  const sources = parts.filter((part) => part.kind === "text").map((part) => stripTagPrefix(part.getText() ?? ""));
+  const vectorFingerprint = textIdentityDigest(JSON.stringify(sources));
+  const occurrences = new Map;
+  return sources.map((source) => {
+    const contentFingerprint = textIdentityDigest(source);
+    const occurrence = occurrences.get(contentFingerprint) ?? 0;
+    occurrences.set(contentFingerprint, occurrence + 1);
+    return `${messageId}${TEXT_TAG_IDENTITY_MARKER}${vectorFingerprint}:${contentFingerprint}:o${occurrence}`;
+  });
+}
+function tagTranscript(sessionId, transcript, tagger, db, options = {}) {
+  const skipPrefixInjection = options.skipPrefixInjection === true;
+  const targets = new Map;
+  const timing = options.onTiming ? { identity: 0, prefix: 0, targets: 0, tokenCounting: 0 } : undefined;
+  const toolAggregates = new Map;
+  const openToolAggregateKeysByCallId = new Map;
+  let activeToolResultRun;
+  for (let msgIndex = 0;msgIndex < transcript.messages.length; msgIndex += 1) {
+    const message = transcript.messages[msgIndex];
+    if (message === undefined)
+      continue;
+    activeToolResultRun = undefined;
+    const messageId = message.info.id;
+    const reuseIdentity = messageId !== undefined && options.reuseMessageIds?.has(messageId) === true;
+    let textOrdinal = 0;
+    let toolResultOrdinal = 0;
+    const parts = message.parts;
+    const contentDerivedTextIds = messageId !== undefined && options.textIdentityDriftMessageIds?.has(messageId) === true ? buildContentDerivedTextIds(messageId, parts) : undefined;
+    for (let partIndex = 0;partIndex < parts.length; partIndex += 1) {
+      const part = parts[partIndex];
+      if (part === undefined)
+        continue;
+      const resultBlockOrdinal = part.kind === "tool_result" ? toolResultOrdinal++ : undefined;
+      if (part.kind !== "tool_result") {
+        activeToolResultRun = undefined;
+      }
+      if (part.kind === "text") {
+        if (messageId === undefined) {
+          textOrdinal += 1;
+          continue;
+        }
+        tagTextPart({
+          sessionId,
+          message,
+          messageId,
+          contentId: contentDerivedTextIds?.[textOrdinal] ?? `${messageId}:p${textOrdinal}`,
+          msgIndex,
+          textOrdinal,
+          part,
+          tagger,
+          db,
+          targets,
+          skipPrefixInjection,
+          entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
+          reuseIdentity: reuseIdentity || contentDerivedTextIds !== undefined,
+          timing,
+          textIdentitySourceCache: options.textIdentitySourceCache,
+          textTokenCache: options.textTokenCache
+        });
+        textOrdinal += 1;
+        continue;
+      }
+      if (part.kind === "tool_use" || part.kind === "tool_result") {
+        if (messageId === undefined) {
+          activeToolResultRun = undefined;
+          continue;
+        }
+        const identityStart = timing ? performance.now() : 0;
+        const callId = part.id;
+        if (typeof callId !== "string" || callId.length === 0) {
+          activeToolResultRun = undefined;
+          tagToolPart({
+            sessionId,
+            message,
+            messageId,
+            msgIndex,
+            partIndex,
+            part,
+            tagger,
+            db,
+            targets,
+            skipPrefixInjection,
+            reuseIdentity,
+            timing
+          });
+          continue;
+        }
+        const pendingKeys = openToolAggregateKeysByCallId.get(callId) ?? [];
+        let existingKey;
+        if (part.kind === "tool_result") {
+          if (activeToolResultRun !== undefined && activeToolResultRun.callId === callId) {
+            existingKey = activeToolResultRun.aggregateKey;
+          } else {
+            existingKey = findLastUnresolvedToolAggregateKey(pendingKeys, toolAggregates);
+          }
+        }
+        const aggregateKey = existingKey ?? makeToolCompositeKey(messageId, callId);
+        const tokenCacheKey = resultBlockOrdinal === undefined ? aggregateKey : `${aggregateKey}\x00result-part:${messageId}:${resultBlockOrdinal}`;
+        const existing = toolAggregates.get(aggregateKey);
+        if (existing) {
+          existing.occurrences.push({ message, part, kind: part.kind });
+          const canReuseIdentity = reuseIdentity && existing.identityReusable;
+          let text = "";
+          if (canReuseIdentity) {
+            if (part.kind === "tool_result") {
+              text = part.getText() ?? "";
+              applyGrownToolResultAccounting({
+                db,
+                sessionId,
+                tagger,
+                aggregate: existing,
+                byteSize: getToolPartByteSize(part, text),
+                part,
+                text,
+                timing,
+                tokenCache: options.toolTokenCache,
+                tokenCacheKey
+              });
+            }
+            if (timing)
+              timing.identity += performance.now() - identityStart;
+          } else {
+            const accounting = readAggregateToolAccounting(part, timing, options.toolTokenCache, tokenCacheKey);
+            text = accounting.text;
+            if (part.kind === "tool_result") {
+              applyGrownToolResultAccounting({
+                db,
+                sessionId,
+                tagger,
+                aggregate: existing,
+                byteSize: accounting.byteSize,
+                part,
+                text,
+                timing,
+                knownTokenCount: accounting.tokenCount
+              });
+            }
+            if (existing.toolName === null && accounting.toolName) {
+              existing.toolName = accounting.toolName;
+            }
+            if (existing.inputByteSize === 0 && part.kind === "tool_use" && accounting.inputByteSize > 0) {
+              existing.inputByteSize = accounting.inputByteSize;
+              updateTagInputByteSize(db, sessionId, existing.tagId, accounting.inputByteSize);
+            }
+            if (existing.inputTokenCount === null && part.kind === "tool_use" && accounting.inputTokenCount > 0) {
+              existing.inputTokenCount = accounting.inputTokenCount;
+              updateTagInputTokenCount(db, sessionId, existing.tagId, accounting.inputTokenCount);
+            }
+            syncToolAggregateAccounting(tagger, sessionId, existing);
+            if (timing)
+              timing.identity += performance.now() - identityStart;
+          }
+          existing.identityReusable &&= reuseIdentity;
+          applyToolPrefixAndTarget({
+            skipPrefixInjection,
+            part,
+            text,
+            tagId: existing.tagId,
+            aggregate: existing,
+            targets,
+            timing
+          });
+          if (part.kind === "tool_result") {
+            markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
+            activeToolResultRun = { callId, aggregateKey };
+          }
+          continue;
+        }
+        const reusableTagId = reuseIdentity ? tagger.getToolTag(sessionId, callId, messageId) : undefined;
+        const reusableAccounting = reuseIdentity ? tagger.getToolTagAccounting(sessionId, callId, messageId) : undefined;
+        let aggregate;
+        let text = "";
+        if (reusableTagId !== undefined && reusableAccounting !== undefined) {
+          aggregate = {
+            callId,
+            tagId: reusableTagId,
+            identityReusable: true,
+            occurrences: [{ message, part, kind: part.kind }],
+            maxByteSize: reusableAccounting.byteSize,
+            maxTokenCount: reusableAccounting.tokenCount ?? 0,
+            toolName: null,
+            inputByteSize: reusableAccounting.inputByteSize,
+            inputTokenCount: reusableAccounting.inputTokenCount
+          };
+          if (part.kind === "tool_result") {
+            text = part.getText() ?? "";
+            applyGrownToolResultAccounting({
+              db,
+              sessionId,
+              tagger,
+              aggregate,
+              byteSize: getToolPartByteSize(part, text),
+              part,
+              text,
+              timing,
+              tokenCache: options.toolTokenCache,
+              tokenCacheKey
+            });
+          }
+          if (timing)
+            timing.identity += performance.now() - identityStart;
+        } else {
+          const accounting = readAggregateToolAccounting(part, timing, options.toolTokenCache, tokenCacheKey);
+          text = accounting.text;
+          const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
+          const outputTokenCount = part.kind === "tool_result" ? accounting.tokenCount : 0;
+          const firstInputTokenCount = part.kind === "tool_use" ? accounting.inputTokenCount : 0;
+          const tagId = tagger.assignToolTag(sessionId, callId, messageId, outputByteSize, db, 0, accounting.toolName, accounting.inputByteSize, () => ({
+            tokenCount: outputTokenCount,
+            inputTokenCount: firstInputTokenCount,
+            reasoningTokenCount: null
+          }));
+          const persistedAccounting = tagger.getToolTagAccounting(sessionId, callId, messageId);
+          aggregate = {
+            callId,
+            tagId,
+            identityReusable: false,
+            occurrences: [{ message, part, kind: part.kind }],
+            maxByteSize: persistedAccounting?.byteSize ?? outputByteSize,
+            maxTokenCount: persistedAccounting?.tokenCount ?? outputTokenCount,
+            toolName: accounting.toolName,
+            inputByteSize: persistedAccounting?.inputByteSize ?? (part.kind === "tool_use" ? accounting.inputByteSize : 0),
+            inputTokenCount: persistedAccounting?.inputTokenCount ?? (part.kind === "tool_use" ? firstInputTokenCount : null)
+          };
+          if (part.kind === "tool_result") {
+            applyGrownToolResultAccounting({
+              db,
+              sessionId,
+              tagger,
+              aggregate,
+              byteSize: accounting.byteSize,
+              part,
+              text,
+              timing,
+              knownTokenCount: accounting.tokenCount
+            });
+          }
+          syncToolAggregateAccounting(tagger, sessionId, aggregate);
+          if (timing)
+            timing.identity += performance.now() - identityStart;
+        }
+        toolAggregates.set(aggregateKey, aggregate);
+        if (part.kind === "tool_use") {
+          openToolAggregateKeysByCallId.set(callId, [...pendingKeys, aggregateKey]);
+        }
+        applyToolPrefixAndTarget({
+          skipPrefixInjection,
+          part,
+          text,
+          tagId: aggregate.tagId,
+          aggregate,
+          targets,
+          timing
+        });
+        if (part.kind === "tool_result") {
+          markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
+          activeToolResultRun = { callId, aggregateKey };
+        }
+      }
+    }
+  }
+  if (timing && options.onTiming) {
+    options.onTiming("identity", timing.identity);
+    options.onTiming("prefix", timing.prefix);
+    options.onTiming("targets", timing.targets);
+    options.onTiming("tokenCounting", timing.tokenCounting);
+  }
+  return { targets };
+}
+function syncToolAggregateAccounting(tagger, sessionId, aggregate) {
+  tagger.setToolTagAccounting(sessionId, aggregate.tagId, {
+    byteSize: aggregate.maxByteSize,
+    tokenCount: aggregate.maxTokenCount,
+    inputByteSize: aggregate.inputByteSize,
+    inputTokenCount: aggregate.inputTokenCount
+  });
+}
+function applyGrownToolResultAccounting(args) {
+  if (args.byteSize <= args.aggregate.maxByteSize)
+    return;
+  let tokenCount = args.knownTokenCount;
+  if (tokenCount !== undefined && args.tokenCacheKey) {
+    args.tokenCache?.set(args.tokenCacheKey, { text: args.text, tokenCount });
+  }
+  if (tokenCount === undefined) {
+    const tokenStart = args.timing ? performance.now() : 0;
+    tokenCount = getCachedToolPartTokenCount(args.part, args.text, args.tokenCache, args.tokenCacheKey);
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart;
+  }
+  args.aggregate.maxByteSize = args.byteSize;
+  args.aggregate.maxTokenCount = tokenCount;
+  updateTagByteSize(args.db, args.sessionId, args.aggregate.tagId, args.byteSize);
+  updateTagTokenCount(args.db, args.sessionId, args.aggregate.tagId, tokenCount);
+  syncToolAggregateAccounting(args.tagger, args.sessionId, args.aggregate);
+}
+function readAggregateToolAccounting(part, timing, tokenCache, tokenCacheKey) {
+  const text = part.getText() ?? "";
+  const byteSize = getToolPartByteSize(part, text);
+  const metadata = part.getToolMetadata();
+  let tokenCount = 0;
+  if (part.kind === "tool_result") {
+    const tokenStart = timing ? performance.now() : 0;
+    tokenCount = getCachedToolPartTokenCount(part, text, tokenCache, tokenCacheKey);
+    if (timing)
+      timing.tokenCounting += performance.now() - tokenStart;
+  }
+  return {
+    text,
+    byteSize,
+    tokenCount,
+    toolName: metadata.toolName ?? null,
+    inputByteSize: metadata.inputByteSize,
+    inputTokenCount: metadata.inputTokenCount
+  };
+}
+function applyToolPrefixAndTarget(args) {
+  if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(args.tagId, args.text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(args.tagId, buildAggregateTarget(args.tagId, args.aggregate.occurrences));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function findLastUnresolvedToolAggregateKey(pendingKeys, toolAggregates) {
+  for (let i = pendingKeys.length - 1;i >= 0; i -= 1) {
+    const key = pendingKeys[i];
+    if (key === undefined)
+      continue;
+    const aggregate = toolAggregates.get(key);
+    if (aggregate === undefined)
+      continue;
+    if (!aggregate.occurrences.some((occ) => occ.kind === "tool_result")) {
+      return key;
+    }
+  }
+  return;
+}
+function markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId) {
+  const pendingKeys = openToolAggregateKeysByCallId.get(callId);
+  if (pendingKeys === undefined)
+    return;
+  const nextPendingKeys = pendingKeys.filter((key) => key !== aggregateKey);
+  if (nextPendingKeys.length === 0) {
+    openToolAggregateKeysByCallId.delete(callId);
+    return;
+  }
+  openToolAggregateKeysByCallId.set(callId, nextPendingKeys);
+}
+function estimateTagTextTokens(text) {
+  if (!text)
+    return 0;
+  if (text.startsWith("data:image/"))
+    return estimateImageTokensFromDataUrl(text);
+  return estimateTokens(text);
+}
+function getToolPartByteSize(part, text) {
+  const textByteSize = byteSize(text);
+  if (textByteSize > 0 || part.kind !== "tool_result")
+    return textByteSize;
+  return getNonTextToolResultByteSize(part);
+}
+function getToolPartTokenCount(part, text) {
+  if (text.length > 0 || part.kind !== "tool_result")
+    return estimateTokens(text);
+  const raw = part.rawByteSize?.();
+  if (typeof raw === "number" && raw > 0) {
+    const record = isRecord3(part) ? part : undefined;
+    const content = record?.content ?? record?.rawContent ?? record?.rawPart ?? record?.part ?? record?.data ?? record?.image ?? record?.source;
+    const serialized = safeJsonStringify(content ?? part);
+    return serialized === undefined ? 0 : estimateTokens(serialized);
+  }
+  return 0;
+}
+function getCachedToolPartTokenCount(part, text, cache, cacheKey) {
+  const cached = cacheKey ? cache?.get(cacheKey) : undefined;
+  if (cached?.text === text)
+    return cached.tokenCount;
+  const tokenCount = getToolPartTokenCount(part, text);
+  if (cacheKey)
+    cache?.set(cacheKey, { text, tokenCount });
+  return tokenCount;
+}
+function getNonTextToolResultByteSize(part) {
+  const raw = part.rawByteSize?.();
+  if (typeof raw === "number" && raw > 0)
+    return raw;
+  const record = isRecord3(part) ? part : undefined;
+  const content = record?.content ?? record?.rawContent ?? record?.rawPart ?? record?.part ?? record?.data ?? record?.image ?? record?.source;
+  const serialized = safeJsonStringify(content ?? part);
+  return serialized === undefined ? 0 : byteSize(serialized);
+}
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return;
+  }
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null;
+}
+function tagTextPart(args) {
+  const identityStart = args.timing ? performance.now() : 0;
+  const text = args.part.getText() ?? "";
+  const contentId = args.contentId;
+  const reusableTagId = args.reuseIdentity ? args.tagger.getTag(args.sessionId, contentId, "message") : undefined;
+  if (reusableTagId !== undefined) {
+    if (args.timing)
+      args.timing.identity += performance.now() - identityStart;
+    applyTextPrefixAndTarget(args, reusableTagId, text);
+    return;
+  }
+  const tagId = args.tagger.assignTag(args.sessionId, contentId, "message", byteSize(text), args.db, 0, null, 0, args.entryFingerprint, () => {
+    const tokenStart = args.timing ? performance.now() : 0;
+    const cached = args.textTokenCache?.get(contentId);
+    const tokenCount = cached?.text === text ? cached.tokenCount : estimateTagTextTokens(stripTagPrefix(text));
+    if (cached?.text !== text) {
+      args.textTokenCache?.set(contentId, { text, tokenCount });
+    }
+    const counts = {
+      tokenCount,
+      inputTokenCount: null,
+      reasoningTokenCount: null
+    };
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart;
+    return counts;
+  });
+  const sourceContent = stripTagPrefix(text);
+  if (sourceContent.trim().length > 0) {
+    saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
+    args.textIdentitySourceCache?.set(tagId, sourceContent);
+  }
+  if (args.timing)
+    args.timing.identity += performance.now() - identityStart;
+  applyTextPrefixAndTarget(args, tagId, text);
+}
+function applyTextPrefixAndTarget(args, tagId, text) {
+  if (!args.skipPrefixInjection) {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(tagId, text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(tagId, buildTextTarget(args.part, args.message));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function tagToolPart(args) {
+  const identityStart = args.timing ? performance.now() : 0;
+  const stableId = args.part.id;
+  const contentId = stableId ?? `${args.messageId}:t${args.partIndex}`;
+  const reusableTagId = args.reuseIdentity ? args.tagger.getToolTag(args.sessionId, contentId, contentId) : undefined;
+  if (reusableTagId !== undefined) {
+    const text = args.part.kind === "tool_result" ? args.part.getText() ?? "" : "";
+    if (args.timing)
+      args.timing.identity += performance.now() - identityStart;
+    applySingleToolPrefixAndTarget(args, reusableTagId, text);
+    return;
+  }
+  const text = args.part.getText() ?? "";
+  const toolByteSize = getToolPartByteSize(args.part, text);
+  const meta = args.part.getToolMetadata();
+  const tokenStart = args.timing ? performance.now() : 0;
+  const toolTokenCount = getToolPartTokenCount(args.part, text);
+  if (args.timing)
+    args.timing.tokenCounting += performance.now() - tokenStart;
+  const tagId = args.tagger.assignToolTag(args.sessionId, contentId, contentId, toolByteSize, args.db, 0, meta.toolName ?? null, meta.inputByteSize, () => {
+    const tokenStart = args.timing ? performance.now() : 0;
+    const counts = {
+      tokenCount: toolTokenCount,
+      inputTokenCount: meta.inputTokenCount,
+      reasoningTokenCount: null
+    };
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart;
+    return counts;
+  });
+  if (args.timing)
+    args.timing.identity += performance.now() - identityStart;
+  applySingleToolPrefixAndTarget(args, tagId, text);
+}
+function applySingleToolPrefixAndTarget(args, tagId, text) {
+  if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(tagId, text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(tagId, buildToolTarget(args.part, args.message, tagId));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function setToolContentOrText(part, content) {
+  try {
+    if (part.setToolOutput(content))
+      return true;
+  } catch {}
+  return part.setText(content);
+}
+function buildAggregateTarget(tagId, occurrences) {
+  const role = occurrences[0]?.message.info.role ?? "user";
+  const messageId = occurrences[0]?.message.info.id;
+  return {
+    setContent(content) {
+      let changed = false;
+      for (const occ of occurrences) {
+        if (setToolContentOrText(occ.part, content)) {
+          changed = true;
+        }
+      }
+      return changed;
+    },
+    getContent() {
+      for (const occ of occurrences) {
+        if (occ.kind === "tool_result") {
+          return occ.part.getText() ?? null;
+        }
+      }
+      return occurrences[0]?.part.getText() ?? null;
+    },
+    drop() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any = false;
+      for (const occ of occurrences) {
+        if (occ.part.replaceWithSentinel(sentinel))
+          any = true;
+      }
+      return any ? "removed" : "absent";
+    },
+    truncate() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any = false;
+      for (const occ of occurrences) {
+        if (setToolContentOrText(occ.part, sentinel)) {
+          any = true;
+        }
+      }
+      return any ? "truncated" : "absent";
+    },
+    editMarker() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any = false;
+      for (const occ of occurrences) {
+        if (occ.kind === "tool_use") {
+          const input = occ.part.getToolInput?.();
+          if (input) {
+            const next = { ...input };
+            applyEditMarkerToInput(next);
+            if (occ.part.setToolInput?.(next))
+              any = true;
+          }
+        } else if (setToolContentOrText(occ.part, sentinel)) {
+          any = true;
+        }
+      }
+      return any ? "truncated" : "absent";
+    },
+    canDrop() {
+      return occurrences.length > 0;
+    },
+    readInput() {
+      for (const occ of occurrences) {
+        const input = occ.part.getToolInput?.();
+        if (input)
+          return input;
+      }
+      return null;
+    },
+    message: {
+      info: { id: messageId, role },
+      parts: []
+    }
+  };
+}
+function buildTextTarget(part, message) {
+  return {
+    setContent(content) {
+      return part.setText(content);
+    },
+    getContent() {
+      return part.getText() ?? null;
+    },
+    message: {
+      info: { id: message.info.id, role: message.info.role },
+      parts: []
+    }
+  };
+}
+function buildToolTarget(part, message, tagId) {
+  return {
+    setContent(content) {
+      return setToolContentOrText(part, content);
+    },
+    getContent() {
+      return part.getText() ?? null;
+    },
+    drop() {
+      const replaced = part.replaceWithSentinel(`[dropped §${tagId}§]`);
+      return replaced ? "removed" : "absent";
+    },
+    truncate() {
+      const ok = setToolContentOrText(part, `[dropped §${tagId}§]`);
+      return ok ? "truncated" : "absent";
+    },
+    message: {
+      info: { id: message.info.id, role: message.info.role },
+      parts: []
+    }
+  };
+}
+
+// src/agent/transcript.ts
+function isRecord4(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function asEvent(value) {
+  return isRecord4(value) ? value : null;
+}
+function seqOf(event) {
+  return typeof event.seq === "number" ? event.seq : -1;
+}
+function timeOf(event) {
+  return typeof event.time === "number" ? event.time : undefined;
+}
+function dataOf(event) {
+  return isRecord4(event.data) ? event.data : null;
+}
+function sha256Hex(value) {
+  return createHash13("sha256").update(value, "utf8").digest("hex");
+}
+var SYNTH_USER_ID_PREFIX = "synth-user-";
+function isSyntheticUserMessage(message) {
+  return typeof message.id === "string" && message.id.startsWith(SYNTH_USER_ID_PREFIX);
+}
+function isKnowledgeMessage(message) {
+  const source = isRecord4(message.source) ? message.source : null;
+  return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
+}
+function isSkillCatalogMessage(message) {
+  const source = isRecord4(message.source) ? message.source : null;
+  return source !== null && source.kind === "skill-catalog";
+}
+function parseToolArguments(raw) {
+  if (typeof raw !== "string" || raw.length === 0)
+    return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return isRecord4(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function userTextParts(content) {
+  if (!Array.isArray(content))
+    return [];
+  const parts = [];
+  for (const block of content) {
+    if (!isRecord4(block) || block.type !== "text" || typeof block.text !== "string")
+      continue;
+    parts.push({ type: "text", text: block.text });
+  }
+  return parts;
+}
+function assistantParts(message, keepReasoning, toolNameByCallId) {
+  const content = message.content;
+  if (!Array.isArray(content))
+    return [];
+  const parts = [];
+  for (const block of content) {
+    if (!isRecord4(block))
+      continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push({ type: "text", text: block.text });
+    } else if (block.type === "tool-call" && typeof block.id === "string") {
+      const name = typeof block.name === "string" ? block.name : "unknown";
+      if (typeof block.name === "string" && block.name.length > 0) {
+        toolNameByCallId.set(block.id, block.name);
+      }
+      parts.push({
+        type: "tool",
+        tool: name,
+        callID: block.id,
+        state: { input: parseToolArguments(block.arguments) }
+      });
+    } else if (keepReasoning && (block.type === "reasoning" || block.type === "thinking") && typeof block.text === "string") {
+      parts.push({ type: "reasoning", text: block.text });
+    }
+  }
+  return parts;
+}
+function toolResultParts(message, toolNameByCallId) {
+  const content = Array.isArray(message.content) ? message.content : [];
+  let callId;
+  const source = isRecord4(message.source) ? message.source : null;
+  if (source && typeof source.callId === "string" && source.callId.length > 0) {
+    callId = source.callId;
+  }
+  if (!callId) {
+    for (const block of content) {
+      if (isRecord4(block) && block.type === "tool-result" && typeof block.toolCallId === "string" && block.toolCallId.length > 0) {
+        callId = block.toolCallId;
+        break;
+      }
+    }
+  }
+  if (!callId)
+    return [];
+  const fragments = [];
+  for (const block of content) {
+    if (!isRecord4(block) || block.type !== "tool-result")
+      continue;
+    const inner = block.content;
+    if (!Array.isArray(inner))
+      continue;
+    for (const fragment of inner) {
+      if (isRecord4(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
+        fragments.push(fragment.text);
+      }
+    }
+  }
+  return [
+    {
+      type: "tool",
+      tool: toolNameByCallId.get(callId) ?? "unknown",
+      callID: callId,
+      state: { output: fragments.join(`
+`) }
+    }
+  ];
+}
+var DSH_MESSAGE_SPAN_KEY = "__dshMessageNodeSpan";
+var DSH_KNOWLEDGE_KEY = "__dshKnowledgeBaseline";
+var DSH_SKILL_CATALOG_KEY = "__dshSkillCatalog";
+function messageNodeSpan(message) {
+  const span = message[DSH_MESSAGE_SPAN_KEY];
+  return span !== null && typeof span === "object" ? span : null;
+}
+function isKnowledgeBaselineMessage(message) {
+  return message[DSH_KNOWLEDGE_KEY] === true;
+}
+function isSkillCatalogBaselineMessage(message) {
+  return message[DSH_SKILL_CATALOG_KEY] === true;
+}
+function walkDshLog(events, surfaceNodes) {
+  const eventBySeq = new Map;
+  const toolNameByCallId = new Map;
+  for (const raw of events) {
+    const event = asEvent(raw);
+    if (!event)
+      continue;
+    const seq = seqOf(event);
+    if (seq >= 0 && !eventBySeq.has(seq))
+      eventBySeq.set(seq, event);
+    const data = dataOf(event);
+    if (event.type === "tool/call" && data) {
+      const callId = data.callId;
+      const name = data.name;
+      if (typeof callId === "string" && callId.length > 0 && typeof name === "string") {
+        toolNameByCallId.set(callId, name);
+      }
+    }
+  }
+  const ordered = surfaceNodes !== null ? surfaceNodes.map((seq) => eventBySeq.get(seq)).filter((event) => event !== undefined) : events.map(asEvent).filter((event) => event !== null);
+  const messages = [];
+  const spans = [];
+  const knowledgeOrdinals = new Set;
+  const skillCatalogOrdinals = new Set;
+  const ordinalToSeq = new Map;
+  const seqToOrdinal = new Map;
+  let pendingParts = [];
+  let pendingSeqs = [];
+  let pendingStartIndex = null;
+  let pendingFirstId = null;
+  let pendingFirstSeq = -1;
+  let pendingFirstTime = undefined;
+  let pendingAssistant = null;
+  const resetPending = () => {
+    pendingParts = [];
+    pendingSeqs = [];
+    pendingStartIndex = null;
+    pendingFirstId = null;
+    pendingFirstSeq = -1;
+    pendingFirstTime = undefined;
+    pendingAssistant = null;
+  };
+  const pushAssistant = (item) => {
+    const ordinal = messages.length + 1;
+    messages.push({
+      ordinal,
+      id: item.id,
+      role: "assistant",
+      parts: item.parts,
+      createdAt: item.createdAt,
+      version: item.seq >= 0 ? item.seq : null
+    });
+    spans.push(surfaceNodes !== null ? { nodeStart: item.nodeIndex, nodeEnd: item.nodeIndex + 1, seqs: [item.seq] } : null);
+    ordinalToSeq.set(ordinal, item.seq);
+    if (item.seq >= 0)
+      seqToOrdinal.set(item.seq, ordinal);
+  };
+  const flushSynthetic = () => {
+    if (pendingParts.length === 0 && pendingAssistant === null)
+      return;
+    const ordinal = messages.length + 1;
+    const seqs = [
+      ...pendingAssistant === null ? [] : [pendingAssistant.seq],
+      ...pendingSeqs
+    ];
+    const start = Math.min(pendingStartIndex ?? Number.POSITIVE_INFINITY, pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(start))
+      throw new Error("fold flush without any covered node");
+    messages.push({
+      ordinal,
+      id: `${SYNTH_USER_ID_PREFIX}${pendingFirstId ?? "tail"}`,
+      role: "user",
+      parts: [...pendingAssistant?.parts ?? [], ...pendingParts],
+      createdAt: pendingFirstTime ?? null,
+      version: pendingFirstSeq >= 0 ? pendingFirstSeq : null
+    });
+    spans.push(surfaceNodes !== null ? { nodeStart: start, nodeEnd: start + seqs.length, seqs: [...seqs] } : null);
+    if (pendingFirstSeq >= 0)
+      ordinalToSeq.set(ordinal, pendingFirstSeq);
+    for (const s of seqs)
+      seqToOrdinal.set(s, ordinal);
+    resetPending();
+  };
+  for (let nodeIndex = 0;nodeIndex < ordered.length; nodeIndex += 1) {
+    const event = ordered[nodeIndex];
+    const type = event.type;
+    if (type !== "user/message" && type !== "assistant/message" && type !== "tool/result") {
+      continue;
+    }
+    const message = deriveEventMessage2(event);
+    if (!message)
+      continue;
+    const record = message;
+    const seq = seqOf(event);
+    if (type === "assistant/message") {
+      if (pendingParts.length > 0)
+        flushSynthetic();
+      const parts = assistantParts(record, surfaceNodes !== null, toolNameByCallId);
+      const hasToolCalls = parts.some((part) => isRecord4(part) && part.type === "tool" && typeof part.callID === "string");
+      if (hasToolCalls) {
+        pendingAssistant = {
+          nodeIndex,
+          seq,
+          parts,
+          createdAt: timeOf(event) ?? null,
+          id: String(message.id)
+        };
+        continue;
+      }
+      if (pendingAssistant !== null) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
+      pushAssistant({ nodeIndex, seq, parts, createdAt: timeOf(event) ?? null, id: String(message.id) });
+      continue;
+    }
+    if (type === "user/message") {
+      if (pendingAssistant !== null && pendingParts.length === 0) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
+      const ordinal = messages.length + 1;
+      const start = surfaceNodes !== null ? Math.min(pendingStartIndex ?? Number.POSITIVE_INFINITY, pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY, nodeIndex) : nodeIndex;
+      const knowledge = isKnowledgeMessage(record);
+      const skillCatalog = isSkillCatalogMessage(record);
+      messages.push({
+        ordinal,
+        id: String(message.id),
+        role: "user",
+        parts: [
+          ...pendingAssistant?.parts ?? [],
+          ...pendingParts,
+          ...userTextParts(record.content)
+        ],
+        createdAt: timeOf(event) ?? null,
+        version: seq >= 0 ? seq : null
+      });
+      spans.push(surfaceNodes !== null ? {
+        nodeStart: start,
+        nodeEnd: nodeIndex + 1,
+        seqs: [...pendingAssistant === null ? [] : [pendingAssistant.seq], ...pendingSeqs, seq]
+      } : null);
+      ordinalToSeq.set(ordinal, seq);
+      for (const s of [...pendingAssistant === null ? [] : [pendingAssistant.seq], ...pendingSeqs, seq]) {
+        seqToOrdinal.set(s, ordinal);
+      }
+      if (knowledge)
+        knowledgeOrdinals.add(ordinal);
+      if (skillCatalog)
+        skillCatalogOrdinals.add(ordinal);
+      resetPending();
+      continue;
+    }
+    pendingParts.push(...toolResultParts(record, toolNameByCallId));
+    pendingSeqs.push(seq);
+    if (pendingStartIndex === null)
+      pendingStartIndex = nodeIndex;
+    if (pendingFirstId === null)
+      pendingFirstId = String(message.id);
+    if (pendingFirstSeq < 0)
+      pendingFirstSeq = seq;
+    if (pendingFirstTime === undefined)
+      pendingFirstTime = timeOf(event);
+  }
+  if (pendingAssistant !== null && pendingParts.length === 0) {
+    pushAssistant(pendingAssistant);
+    pendingAssistant = null;
+  }
+  if (pendingParts.length > 0 || pendingAssistant !== null)
+    flushSynthetic();
+  return { messages, spans, knowledgeOrdinals, skillCatalogOrdinals, ordinalToSeq, seqToOrdinal };
+}
+function convertDshEventsToRawMessages(events) {
+  return walkDshLog(events, null).messages;
+}
+function readDshTranscript(input) {
+  const events = sessionEvents2(input.session);
+  const nodes = Array.isArray(input.session.surface?.nodes) ? [...input.session.surface.nodes] : [];
+  const walk = walkDshLog(events, nodes);
+  for (let i = 0;i < walk.messages.length; i += 1) {
+    const message = walk.messages[i];
+    const span = walk.spans[i];
+    if (span !== null) {
+      Object.defineProperty(message, DSH_MESSAGE_SPAN_KEY, {
+        value: span,
+        enumerable: false,
+        configurable: true
+      });
+    }
+    if (walk.knowledgeOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_KNOWLEDGE_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true
+      });
+    }
+    if (walk.skillCatalogOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_SKILL_CATALOG_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true
+      });
+    }
+  }
+  return {
+    sessionId: input.canonicalSessionId,
+    sourceWatermark: maxEventSeq(events),
+    inputDigest: sha256Hex(JSON.stringify(walk.messages)).slice(0, 16),
+    generation: typeof input.session.surface?.replaceGeneration === "number" ? input.session.surface.replaceGeneration : 0,
+    messages: walk.messages,
+    surfaceNodes: nodes
+  };
+}
+function maxEventSeq(events) {
+  let max = 0;
+  for (const raw of events) {
+    const event = asEvent(raw);
+    if (!event)
+      continue;
+    const seq = seqOf(event);
+    if (seq > max)
+      max = seq;
+  }
+  return max;
+}
+var DROPPED_SENTINEL_PATTERN = /^\[dropped\s+\u00a7\d+\u00a7\]$/;
+function classifyRecordingPart(raw) {
+  switch (raw.type) {
+    case "text":
+      return "text";
+    case "reasoning":
+    case "thinking":
+      return "thinking";
+    case "tool": {
+      const state = isRecord4(raw.state) ? raw.state : null;
+      return state !== null && state.output !== undefined ? "tool_result" : "tool_use";
+    }
+    case "image":
+      return "image";
+    default:
+      return "unknown";
+  }
+}
+
+class RecordingPart {
+  kind;
+  id;
+  partIndex;
+  owner;
+  raw;
+  toolName;
+  callId;
+  payload;
+  input;
+  constructor(owner, partIndex, raw) {
+    this.owner = owner;
+    this.partIndex = partIndex;
+    this.raw = isRecord4(raw) ? raw : {};
+    this.kind = classifyRecordingPart(this.raw);
+    this.callId = typeof this.raw.callID === "string" ? this.raw.callID : undefined;
+    this.toolName = typeof this.raw.tool === "string" ? this.raw.tool : undefined;
+    this.id = this.callId;
+    this.input = this.readInputState();
+    this.payload = this.initPayload();
+  }
+  readInputState() {
+    if (this.kind !== "tool_use" && this.kind !== "tool_result")
+      return null;
+    const state = isRecord4(this.raw.state) ? this.raw.state : null;
+    return state !== null && isRecord4(state.input) ? state.input : null;
+  }
+  initPayload() {
+    if (this.kind === "text")
+      return typeof this.raw.text === "string" ? this.raw.text : "";
+    if (this.kind === "thinking") {
+      const text = typeof this.raw.text === "string" ? this.raw.text : undefined;
+      return text ?? (typeof this.raw.thinking === "string" ? this.raw.thinking : "");
+    }
+    if (this.kind === "tool_use")
+      return JSON.stringify(this.input ?? {});
+    if (this.kind === "tool_result") {
+      const state = isRecord4(this.raw.state) ? this.raw.state : null;
+      const output = state !== null ? state.output : undefined;
+      if (typeof output === "string")
+        return output;
+      return output !== undefined ? JSON.stringify(output) : "";
+    }
+    return "";
+  }
+  record(field, from, to, tag) {
+    const record = {
+      partIndex: this.partIndex,
+      field,
+      from,
+      to,
+      ...tag !== undefined ? { tag } : {}
+    };
+    this.owner.mutations.push(record);
+  }
+  getText() {
+    return this.payload;
+  }
+  setText(newText) {
+    if (newText === this.payload)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = newText;
+    this.record("text", from, newText);
+    return true;
+  }
+  setToolOutput(newText) {
+    if (newText === this.payload)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = newText;
+    this.record("output", from, newText);
+    return true;
+  }
+  getToolInput() {
+    return this.input;
+  }
+  setToolInput(input) {
+    if (input === this.input)
+      return false;
+    const from = JSON.stringify(this.input ?? {});
+    this.input = input;
+    this.record("input", from, JSON.stringify(input));
+    return true;
+  }
+  getToolMetadata() {
+    if (this.kind === "tool_use" || this.kind === "tool_result") {
+      return {
+        toolName: this.toolName,
+        inputByteSize: byteSize(JSON.stringify(this.input ?? {})),
+        inputTokenCount: 0
+      };
+    }
+    return { toolName: undefined, inputByteSize: 0, inputTokenCount: 0 };
+  }
+  replaceWithSentinel(sentinelText) {
+    if (this.payload === sentinelText)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = sentinelText;
+    this.record("sentinel", from, sentinelText);
+    return true;
+  }
+  render() {
+    if (this.kind === "thinking" || this.kind === "image")
+      return null;
+    const payload = this.payload ?? "";
+    if (this.kind === "text" || this.kind === "unknown")
+      return payload.length > 0 ? payload : null;
+    if (DROPPED_SENTINEL_PATTERN.test(payload))
+      return payload.length > 0 ? payload : null;
+    const head = this.kind === "tool_use" ? "tool" : "tool result";
+    const lines = [
+      `[${head}: ${this.toolName ?? "tool"}${this.callId ? ` #${this.callId}` : ""}]`
+    ];
+    if (this.input)
+      lines.push(`input: ${JSON.stringify(this.input)}`);
+    if (this.kind === "tool_result" && payload.length > 0)
+      lines.push(`output:
+${payload}`);
+    return lines.join(`
+`);
+  }
+}
+
+class RecordingMessage {
+  info;
+  parts = [];
+  span;
+  mutations = [];
+  constructor(info, span) {
+    this.info = info;
+    this.span = span;
+  }
+  addPart(raw) {
+    const part = new RecordingPart(this, this.parts.length, raw);
+    this.parts.push(part);
+    return part;
+  }
+  isDirty() {
+    return this.mutations.length > 0;
+  }
+  opKind() {
+    if (this.mutations.some((record) => record.field === "sentinel" || record.field === "output" || record.field === "input" || DROPPED_SENTINEL_PATTERN.test(record.to))) {
+      return "drops";
+    }
+    if (this.mutations.some((record) => record.field === "reasoning"))
+      return "reasoning";
+    return "tags";
+  }
+  reason() {
+    const parts = [];
+    for (const record of this.mutations) {
+      if (record.field === "sentinel") {
+        parts.push(`drop → ${record.to}`);
+      } else if (record.field === "reasoning") {
+        parts.push(`reasoning cleared through tag §${record.tag ?? "?"}§`);
+      } else if (/^\u00a7\d+\u00a7/.test(record.to)) {
+        const space = record.to.indexOf(" ");
+        parts.push(`tag prefix ${space > 0 ? record.to.slice(0, space) : record.to}`);
+      } else {
+        parts.push(`${record.field} → ${record.to}`);
+      }
+    }
+    return parts.join("; ");
+  }
+  render() {
+    return this.parts.map((part) => part.render()).filter((value) => value !== null && value.length > 0).join(`
+
+`);
+  }
+}
+
+class RecordingTranscript {
+  harness = "opencode";
+  messages;
+  constructor(messages) {
+    this.messages = messages;
+  }
+  commit() {}
+}
+
+class RecordingTagTarget {
+  tagId;
+  inner;
+  constructor(tagId, inner) {
+    this.tagId = tagId;
+    this.inner = inner;
+  }
+  setContent(content) {
+    return this.inner.setContent(content);
+  }
+  getContent() {
+    return this.inner.getContent?.() ?? null;
+  }
+  drop() {
+    return this.inner.drop?.() ?? "absent";
+  }
+  truncate() {
+    return this.inner.truncate?.() ?? "absent";
+  }
+  editMarker() {
+    return this.inner.editMarker?.() ?? "absent";
+  }
+  canDrop() {
+    return this.inner.canDrop?.() ?? false;
+  }
+  readInput() {
+    return this.inner.readInput?.() ?? null;
+  }
+  get message() {
+    return this.inner.message;
+  }
+}
+function buildRecordingTranscript(view) {
+  const messages = [];
+  const byMessageId = new Map;
+  for (const raw of view.messages) {
+    if (isKnowledgeBaselineMessage(raw))
+      continue;
+    if (isSkillCatalogBaselineMessage(raw))
+      continue;
+    const message = new RecordingMessage({ id: raw.id, role: raw.role, sessionId: view.sessionId }, messageNodeSpan(raw));
+    for (const part of raw.parts)
+      message.addPart(part);
+    messages.push(message);
+    if (typeof raw.id === "string")
+      byMessageId.set(raw.id, message);
+  }
+  return { transcript: new RecordingTranscript(messages), byMessageId };
+}
+function minimalCacheClassForOp(range, surfaceNodeCount, baselineNodeIndices = []) {
+  if (range.start >= surfaceNodeCount)
+    return "soft-plus";
+  for (let i = range.start;i < range.end; i += 1) {
+    if (baselineNodeIndices.includes(i))
+      return "hard";
+  }
+  return "soft";
+}
+function baselineNodeIndices(view) {
+  const out = [];
+  for (const message of view.messages) {
+    if (!isKnowledgeBaselineMessage(message))
+      continue;
+    const span = messageNodeSpan(message);
+    if (span !== null)
+      out.push(span.nodeStart);
+  }
+  return out;
+}
+function planTemporalMarkers(view) {
+  const ops = [];
+  const baseline = baselineNodeIndices(view);
+  let prev = null;
+  for (const message of view.messages) {
+    const isGapEligibleUser = message.role === "user" && !isKnowledgeBaselineMessage(message) && !isSkillCatalogBaselineMessage(message) && !isSyntheticUserMessage(message);
+    if (isGapEligibleUser && prev !== null) {
+      const prevTime = typeof prev.createdAt === "number" ? prev.createdAt : null;
+      const currTime = typeof message.createdAt === "number" ? message.createdAt : null;
+      if (prevTime !== null && currTime !== null) {
+        const gapSeconds = Math.floor((currTime - prevTime) / 1000);
+        const marker = temporalMarkerPrefix(gapSeconds);
+        if (marker !== null && !hasTemporalMarker(message) && !isTemporalMarkerMessage(prev)) {
+          const span = messageNodeSpan(message);
+          if (span !== null) {
+            ops.push({
+              kind: "temporal",
+              start: span.nodeStart,
+              end: span.nodeStart,
+              replacement: marker,
+              cacheClass: minimalCacheClassForOp({ start: span.nodeStart, end: span.nodeStart }, view.surfaceNodes.length, baseline),
+              reason: `temporal gap ${formatGap(gapSeconds) ?? "?"}`,
+              shadowedSeqs: []
+            });
+          }
+        }
+      }
+    }
+    if (!isKnowledgeBaselineMessage(message) && !isSkillCatalogBaselineMessage(message)) {
+      prev = message;
+    }
+  }
+  return ops;
+}
+function hasTemporalMarker(message) {
+  for (const part of message.parts) {
+    if (!isRecord4(part) || part.type !== "text" || typeof part.text !== "string")
+      continue;
+    return TEMPORAL_MARKER_PATTERN.test(peelLeadingMcTagNotation(part.text).body);
+  }
+  return false;
+}
+function isTemporalMarkerMessage(message) {
+  let sawMarker = false;
+  for (const part of message.parts) {
+    if (!isRecord4(part) || part.type !== "text")
+      continue;
+    const text = typeof part.text === "string" ? part.text : "";
+    if (text.trim().length === 0)
+      continue;
+    if (TEMPORAL_MARKER_PATTERN.test(peelLeadingMcTagNotation(text).body)) {
+      sawMarker = true;
+    } else {
+      return false;
+    }
+  }
+  return sawMarker;
+}
+function planReasoningReplay(view, byMessageId, targets, db) {
+  const meta = getOrCreateSessionMeta(db, view.sessionId);
+  const watermark = typeof meta.clearedReasoningThroughTag === "number" ? meta.clearedReasoningThroughTag : 0;
+  if (watermark <= 0)
+    return;
+  const maxTagById = new Map;
+  for (const [tagId, target] of targets) {
+    const id = target.message?.info?.id;
+    if (typeof id !== "string" || id.length === 0)
+      continue;
+    const prev = maxTagById.get(id) ?? 0;
+    if (tagId > prev)
+      maxTagById.set(id, tagId);
+  }
+  for (const message of view.messages) {
+    if (message.role !== "assistant" || typeof message.id !== "string")
+      continue;
+    const msgTag = maxTagById.get(message.id) ?? 0;
+    if (msgTag === 0 || msgTag > watermark)
+      continue;
+    const reasoningTexts = [];
+    for (const part of message.parts) {
+      if (!isRecord4(part))
+        continue;
+      const type = part.type;
+      if (type !== "reasoning" && type !== "thinking")
+        continue;
+      const text = typeof part.text === "string" ? part.text : typeof part.thinking === "string" ? part.thinking : "";
+      if (text.length > 0 && text !== "[cleared]")
+        reasoningTexts.push(text);
+    }
+    if (reasoningTexts.length === 0)
+      continue;
+    const recording = byMessageId.get(message.id);
+    if (!recording)
+      continue;
+    recording.mutations.push({
+      partIndex: -1,
+      field: "reasoning",
+      from: reasoningTexts.join(`
+`),
+      to: "[cleared]",
+      tag: msgTag
+    });
+  }
+}
+function deriveMutationPlan(view, ctx) {
+  const db = ctx.db;
+  const sessionId = view.sessionId;
+  const protectedTags = Math.max(0, Math.floor(ctx.protectedTags ?? 0));
+  const ops = [...planTemporalMarkers(view)];
+  const { transcript, byMessageId } = buildRecordingTranscript(view);
+  if (transcript.messages.length > 0) {
+    const tagger = createTagger();
+    tagger.initFromDb(sessionId, db);
+    const tagged = tagTranscript(sessionId, transcript, tagger, db);
+    const recordingTargets = new Map;
+    for (const [tagId, target] of tagged.targets) {
+      recordingTargets.set(tagId, new RecordingTagTarget(tagId, target));
+    }
+    const preloadedTags = getTagsBySession(db, sessionId);
+    const preloadedPendingOps = getPendingOps(db, sessionId);
+    applyPendingOperations(sessionId, db, recordingTargets, protectedTags, preloadedTags, preloadedPendingOps);
+    applyFlushedStatuses(sessionId, db, recordingTargets, preloadedTags);
+    const cleanupCfg = ctx.heuristicCleanup;
+    if (cleanupCfg !== undefined) {
+      try {
+        const messageTagNumbers = new Map;
+        for (const [tagId, target] of recordingTargets) {
+          const message = target.message;
+          if (message !== undefined)
+            messageTagNumbers.set(message, tagId);
+        }
+        applyHeuristicCleanup(sessionId, db, recordingTargets, messageTagNumbers, {
+          protectedTags,
+          caveman: cleanupCfg.caveman
+        }, preloadedTags);
+      } catch {}
+    }
+    planReasoningReplay(view, byMessageId, recordingTargets, db);
+    const baseline = baselineNodeIndices(view);
+    for (const message of transcript.messages) {
+      if (!message.isDirty())
+        continue;
+      const span = message.span;
+      if (span === null || span.seqs.length === 0)
+        continue;
+      ops.push({
+        kind: message.opKind(),
+        start: span.nodeStart,
+        end: span.nodeEnd,
+        replacement: message.render(),
+        cacheClass: minimalCacheClassForOp({ start: span.nodeStart, end: span.nodeEnd }, view.surfaceNodes.length, baseline),
+        reason: message.reason(),
+        shadowedSeqs: [...span.seqs]
+      });
+    }
+  }
+  if (ops.length === 0)
+    return null;
+  ops.sort((left, right) => left.start - right.start || left.end - right.end);
+  return {
+    opId: randomUUID2(),
+    sessionId: view.sessionId,
+    sourceWatermark: view.sourceWatermark,
+    inputDigest: view.inputDigest,
+    generation: view.generation,
+    ops
+  };
+}
+
+// src/agent/tools.ts
+async function resolveDb(ctx, opts) {
+  if (opts.db !== undefined) {
+    return typeof opts.db === "function" ? opts.db() : opts.db;
+  }
+  const host = ctx.get("magicContextHost");
+  const boot = await host?.ready;
+  if (boot?.kind === "ok" && boot.db)
+    return boot.db;
+  throw new Error("Magic Context database is not available (host bootstrap not ready).");
+}
+function resolveCanonicalKey(ctx, opts, agent) {
+  const dshSessionId = String(agent.id);
+  if (opts.canonicalKey !== undefined)
+    return opts.canonicalKey(dshSessionId);
+  const host = ctx.get("magicContextHost");
+  const key = host?.canonicalKey?.(dshSessionId);
+  if (key !== undefined)
+    return key;
+  if (opts.homeHash !== undefined && opts.homeHash.length > 0) {
+    return canonicalSessionKey(opts.homeHash, dshSessionId);
+  }
+  return;
+}
+function cwdOf(agent) {
+  return agent.session?.header?.cwd;
+}
+function resolveProjectIdentity(ctx, opts, directory) {
+  if (opts.resolveProjectIdentity !== undefined)
+    return opts.resolveProjectIdentity(directory);
+  return resolveProjectIdentityForSession(directory, opts.allowHomeProject);
+}
+function resolveAgentContext(ctx, opts, agent) {
+  return {
+    agent,
+    sessionId: resolveCanonicalKey(ctx, opts, agent),
+    nativeSessionId: String(agent.id),
+    cwd: cwdOf(agent),
+    projectIdentity: cwdOf(agent) ? resolveProjectIdentity(ctx, opts, cwdOf(agent)) : undefined
+  };
+}
+var TEXT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: { text: { type: "string", required: true } },
+  additionalProperties: false
+};
+function renderTextOutput(_args, value) {
+  return [textBlock2(value.text)];
+}
+function toolError(message) {
+  return new Error(message.replace(/^Error:\s*/, ""));
+}
+var DEFAULT_SEARCH_LIMIT2 = 10;
+var NOTE_EXPAND_HINT = "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
+function normalizeLimit2(limit, fallback = DEFAULT_SEARCH_LIMIT2) {
+  if (typeof limit !== "number" || !Number.isFinite(limit))
+    return fallback;
+  return Math.max(1, Math.floor(limit));
+}
+function formatAge(committedAtMs) {
+  const ageMs = Date.now() - committedAtMs;
+  if (ageMs < 0)
+    return "future";
+  const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+  if (days <= 0)
+    return "today";
+  if (days === 1)
+    return "1d ago";
+  if (days < 30)
+    return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months === 1)
+    return "1mo ago";
+  if (months < 12)
+    return `${months}mo ago`;
+  const years = Math.floor(days / 365);
+  return years === 1 ? "1y ago" : `${years}y ago`;
+}
+function formatSearchResult(result, index, currentSessionId) {
+  if (result.source === "memory") {
+    const source = result.sourceName ? ` source=${result.sourceName}` : "";
+    return [
+      `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${result.category}${source} match=${result.matchType}`,
+      result.content
+    ].join(`
+`);
+  }
+  if (result.source === "git_commit") {
+    return [
+      `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${result.shortSha} ${formatAge(result.committedAtMs)} match=${result.matchType}`,
+      result.content
+    ].join(`
+`);
+  }
+  if (result.source === "primer") {
+    return [
+      `[${index}] [primer] score=${result.score.toFixed(2)} id=${result.primerId} support=${result.support} match=${result.matchType}`,
+      result.content
+    ].join(`
+`);
+  }
+  if (result.source === "note") {
+    const anchor = result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId ? ` @msg ${result.anchorOrdinal}` : "";
+    return [
+      `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
+      result.content
+    ].join(`
+`);
+  }
+  if (result.source === "compartment") {
+    return [
+      `[${index}] [message] score=${result.score.toFixed(2)} compartment_id=${result.compartmentId} range=${result.startOrdinal}-${result.endOrdinal} match=${result.matchType} title=${result.title}`,
+      result.snippet ? `Snippet: ${result.snippet}` : result.content
+    ].join(`
+`);
+  }
+  const expandStart = Math.max(1, result.messageOrdinal - 3);
+  const expandEnd = result.messageOrdinal + 3;
+  return [
+    `[${index}] [message] score=${result.score.toFixed(2)} ordinal=${result.messageOrdinal} range=${expandStart}-${expandEnd} role=${result.role}`,
+    result.content
+  ].join(`
+`);
+}
+function formatSearchResults(query, results, currentSessionId) {
+  if (results.length === 0) {
+    return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
+  }
+  const bodyParts = results.map((result, index) => formatSearchResult(result, index + 1, currentSessionId));
+  if (results.some((result) => result.source === "message" || result.source === "compartment")) {
+    bodyParts.push("Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.");
+  }
+  if (results.some((result) => result.source === "note" && result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId)) {
+    bodyParts.push(NOTE_EXPAND_HINT);
+  }
+  const body = bodyParts.join(`
+
+`);
+  return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":
+
+${body}`;
+}
+function createCtxSearchTool(ctx, opts) {
+  return defineTool2({
+    name: "ctx_search",
+    description: CTX_SEARCH_DESCRIPTION,
+    parameters: {
+      query: {
+        type: "string",
+        description: "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text."
+      },
+      limit: {
+        type: "integer",
+        description: "Maximum results to return (default: 10)"
+      },
+      sources: {
+        type: "array",
+        items: {
+          type: "string",
+          enum: ["memory", "message", "git_commit", "primer", "note"]
+        },
+        description: 'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups. Omit for a broad search across all enabled sources.'
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'ctx_search' requires an agent execution context.");
+      const params = unwrapImitatedReducedArgs(args, ["query"], {
+        query: "string",
+        limit: "number",
+        sources: {
+          type: "array",
+          items: "string",
+          maxItems: 5,
+          values: ["memory", "message", "git_commit", "primer", "note"]
+        }
+      });
+      const query = params.query?.trim();
+      if (!query)
+        throw toolError("'query' is required.");
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId)
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      if (!runtime.cwd)
+        throw toolError("Could not resolve the working directory for this agent.");
+      if (!runtime.projectIdentity) {
+        throw toolError("Could not resolve project identity for search.");
+      }
+      const db = await resolveDb(ctx, opts);
+      await opts.ensureProjectRegistered?.(runtime.cwd, db);
+      const snapshot = getProjectEmbeddingSnapshot(runtime.projectIdentity);
+      const memoryEnabled = snapshot?.features.memoryEnabled ?? opts.memoryEnabled;
+      const embeddingEnabled = snapshot ? snapshot.enabled || snapshot.gitCommitEnabled : opts.embeddingEnabled;
+      const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? opts.gitCommitsEnabled ?? false;
+      const lastCompartmentEnd = getLastCompartmentEndMessage(db, runtime.sessionId);
+      const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
+      const visibleMemoryIds = getVisibleMemoryIds(db, runtime.sessionId);
+      const idShape = parseIdShapedQuery(query);
+      if (idShape && memoryEnabled) {
+        const idResults = resolveMemoriesByIdsForSearch({
+          db,
+          projectPath: runtime.projectIdentity,
+          ids: idShape,
+          limit: Math.max(normalizeLimit2(params.limit), idShape.length),
+          visibleMemoryIds
+        });
+        if (idResults !== null) {
+          return { text: formatSearchResults(query, idResults, runtime.sessionId) };
+        }
+      }
+      const results = await unifiedSearch(db, runtime.sessionId, runtime.projectIdentity, query, {
+        limit: normalizeLimit2(params.limit),
+        memoryEnabled,
+        embeddingEnabled,
+        embedQuery: async (text, signal) => {
+          const result = await embedTextForProject(runtime.projectIdentity, text, signal, "query");
+          return result?.vector ?? null;
+        },
+        isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+        maxMessageOrdinal: messageOrdinalCutoff,
+        gitCommitsEnabled,
+        sources: params.sources,
+        visibleMemoryIds,
+        explicitSearch: true
+      });
+      return { text: formatSearchResults(query, results, runtime.sessionId) };
+    }
+  });
+}
+var ALL_ACTIONS = ["write", "archive", "update", "merge", "get", "list"];
+var DREAMER_ONLY_ACTIONS = new Set(["list"]);
+var GET_MAX_IDS = 20;
+var DEFAULT_LIST_LIMIT = 10;
+var MEMORY_CATEGORIES = new Set(V2_MEMORY_CATEGORIES);
+function asMemoryCategory(value) {
+  return value !== undefined && MEMORY_CATEGORIES.has(value) ? value : undefined;
+}
+function formatMemoryList(memories) {
+  if (memories.length === 0)
+    return "No active memories found.";
+  const rows = memories.map((m) => ({
+    id: String(m.id),
+    category: m.category,
+    status: m.status,
+    verification: m.verificationStatus,
+    updated: new Date(m.updatedAt).toISOString(),
+    content: m.content.replace(/\s+/g, " ").trim()
+  }));
+  const headers = {
+    id: "ID",
+    category: "CATEGORY",
+    status: "STATUS",
+    verification: "VERIFY",
+    updated: "UPDATED",
+    content: "CONTENT"
+  };
+  const widths = {
+    id: Math.max(headers.id.length, ...rows.map((r) => r.id.length)),
+    category: Math.max(headers.category.length, ...rows.map((r) => r.category.length)),
+    status: Math.max(headers.status.length, ...rows.map((r) => r.status.length)),
+    verification: Math.max(headers.verification.length, ...rows.map((r) => r.verification.length)),
+    updated: Math.max(headers.updated.length, ...rows.map((r) => r.updated.length))
+  };
+  const fmt = (r) => [
+    r.id.padEnd(widths.id),
+    r.category.padEnd(widths.category),
+    r.status.padEnd(widths.status),
+    r.verification.padEnd(widths.verification),
+    r.updated.padEnd(widths.updated),
+    r.content
+  ].join(" | ");
+  return [
+    `Found ${rows.length} active ${rows.length === 1 ? "memory" : "memories"}:`,
+    "",
+    fmt(headers),
+    [
+      "-".repeat(widths.id),
+      "-".repeat(widths.category),
+      "-".repeat(widths.status),
+      "-".repeat(widths.verification),
+      "-".repeat(widths.updated),
+      "-------"
+    ].join("-+-"),
+    ...rows.map(fmt)
+  ].join(`
+`);
+}
+function isPrimaryMutableMemory(memory) {
+  return (memory.status === "active" || memory.status === "permanent") && memory.supersededByMemoryId === null;
+}
+function inactiveMemoryError(id, action) {
+  return `Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
+}
+function formatGetOutput(args) {
+  const parts = [];
+  for (const id of args.requestedIds) {
+    const memory = args.memoriesById.get(id);
+    parts.push(memory ? formatMemoryList([memory]) : `id ${id}: not found or not visible from this project`);
+  }
+  return parts.join(`
+
+`);
+}
+function updateMemoryContentInCurrentTransaction(db, memory, content, normalizedHash) {
+  db.prepare("UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?").run(content, normalizedHash, Date.now(), memory.id);
+  if (hasMemoryShareableColumn(db)) {
+    db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(memory.id);
+  }
+  if (hasMemoryClassifiedAtColumn(db)) {
+    db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(memory.id);
+  }
+  db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memory.id);
+  invalidateMemory(memory.projectPath, memory.id);
+}
+function queueEmbedding(args) {
+  const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
+  if (!snapshot?.enabled)
+    return;
+  (async () => {
+    try {
+      const result = await embedTextForProject(args.projectIdentity, args.content);
+      if (!result)
+        return;
+      saveEmbedding(args.db, args.memoryId, result.vector, result.modelId);
+    } catch {}
+  })();
+}
+function createCtxMemoryTool(ctx, opts) {
+  const dreamerAllowed = opts.allowDreamerActions === true;
+  return defineTool2({
+    name: "ctx_memory",
+    description: dreamerAllowed ? `${CTX_MEMORY_DESCRIPTION}
+- list: enumerate stored memories (maintenance sessions).` : CTX_MEMORY_DESCRIPTION,
+    parameters: {
+      action: {
+        type: "string",
+        enum: [...ALL_ACTIONS],
+        description: "What to do: write, update, archive, merge, get, or list"
+      },
+      content: {
+        type: "string",
+        description: "The memory text — one standalone fact (required for write, update, merge)"
+      },
+      category: {
+        type: "string",
+        enum: [...V2_MEMORY_CATEGORIES],
+        description: "What kind of fact this is (required for write; optional merge override)"
+      },
+      ids: {
+        type: "array",
+        items: { type: "integer" },
+        description: "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty"
+      },
+      limit: { type: "integer", description: "Max results for list (default: 10)" },
+      reason: {
+        type: "string",
+        description: "Why the memory is being archived (optional, recommended)"
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'ctx_memory' requires an agent execution context.");
+      const params = unwrapImitatedReducedArgs(args, ["action"], {
+        action: { type: "enum", values: ALL_ACTIONS },
+        content: "string",
+        category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+        ids: { type: "array", items: "number", maxItems: 100 },
+        limit: "number",
+        reason: "string"
+      });
+      if (params.action === undefined) {
+        throw toolError("Action 'undefined' is not allowed in this context.");
+      }
+      if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(params.action)) {
+        throw toolError(`Action '${params.action}' is not allowed in this context.`);
+      }
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId)
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      if (!runtime.cwd)
+        throw toolError("Could not resolve the working directory for this agent.");
+      if (!runtime.projectIdentity) {
+        throw toolError("Could not resolve project identity for memory action.");
+      }
+      const projectIdentity = runtime.projectIdentity;
+      const db = await resolveDb(ctx, opts);
+      await opts.ensureProjectRegistered?.(runtime.cwd, db);
+      const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+      if (snapshot ? !snapshot.features.memoryEnabled : opts.memoryEnabled === false) {
+        throw toolError("Cross-session memory is disabled for this project.");
+      }
+      const memoryOwnedByTool = (memory) => storedPathBelongsToIdentity(memory.projectPath, projectIdentity);
+      const { action } = params;
+      if (action === "write") {
+        const content = params.content?.trim();
+        if (!content)
+          throw toolError("'content' is required when action is 'write'.");
+        const rawCategory = asMemoryCategory(params.category);
+        if (!rawCategory)
+          throw toolError("'category' is required when action is 'write'.");
+        const existing = getMemoryByHash(db, projectIdentity, rawCategory, computeNormalizedHash(content));
+        if (existing) {
+          updateMemorySeenCount(db, existing.id);
+          return {
+            text: `Memory already exists [ID: ${existing.id}] in ${rawCategory} (seen count incremented).`
+          };
+        }
+        const memory = insertMemory(db, {
+          projectPath: projectIdentity,
+          category: rawCategory,
+          content,
+          sourceSessionId: runtime.sessionId,
+          sourceType: dreamerAllowed ? "dreamer" : "agent"
+        });
+        queueEmbedding({ db, projectIdentity, memoryId: memory.id, content });
+        return { text: `Saved memory [ID: ${memory.id}] in ${rawCategory}.` };
+      }
+      if (action === "list") {
+        const limit = normalizeLimit2(params.limit, DEFAULT_LIST_LIMIT);
+        const filtered = getMemoriesByProject(db, projectIdentity);
+        const category = params.category;
+        const filtered2 = category ? filtered.filter((m) => m.category === category) : filtered;
+        return { text: formatMemoryList(filtered2.slice(0, limit)) };
+      }
+      if (action === "get") {
+        const getIds = params.ids;
+        if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+          throw toolError("'ids' must contain at least one integer memory ID when action is 'get'.");
+        }
+        if (getIds.length > GET_MAX_IDS) {
+          throw toolError(`'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`);
+        }
+        const uniqueIds = [...new Set(getIds)];
+        const fetched = getMemoriesByIds(db, uniqueIds);
+        const memoriesById = new Map(fetched.filter((memory) => memoryOwnedByTool(memory)).map((memory) => [memory.id, memory]));
+        return { text: formatGetOutput({ requestedIds: uniqueIds, memoriesById }) };
+      }
+      if (action === "update") {
+        const updateIds = params.ids;
+        if (updateIds?.length !== 1 || !updateIds.every(Number.isInteger)) {
+          throw toolError("'ids' must contain exactly one integer memory ID when action is 'update'.");
+        }
+        const updateId = updateIds[0];
+        const content = params.content?.trim();
+        if (!content)
+          throw toolError("'content' is required when action is 'update'.");
+        const memory = getMemoryById(db, updateId);
+        if (!memory || !memoryOwnedByTool(memory)) {
+          throw toolError(`Memory with ID ${updateId} was not found.`);
+        }
+        if (!isPrimaryMutableMemory(memory)) {
+          throw toolError(inactiveMemoryError(updateId, "updating"));
+        }
+        const normalizedHash = computeNormalizedHash(content);
+        const duplicate = getMemoryByHash(db, projectIdentity, memory.category, normalizedHash);
+        if (duplicate && duplicate.id !== memory.id) {
+          throw toolError(`Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`);
+        }
+        runImmediateTransaction(db, () => {
+          updateMemoryContentInCurrentTransaction(db, memory, content, normalizedHash);
+          queueMemoryMutation(db, {
+            projectPath: normalizeStoredProjectPath(projectIdentity),
+            mutationType: "update",
+            targetMemoryId: memory.id,
+            category: memory.category,
+            newContent: content
+          });
+        });
+        queueEmbedding({ db, projectIdentity, memoryId: memory.id, content });
+        return { text: `Updated memory [ID: ${memory.id}] in ${memory.category}.` };
+      }
+      if (action === "merge") {
+        const ids = params.ids;
+        if (!ids || ids.length < 2 || !ids.every(Number.isInteger)) {
+          throw toolError("'ids' must include at least two integer memory IDs when action is 'merge'.");
+        }
+        if (new Set(ids).size !== ids.length) {
+          throw toolError("'ids' must include at least two distinct memory IDs when action is 'merge'.");
+        }
+        const content = params.content?.trim();
+        if (!content)
+          throw toolError("'content' is required when action is 'merge'.");
+        const sourceMemories = ids.map((id) => getMemoryById(db, id)).filter((memory) => Boolean(memory));
+        if (sourceMemories.length !== ids.length) {
+          throw toolError("One or more source memories were not found.");
+        }
+        const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
+        if (foreign)
+          throw toolError(`Memory with ID ${foreign.id} was not found.`);
+        const inactive = sourceMemories.find((memory) => !isPrimaryMutableMemory(memory));
+        if (inactive)
+          throw toolError(inactiveMemoryError(inactive.id, "merging"));
+        const sourceCategories = new Set(sourceMemories.map((memory) => memory.category));
+        if (sourceCategories.size > 1) {
+          throw toolError(`Cannot merge memories from different categories (${[...sourceCategories].join(", ")}). If they are genuine duplicates, one is miscategorized — archive the redundant one instead of merging across categories.`);
+        }
+        const category = asMemoryCategory(params.category) ?? sourceMemories[0]?.category;
+        if (!category)
+          throw toolError("A valid category is required when action is 'merge'.");
+        const normalizedHash = computeNormalizedHash(content);
+        const duplicate = getMemoryByHash(db, projectIdentity, category, normalizedHash);
+        const canonicalExisting = duplicate && ids.includes(duplicate.id) ? duplicate : null;
+        if (duplicate && !canonicalExisting) {
+          throw toolError(`Memory content already exists as ID ${duplicate.id}; update or archive existing duplicates instead.`);
+        }
+        const mergedSeenCount = sourceMemories.reduce((sum, memory) => sum + memory.seenCount, 0);
+        const mergedRetrievalCount = sourceMemories.reduce((sum, memory) => sum + memory.retrievalCount, 0);
+        const mergedFromIds = Array.from(new Set(sourceMemories.flatMap((memory) => {
+          let parsed = [];
+          try {
+            parsed = memory.mergedFrom ? JSON.parse(memory.mergedFrom) : [];
+          } catch {
+            parsed = [];
+          }
+          const priorIds = Array.isArray(parsed) ? parsed.filter((value) => typeof value === "number") : [];
+          return [memory.id, ...priorIds];
+        }))).sort((left, right) => left - right);
+        const mergedFrom = JSON.stringify(mergedFromIds);
+        const mergedStatus = sourceMemories.some((memory) => memory.status === "permanent") ? "permanent" : "active";
+        let canonicalMemory;
+        db.transaction(() => {
+          let canonicalContentChanged = false;
+          if (canonicalExisting) {
+            canonicalMemory = canonicalExisting;
+            canonicalContentChanged = canonicalMemory.content !== content || canonicalMemory.normalizedHash !== normalizedHash;
+            if (canonicalContentChanged) {
+              updateMemoryContent(db, canonicalMemory.id, content, normalizedHash);
+            }
+          } else {
+            canonicalMemory = insertMemory(db, {
+              projectPath: projectIdentity,
+              category,
+              content,
+              sourceSessionId: runtime.sessionId,
+              sourceType: dreamerAllowed ? "dreamer" : "agent"
+            });
+          }
+          mergeMemoryStats(db, canonicalMemory.id, mergedSeenCount, mergedRetrievalCount, mergedFrom, mergedStatus);
+          for (const memory of sourceMemories) {
+            if (memory.id === canonicalMemory.id)
+              continue;
+            supersededMemory(db, memory.id, canonicalMemory.id);
+            queueMemoryMutation(db, {
+              projectPath: normalizeStoredProjectPath(memory.projectPath),
+              mutationType: "superseded",
+              targetMemoryId: memory.id,
+              supersededById: canonicalMemory.id
+            });
+          }
+          if (canonicalExisting && canonicalContentChanged) {
+            queueMemoryMutation(db, {
+              projectPath: normalizeStoredProjectPath(canonicalMemory.projectPath),
+              mutationType: "update",
+              targetMemoryId: canonicalMemory.id,
+              category,
+              newContent: content
+            });
+          }
+        })();
+        queueEmbedding({ db, projectIdentity, memoryId: canonicalMemory.id, content });
+        const supersededIds = sourceMemories.map((memory) => memory.id).filter((id) => id !== canonicalMemory.id);
+        return {
+          text: `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemory.id}] in ${category}; superseded [${supersededIds.join(", ")}].`
+        };
+      }
+      if (action === "archive") {
+        const rawArchiveIds = params.ids;
+        if (!rawArchiveIds || rawArchiveIds.length === 0 || !rawArchiveIds.every(Number.isInteger)) {
+          throw toolError("'ids' must contain at least one integer memory ID when action is 'archive'.");
+        }
+        const archiveIds = [...new Set(rawArchiveIds)];
+        for (const memoryId of archiveIds) {
+          const memory = getMemoryById(db, memoryId);
+          if (!memory || !memoryOwnedByTool(memory)) {
+            throw toolError(`Memory with ID ${memoryId} was not found.`);
+          }
+          if (!isPrimaryMutableMemory(memory)) {
+            throw toolError(inactiveMemoryError(memoryId, "archiving"));
+          }
+        }
+        runImmediateTransaction(db, () => {
+          for (const memoryId of archiveIds) {
+            archiveMemory(db, memoryId, params.reason);
+            queueMemoryMutation(db, {
+              projectPath: normalizeStoredProjectPath(projectIdentity),
+              mutationType: "archive",
+              targetMemoryId: memoryId
+            });
+          }
+        });
+        const reasonSuffix = params.reason ? ` (${params.reason})` : "";
+        const idList = archiveIds.join(", ");
+        const plural = archiveIds.length > 1 ? "memories" : "memory";
+        return { text: `Archived ${plural} [ID: ${idList}]${reasonSuffix}.` };
+      }
+      throw toolError("Unknown action.");
+    }
+  });
+}
+var FILTER_VALUES = ["active", "pending", "ready", "dismissed", "all"];
+var DEFAULT_READ_LIMIT = 25;
+var DISMISS_FOOTER = `
+
+To dismiss a stale note: ctx_note(action="dismiss", note_id=N)`;
+function captureAnchorOrdinal(db, sessionId) {
+  try {
+    const ordinal = getLastIndexedOrdinal(db, sessionId);
+    return ordinal > 0 ? ordinal : null;
+  } catch {
+    return null;
+  }
+}
+function anchorSuffix(note) {
+  return note.anchorOrdinal !== null ? ` ↳ @msg ${note.anchorOrdinal}` : "";
+}
+function formatNoteLine(note) {
+  if (note.type === "smart") {
+    const conditionLine = note.status === "ready" ? note.readyReason ?? note.surfaceCondition ?? "Condition satisfied" : note.surfaceCondition ?? "No condition recorded";
+    const statusSuffix = note.status === "active" ? "" : ` (${note.status})`;
+    return `- **#${note.id}**${statusSuffix}: ${note.content}${anchorSuffix(note)}
+  *Condition*: ${conditionLine}`;
+  }
+  const statusSuffix = note.status === "active" ? "" : ` (${note.status})`;
+  return `- **#${note.id}**${statusSuffix}: ${note.content}${anchorSuffix(note)}`;
+}
+function paginateNewestFirst(notes, limit, offset) {
+  const total = notes.length;
+  const newestFirst = [...notes].reverse();
+  const page = newestFirst.slice(offset, offset + limit);
+  const remaining = total - offset - page.length;
+  const footer = remaining > 0 ? `Showing ${page.length} of ${total} (newest first) — ${remaining} older: ctx_note(action="read", offset=${offset + page.length})` : null;
+  return { page, total, footer };
+}
+function readNotes(args) {
+  const { db, sessionId, projectIdentity, filter, limit, offset } = args;
+  if (filter === undefined) {
+    const sessionNotes = getNotes(db, {
+      sessionId,
+      type: "session",
+      status: "active"
+    });
+    const readySmartNotes = projectIdentity ? getNotes(db, {
+      projectPath: projectIdentity,
+      type: "smart",
+      status: "ready"
+    }) : [];
+    const sections = [];
+    if (sessionNotes.length > 0) {
+      const { page, footer } = paginateNewestFirst(sessionNotes, limit, offset);
+      sections.push(`## Session Notes
+
+${page.map(formatNoteLine).join(`
+`)}${footer ? `
+
+${footer}` : ""}`);
+    }
+    if (readySmartNotes.length > 0) {
+      sections.push(`## \uD83D\uDD14 Ready Smart Notes
+
+${readySmartNotes.map(formatNoteLine).join(`
+
+`)}`);
+    }
+    return sections;
+  }
+  const statusByFilter = {
+    active: "active",
+    all: ["active", "pending", "ready", "dismissed"],
+    dismissed: "dismissed",
+    pending: "pending",
+    ready: "ready"
+  };
+  const status = statusByFilter[filter];
+  const sessionNotes = getNotes(db, { sessionId, type: "session", status });
+  const smartNotes = projectIdentity ? getNotes(db, { projectPath: projectIdentity, type: "smart", status }) : [];
+  const sections = [];
+  if (sessionNotes.length > 0) {
+    const { page, footer } = paginateNewestFirst(sessionNotes, limit, offset);
+    sections.push(`## Session Notes
+
+${page.map(formatNoteLine).join(`
+`)}${footer ? `
+
+${footer}` : ""}`);
+  }
+  if (smartNotes.length > 0) {
+    const { page, footer } = paginateNewestFirst(smartNotes, limit, offset);
+    sections.push(`## Smart Notes
+
+${page.map(formatNoteLine).join(`
+
+`)}${footer ? `
+
+${footer}` : ""}`);
+  }
+  return sections;
+}
+function createCtxNoteTool(ctx, opts) {
+  return defineTool2({
+    name: "ctx_note",
+    description: CTX_NOTE_DESCRIPTION,
+    parameters: {
+      action: {
+        type: "string",
+        enum: ["write", "read", "dismiss", "update"],
+        description: "Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'."
+      },
+      content: { type: "string", description: "Note text to store when action is 'write'." },
+      surface_condition: {
+        type: "string",
+        description: "Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead."
+      },
+      note_id: { type: "integer", description: "Note ID (required for 'dismiss' and 'update' actions)." },
+      filter: {
+        type: "string",
+        enum: [...FILTER_VALUES],
+        description: "Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes."
+      },
+      limit: { type: "integer", description: "Max notes per section for read, newest first (default: 25)" },
+      offset: { type: "integer", description: "Skip this many newest notes for read — page older ones (default: 0)" }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'ctx_note' requires an agent execution context.");
+      const params = unwrapImitatedReducedArgs(args, ["action", "content"], {
+        action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
+        content: "string",
+        surface_condition: "string",
+        note_id: "number",
+        filter: { type: "enum", values: FILTER_VALUES },
+        limit: "number",
+        offset: "number"
+      });
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId)
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      const sessionId = runtime.sessionId;
+      const db = await resolveDb(ctx, opts);
+      const dreamerEnabled = opts.dreamerEnabled;
+      const action = params.action ?? (params.content?.trim() ? "write" : "read");
+      if (action === "write") {
+        const content = params.content?.trim();
+        if (!content)
+          throw toolError("'content' is required when action is 'write'.");
+        const anchorOrdinal = captureAnchorOrdinal(db, sessionId);
+        const surfaceCondition = params.surface_condition?.trim();
+        if (surfaceCondition) {
+          if (dreamerEnabled !== true) {
+            throw toolError("Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.");
+          }
+          if (!runtime.cwd)
+            throw toolError("Could not resolve the working directory for this agent.");
+          if (!runtime.projectIdentity) {
+            throw toolError("Could not resolve project identity for smart note.");
+          }
+          const note = addNote(db, "smart", {
+            content,
+            sessionId,
+            projectPath: runtime.projectIdentity,
+            surfaceCondition,
+            anchorOrdinal
+          });
+          return {
+            text: `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:
+- Content: ${content}
+- Condition: ${surfaceCondition}`
+          };
+        }
+        const note = addNote(db, "session", { sessionId, content, anchorOrdinal });
+        return { text: `Saved session note #${note.id}.` };
+      }
+      if (action === "dismiss") {
+        if (typeof params.note_id !== "number") {
+          throw toolError("'note_id' is required when action is 'dismiss'.");
+        }
+        if (!runtime.cwd)
+          throw toolError("Could not resolve the working directory for this agent.");
+        if (!runtime.projectIdentity) {
+          throw toolError("Could not resolve project identity for note dismiss.");
+        }
+        const dismissed = dismissNote(db, params.note_id, {
+          projectPath: runtime.projectIdentity,
+          sessionId
+        });
+        if (!dismissed) {
+          throw toolError(`Note #${params.note_id} not found in your session/project or already dismissed.`);
+        }
+        return { text: `Note #${params.note_id} dismissed.` };
+      }
+      if (action === "update") {
+        if (typeof params.note_id !== "number") {
+          throw toolError("'note_id' is required when action is 'update'.");
+        }
+        const updates = {};
+        if (params.content?.trim())
+          updates.content = params.content.trim();
+        if (params.surface_condition?.trim())
+          updates.surfaceCondition = params.surface_condition.trim();
+        if (!updates.content && !updates.surfaceCondition) {
+          throw toolError("Provide 'content' and/or 'surface_condition' to update.");
+        }
+        if (!runtime.cwd)
+          throw toolError("Could not resolve the working directory for this agent.");
+        if (!runtime.projectIdentity) {
+          throw toolError("Could not resolve project identity for note update.");
+        }
+        const updated = updateNote(db, params.note_id, updates, {
+          projectPath: runtime.projectIdentity,
+          sessionId
+        });
+        if (!updated)
+          throw toolError(`Note #${params.note_id} not found in your session/project.`);
+        const parts = [];
+        if (updates.content)
+          parts.push(`content: ${updates.content}`);
+        if (updates.surfaceCondition)
+          parts.push(`condition: ${updates.surfaceCondition}`);
+        return { text: `Updated note #${params.note_id}
+- ${parts.join(`
+- `)}` };
+      }
+      const limit = typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : DEFAULT_READ_LIMIT;
+      const offset = typeof params.offset === "number" && params.offset > 0 ? Math.floor(params.offset) : 0;
+      const sections = readNotes({
+        db,
+        sessionId,
+        projectIdentity: runtime.projectIdentity,
+        filter: params.filter,
+        limit,
+        offset
+      });
+      try {
+        setNoteLastReadAt(db, sessionId);
+      } catch {}
+      if (sections.length === 0)
+        return { text: `## Notes
+
+No session notes or smart notes.` };
+      const body = sections.join(`
+
+`);
+      const anchorHint = body.includes("↳ @msg ") ? `
+
+↳ @msg N marks the conversation tail when a note was written. To see what led to it: ctx_expand(start=N-x, end=N) (pick x for how far back to look).` : "";
+      return { text: `${body}${anchorHint}${DISMISS_FOOTER}` };
+    }
+  });
+}
+function readRawMessagesFromAgent(agent) {
+  return convertDshEventsToRawMessages(sessionEvents2(agent.session));
+}
+function createCtxExpandTool(ctx, opts) {
+  const readRawMessages = opts.readRawMessages ?? readRawMessagesFromAgent;
+  return defineTool2({
+    name: "ctx_expand",
+    description: CTX_EXPAND_DESCRIPTION,
+    parameters: {
+      start: {
+        type: "integer",
+        description: `First message ordinal to expand — a compartment's start="N" attribute, or an ordinal from a ctx_search message hit`
+      },
+      end: { type: "integer", description: `Last message ordinal to expand (inclusive) — a compartment's end="M" attribute` },
+      verbose: {
+        type: "boolean",
+        description: "With start/end: list each message separately with its ordinal [N] and per-part preview, so you can recover one in full by ordinal."
+      },
+      message: {
+        type: "integer",
+        description: "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce."
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'ctx_expand' requires an agent execution context.");
+      const params = unwrapImitatedReducedArgs(args, ["message", "start"], {
+        start: "number",
+        end: "number",
+        verbose: "boolean",
+        message: "number"
+      });
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId)
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      const sessionId = runtime.sessionId;
+      const db = await resolveDb(ctx, opts);
+      const unregister = setRawMessageProvider(sessionId, {
+        readMessages: () => readRawMessages(agent)
+      });
+      try {
+        if (typeof params.message === "number" && params.message >= 1) {
+          return { text: renderMessageByOrdinal(sessionId, params.message) };
+        }
+        if (typeof params.start !== "number" || typeof params.end !== "number" || params.start < 1 || params.end < params.start) {
+          throw toolError("provide either message=<ordinal>, or start and end (positive integers, start <= end).");
+        }
+        const lastCompartmentEnd = getLastCompartmentEndMessage(db, sessionId);
+        if (lastCompartmentEnd >= 0 && params.start > lastCompartmentEnd) {
+          return {
+            text: `Range ${params.start}-${params.end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`
+          };
+        }
+        const effectiveEnd = lastCompartmentEnd >= 0 ? Math.min(params.end, lastCompartmentEnd) : params.end;
+        if (params.verbose === true) {
+          const v = renderVerboseRange(sessionId, params.start, effectiveEnd, CTX_EXPAND_TOKEN_BUDGET);
+          if (!v.text) {
+            return {
+              text: `No messages found in range ${params.start}-${effectiveEnd}. The range may be outside this session's history.`
+            };
+          }
+          const out = [
+            `Messages ${params.start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
+            "",
+            v.text
+          ];
+          if (v.truncated) {
+            out.push("", `Truncated at message ${v.lastOrdinal} (budget: ~${CTX_EXPAND_TOKEN_BUDGET} tokens). Call again with start=${v.lastOrdinal + 1} end=${effectiveEnd} verbose=true for more.`);
+          }
+          return { text: out.join(`
+`) };
+        }
+        const chunk = readSessionChunk(sessionId, CTX_EXPAND_TOKEN_BUDGET, params.start, effectiveEnd + 1);
+        if (!chunk.text || chunk.messageCount === 0) {
+          return {
+            text: `No messages found in range ${params.start}-${params.end}. The range may be outside this session's history.`
+          };
+        }
+        const lines = [];
+        lines.push(`Messages ${chunk.startIndex}-${chunk.endIndex} (${chunk.messageCount} messages, ~${chunk.tokenEstimate} tokens):`);
+        lines.push("");
+        lines.push(chunk.text);
+        if (chunk.endIndex < effectiveEnd) {
+          lines.push("", `Truncated at message ${chunk.endIndex} (budget: ~${CTX_EXPAND_TOKEN_BUDGET} tokens). Call again with start=${chunk.endIndex + 1} end=${effectiveEnd} for more.`);
+        }
+        return { text: lines.join(`
+`) };
+      } finally {
+        unregister();
+      }
+    }
+  });
+}
+function formatIds(ids) {
+  return ids.map((id) => `§${id}§`).join(", ");
+}
+function createCtxReduceTool(ctx, opts) {
+  return defineTool2({
+    name: "ctx_reduce",
+    description: CTX_REDUCE_DESCRIPTION,
+    parameters: {
+      drop: {
+        type: "string",
+        description: "Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'ctx_reduce' requires an agent execution context.");
+      const params = unwrapImitatedReducedArgs(args, ["drop"], {
+        drop: "string"
+      });
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId)
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      const sessionId = runtime.sessionId;
+      const protectedTags = Math.max(0, Math.floor(opts.protectedTags ?? 20));
+      if (!params.drop)
+        throw toolError("'drop' must be provided.");
+      let dropIds = [];
+      try {
+        dropIds = parseRangeString(params.drop);
+      } catch (error) {
+        throw toolError(`Invalid range syntax. ${getErrorMessage(error)}`);
+      }
+      const allIds = [...new Set(dropIds)];
+      const db = await resolveDb(ctx, opts);
+      const allTags = getTagsBySession(db, sessionId);
+      const foundSet = new Set(allTags.map((tag) => tag.tagNumber));
+      const unknownIds = allIds.filter((id) => !foundSet.has(id));
+      if (unknownIds.length > 0) {
+        throw toolError(`Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`);
+      }
+      const activeTags = allTags.filter((tag) => tag.status === "active");
+      const protectedTagIds = activeTags.map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, protectedTags);
+      const protectedSet = new Set(protectedTagIds);
+      const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
+      const pendingOps = getPendingOps(db, sessionId);
+      const pendingMap = new Map(pendingOps.map((op) => [op.tagId, op.operation]));
+      const conflicts = [];
+      for (const id of dropIds) {
+        if (tagStatusMap.get(id) === "compacted") {
+          conflicts.push(`§${id}§ is from before compaction`);
+        }
+      }
+      if (conflicts.length > 0) {
+        throw toolError(`Conflicting operations — ${conflicts.join("; ")}.`);
+      }
+      const preFilterDropCount = dropIds.length;
+      dropIds = dropIds.filter((id) => tagStatusMap.get(id) !== "dropped" && pendingMap.get(id) !== "drop");
+      const skippedCount = preFilterDropCount - dropIds.length;
+      if (dropIds.length === 0) {
+        return {
+          text: "All requested tags were already queued or processed. No new action is needed."
+        };
+      }
+      try {
+        db.transaction(() => {
+          const now = Date.now();
+          for (const id of dropIds) {
+            queuePendingOp(db, sessionId, id, "drop", now);
+          }
+        })();
+      } catch (error) {
+        throw toolError(`Failed to queue ctx_reduce operations. ${getErrorMessage(error)}`);
+      }
+      const currentInputTokens = getOrCreateSessionMeta(db, sessionId).lastInputTokens;
+      updateSessionMeta(db, sessionId, {
+        lastNudgeTokens: currentInputTokens
+      });
+      const immediateDropIds = dropIds.filter((id) => !protectedSet.has(id));
+      const deferredDropIds = [...new Set(dropIds.filter((id) => protectedSet.has(id)))];
+      const skippedNote = skippedCount > 0 ? ` ${skippedCount} requested tag${skippedCount === 1 ? " was" : "s were"} already queued and need no action.` : "";
+      const parts = [];
+      if (immediateDropIds.length > 0)
+        parts.push(`drop ${formatIds(immediateDropIds)}`);
+      if (deferredDropIds.length > 0)
+        parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
+      return { text: `Queued: ${parts.join(", ")}.${skippedNote}` };
+    }
+  });
+}
+function createTodowriteTool(ctx, opts) {
+  return defineTool2({
+    name: "todowrite",
+    description: `Manage the session task list.
+
+` + "Use todowrite for non-trivial work spanning 3+ steps, when the user gives you multiple tasks, " + "or when you need to track progress across a verify/fix loop. Skip it for single-shot answers " + `or trivial one-step work.
+` + "Pass the COMPLETE updated todo list every time. This tool replaces the prior list rather than " + "appending to it, so include pending, in_progress, completed, and cancelled tasks that should " + `remain visible.
+` + "When starting a task, mark exactly one todo in_progress before doing the work. Mark items " + `completed immediately when done; use cancelled only for work that is no longer needed.
+` + "Never mark a todo completed if verification is failing, implementation is partial, or an " + "unresolved blocker remains. Keep it in_progress and add or update a todo for the blocker instead.",
+    parameters: {
+      todos: {
+        type: "array",
+        description: "Replace the current task list with this complete set of todos. Include every task you intend to track this turn — pending, in_progress, completed, or cancelled — because the list overwrites previous state.",
+        items: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "Brief description of the task" },
+            status: { type: "string", enum: [...TODO_STATUSES] },
+            priority: { type: "string", enum: [...TODO_PRIORITIES] },
+            id: { type: "string", description: "Optional stable id for the todo" }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'todowrite' requires an agent execution context.");
+      const params = args ?? {};
+      const todos = Array.isArray(params.todos) ? params.todos : [];
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId) {
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      }
+      try {
+        const db = await resolveDb(ctx, opts);
+        const normalized = normalizeTodoStateJson(todos);
+        if (normalized !== null) {
+          updateSessionMeta(db, runtime.sessionId, { lastTodoState: normalized });
+        }
+      } catch {}
+      const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
+      if (todos.length > 0 && todos.every((todo) => TERMINAL_STATUSES.has(todo.status))) {
+        try {
+          const todoDb = await resolveDb(ctx, opts);
+          onNoteTrigger(todoDb, runtime.sessionId, "todos_complete");
+        } catch {}
+      }
+      return { text: JSON.stringify(todos, null, 2) };
+    }
+  });
+}
+function registerCtxTools(ctx, opts = {}) {
+  const disposers = [];
+  try {
+    disposers.push(registerTool(ctx, createCtxSearchTool(ctx, opts)));
+    if (opts.todowriteEnabled !== false) {
+      disposers.push(registerTool(ctx, createTodowriteTool(ctx, opts)));
+    }
+    if (opts.memoryToolEnabled !== false) {
+      disposers.push(registerTool(ctx, createCtxMemoryTool(ctx, opts)));
+    }
+    if (!opts.sessionScopedToolsDisabled) {
+      disposers.push(registerTool(ctx, createCtxNoteTool(ctx, opts)));
+      disposers.push(registerTool(ctx, createCtxExpandTool(ctx, opts)));
+    }
+    if (!opts.sessionScopedToolsDisabled && !opts.compactionOff) {
+      disposers.push(registerTool(ctx, createCtxReduceTool(ctx, opts)));
+    }
+  } catch (error) {
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch {}
+    }
+    throw error;
+  }
+  return () => {
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch {}
+    }
+  };
+}
+
+export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, stripJsonComments, isPrototypePollutionKey, parseJsonc, detectConfigFile, setOutputReserveConfig, getSdkContextLimit, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, DEFAULT_PROTECTED_TAGS, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, DreamerConfigSchema, MagicContextConfigSchema, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, contentSha256, enqueueShadowEmbeddingItems, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isMidTurn, getMessageTimesFromOpenCodeDb, isRecord, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, getLastNudgeUndropped, setLastNudgeUndropped, getLastNudgeLevel, setLastNudgeLevel, getChannel2NudgeState, setChannel2NudgeState, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, getActiveTagTokenAggregate, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, buildSyntheticTodoPart, onNoteTrigger, peekNoteNudgeText, markNoteNudgeDelivered, cavemanCompress, unifiedSearch, resolveFallbackChain, parseProviderModel, modelBodyField, promptSyncWithModelSuggestionRetry, promptSyncWithValidatedOutputRetry, normalizeSDKResponse, CHANNEL1_FLOOR_TOKENS, decideChannel1, shouldTriggerChannel2, buildChannel2Reminder, buildChannel1Reminder, createTagger, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity, registerCtxTools };

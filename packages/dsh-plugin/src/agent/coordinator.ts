@@ -33,6 +33,7 @@ import {
   magicUserMessage,
 } from "../compat/dsh-0.1/session";
 import { readDshTranscript, type MutationPlan } from "./transcript";
+import { sessionEvents } from "../compat/dsh-0.1/session";
 import {
   getOutboxRecord,
   insertOutboxPending,
@@ -74,7 +75,7 @@ export function createCoordinatorState(): CoordinatorState {
 function liveFacts(session: Session, canonicalSessionId: string): { digest: string; generation: number } {
   const view = readDshTranscript({
     session: {
-      events: session.events,
+      events: sessionEvents(session),
       surface: session.surface,
       header: {},
     },
@@ -155,7 +156,7 @@ function applyInsertionMerge(
   if (nodeSeq === undefined) {
     throw new Error(`magic-context: insertion op at ${op.start} outside the live surface`);
   }
-  const event = session.events[nodeSeq];
+  const event = sessionEvents(session)[nodeSeq];
   const existing = deriveEventMessage(event);
   const originalText = existing?.content
     ?.map((block) => (block.type === "text" ? block.text : ""))

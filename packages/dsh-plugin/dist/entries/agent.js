@@ -192,7 +192,7 @@ import {
   deriveMutationPlan,
   resolveDb,
   registerCtxTools
-} from "./agent-v534j6cb.js";
+} from "./agent-9zm01x6r.js";
 import {
   getHarness,
   ensureCortexKitArtifactGitignore,
@@ -274,12 +274,13 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-a4fynjzt.js";
+} from "./agent-jkdfesgp.js";
 import {
   createUserMessage2,
   deriveEventMessage2,
-  magicUserMessage2
-} from "./agent-56hph06t.js";
+  magicUserMessage2,
+  sessionEvents2
+} from "./agent-md57b5ck.js";
 import {
   pushNotification2
 } from "./agent-b3eqj1g6.js";
@@ -2825,7 +2826,7 @@ ${m1Text}` : "";
   };
 }
 function isMagicWatermarkOnSurface(session, watermark) {
-  const events = session.events;
+  const events = sessionEvents2(session);
   for (const seq of session.surface.nodes) {
     const event = events[seq];
     if (!event || event.type !== "user/message")
@@ -3155,7 +3156,7 @@ function createCoordinatorState() {
 function liveFacts(session, canonicalSessionId) {
   const view = readDshTranscript({
     session: {
-      events: session.events,
+      events: sessionEvents2(session),
       surface: session.surface,
       header: {}
     },
@@ -3207,7 +3208,7 @@ function applyInsertionMerge(host, session, plan, op) {
   if (nodeSeq === undefined) {
     throw new Error(`magic-context: insertion op at ${op.start} outside the live surface`);
   }
-  const event = session.events[nodeSeq];
+  const event = sessionEvents2(session)[nodeSeq];
   const existing = deriveEventMessage2(event);
   const originalText = existing?.content?.map((block) => block.type === "text" ? block.text : "").join(`
 `) ?? "";
@@ -4379,7 +4380,7 @@ function createLlmSummarizeCall(ctx, modelOverride) {
 function transcriptRawMessageProvider(agent, canonicalSessionId) {
   const view = readDshTranscript({
     session: {
-      events: agent.session.events,
+      events: sessionEvents2(agent.session),
       surface: agent.session.surface,
       header: { cwd: agent.session.header.cwd }
     },
@@ -4433,7 +4434,7 @@ function createContextPlaneState() {
   };
 }
 function sessionLogView(db, sessionId, agent, canonicalSessionId) {
-  const events = agent.session.events;
+  const events = sessionEvents2(agent.session);
   const seqSet = new Set;
   for (const event of events) {
     if (event !== null && typeof event === "object") {
@@ -4444,7 +4445,7 @@ function sessionLogView(db, sessionId, agent, canonicalSessionId) {
   }
   return {
     hasSeq: (seq) => seqSet.has(seq),
-    generation: agent.session.surface.replaceGeneration
+    generation: agent.session.surface?.replaceGeneration ?? 0
   };
 }
 var COMMIT_MENTION_RE = /(?:^|[\s(`])[0-9a-f]{7,40}(?:$|[\s`)])/i;
@@ -4593,7 +4594,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
         session: {
-          events: agent.session.events,
+          events: sessionEvents2(agent.session),
           surface: agent.session.surface,
           header: {}
         },
@@ -4604,6 +4605,10 @@ async function runContextPlaneStep(state, deps, payload, next) {
         protectedTags: deps.config?.protectedTags ?? 20,
         heuristicCleanup: deps.heuristicCleanup
       });
+      const sessionEventCount = sessionEvents2(agent.session).length;
+      if (view.messages.length === 0 && sessionEventCount > 0) {
+        log(`[magic-context] empty transcript despite ${sessionEventCount} session events` + ` (surfaceNodes=${agent.session.surface?.nodes?.length ?? "n/a"}) — tagging is producing nothing.`);
+      }
       if (plan !== null) {
         const hostView = {
           db,
@@ -4632,7 +4637,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
           return source?.plugin === "magic-context" && source?.messageId === noteMarker;
         });
         if (!alreadyInjected) {
-          const { magicUserMessage } = await import("./session-z397bmc3.js");
+          const { magicUserMessage } = await import("./session-84q6p5q0.js");
           const noteMessage = magicUserMessage(noteText, { kind: "plugin", plugin: "magic-context", messageId: noteMarker }, []);
           agent.inject?.(noteMessage);
           markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
@@ -4644,6 +4649,9 @@ async function runContextPlaneStep(state, deps, payload, next) {
       maybeFireHistorian(historian, db, canonicalSessionId, agent, deps.directory);
     }
   } catch (error) {
+    const detail = error instanceof Error ? `${error.message}
+${error.stack ?? ""}` : String(error);
+    log(`[magic-context] context plane failed (fail-open): ${detail}`);
     deps.log?.(`[magic-context] context plane failed (fail-open): ${error instanceof Error ? error.message : String(error)}`);
   }
   return await next();

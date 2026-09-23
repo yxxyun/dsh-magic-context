@@ -99,3 +99,37 @@ export function surfaceNodes(session: Session): readonly number[] {
 export function surfaceGeneration(session: Session): number {
   return session.surface.replaceGeneration;
 }
+
+/**
+ * Read a session's full event log.
+ *
+ * The DSH RUNTIME exposes events as `session.snapshotEvents()` — a METHOD. The
+ * type stubs this adapter compiles against (0.1.0-rc.6) instead declare a plain
+ * `session.events` property, which does not exist at runtime. Reading that
+ * property yields `undefined`, and `for (const e of undefined)` throws
+ * `TypeError: events is not iterable`.
+ *
+ * That throw was not benign: it fired inside the context plane's fail-open
+ * try/catch on the FIRST pre-step of every session, so `reconcileSessionOutbox`
+ * aborted the whole plane — no assistant/tool tagging, no history indexing, no
+ * transform decisions — and the catch logged through `ctx.logger.info`, a sink
+ * DSH never persists. The result looked perfectly healthy from the outside
+ * while only the separate pre-step `payload.messages` preview (user messages
+ * only) ever wrote tags.
+ *
+ * Prefer the runtime method, fall back to the property (tests, and any runtime
+ * that does expose it), and never throw — an unreadable log must degrade to
+ * "nothing to tag", not to "the plane is dead".
+ */
+export function sessionEvents(session: unknown): readonly SessionEvent[] {
+  const view = session as unknown as {
+    snapshotEvents?: () => unknown;
+    events?: unknown;
+  } | null | undefined;
+  if (view === null || view === undefined) return [];
+  if (typeof view.snapshotEvents === "function") {
+    const events = view.snapshotEvents();
+    if (Array.isArray(events)) return events as readonly SessionEvent[];
+  }
+  return Array.isArray(view.events) ? (view.events as readonly SessionEvent[]) : [];
+}

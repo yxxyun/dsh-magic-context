@@ -17,7 +17,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import { createUserMessage } from "../compat/dsh-0.1/session";
+import { createUserMessage, sessionEvents } from "../compat/dsh-0.1/session";
 import type { SummarizeHook } from "../compat/dsh-0.1/compaction";
 import type { MagicContextHostService, MagicSummarizeHook } from "../index";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
@@ -183,7 +183,7 @@ export function transcriptRawMessageProvider(
 ): RawMessageProvider {
   const view = readDshTranscript({
     session: {
-      events: agent.session.events,
+      events: sessionEvents(agent.session),
       surface: agent.session.surface,
       header: { cwd: agent.session.header.cwd },
     },

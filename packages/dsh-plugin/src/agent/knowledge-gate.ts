@@ -60,6 +60,7 @@ import {
   type PreStepPayload,
 } from "../compat/dsh-0.1/prestep";
 import type { DshStorageBootstrap } from "../host/bootstrap";
+import { sessionEvents } from "../compat/dsh-0.1/session";
 import { trackSessionProjectOnce, sessionProjectPath } from "./session-track";
 import { maybeRunAutoSearchHint, type AutoSearchConfig } from "./auto-search";
 import { isMagicChildSession } from "./worker";
@@ -304,7 +305,7 @@ export function isMagicWatermarkOnSurface(
   session: KnowledgeSessionView,
   watermark: string,
 ): boolean {
-  const events = session.events;
+  const events = sessionEvents(session);
   for (const seq of session.surface.nodes) {
     const event = events[seq] as
       | { type?: string; data?: { source?: MagicMessageSource | { kind?: string } } }

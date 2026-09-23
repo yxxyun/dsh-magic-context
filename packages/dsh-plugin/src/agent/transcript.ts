@@ -75,6 +75,7 @@ import type {
 import type { KnowledgeSessionView } from "./knowledge-gate";
 import {
   deriveEventMessage,
+  sessionEvents,
   type SessionEvent,
 } from "../compat/dsh-0.1/session";
 
@@ -682,7 +683,11 @@ export function findKnowledgeBaselineNodeIndices(
 
 /** Build the read-only transcript view (design §3). */
 export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView {
-  const events = Array.isArray(input.session.events) ? input.session.events : [];
+  // Resolve through the compat seam: the runtime exposes events as
+  // `session.snapshotEvents()`, NOT the `session.events` property the type
+  // stubs declare. Reading the property yielded undefined, which made every
+  // view empty and silently disabled all assistant/tool tagging.
+  const events = sessionEvents(input.session);
   const nodes = Array.isArray(input.session.surface?.nodes)
     ? [...input.session.surface.nodes]
     : [];
