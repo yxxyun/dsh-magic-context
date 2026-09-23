@@ -4,8 +4,10 @@ import {
   dshModelRefToCanonical,
   stripJsonComments,
   isPrototypePollutionKey,
+  parseJsoncRecovering,
   parseJsonc,
   detectConfigFile,
+  setWindowOverlayPath,
   setOutputReserveConfig,
   modelSupportsVision,
   withContentLanguageDirective,
@@ -16,15 +18,21 @@ import {
   nextDueAtMs,
   DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
   DEFAULT_HISTORIAN_TIMEOUT_MS,
+  PROTECTED_TOKENS_MIN,
+  PER_HARNESS_MIGRATION_INVENTORY,
+  PER_HARNESS_MODEL_KEYS,
+  ConfigProfilesSchema,
   DreamerConfigSchema,
   MagicContextConfigSchema,
   COMPARTMENT_LEASE_RENEWAL_MS,
   acquireCompartmentLease,
   renewCompartmentLease,
   releaseCompartmentLease,
+  releaseCompartmentLeaseBestEffort,
   isCompartmentLeaseHeld,
   clearCompressionDepth,
   clearCompressionDepthRange,
+  isNoContentCompartment,
   clearCachedM0M1,
   getCompartments,
   getLastCompartmentEndMessage,
@@ -58,6 +66,8 @@ import {
   archiveMemory,
   deleteMemory,
   getMemoryCountsByStatus,
+  SubcClient,
+  connectionFileExists,
   buildCanonicalChunkTextFromFts,
   buildCompartmentSummaryFallbackText,
   canonicalizeInMemoryChunkTextForEmbedding,
@@ -89,10 +99,19 @@ import {
   readGitFileChangeTimesSince,
   verificationFileExists,
   normalizeVerificationFiles,
-  isMidTurn,
-  getMessageTimesFromOpenCodeDb,
   isRecord,
+  buildSyntheticTodoPart,
+  CHANNEL1_FLOOR_TOKENS,
+  decideChannel1,
+  evaluateChannel2,
+  buildChannel2Reminder,
+  buildChannel1Reminder,
+  getActiveTagTokenAggregate,
+  getOldestActiveUnprotectedToolTags,
+  getTagsBySession,
+  getMessageTimesFromOpenCodeDb,
   completedToolArcCrossesBoundary,
+  hasRawMessageProvider,
   setRawMessageProvider,
   withRawMessageProvider,
   cleanUserText,
@@ -107,6 +126,7 @@ import {
   indexMessagesAfterOrdinal,
   queueM0Mutation,
   queueMemoryMutation,
+  describeProtectedTailDrainBudgetSkip,
   recordProtectedTailPublicationFloor,
   getWrapupInProgressState,
   isWrapupInProgress,
@@ -120,8 +140,8 @@ import {
   rollbackProtectedTailDrainReservation,
   getLastNudgeUndropped,
   setLastNudgeUndropped,
-  getLastNudgeLevel,
-  setLastNudgeLevel,
+  getChannel1NudgeState,
+  setChannel1NudgeState,
   getChannel2NudgeState,
   setChannel2NudgeState,
   getAutoSearchHintDecisions,
@@ -155,8 +175,6 @@ import {
   bumpProjectUserProfileVersion,
   recordSubagentInvocation,
   getLatestHistorianInvocationId,
-  getActiveTagTokenAggregate,
-  getTagsBySession,
   USER_MEMORY_CANDIDATE_TTL_MS,
   insertUserMemoryCandidates,
   getUserMemoryCandidates,
@@ -166,6 +184,7 @@ import {
   getActiveUserMemories,
   updateUserMemoryContent,
   dismissUserMemory,
+  BoundedSessionMap,
   updateCompactionMarkerAfterPublication,
   clearInjectionCache,
   getVisibleMemoryIds,
@@ -173,66 +192,31 @@ import {
   mustMaterialize,
   materializeWithRetry,
   renderM1,
-  buildSyntheticTodoPart,
   onNoteTrigger,
   peekNoteNudgeText,
   markNoteNudgeDelivered,
   cavemanCompress,
   unifiedSearch,
-  resolveFallbackChain,
   parseProviderModel,
   modelBodyField,
+  toModelEntry,
+  getPromptFailureDetail,
   promptSyncWithModelSuggestionRetry,
   promptSyncWithValidatedOutputRetry,
   normalizeSDKResponse,
-  CHANNEL1_FLOOR_TOKENS,
-  decideChannel1,
-  shouldTriggerChannel2,
-  buildChannel2Reminder,
-  buildChannel1Reminder,
   createTagger,
   convertDshEventsToRawMessages,
   readDshTranscript,
   deriveMutationPlan,
-  resolveDb,
   registerCtxTools
-} from "./agent-89gq5dda.js";
+} from "./agent-bqmbqaya.js";
 import {
-  getHarness,
-  ensureCortexKitArtifactGitignore,
-  getProjectMagicContextHistorianDir,
-  log,
-  sessionLog
-} from "./agent-nb38pbc0.js";
-import {
-  cortexKitUserConfigBasePath,
-  cortexKitProjectConfigBasePath,
-  resolveLegacyConfigSources,
-  resolveLegacyConfigSourcesForHarness,
-  hasMeaningfulUserText,
-  extractTexts,
-  extractToolCallSummaries,
-  estimateTokens,
-  normalizeText,
-  resolveProjectIdentity2,
-  resolveProjectIdentityForSession,
-  getModuleNoteEvaluationBridge,
-  getContextStoreUuid,
-  parseCompartmentOutput,
-  bumpEpochsForWorkspaceMembers,
-  scheduleAfterBootQuiet,
-  getErrorMessage,
-  describeError,
-  getSchemaFenceRejection,
-  LATEST_SUPPORTED_VERSION,
-  getPersistedSchemaVersion,
-  openDatabase
-} from "./agent-z992kvg4.js";
-import {
+  CONFIG_WARNING_CLASS,
   resolveCacheTtl,
   deriveTriggerBudget,
   deriveHistorianChunkTokens,
   resolveHistorianContextLimit,
+  describeBoundaryDiagnostics,
   selectPerRunCap,
   resolveOpenCodeProtectedTailBoundary,
   resolveWrapupProtectedTailBoundary,
@@ -241,6 +225,11 @@ import {
   recordHighPressureNoEligibleHead,
   createDefaultBoundarySnapshotForTests,
   getProactiveCompartmentTriggerPercentage,
+  renderUserFacingFailure,
+  userFacingFailureCode,
+  renderCapabilityRefusal,
+  renderDreamFailure,
+  dreamFailureCode,
   parseCacheTtl,
   SMART_NOTE_CHECK_FLOOR_MS,
   SMART_NOTE_CHECK_CEILING_MS,
@@ -265,7 +254,11 @@ import {
   writeTaskScheduleState,
   isRetrospectiveWindowProcessed,
   recordRetrospectiveWindowProcessed,
+  curateCategoryForMemoryCategory,
+  beginCurateCategoryRun,
+  curateTaskStateAfterSuccess,
   CANONICAL_DREAM_TASKS,
+  DREAM_TASK_CAPABILITIES,
   processedDreamTaskItems,
   leaseKeyFor,
   getDreamTaskBacklog,
@@ -279,7 +272,47 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-8z9wzard.js";
+} from "./agent-98m64s99.js";
+import {
+  getHarness,
+  getDataDir,
+  ensureCortexKitArtifactGitignore,
+  getProjectMagicContextHistorianDir,
+  sanitizeDiagnosticText,
+  hasShareabilitySensitiveText,
+  log,
+  sessionLog,
+  setJsoncValue,
+  removeJsoncValue,
+  cortexKitUserConfigBasePath,
+  cortexKitProjectConfigBasePath,
+  resolveLegacyConfigSources,
+  resolveLegacyConfigSourcesForHarness,
+  logSlowWriteTransaction,
+  hasMeaningfulUserText,
+  extractTexts,
+  extractToolCallSummaries,
+  estimateTokens,
+  normalizeText,
+  scheduleAfterBootQuiet,
+  resolveProjectIdentity2,
+  resolveProjectIdentityForSession,
+  getModuleNoteEvaluationBridge,
+  getContextStoreUuid,
+  drainMirrorPages,
+  resolveOpenCodeDbPath,
+  openCodeDbPathExists,
+  claimOpenCodeDbDiagnosticOnce,
+  parseCompartmentOutput,
+  bumpEpochsForWorkspaceMembers,
+  getErrorMessage,
+  describeError,
+  FAIL_CLOSED_DOCTOR_COMMAND,
+  getSchemaFenceRejection,
+  LATEST_SUPPORTED_VERSION,
+  getPersistedSchemaVersion,
+  openDatabase
+} from "./agent-5gth7qh5.js";
 import {
   deriveEventMessage2,
   MAGIC_SOURCE_KIND2,
@@ -296,7 +329,7 @@ import {
 } from "./agent-22jkk6wg.js";
 
 // ../plugin/src/config/index.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync as existsSync3 } from "node:fs";
 
 // ../plugin/src/config/agent-disable.ts
 function isDreamerRunnable(config) {
@@ -323,22 +356,14 @@ function migrateLegacyEnabledForAgent(args) {
     args.patched.historian = agent;
     return;
   }
-  if (args.agentName === "dreamer") {
-    if (disable !== true && enabled === false) {
-      agent.disable = true;
-      args.warnings.push('Migrated "dreamer.enabled=false" → "dreamer.disable=true" in-memory (run doctor to persist). This now also disables manual /ctx-dream; for manual-only remove disable and set schedule="".');
-    }
-    args.patched.dreamer = agent;
-    return;
-  }
   if (disable !== true && enabled === false) {
     agent.disable = true;
-    args.warnings.push('Migrated "sidekick.enabled=false" → "sidekick.disable=true" in-memory (run doctor to persist).');
+    args.warnings.push('Migrated "dreamer.enabled=false" → "dreamer.disable=true" in-memory (run doctor to persist). This now also disables manual /ctx-dream; for manual-only remove disable and set schedule="".');
   }
-  args.patched.sidekick = agent;
+  args.patched.dreamer = agent;
 }
 function migrateLegacyAgentEnabledInMemory(rawConfig, warnings) {
-  const shouldPatch = ["dreamer", "sidekick", "historian"].some((key) => {
+  const shouldPatch = ["dreamer", "historian"].some((key) => {
     const agent = rawConfig[key];
     return typeof agent === "object" && agent !== null && !Array.isArray(agent) && "enabled" in agent;
   });
@@ -346,7 +371,6 @@ function migrateLegacyAgentEnabledInMemory(rawConfig, warnings) {
     return rawConfig;
   const patched = { ...rawConfig };
   migrateLegacyEnabledForAgent({ patched, agentName: "dreamer", warnings });
-  migrateLegacyEnabledForAgent({ patched, agentName: "sidekick", warnings });
   migrateLegacyEnabledForAgent({ patched, agentName: "historian", warnings });
   return patched;
 }
@@ -659,17 +683,144 @@ function migrateLegacyExperimental(rawConfig, warnings) {
   return patched;
 }
 
+// ../plugin/src/config/profiles.ts
+function withoutProfileFields(raw) {
+  const copy = { ...raw };
+  delete copy.profile;
+  delete copy.profiles;
+  return copy;
+}
+function readProfileSelection(raw) {
+  if (!Object.hasOwn(raw, "profile"))
+    return { declared: false };
+  const value = raw.profile;
+  if (typeof value !== "string")
+    return { declared: true };
+  const name = value.trim();
+  return name.length > 0 ? { declared: true, name } : { declared: true };
+}
+function resolveConfigProfile(args) {
+  const warnings = [];
+  const userSelection = readProfileSelection(args.userRaw);
+  const projectSelection = readProfileSelection(args.projectRaw);
+  const selection = projectSelection.name ? { name: projectSelection.name, source: "project" } : userSelection.name ? { name: userSelection.name, source: "user" } : undefined;
+  if (projectSelection.declared && !projectSelection.name) {
+    warnings.push("Ignoring invalid profile selection from project config; expected a non-empty string.");
+  }
+  if (!projectSelection.declared && userSelection.declared && !userSelection.name) {
+    warnings.push("Ignoring invalid profile selection from user config; expected a non-empty string.");
+  }
+  let profiles = {};
+  if (Object.hasOwn(args.userRaw, "profiles")) {
+    const parsed = ConfigProfilesSchema.safeParse(args.userRaw.profiles);
+    if (parsed.success) {
+      profiles = parsed.data;
+    } else {
+      warnings.push("Ignoring profiles from user config: invalid profile configuration; profiles may contain only historian/dreamer harness model blocks.");
+    }
+  }
+  if (!selection) {
+    return {
+      userBase: withoutProfileFields(args.userRaw),
+      projectBase: withoutProfileFields(args.projectRaw),
+      overlay: {},
+      warnings
+    };
+  }
+  if (!Object.hasOwn(profiles, selection.name)) {
+    warnings.push(`Unknown profile "${selection.name}" selected by ${selection.source} config; using base config without a profile.`);
+    return {
+      userBase: withoutProfileFields(args.userRaw),
+      projectBase: withoutProfileFields(args.projectRaw),
+      overlay: {},
+      warnings
+    };
+  }
+  const overlay = profiles[selection.name];
+  return {
+    userBase: withoutProfileFields(args.userRaw),
+    projectBase: withoutProfileFields(args.projectRaw),
+    overlay,
+    activeProfile: selection.name,
+    warnings
+  };
+}
+
 // ../plugin/src/config/project-security.ts
-var HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"];
-var HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"];
+var HIDDEN_AGENT_KEYS = ["historian", "dreamer"];
+var HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
+var HISTORIAN_USER_ONLY_FIELDS = PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
 var PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"];
-var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"];
-var EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"];
+var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools"];
+var EMBEDDING_USER_ONLY_FIELDS = [
+  "endpoint",
+  "provider",
+  "fallback_provider",
+  "query_instruction",
+  "document_prefix"
+];
 var PERCENTAGE_THRESHOLD_REASON = "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 var TOKEN_THRESHOLD_REASON = "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
 var TOKEN_THRESHOLD_INTRODUCTION_REASON = "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
+var PROTECTED_TOKENS_REASON = "security: a repository may only raise protected_tokens above the resolved user-or-derived floor; it cannot lower protection.";
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resolveProtectedTokensScalar(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 4000 && value <= 1e6) {
+    return value;
+  }
+  return;
+}
+var PROTECTED_TOKENS_TIER_OVERRIDES = Symbol.for("@cortexkit/magic-context/protected-tokens-tier-overrides");
+function attachProtectedTokensTierOverrides(config, args) {
+  const user = resolveProtectedTokensScalar(args.trustedUser);
+  const rawProject = resolveProtectedTokensScalar(args.project);
+  const project = rawProject !== undefined && (user === undefined || rawProject >= user) ? rawProject : undefined;
+  if (user === undefined && project === undefined)
+    return config;
+  Object.defineProperty(config, PROTECTED_TOKENS_TIER_OVERRIDES, {
+    value: {
+      ...user !== undefined ? { user } : {},
+      ...project !== undefined ? { project } : {}
+    },
+    configurable: false,
+    enumerable: false,
+    writable: false
+  });
+  return config;
+}
+function stripListedFields(target, fields, path, removed) {
+  for (const field of fields) {
+    if (field in target) {
+      delete target[field];
+      removed.push(path.length > 0 ? `${path}.${field}` : field);
+    }
+  }
+}
+function stripEscalationAtExecutableSite(block, path, removed) {
+  stripListedFields(block, AGENT_ESCALATION_FIELDS, path, removed);
+  if (isPlainObject(block.model)) {
+    stripListedFields(block.model, AGENT_ESCALATION_FIELDS, `${path}.model`, removed);
+  }
+  if (Array.isArray(block.fallback_models)) {
+    for (let index = 0;index < block.fallback_models.length; index++) {
+      const entry = block.fallback_models[index];
+      if (isPlainObject(entry)) {
+        stripListedFields(entry, AGENT_ESCALATION_FIELDS, `${path}.fallback_models.${index}`, removed);
+      }
+    }
+  }
+}
+function stripNestedMuralModels(node, path, removed) {
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "mural" && isPlainObject(value) && "model" in value) {
+      delete value.model;
+      removed.push(`${path}.${key}.model`);
+    } else if (isPlainObject(value)) {
+      stripNestedMuralModels(value, `${path}.${key}`, removed);
+    }
+  }
 }
 function isValidPercentageThreshold(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
@@ -764,6 +915,10 @@ function makeProjectThresholdWarning(field, reason) {
 }
 function stripUnsafeProjectConfigFields(projectRaw) {
   const warnings = [];
+  if ("profiles" in projectRaw) {
+    delete projectRaw.profiles;
+    warnings.push("Ignoring profiles from project config (security: profile definitions are user-level only; a repository may select a named user profile with profile).");
+  }
   if ("auto_update" in projectRaw) {
     delete projectRaw.auto_update;
     warnings.push("Ignoring auto_update from project config (security: this setting only honors user-level config).");
@@ -771,6 +926,10 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   if ("fail_closed_blocking" in projectRaw) {
     delete projectRaw.fail_closed_blocking;
     warnings.push("Ignoring fail_closed_blocking from project config (security: only user-level config may disable or force the loud inoperability gate).");
+  }
+  if ("debug_rpc" in projectRaw) {
+    delete projectRaw.debug_rpc;
+    warnings.push("Ignoring debug_rpc from project config (security: only user-level config may enable process heap diagnostics).");
   }
   if ("allow_home_project" in projectRaw) {
     delete projectRaw.allow_home_project;
@@ -784,6 +943,11 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   if ("output_reserve" in projectRaw) {
     delete projectRaw.output_reserve;
     warnings.push("Ignoring output_reserve from project config (security: output-token reservation only honors user-level config).");
+  }
+  const models = projectRaw.models;
+  if (isPlainObject(models) && "window_overlay_path" in models) {
+    delete models.window_overlay_path;
+    warnings.push("Ignoring models.window_overlay_path from project config (security: only user-level config may select model geometry metadata).");
   }
   if ("language" in projectRaw) {
     delete projectRaw.language;
@@ -825,14 +989,46 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   const embedding = projectRaw.embedding;
   if (isPlainObject(embedding)) {
     const removed = [];
-    for (const field of EMBEDDING_DESTINATION_FIELDS) {
+    for (const field of EMBEDDING_USER_ONLY_FIELDS) {
       if (field in embedding) {
         delete embedding[field];
         removed.push(field);
       }
     }
     if (removed.length > 0) {
-      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where private text is embedded).");
+      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where or how private text is embedded).");
+    }
+  }
+  for (const agentKey of HIDDEN_AGENT_KEYS) {
+    const block = projectRaw[agentKey];
+    if (!isPlainObject(block))
+      continue;
+    const removed = [];
+    stripEscalationAtExecutableSite(block, agentKey, removed);
+    for (const harness of HARNESS_KEYS) {
+      const harnessBlock = block[harness];
+      if (!isPlainObject(harnessBlock))
+        continue;
+      stripEscalationAtExecutableSite(harnessBlock, `${agentKey}.${harness}`, removed);
+      const tasks = harnessBlock.tasks;
+      if (isPlainObject(tasks)) {
+        for (const [taskName, taskBlock] of Object.entries(tasks)) {
+          if (isPlainObject(taskBlock)) {
+            stripEscalationAtExecutableSite(taskBlock, `${agentKey}.${harness}.tasks.${taskName}`, removed);
+          }
+        }
+      }
+    }
+    const schedulingTasks = block.tasks;
+    if (isPlainObject(schedulingTasks)) {
+      for (const [taskName, taskBlock] of Object.entries(schedulingTasks)) {
+        if (isPlainObject(taskBlock)) {
+          stripListedFields(taskBlock, AGENT_ESCALATION_FIELDS, `${agentKey}.tasks.${taskName}`, removed);
+        }
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring ${removed.join(", ")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
     }
   }
   const historian = projectRaw.historian;
@@ -844,8 +1040,19 @@ function stripUnsafeProjectConfigFields(projectRaw) {
         removed.push(field);
       }
     }
+    for (const harness of HARNESS_KEYS) {
+      const harnessBlock = historian[harness];
+      if (!isPlainObject(harnessBlock))
+        continue;
+      for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+        if (field in harnessBlock) {
+          delete harnessBlock[field];
+          removed.push(`${harness}.${field}`);
+        }
+      }
+    }
     if (removed.length > 0) {
-      warnings.push(`Ignoring historian.${removed.join("/")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
+      warnings.push(`Ignoring ${removed.map((path) => `historian.${path}`).join(", ")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
     }
   }
   const mural = projectRaw.mural;
@@ -859,20 +1066,15 @@ function stripUnsafeProjectConfigFields(projectRaw) {
     delete legacyMural.model;
     warnings.push("Ignoring experimental.mural.model from project config (security: the mural cue-compressor model is a user-level setting; use user-level mural.model).");
   }
+  const nestedMuralRemoved = [];
   for (const agentKey of HIDDEN_AGENT_KEYS) {
     const block = projectRaw[agentKey];
     if (!isPlainObject(block))
       continue;
-    const removed = [];
-    for (const field of AGENT_ESCALATION_FIELDS) {
-      if (field in block) {
-        delete block[field];
-        removed.push(field);
-      }
-    }
-    if (removed.length > 0) {
-      warnings.push(`Ignoring ${agentKey}.${removed.join("/")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
-    }
+    stripNestedMuralModels(block, agentKey, nestedMuralRemoved);
+  }
+  if (nestedMuralRemoved.length > 0) {
+    warnings.push(`Ignoring ${nestedMuralRemoved.join(", ")} from project config (security: the mural cue-compressor model is a user-level setting; a repository cannot choose where project memory is sent).`);
   }
   return warnings;
 }
@@ -969,6 +1171,30 @@ function constrainProjectThresholdOverrides(args) {
       setMergedTokenThreshold(args.mergedRaw, constrained);
     }
   }
+  if ("protected_tokens" in args.projectRaw) {
+    const rawProject = args.projectRaw.protected_tokens;
+    const projectVal = resolveProtectedTokensScalar(rawProject);
+    const trustedUserVal = resolveProtectedTokensScalar(args.trustedBaseConfig.protected_tokens);
+    if (projectVal !== undefined) {
+      if (trustedUserVal !== undefined) {
+        if (projectVal >= trustedUserVal) {
+          args.mergedRaw.protected_tokens = projectVal;
+        } else {
+          args.mergedRaw.protected_tokens = trustedUserVal;
+          warnings.push(makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON));
+        }
+      } else {
+        args.mergedRaw.protected_tokens = projectVal;
+      }
+    } else {
+      if (trustedUserVal !== undefined) {
+        args.mergedRaw.protected_tokens = trustedUserVal;
+      } else {
+        delete args.mergedRaw.protected_tokens;
+      }
+      warnings.push(makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON));
+    }
+  }
   return warnings;
 }
 function normalizeEndpoint(value) {
@@ -1038,6 +1264,390 @@ function pruneNestedConfigLeaf(block, relativePath) {
   return { block: result, removed: relativePath.map(String).join(".") };
 }
 
+// ../plugin/src/config/raw-loader.ts
+import {
+  closeSync,
+  existsSync,
+  linkSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
+var MODEL_FIELDS = ["model", "fallback_models"];
+var QUALIFIER_FIELDS = ["variant", "thinking_level"];
+var TASK_MODEL_FIELDS = [...MODEL_FIELDS, ...QUALIFIER_FIELDS, "timeout_minutes"];
+var PRE_PER_HARNESS_BACKUP_SUFFIX = ".pre-per-harness.bak";
+var temporaryFileSequence = 0;
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function asDocument(text) {
+  try {
+    const document = parseJsonc(text.startsWith("\uFEFF") ? text.slice(1) : text);
+    return isRecord2(document) ? document : null;
+  } catch {
+    return null;
+  }
+}
+function getAtPath(document, path) {
+  let current = document;
+  for (const part of path) {
+    if (!isRecord2(current) || !Object.hasOwn(current, part))
+      return;
+    current = current[part];
+  }
+  return current;
+}
+function stableJson(value) {
+  if (Array.isArray(value))
+    return `[${value.map(stableJson).join(",")}]`;
+  if (!isRecord2(value))
+    return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+}
+function valuesMatch(left, right) {
+  return stableJson(left) === stableJson(right);
+}
+function valueForDiagnostic(value) {
+  return stableJson(value);
+}
+function migrateEntryForHarness(value, harness) {
+  if (Array.isArray(value))
+    return value.map((entry) => migrateEntryForHarness(entry, harness));
+  if (!isRecord2(value) || !Object.hasOwn(value, "model"))
+    return value;
+  const entry = { model: value.model };
+  if (harness === "opencode" && Object.hasOwn(value, "variant")) {
+    entry.variant = value.variant;
+  }
+  if (harness === "pi" && Object.hasOwn(value, "thinking_level")) {
+    entry.thinking_level = value.thinking_level;
+  }
+  return entry;
+}
+function migrateFallbackForHarness(value, harness) {
+  if (typeof value === "string")
+    return [value];
+  return migrateEntryForHarness(value, harness);
+}
+function canCreateAtPath(document, path) {
+  let current = document;
+  for (const part of path) {
+    if (current === undefined)
+      return true;
+    if (!isRecord2(current))
+      return false;
+    current = current[part];
+  }
+  return current === undefined || isRecord2(current);
+}
+function flatFieldPath(parts) {
+  return parts.join(".");
+}
+function updateDocumentForFlatFields(text) {
+  const hasBom = text.startsWith("\uFEFF");
+  const editableText = hasBom ? text.slice(1) : text;
+  const document = asDocument(text);
+  if (!document) {
+    return { text, hasFlatKeys: false, diagnostics: [], flatPaths: [] };
+  }
+  let nextText = editableText;
+  let hasFlatKeys = false;
+  const diagnostics = [];
+  const flatPaths = [];
+  const sourcePathsToRemove = [];
+  const addDestination = (sourcePath, destinationPath, destinationValue) => {
+    const sourceLabel = flatFieldPath(sourcePath);
+    const destinationLabel = flatFieldPath(destinationPath);
+    if (!canCreateAtPath(document, destinationPath.slice(0, -1))) {
+      diagnostics.push({
+        path: sourceLabel,
+        message: `Flat config field "${sourceLabel}" (${valueForDiagnostic(destinationValue)}) conflicts with non-object destination "${destinationLabel}" (${valueForDiagnostic(getAtPath(document, destinationPath.slice(0, -1)))}); kept the destination and ignored the flat field.`
+      });
+      return;
+    }
+    const existing = getAtPath(document, destinationPath);
+    if (existing !== undefined) {
+      if (!valuesMatch(existing, destinationValue)) {
+        diagnostics.push({
+          path: sourceLabel,
+          message: `Flat config field "${sourceLabel}" (${valueForDiagnostic(destinationValue)}) conflicts with "${destinationLabel}" (${valueForDiagnostic(existing)}); kept "${destinationLabel}" and ignored the flat field.`
+        });
+      }
+      return;
+    }
+    nextText = setJsoncValue(nextText, destinationPath, destinationValue);
+  };
+  const migrateAgentFields = (agentName) => {
+    const agent = document[agentName];
+    if (!isRecord2(agent))
+      return;
+    for (const field of MODEL_FIELDS) {
+      if (!Object.hasOwn(agent, field))
+        continue;
+      const sourcePath = [agentName, field];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      const migrateValue = field === "fallback_models" ? migrateFallbackForHarness : migrateEntryForHarness;
+      addDestination(sourcePath, [agentName, "opencode", field], migrateValue(agent[field], "opencode"));
+      addDestination(sourcePath, [agentName, "pi", field], migrateValue(agent[field], "pi"));
+    }
+    if (Object.hasOwn(agent, "variant")) {
+      const sourcePath = [agentName, "variant"];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      addDestination(sourcePath, [agentName, "opencode", "variant"], agent.variant);
+    }
+    if (Object.hasOwn(agent, "thinking_level")) {
+      const sourcePath = [agentName, "thinking_level"];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      addDestination(sourcePath, [agentName, "pi", "thinking_level"], agent.thinking_level);
+    }
+  };
+  migrateAgentFields("historian");
+  migrateAgentFields("dreamer");
+  const dreamer = document.dreamer;
+  const tasks = isRecord2(dreamer) ? dreamer.tasks : undefined;
+  if (isRecord2(tasks)) {
+    for (const taskName of Object.keys(tasks).sort()) {
+      const task = tasks[taskName];
+      if (!isRecord2(task))
+        continue;
+      for (const field of TASK_MODEL_FIELDS) {
+        if (!Object.hasOwn(task, field))
+          continue;
+        const sourcePath = ["dreamer", "tasks", taskName, field];
+        hasFlatKeys = true;
+        flatPaths.push(flatFieldPath(sourcePath));
+        sourcePathsToRemove.push(sourcePath);
+        if (field === "model" || field === "fallback_models") {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], field === "fallback_models" ? migrateFallbackForHarness(task[field], "opencode") : migrateEntryForHarness(task[field], "opencode"));
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], field === "fallback_models" ? migrateFallbackForHarness(task[field], "pi") : migrateEntryForHarness(task[field], "pi"));
+        } else if (field === "variant") {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], task[field]);
+        } else if (field === "thinking_level") {
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], task[field]);
+        } else {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], task[field]);
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], task[field]);
+        }
+      }
+    }
+  }
+  for (const sourcePath of sourcePathsToRemove) {
+    nextText = removeJsoncValue(nextText, sourcePath);
+  }
+  return {
+    text: hasBom ? `\uFEFF${nextText}` : nextText,
+    hasFlatKeys,
+    diagnostics,
+    flatPaths
+  };
+}
+function hasFlatKeys(input) {
+  const text = typeof input === "string" ? input : input.toString("utf-8");
+  return updateDocumentForFlatFields(text).hasFlatKeys;
+}
+function migrateFlatDetailed(input) {
+  const bytes = typeof input === "string" ? Buffer.from(input, "utf-8") : input;
+  const result = updateDocumentForFlatFields(bytes.toString("utf-8"));
+  return {
+    bytes: Buffer.from(result.text, "utf-8"),
+    hasFlatKeys: result.hasFlatKeys,
+    diagnostics: result.diagnostics
+  };
+}
+function writeExclusiveBackup(backupPath, bytes, mode) {
+  const temporaryPath = writeTemporaryCandidate(backupPath, bytes, mode);
+  try {
+    try {
+      linkSync(temporaryPath, backupPath);
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        throw error;
+    }
+    const existingBytes = readFileSync(backupPath);
+    if (existingBytes.equals(bytes))
+      return;
+    if (bytes.subarray(0, existingBytes.length).equals(existingBytes)) {
+      renameSync(temporaryPath, backupPath);
+      return;
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
+  }
+}
+function writeTemporaryCandidate(configPath, bytes, mode) {
+  const directory = dirname(configPath);
+  const stem = basename(configPath);
+  for (let attempt = 0;attempt < 32; attempt++) {
+    temporaryFileSequence += 1;
+    const path = join(directory, `.${stem}.per-harness-${process.pid}-${temporaryFileSequence}.tmp`);
+    let descriptor;
+    try {
+      descriptor = openSync(path, "wx", mode);
+      writeFileSync(descriptor, bytes);
+      closeSync(descriptor);
+      return path;
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor);
+        } catch {}
+      }
+      try {
+        unlinkSync(path);
+      } catch {}
+      if (error.code !== "EEXIST")
+        throw error;
+    }
+  }
+  throw new Error(`Could not allocate a temporary config file beside ${configPath}`);
+}
+function migrationWarning(diagnostic) {
+  return diagnostic.message;
+}
+function loadRawConfigFile(options) {
+  if (!existsSync(options.configPath))
+    return null;
+  let observedBytes;
+  try {
+    observedBytes = readFileSync(options.configPath);
+  } catch (error) {
+    throw new Error(`failed to read config: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const initialMigration = migrateFlatDetailed(observedBytes);
+  if (!initialMigration.hasFlatKeys) {
+    return {
+      configPath: options.configPath,
+      bytes: observedBytes,
+      text: observedBytes.toString("utf-8"),
+      warnings: [],
+      migrated: false
+    };
+  }
+  if (options.tier === "project") {
+    return {
+      configPath: options.configPath,
+      bytes: initialMigration.bytes,
+      text: initialMigration.bytes.toString("utf-8"),
+      warnings: [
+        "Adapted flat model config in memory; use historian.opencode/historian.pi and dreamer.opencode/dreamer.pi instead. Project config files are never rewritten.",
+        ...initialMigration.diagnostics.map(migrationWarning)
+      ],
+      migrated: false
+    };
+  }
+  const backupPath = `${options.configPath}${PRE_PER_HARNESS_BACKUP_SUFFIX}`;
+  for (;; ) {
+    const migration = migrateFlatDetailed(observedBytes);
+    if (!migration.hasFlatKeys) {
+      return {
+        configPath: options.configPath,
+        bytes: observedBytes,
+        text: observedBytes.toString("utf-8"),
+        warnings: [],
+        migrated: false
+      };
+    }
+    let temporaryPath;
+    try {
+      const mode = statSync(options.configPath).mode & 511;
+      writeExclusiveBackup(backupPath, observedBytes, mode);
+      temporaryPath = writeTemporaryCandidate(options.configPath, migration.bytes, mode);
+      options.afterTemporaryWrite?.();
+      const currentBytes = readFileSync(options.configPath);
+      if (!hasFlatKeys(currentBytes)) {
+        unlinkSync(temporaryPath);
+        return {
+          configPath: options.configPath,
+          bytes: currentBytes,
+          text: currentBytes.toString("utf-8"),
+          warnings: [],
+          migrated: false
+        };
+      }
+      if (!currentBytes.equals(observedBytes)) {
+        unlinkSync(temporaryPath);
+        observedBytes = currentBytes;
+        continue;
+      }
+      renameSync(temporaryPath, options.configPath);
+      return {
+        configPath: options.configPath,
+        bytes: migration.bytes,
+        text: migration.bytes.toString("utf-8"),
+        warnings: [
+          "Migrated flat historian/dreamer model config to per-harness blocks.",
+          ...migration.diagnostics.map(migrationWarning)
+        ],
+        migrated: true
+      };
+    } catch (error) {
+      if (temporaryPath) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {}
+      }
+      return {
+        configPath: options.configPath,
+        bytes: observedBytes,
+        text: observedBytes.toString("utf-8"),
+        warnings: [
+          `Could not migrate flat model config: ${error instanceof Error ? error.message : String(error)}. Flat fields were not applied.`,
+          ...migration.diagnostics.map(migrationWarning)
+        ],
+        migrated: false
+      };
+    }
+  }
+}
+
+// ../plugin/src/config/removed-agent-config.ts
+var REMOVED_AGENT_CONFIG_KEY = "sidekick";
+var REMOVED_AGENT_CONFIG_WARNING = `The "${REMOVED_AGENT_CONFIG_KEY}" configuration was removed and is ignored.`;
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function stripRemovedAgentConfig(rawConfig, warnings) {
+  let removed = false;
+  const patched = { ...rawConfig };
+  if (Object.hasOwn(patched, REMOVED_AGENT_CONFIG_KEY)) {
+    delete patched[REMOVED_AGENT_CONFIG_KEY];
+    removed = true;
+  }
+  if (isPlainObject3(patched.profiles)) {
+    const profiles = { ...patched.profiles };
+    let profilesChanged = false;
+    for (const [name, value] of Object.entries(profiles)) {
+      if (!isPlainObject3(value) || !Object.hasOwn(value, REMOVED_AGENT_CONFIG_KEY))
+        continue;
+      const profile = { ...value };
+      delete profile[REMOVED_AGENT_CONFIG_KEY];
+      profiles[name] = profile;
+      profilesChanged = true;
+      removed = true;
+    }
+    if (profilesChanged)
+      patched.profiles = profiles;
+  }
+  if (removed && !warnings.includes(REMOVED_AGENT_CONFIG_WARNING)) {
+    warnings.push(REMOVED_AGENT_CONFIG_WARNING);
+  }
+  return removed ? patched : rawConfig;
+}
+
 // ../plugin/src/config/transform-mode.ts
 var RUST_COMPACTION_OFF_WARNING = "compaction-off mode does not support rust transform mode; using the TypeScript transform.";
 var RUST_REQUIRES_USER_SUBC_WARNING = "rust mode requires user-level subc configuration; running ts.";
@@ -1058,9 +1668,9 @@ function resolveTransformMode(args) {
 }
 
 // ../plugin/src/config/variable.ts
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname as dirname2, isAbsolute, resolve } from "node:path";
 var ENV_PATTERN = /\{env:([^}]+)\}/g;
 var FILE_PATTERN = /\{file:([^}]+)\}/g;
 function sensitiveFilePathReason(resolvedPath) {
@@ -1109,7 +1719,7 @@ function substituteConfigVariables(input) {
   if (fileMatches.length === 0) {
     return { text, warnings };
   }
-  const configDir = input.configPath ? dirname(input.configPath) : process.cwd();
+  const configDir = input.configPath ? dirname2(input.configPath) : process.cwd();
   let output = "";
   let cursor = 0;
   for (const match of fileMatches) {
@@ -1135,13 +1745,13 @@ function substituteConfigVariables(input) {
     if (sensitiveReason) {
       warnings.push(`${token} resolves to a sensitive path (${sensitiveReason}: ${filePath}); ` + "inlining its contents into config — make sure this is intentional.");
     }
-    if (!existsSync(filePath)) {
+    if (!existsSync2(filePath)) {
       warnings.push(`File not found for ${token} (resolved to ${filePath}); using empty string`);
       continue;
     }
     let contents;
     try {
-      contents = readFileSync(filePath, "utf-8").trim();
+      contents = readFileSync2(filePath, "utf-8").trim();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       warnings.push(`Failed to read file for ${token} (${filePath}): ${message}; using empty string`);
@@ -1161,20 +1771,28 @@ function getProjectConfigBasePath(directory) {
   return cortexKitProjectConfigBasePath(directory);
 }
 function resolveLegacyReadFallback(sources) {
-  return { source: sources.find((s) => existsSync2(s.path)) ?? null };
+  return { source: sources.find((s) => existsSync3(s.path)) ?? null };
 }
 function loadConfigFileDetailed(configPath, source) {
-  if (!existsSync2(configPath)) {
+  if (!existsSync3(configPath)) {
     return null;
   }
   let rawText;
+  let rawWarnings;
   try {
-    rawText = readFileSync2(configPath, "utf-8");
+    const raw = loadRawConfigFile({ configPath, tier: source });
+    if (!raw)
+      return null;
+    rawText = raw.text;
+    rawWarnings = raw.warnings;
   } catch (error) {
+    const message = `failed to read config: ${error instanceof Error ? error.message : String(error)}`;
     return {
       config: {},
-      warnings: [
-        `${configPath}: failed to read config: ${error instanceof Error ? error.message : String(error)}`
+      warnings: [`${configPath}: ${message}`],
+      parseFailures: [],
+      warningDetails: [
+        { warningClass: CONFIG_WARNING_CLASS.FILE_IO, source, path: configPath, message }
       ],
       outcome: "project-file-io-error",
       source
@@ -1187,22 +1805,56 @@ function loadConfigFileDetailed(configPath, source) {
       isProjectConfig: source === "project"
     });
     const rejectedKeyPaths = [];
-    const config = parseJsonc(substituted.text, {
+    const parsed = parseJsoncRecovering(substituted.text, {
       onRejectedKey: (path) => rejectedKeyPaths.push(path.join("."))
     });
+    const config = parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value) ? parsed.value : {};
     const unsafeKeyWarnings = rejectedKeyPaths.map((path) => `Ignored unsafe config key "${path}" (security: prototype-pollution keys are not allowed).`);
+    const firstIssue = parsed.issues[0];
+    const recovered = firstIssue !== undefined && Object.keys(config).length > 0;
+    const parseFailures = firstIssue ? [
+      {
+        warningClass: CONFIG_WARNING_CLASS.FILE_PARSE,
+        source,
+        path: configPath,
+        line: firstIssue.line,
+        column: firstIssue.column,
+        message: firstIssue.message,
+        recovered,
+        warning: `${configPath}:${firstIssue.line}:${firstIssue.column}: ${firstIssue.message}; ${recovered ? "recovered values were applied, but the file must be fixed." : "using defaults for this file."}`
+      }
+    ] : [];
     return {
       config,
-      warnings: [...substituted.warnings, ...unsafeKeyWarnings].map((warning) => `${configPath}: ${warning}`),
-      outcome: rejectedKeyPaths.length > 0 ? "schema-recovery" : substituted.warnings.length > 0 ? "substitution-failure" : "ok",
+      warnings: [
+        ...parseFailures.map((failure) => failure.warning),
+        ...rawWarnings.map((warning) => `${configPath}: ${warning}`),
+        ...substituted.warnings.map((warning) => `${configPath}: ${warning}`),
+        ...unsafeKeyWarnings.map((warning) => `${configPath}: ${warning}`)
+      ],
+      parseFailures,
+      warningDetails: parseFailures,
+      outcome: parseFailures.length > 0 ? "project-file-parse-error" : rejectedKeyPaths.length > 0 ? "schema-recovery" : substituted.warnings.length > 0 ? "substitution-failure" : "ok",
       source
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const warning = `${configPath}:1:1: ${message}; using defaults for this file.`;
+    const failure = {
+      warningClass: CONFIG_WARNING_CLASS.FILE_PARSE,
+      source,
+      path: configPath,
+      line: 1,
+      column: 1,
+      message,
+      recovered: false,
+      warning
+    };
     return {
       config: {},
-      warnings: [
-        `${configPath}: failed to load config: ${error instanceof Error ? error.message : String(error)}`
-      ],
+      warnings: [warning],
+      parseFailures: [failure],
+      warningDetails: [failure],
       outcome: "project-file-parse-error",
       source
     };
@@ -1259,9 +1911,24 @@ function redactConfigValue(value) {
   }
   return typeof value;
 }
+var warnedProtectedTagsDeprecation = false;
+function formatProtectedTokensBelowMinWarning(value) {
+  return `protected_tokens is a token floor (minimum ${PROTECTED_TOKENS_MIN}, default derived from the context window); ${value} looks like the old protected_tags count. Remove the key to use the default, or set a token count such as 16000.`;
+}
+function warnProtectedTagsDeprecationOnce() {
+  if (!warnedProtectedTagsDeprecation) {
+    warnedProtectedTagsDeprecation = true;
+    console.warn("[magic-context] protected_tags is deprecated and ignored; use protected_tokens instead.");
+  }
+}
 function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
   const preMigrationWarnings = [];
-  const migratedExperimental = migrateLegacyExperimental(rawConfig, preMigrationWarnings);
+  const configWithoutRemovedAgent = stripRemovedAgentConfig(rawConfig, preMigrationWarnings);
+  if (Object.hasOwn(rawConfig, "protected_tags")) {
+    warnProtectedTagsDeprecationOnce();
+    preMigrationWarnings.push("protected_tags is deprecated and ignored; use protected_tokens instead.");
+  }
+  const migratedExperimental = migrateLegacyExperimental(configWithoutRemovedAgent, preMigrationWarnings);
   const migratedDreamer = migrateDreamerV2(migratedExperimental, preMigrationWarnings);
   const migrated = migrateLegacyAgentEnabledInMemory(migratedDreamer, preMigrationWarnings);
   const parsed = MagicContextConfigSchema.safeParse(migrated);
@@ -1287,7 +1954,13 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
       const key = String(topKey);
       errorPaths.add(key);
       const paths = issuePathsByKey.get(key) ?? [];
-      paths.push([...issue.path]);
+      if (issue.code === "unrecognized_keys") {
+        for (const unrecognizedKey of issue.keys) {
+          paths.push([...issue.path, unrecognizedKey]);
+        }
+      } else {
+        paths.push([...issue.path]);
+      }
       issuePathsByKey.set(key, paths);
       const msg = issue.message;
       if (msg && !GENERIC_ZOD_PREFIXES.some((p) => msg.startsWith(p))) {
@@ -1300,12 +1973,7 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
   const patched = { ...rawConfig };
   for (const key of errorPaths) {
     recoveredTopLevelKeys.push(key);
-    const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
-    if (isAgentConfig) {
-      delete patched[key];
-      warnings.push(`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`);
-      continue;
-    }
+    const isAgentConfig = key === "historian" || key === "dreamer";
     const issuePaths = issuePathsByKey.get(key) ?? [];
     const rawValue = rawConfig[key];
     const allNested = issuePaths.length > 0 && issuePaths.every((p) => p.length >= 2) && typeof rawValue === "object" && rawValue !== null && !Array.isArray(rawValue);
@@ -1322,14 +1990,26 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
           prunedLeaves.push(result.removed);
         }
       }
-      patched[key] = prunedBlock;
-      const reason = customMessagesByKey.get(key);
-      warnings.push(`"${key}": invalid nested field(s) ${prunedLeaves.map((l) => `"${l}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`);
+      if (prunedLeaves.length === issuePaths.length) {
+        patched[key] = prunedBlock;
+        const reason = customMessagesByKey.get(key);
+        warnings.push(`"${key}": invalid nested field(s) ${prunedLeaves.map((leaf) => `"${key}.${leaf}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`);
+        continue;
+      }
+    }
+    if (isAgentConfig) {
+      delete patched[key];
+      warnings.push(`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`);
       continue;
     }
     delete patched[key];
     const defaultVal = defaults[key];
     const reason = customMessagesByKey.get(key);
+    const invalidRawValue = rawConfig[key];
+    if (key === "protected_tokens" && typeof invalidRawValue === "number" && invalidRawValue < PROTECTED_TOKENS_MIN) {
+      warnings.push(formatProtectedTokensBelowMinWarning(invalidRawValue));
+      continue;
+    }
     warnings.push(`"${key}": invalid value (${redactConfigValue(rawConfig[key])}), using default ${JSON.stringify(defaultVal)}.${reason ? ` ${reason}` : ""}`);
   }
   const retryMigrated = migrateLegacyAgentEnabledInMemory(migrateDreamerV2(migrateLegacyExperimental(patched, preMigrationWarnings), preMigrationWarnings), preMigrationWarnings);
@@ -1408,13 +2088,13 @@ function loadPluginConfigDetailed(directory) {
   const harnessLegacy = resolveLegacyConfigSourcesForHarness(directory, "opencode");
   const userLegacyFallback = userDetected.format === "none" ? resolveLegacyReadFallback(harnessLegacy.user) : { source: null };
   const projectLegacyFallback = projectDetected.format === "none" ? resolveLegacyReadFallback(harnessLegacy.project) : { source: null };
-  const legacyUserUnmigrated = userDetected.format === "none" && !userLegacyFallback.source && legacySources.user.some((source) => existsSync2(source.path));
-  const legacyProjectUnmigrated = projectDetected.format === "none" && !projectLegacyFallback.source && legacySources.project.some((source) => existsSync2(source.path));
+  const legacyUserUnmigrated = userDetected.format === "none" && !userLegacyFallback.source && legacySources.user.some((source) => existsSync3(source.path));
+  const legacyProjectUnmigrated = projectDetected.format === "none" && !projectLegacyFallback.source && legacySources.project.some((source) => existsSync3(source.path));
   const userLoaded = userDetected.format !== "none" ? loadConfigFileDetailed(userDetected.path, "user") : userLegacyFallback.source ? loadConfigFileDetailed(userLegacyFallback.source.path, "user") : null;
   const projectLoaded = projectDetected.format !== "none" ? loadConfigFileDetailed(projectDetected.path, "project") : projectLegacyFallback.source ? loadConfigFileDetailed(projectLegacyFallback.source.path, "project") : null;
   const allWarnings = [];
-  let mergedRaw = {};
-  const trustedBaseConfig = parsePluginConfig(userLoaded?.config ?? {});
+  const removedConfigWarnings = [];
+  const userRaw = stripRemovedAgentConfig(userLoaded?.config ?? {}, removedConfigWarnings);
   if (userLegacyFallback.source) {
     allWarnings.push(`[user config] reading legacy config from ${userLegacyFallback.source.path} until migration completes; run \`npx @cortexkit/magic-context doctor\` to consolidate into the shared CortexKit location.`);
   } else if (legacyUserUnmigrated) {
@@ -1427,29 +2107,49 @@ function loadPluginConfigDetailed(directory) {
   }
   if (userLoaded) {
     allWarnings.push(...userLoaded.warnings.map((w) => `[user config] ${w}`));
-    mergedRaw = deepMergeRawConfig(mergedRaw, userLoaded.config);
   }
+  let projectRaw = {};
   if (projectLoaded) {
     allWarnings.push(...projectLoaded.warnings.map((w) => `[project config] ${w}`));
-    const projectRaw = { ...projectLoaded.config };
+    projectRaw = stripRemovedAgentConfig(projectLoaded.config, removedConfigWarnings);
     for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
       allWarnings.push(`[project config] ${warning}`);
     }
-    mergedRaw = deepMergeRawConfig(mergedRaw, projectRaw);
-    for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, userLoaded?.config)) {
+  }
+  allWarnings.push(...removedConfigWarnings.map((warning) => `[config] ${warning}`));
+  const profileResolution = resolveConfigProfile({
+    userRaw,
+    projectRaw
+  });
+  allWarnings.push(...profileResolution.warnings.map((warning) => `[config] ${warning}`));
+  const trustedProfiledRaw = deepMergeRawConfig(profileResolution.userBase, profileResolution.overlay);
+  let mergedRaw = trustedProfiledRaw;
+  const trustedBaseConfig = parsePluginConfig(trustedProfiledRaw);
+  if (projectLoaded) {
+    mergedRaw = deepMergeRawConfig(mergedRaw, profileResolution.projectBase);
+    for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, profileResolution.userBase)) {
       allWarnings.push(`[project config] ${warning}`);
     }
     for (const warning of constrainProjectThresholdOverrides({
       mergedRaw,
-      projectRaw,
+      projectRaw: profileResolution.projectBase,
       trustedBaseConfig
     })) {
       allWarnings.push(`[project config] ${warning}`);
     }
   }
   const recoveredTopLevelKeys = [];
+  const cacheTtlConfigured = Object.hasOwn(mergedRaw, "cache_ttl");
   const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+  attachProtectedTokensTierOverrides(config, {
+    trustedUser: trustedBaseConfig.protected_tokens,
+    project: projectLoaded ? profileResolution.projectBase.protected_tokens : undefined
+  });
+  if (profileResolution.activeProfile)
+    config.profile = profileResolution.activeProfile;
   setOutputReserveConfig(config.output_reserve);
+  setWindowOverlayPath(config.models?.window_overlay_path);
+  const leafValidationWarnings = [...config.configWarnings ?? []];
   if (config.configWarnings?.length) {
     allWarnings.push(...config.configWarnings.map((w) => {
       if (userLoaded && projectLoaded)
@@ -1461,7 +2161,7 @@ function loadPluginConfigDetailed(directory) {
   }
   const resolvedTransformMode = resolveTransformMode({
     configured: config.transform_mode,
-    userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
+    userTierHasSubc: hasUserTierSubcConfig(userRaw),
     compactionEnabled: isCompactionEnabled(config)
   });
   config.transform_mode = resolvedTransformMode.mode;
@@ -1475,6 +2175,21 @@ function loadPluginConfigDetailed(directory) {
     ...bindSubstitutionFailures(userLoaded),
     ...bindSubstitutionFailures(projectLoaded)
   ];
+  const configParseFailures = [
+    ...userLoaded?.parseFailures ?? [],
+    ...projectLoaded?.parseFailures ?? []
+  ];
+  const warningDetails = [
+    ...userLoaded?.warningDetails ?? [],
+    ...projectLoaded?.warningDetails ?? [],
+    ...leafValidationWarnings.map((message) => ({
+      warningClass: CONFIG_WARNING_CLASS.INVALID_LEAF,
+      message
+    }))
+  ];
+  config.configParseFailures = configParseFailures;
+  config.configWarningDetails = warningDetails;
+  config.cacheTtlConfigured = cacheTtlConfigured;
   const sources = {
     userConfig: userLoaded?.outcome ?? (legacyUserUnmigrated ? "legacy-config-unmigrated" : "ok"),
     projectConfig: projectLoaded?.outcome ?? (legacyProjectUnmigrated ? "legacy-config-unmigrated" : "ok")
@@ -1485,7 +2200,10 @@ function loadPluginConfigDetailed(directory) {
     loadOutcome: combinedOutcome({ sources, substitutionFailures, recoveredTopLevelKeys }),
     sources,
     substitutionFailures,
-    recoveredTopLevelKeys
+    recoveredTopLevelKeys,
+    configParseFailures,
+    warningDetails,
+    cacheTtlConfigured
   };
 }
 
@@ -1542,7 +2260,11 @@ function recordHistorianRun(db, input) {
                     facts_emitted, facts_by_category_json, events_emitted,
                     importance_min, importance_max, importance_avg,
                     discarded_last, legacy, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagentInvocationId ?? null, input.runKind, input.status, input.failureReason ?? null, input.chunkStartOrdinal ?? null, input.chunkEndOrdinal ?? null, input.unprocessedFrom ?? null, input.compartmentsProduced ?? 0, input.compartmentIdMin ?? null, input.compartmentIdMax ?? null, input.factsEmitted ?? 0, input.factsByCategory ? JSON.stringify(input.factsByCategory) : null, input.eventsEmitted ?? 0, input.importanceMin ?? null, input.importanceMax ?? null, input.importanceAvg ?? null, input.discardedLast ? 1 : 0, input.legacy ? 1 : 0, Date.now());
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagentInvocationId ?? null, input.runKind, input.status, input.failureReason ?? null, input.chunkStartOrdinal ?? null, input.chunkEndOrdinal ?? null, input.unprocessedFrom ?? null, input.compartmentsProduced ?? 0, input.compartmentIdMin ?? null, input.compartmentIdMax ?? null, input.factsEmitted ?? 0, JSON.stringify({
+      ...input.factsByCategory ?? {},
+      facts_promoted: input.factsPromoted ?? 0,
+      events_published: input.eventsPublished ?? 0
+    }), input.eventsEmitted ?? 0, input.importanceMin ?? null, input.importanceMax ?? null, input.importanceAvg ?? null, input.discardedLast ? 1 : 0, input.legacy ? 1 : 0, Date.now());
     return Number(result.lastInsertRowid);
   } catch {
     return null;
@@ -1574,26 +2296,27 @@ function tallyFactsByCategory(facts) {
 }
 
 // ../plugin/src/hooks/magic-context/compartment-runner-drop-queue.ts
-function queueDropsForCompartmentalizedMessages(db, sessionId, upToMessageIndex) {
+function queueDropsForCompartmentalizedMessages(db, sessionId, upToMessageIndex, observedKeys) {
+  if (!observedKeys) {
+    return getRawSessionTagKeysThrough(sessionId, upToMessageIndex, { db }).then((keys) => queueDropsForCompartmentalizedMessages(db, sessionId, upToMessageIndex, keys));
+  }
   const tags = getTagsBySession(db, sessionId);
-  const { messageFileKeys, toolObservations } = getRawSessionTagKeysThrough(sessionId, upToMessageIndex);
   let dropsQueued = 0;
   for (const tag of tags) {
     if (tag.status !== "active")
       continue;
     if (tag.type === "tool") {
-      const observedOwners = toolObservations.get(tag.messageId);
+      const observedOwners = observedKeys.toolObservations.get(tag.messageId);
       if (!observedOwners)
         continue;
-      if (tag.toolOwnerMessageId !== null) {
-        if (!observedOwners.has(tag.toolOwnerMessageId))
-          continue;
+      if (tag.toolOwnerMessageId !== null && !observedOwners.has(tag.toolOwnerMessageId)) {
+        continue;
       }
       queuePendingOp(db, sessionId, tag.tagNumber, "drop");
       dropsQueued += 1;
       continue;
     }
-    if (messageFileKeys.has(tag.messageId)) {
+    if (observedKeys.messageFileKeys.has(tag.messageId)) {
       queuePendingOp(db, sessionId, tag.tagNumber, "drop");
       dropsQueued += 1;
     }
@@ -1726,24 +2449,9 @@ function validateHistorianOutput(text, _sessionId, chunk, _priorCompartments, se
   };
 }
 var HISTORIAN_PERSISTENT_FAILURE_THRESHOLD = 3;
-function buildHistorianFailureNotice(failureCount, lastError) {
-  if (failureCount >= HISTORIAN_PERSISTENT_FAILURE_THRESHOLD) {
-    return [
-      "## Magic Context — history comparting needs attention",
-      "",
-      `Magic Context has been unable to compart this session's history ${failureCount} times in a row. This usually means the configured historian model is misconfigured or unreachable (Magic Context already retried every fallback model automatically).`,
-      "",
-      `Last error: ${lastError}`,
-      "",
-      "Check your historian model in magic-context.jsonc, then restart. Your conversation keeps working normally in the meantime — this only affects how older history is summarized."
-    ].join(`
-`);
-  }
-  return [
-    "## Magic Context",
-    "",
-    "Hit a transient issue comparting history this turn — Magic Context will retry automatically on the next turn. Nothing is lost and your conversation continues normally. You'll only be alerted again if this keeps happening."
-  ].join(`
+function buildHistorianFailureNotice(failureCount, _lastError) {
+  const heading = failureCount >= HISTORIAN_PERSISTENT_FAILURE_THRESHOLD ? "## Magic Context — History compression" : "## Magic Context";
+  return [heading, "", renderUserFacingFailure("historian_unavailable")].join(`
 `);
 }
 function buildHistorianRepairPrompt(originalPrompt, previousOutput, validationError, language) {
@@ -2159,7 +2867,7 @@ function publishHistorianResult(args) {
         args.log(`[magic-context] failed to store compartment events: ${describeError(error).brief}`);
       }
     }
-    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd);
+    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd, args.observedKeys);
     recordProtectedTailPublicationFloor(db, sessionId, args.lastNewEnd + 1);
     if (lastNewEndMessageId) {
       stageDshCompactionMarker(db, sessionId, {
@@ -2245,17 +2953,33 @@ async function runDshHistorian(deps) {
         }
         return;
       }
-      const publish = publishHistorianResult({
-        db,
-        sessionId,
-        directory: deps.directory,
-        leaseHolderId: holderId,
-        chunk: result.chunk,
-        newCompartments: result.newCompartments,
-        lastNewEnd: result.lastNewEnd,
-        validated: result.validated,
-        log
-      });
+      let observedKeys;
+      try {
+        observedKeys = await getRawSessionTagKeysThrough(sessionId, result.lastNewEnd, { db });
+      } catch (error) {
+        log(`[magic-context] historian drop-key read failed: ${describeError(error).brief}`);
+        telemetry.failureReason = "publish failed (drop-key read error)";
+        return;
+      }
+      let publish;
+      try {
+        publish = publishHistorianResult({
+          db,
+          sessionId,
+          directory: deps.directory,
+          leaseHolderId: holderId,
+          chunk: result.chunk,
+          newCompartments: result.newCompartments,
+          lastNewEnd: result.lastNewEnd,
+          observedKeys,
+          validated: result.validated,
+          log
+        });
+      } catch (error) {
+        log(`[magic-context] historian publish failed: ${describeError(error).brief}`);
+        telemetry.failureReason = "publish failed (transaction error)";
+        return;
+      }
       if (!publish.ok) {
         telemetry.failureReason = "publish failed (lease lost or transaction error)";
         return;
@@ -2380,6 +3104,7 @@ function createMagicSummarizeHook(deps) {
           if (!result.ok) {
             throw new Error(`magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`);
           }
+          const observedKeys = await getRawSessionTagKeysThrough(sessionId, result.lastNewEnd, { db: deps.db });
           const publish = publishHistorianResult({
             db: deps.db,
             sessionId,
@@ -2388,6 +3113,7 @@ function createMagicSummarizeHook(deps) {
             chunk: result.chunk,
             newCompartments: result.newCompartments,
             lastNewEnd: result.lastNewEnd,
+            observedKeys,
             validated: result.validated,
             log
           });
@@ -2431,16 +3157,6 @@ import {
   resolveChildDepth,
   SubagentDepthError
 } from "@deepseek-ai/dsh-subagent";
-var MAGIC_WORKER_READONLY_TOOLS = [
-  "read",
-  "grep",
-  "glob",
-  "fs_search"
-];
-var MAGIC_SIDEKICK_TOOLS = [
-  ...MAGIC_WORKER_READONLY_TOOLS,
-  "ctx_search"
-];
 
 // src/agent/worker.ts
 function isMagicChildSession(agent) {
@@ -3019,18 +3735,18 @@ function memoryGuidanceBlock(memoryEnabled) {
   return memoryEnabled ? `${MEMORY_GUIDANCE}
 ` : "";
 }
-var BASE_INTRO = (protectedTags, memoryEnabled) => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
-Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space. Marking is NOT an immediate delete — it queues the content, which stays fully visible until space is actually needed (as soon as the next turn if you're already under pressure, much later if not), so mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The last ${protectedTags} tags are protected (marking one just queues it until it ages out). Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
+var BASE_INTRO = (memoryEnabled) => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
+Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. Mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The newest token-mass window stays protected until displaced. Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
 Do not announce or narrate \`ctx_reduce\` drops — just call the tool silently. Saying "I'll drop these outputs" wastes tokens the user does not care about.
 ${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
-- Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
-- Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres")\`
-- Need a config value, API key location, or environment detail → \`ctx_search(query="embedding provider configuration")\`
-- Looking for how something was implemented previously → \`ctx_search(query="how does the dreamer lease work")\`
-- Want to recall what was decided in an earlier conversation → \`ctx_search(query="dashboard release signing setup")\`
+- Can't remember where a related codebase or dependency lives → \`ctx_search(query="where is the opencode source code path?")\`
+- Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres?")\`
+- Need a config value, API key location, or environment detail → \`ctx_search(query="how is the embedding provider configured?")\`
+- Looking for how something was implemented previously → \`ctx_search(query="how does the dreamer lease work?")\`
+- Want to recall what was decided in an earlier conversation → \`ctx_search(query="what did we decide about the dashboard release signing setup?")\`
 \`ctx_search\` returns ranked results from memories, git commits, and raw message history. Use message ordinals from results with \`ctx_expand\` to retrieve surrounding conversation context.
 ${TOOL_HISTORY_GUIDANCE}
 NEVER drop large ranges blindly (e.g., "1-50"). Review each tag before deciding.
@@ -3041,16 +3757,16 @@ var BASE_INTRO_NO_REDUCE = (memoryEnabled) => `${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use \`ctx_expand\` to recover the raw conversation behind a summary under a \`## start-end · date · title\` heading inside \`<session-history>\` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
 **Search before asking the user**: If you can't remember or don't know something that might have been discussed before or stored in project memory, use \`ctx_search\` before asking the user. Examples:
-- Can't remember where a related codebase or dependency lives → \`ctx_search(query="opencode source code path")\`
-- Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres")\`
-- Need a config value, API key location, or environment detail → \`ctx_search(query="embedding provider configuration")\`
-- Looking for how something was implemented previously → \`ctx_search(query="how does the dreamer lease work")\`
-- Want to recall what was decided in an earlier conversation → \`ctx_search(query="dashboard release signing setup")\`
+- Can't remember where a related codebase or dependency lives → \`ctx_search(query="where is the opencode source code path?")\`
+- Forgot a prior architectural decision or constraint → \`ctx_search(query="why did we choose SQLite over postgres?")\`
+- Need a config value, API key location, or environment detail → \`ctx_search(query="how is the embedding provider configured?")\`
+- Looking for how something was implemented previously → \`ctx_search(query="how does the dreamer lease work?")\`
+- Want to recall what was decided in an earlier conversation → \`ctx_search(query="what did we decide about the dashboard release signing setup?")\`
 \`ctx_search\` returns ranked results from memories, git commits, and raw message history. Use message ordinals from results with \`ctx_expand\` to retrieve surrounding conversation context.
 ${TOOL_HISTORY_GUIDANCE}`;
 var LIGHT_SEARCH_RECOVERY = `Use ctx_search before asking the user about prior project context; it searches memories, commits, and compacted conversation. When a session-history summary lacks exact wording, values, errors, or reasoning, call ctx_expand with its heading range instead of guessing.`;
-var BASE_INTRO_LIGHT = (protectedTags, memoryEnabled) => `In primary sessions with ctx_reduce, the system tags messages and tool outputs as §N§ (for example §1§ and §42§); never imitate these prefixes in replies because only injected tag numbers are valid ctx_reduce handles.
-In primary sessions, NEVER narrate ctx_reduce; call it silently after extracting a spent output because it marks content discardable and QUEUES release rather than deleting immediately. The last ${protectedTags} tags stay protected until they age out. Use drop grammar "3-5", "1,2,9", or "1-5,8,12-15".
+var BASE_INTRO_LIGHT = (memoryEnabled) => `In primary sessions with ctx_reduce, the system tags messages and tool outputs as §N§ (for example §1§ and §42§); never imitate these prefixes in replies because only injected tag numbers are valid ctx_reduce handles.
+In primary sessions, NEVER narrate ctx_reduce; call it silently after extracting a spent output because it marks content discardable and QUEUES release rather than deleting immediately. The newest token-mass window stays protected until displaced. Use drop grammar "3-5", "1,2,9", or "1-5,8,12-15".
 ${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}${LIGHT_SEARCH_RECOVERY}
 ${TOOL_HISTORY_GUIDANCE}
@@ -3079,18 +3795,18 @@ var SMART_NOTE_GUIDANCE_LIGHT = `
 surface_condition creates a smart note checked nightly against external signals on ctx_note write.`;
 var TEMPORAL_AWARENESS_GUIDANCE = `
 **Temporal awareness**: User messages may be preceded by HTML comments like \`<!-- +12m -->\`, \`<!-- +2h 15m -->\`, or \`<!-- +3d 4h -->\` indicating time elapsed since the previous message's completion. Compartments in \`<session-history>\` carry \`start-date\` and \`end-date\` attributes (YYYY-MM-DD) showing real-time boundaries. Use these when reasoning about workflow pacing, log durations, build times, or how long ago something happened.`;
-var SUBAGENT_REDUCE_INTRO = (protectedTags) => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
-Use \`ctx_reduce\` to drop tool outputs you have already finished with, keeping your working context lean. Syntax: "3-5", "1,2,9", or "1-5,8,12-15". The last ${protectedTags} tags are protected.
+var SUBAGENT_REDUCE_INTRO = () => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
+Use \`ctx_reduce\` to drop tool outputs you have already finished with, keeping your working context lean. Syntax: "3-5", "1,2,9", or "1-5,8,12-15". The newest token-mass window stays protected.
 Drop silently — do not narrate it. NEVER drop large ranges blindly (e.g., "1-50"); review each tag first. Do not drop user or assistant text messages — only large tool outputs are worth dropping.
 Older tool calls may show \`[dropped §N§]\` sentinels; that is normal context management, not a pattern to copy. ALWAYS make fresh real tool calls when you need data again; never fabricate or inline tool output.`;
-var SUBAGENT_REDUCE_INTRO_LIGHT = (protectedTags) => `In bounded subagent sessions, the system tags messages and tool outputs as §N§; use only those IDs in ctx_reduce drop ranges such as "3-5", "1,2,9", or "1-5,8,12-15". The last ${protectedTags} tags stay protected.
+var SUBAGENT_REDUCE_INTRO_LIGHT = () => `In bounded subagent sessions, the system tags messages and tool outputs as §N§; use only those IDs in ctx_reduce drop ranges such as "3-5", "1,2,9", or "1-5,8,12-15". Tags in the newest token-mass window stay protected.
 When dropping, do it silently and NEVER choose a large range before reviewing every tag; drop only finished large tool outputs, never user or assistant messages.
 If older calls show [dropped §N§], never copy that system sentinel because it is not reply syntax; make a fresh real tool call and never fabricate or inline output.`;
 var CAVEMAN_COMPRESSION_WARNING = `
 **BEWARE**: History compression is on; older user AND assistant text — including your own earlier responses — has been deterministically rewritten in a terse caveman style (dropped articles, missing auxiliaries, \`//\` instead of connectives like \`because\`). This is automatic context compression that runs after the fact, not your actual prior wording or the user's. **DO NOT mimic this style in new turns.** Write fresh responses in normal prose. If you notice your output drifting into caveman cadence, that drift is in-context-learning bleeding from the compressed history — consciously revert to full sentences.`;
-function buildMagicContextSection(_agent, protectedTags, ctxReduceCallable = true, dreamerEnabled = false, temporalAwarenessEnabled = false, cavemanTextCompressionEnabled = false, subagentMode = false, language, memoryEnabled = true, preset = "full", primaryOverride) {
+function buildMagicContextSection(_agent, _legacyProtectionCount, ctxReduceCallable = true, dreamerEnabled = false, temporalAwarenessEnabled = false, cavemanTextCompressionEnabled = false, subagentMode = false, language, memoryEnabled = true, preset = "full", primaryOverride) {
   if (subagentMode) {
-    const intro = preset === "light" ? SUBAGENT_REDUCE_INTRO_LIGHT(protectedTags) : SUBAGENT_REDUCE_INTRO(protectedTags);
+    const intro = preset === "light" ? SUBAGENT_REDUCE_INTRO_LIGHT() : SUBAGENT_REDUCE_INTRO();
     return `## Magic Context
 
 ${intro}`;
@@ -3130,14 +3846,14 @@ ${BASE_INTRO_NO_REDUCE(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${c
 ${LONG_TERM_PARTNER_FRAME}
 ${PARTNER_FRAME_CLOSER_REDUCE_LIGHT}
 
-${BASE_INTRO_LIGHT(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
+${BASE_INTRO_LIGHT(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
   }
   return `## Magic Context
 
 ${LONG_TERM_PARTNER_FRAME}
 ${PARTNER_FRAME_CLOSER_REDUCE}
 
-${BASE_INTRO(protectedTags, memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}
+${BASE_INTRO(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}
 ${GENERIC_SECTION}
 
 Prefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.${languageGuidance}`;
@@ -3189,12 +3905,17 @@ function isDatabaseLockedError(error) {
   return false;
 }
 var RECONCILIATION_BATCH_SIZE = 100;
-var reconciledSessions = new Set;
-var reconciliationScheduledSessions = new Set;
-var sessionLocks = new Map;
-var incrementalTimers = new Map;
-var pendingIncrementalKeys = new Set;
-var completedIncrementalKeys = new Set;
+
+class MagicContextMessageIndexHeapHolder {
+  reconciledSessions = new Set;
+  reconciliationScheduledSessions = new Set;
+  sessionLocks = new Map;
+  incrementalTimers = new Map;
+  pendingIncrementalKeys = new Set;
+  completedIncrementalKeys = new Set;
+  activeReconcilerBuffers = new Map;
+}
+var heapHolder = new MagicContextMessageIndexHeapHolder;
 function defer(fn) {
   const immediate = globalThis.setImmediate;
   if (typeof immediate === "function") {
@@ -3207,16 +3928,16 @@ function yieldToEventLoop() {
   return new Promise((resolve) => defer(resolve));
 }
 function runWithSessionLock(sessionId, operation) {
-  const previous = sessionLocks.get(sessionId) ?? Promise.resolve();
+  const previous = heapHolder.sessionLocks.get(sessionId) ?? Promise.resolve();
   const run = previous.catch(() => {
     return;
   }).then(async () => {
     await operation();
   });
-  sessionLocks.set(sessionId, run);
+  heapHolder.sessionLocks.set(sessionId, run);
   run.finally(() => {
-    if (sessionLocks.get(sessionId) === run) {
-      sessionLocks.delete(sessionId);
+    if (heapHolder.sessionLocks.get(sessionId) === run) {
+      heapHolder.sessionLocks.delete(sessionId);
     }
   }).catch(() => {
     return;
@@ -3233,39 +3954,45 @@ function logIndexingError(sessionId, action, error) {
 }
 async function reconcileSessionIndex(db, sessionId, readMessages) {
   await runWithSessionLock(sessionId, async () => {
-    if (reconciledSessions.has(sessionId))
+    if (heapHolder.reconciledSessions.has(sessionId))
       return;
     let fallbackSnapshot = null;
-    const finalWatermark = readMessages.getCount ? readMessages.getCount(sessionId) : (fallbackSnapshot = readMessages(sessionId)).length;
-    let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
-    while (cursor < finalWatermark) {
-      const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
-      const messages = readMessages.readPage ? readMessages.readPage(sessionId, cursor, RECONCILIATION_BATCH_SIZE, finalWatermark) : (fallbackSnapshot ?? []).filter((message) => message.ordinal > cursor && message.ordinal <= pageEnd);
-      indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd);
-      const nextCursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
-      if (nextCursor <= cursor)
-        break;
-      cursor = nextCursor;
-      if (cursor < finalWatermark) {
-        await yieldToEventLoop();
+    try {
+      const finalWatermark = readMessages.getCount ? readMessages.getCount(sessionId) : (fallbackSnapshot = readMessages(sessionId)).length;
+      let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+      while (cursor < finalWatermark) {
+        const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
+        const messages = readMessages.readPage ? readMessages.readPage(sessionId, cursor, RECONCILIATION_BATCH_SIZE, finalWatermark) : (fallbackSnapshot ?? []).filter((message) => message.ordinal > cursor && message.ordinal <= pageEnd);
+        const retainedMessages = fallbackSnapshot ?? messages;
+        heapHolder.activeReconcilerBuffers.set(sessionId, retainedMessages);
+        indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd);
+        const nextCursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+        if (nextCursor <= cursor)
+          break;
+        cursor = nextCursor;
+        if (cursor < finalWatermark) {
+          await yieldToEventLoop();
+        }
       }
-    }
-    if (isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
-      reconciledSessions.add(sessionId);
+      if (isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
+        heapHolder.reconciledSessions.add(sessionId);
+      }
+    } finally {
+      heapHolder.activeReconcilerBuffers.delete(sessionId);
     }
   });
 }
 function scheduleReconciliation(db, sessionId, readMessages) {
-  if (reconciledSessions.has(sessionId) || reconciliationScheduledSessions.has(sessionId)) {
+  if (heapHolder.reconciledSessions.has(sessionId) || heapHolder.reconciliationScheduledSessions.has(sessionId)) {
     return;
   }
-  reconciliationScheduledSessions.add(sessionId);
+  heapHolder.reconciliationScheduledSessions.add(sessionId);
   scheduleAfterBootQuiet(() => {
     defer(() => {
       reconcileSessionIndex(db, sessionId, readMessages).catch((error) => {
         logIndexingError(sessionId, "reconciliation", error);
       }).finally(() => {
-        reconciliationScheduledSessions.delete(sessionId);
+        heapHolder.reconciliationScheduledSessions.delete(sessionId);
       });
     });
   });
@@ -3425,10 +4152,18 @@ function scanSessionMetrics(agent) {
   }
   return { lastInputTokens, contextWindow };
 }
-function oldestReclaimableToolTags(tags, protectedTags) {
-  const active = [...tags].filter((t) => t.type === "tool" && t.status === "active").sort((a, b) => a.tagNumber - b.tagNumber);
-  const protectedSet = protectedTags > 0 ? new Set([...tags].filter((t) => t.type === "tool" && t.status === "active").map((t) => t.tagNumber).sort((a, b) => b - a).slice(0, protectedTags)) : new Set;
-  return active.filter((t) => !protectedSet.has(t.tagNumber)).slice(0, 4).map((t) => ({ tagNumber: t.tagNumber, toolName: t.toolName }));
+function protectedWindow(tags, newestCount) {
+  if (newestCount <= 0)
+    return { numbers: new Set, cutoff: null };
+  const newest = tags.filter((t) => t.type === "tool" && t.status === "active").sort((a, b) => b.tagNumber - a.tagNumber).slice(0, newestCount);
+  const oldestProtected = newest[newest.length - 1];
+  return {
+    numbers: new Set(newest.map((t) => t.tagNumber)),
+    cutoff: oldestProtected === undefined ? null : oldestProtected.tagNumber
+  };
+}
+function reclaimableOutputCount(tags, protectedNumbers) {
+  return tags.filter((t) => t.type === "tool" && t.status === "active" && !protectedNumbers.has(t.tagNumber)).length;
 }
 function injectNudge(agent, sessionId, kind, text) {
   const marker = `mc-nudge:${kind}`;
@@ -3457,40 +4192,55 @@ function maybeNudgeChannels(db, sessionId, agent, opts = {}) {
     const contextWindow = opts.contextWindow ?? scanWindow ?? 1e6;
     if (typeof contextWindow !== "number" || contextWindow <= 0)
       return;
-    const agg = getActiveTagTokenAggregate(db, sessionId, protectedTags);
+    const tags = getTagsBySession(db, sessionId);
+    const window = protectedWindow(tags, protectedTags);
+    const agg = getActiveTagTokenAggregate(db, sessionId, window.cutoff);
     const reclaimable = agg.toolOutput ?? 0;
+    const baselineU = reclaimable;
+    const baselineT = Math.max(baselineU, agg.conversation + agg.toolCall + reclaimable);
     if (reclaimable >= CHANNEL1_FLOOR_TOKENS) {
-      const workingWindowTokens = Math.round(contextWindow * threshold / 100);
-      const pressure = lastInputTokens > 0 ? lastInputTokens / contextWindow : 0;
+      const nudgeState = getChannel1NudgeState(db, sessionId);
       const decision = decideChannel1({
-        undroppedTokens: reclaimable,
-        pressure,
-        estimatedInputTokens: lastInputTokens + reclaimable,
-        workingWindowTokens,
+        baselineU,
+        baselineT,
+        turnDeltaU: 0,
+        turnDeltaT: 0,
         lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
-        lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+        lastNudgeLevel: nudgeState.level,
+        lastFireOrdinal: nudgeState.ordinal,
         hasRecentReduce: false
       });
       setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
-      setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
+      setChannel1NudgeState(db, sessionId, {
+        ...nudgeState,
+        level: decision.nextLastNudgeLevel,
+        postReduceGracePending: decision.clearPostReduceGrace ? undefined : nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: decision.clearPostReduceGrace ? undefined : nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: decision.clearPostReduceGrace ? undefined : nudgeState.postReduceGracePreLevel
+      });
       if (decision.fire) {
-        const tags = getTagsBySession(db, sessionId);
-        const hint = oldestReclaimableToolTags(tags, protectedTags);
-        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, hint);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, reclaimableOutputCount(tags, window.numbers), hint, decision.sticky);
         injectNudge(agent, sessionId, "channel1", reminder);
         opts.log?.(`[magic-context] channel1 nudge fired: level=${decision.level} reclaimable~${Math.round(reclaimable / 1000)}k`);
       }
     }
-    const usable = Math.max(0, Math.round(contextWindow * threshold / 100) - lastInputTokens + agg.conversation + agg.toolCall);
-    if (shouldTriggerChannel2({ reclaimableTokens: reclaimable, usableTokens: usable })) {
+    const evaluation = evaluateChannel2({
+      baselineU,
+      baselineT,
+      turnDeltaU: 0,
+      turnDeltaT: 0,
+      evaluable: true,
+      generationInvalidated: false
+    });
+    if (evaluation.shouldTrigger) {
       const state = getChannel2NudgeState(db, sessionId);
       if (state === "") {
-        const tags = getTagsBySession(db, sessionId);
-        const hint = oldestReclaimableToolTags(tags, protectedTags);
-        const reminder = buildChannel2Reminder(reclaimable, hint);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const reminder = buildChannel2Reminder(evaluation.reclaimableTokens, reclaimableOutputCount(tags, window.numbers), hint);
         setChannel2NudgeState(db, sessionId, "delivered");
         injectNudge(agent, sessionId, "channel2", reminder);
-        opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(reclaimable / 1000)}k`);
+        opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(evaluation.reclaimableTokens / 1000)}k`);
       }
     }
   } catch {}
@@ -4784,26 +5534,131 @@ function registerContextPlane(ctx, deps) {
   return registerPreStepGate(ctx, (payload, next) => runContextPlaneStep(state, deps, payload, next));
 }
 
-// ../plugin/src/features/magic-context/dreamer/task-config.ts
-function buildDreamTaskRuntimeConfigs(dreamer, language) {
-  const tasks = dreamer.tasks ?? {};
-  return CANONICAL_DREAM_TASKS.map((task) => {
-    const t = tasks[task] ?? {
-      schedule: "",
-      timeout_minutes: 20
+// ../plugin/src/shared/model-resolution.ts
+function asRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+function readString(value) {
+  if (typeof value !== "string")
+    return;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+function prefersVariantSpelling(harness) {
+  return harness === "opencode" || harness === "dsh";
+}
+function hasOwn(record, key) {
+  return Object.hasOwn(record, key);
+}
+function resolveHarnessBlock(container, harness) {
+  const selected = harness === "omp" ? container?.omp ?? container?.pi : harness === "dsh" ? container?.dsh ?? container?.opencode : container?.[harness];
+  return asRecord(selected);
+}
+function normalizeModelEntry(entry, harness) {
+  if (typeof entry === "string") {
+    const model = readString(entry);
+    return model ? { model } : undefined;
+  }
+  const objectEntry = asRecord(entry);
+  if (!objectEntry)
+    return;
+  const model = readString(objectEntry.model);
+  if (!model)
+    return;
+  const qualifier = readString(objectEntry[prefersVariantSpelling(harness) ? "variant" : "thinking_level"]);
+  return qualifier ? { model, qualifier } : { model };
+}
+function isValidModelReference(entry) {
+  const slash = entry.model.indexOf("/");
+  return slash > 0 && slash < entry.model.length - 1;
+}
+function sameAttempt(a, b) {
+  return a.model === b.model && a.qualifier === b.qualifier;
+}
+function resolveFallbackEntries(value, harness) {
+  const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+  const resolved = [];
+  for (const value of values) {
+    const entry = normalizeModelEntry(value, harness);
+    if (!entry || !isValidModelReference(entry))
+      continue;
+    if (resolved.some((candidate) => sameAttempt(candidate, entry)))
+      continue;
+    resolved.push(entry);
+  }
+  return resolved;
+}
+function resolvePrimaryEntry(args) {
+  const entry = normalizeModelEntry(args.entry, args.harness);
+  if (!entry)
+    return;
+  const qualifier = entry.qualifier ?? readString(args.defaultQualifier);
+  return qualifier ? { ...entry, qualifier } : entry;
+}
+function resolveHistorianModel(config, harness) {
+  const historian = asRecord(asRecord(config)?.historian);
+  const block = resolveHarnessBlock(historian, harness);
+  if (!block)
+    return { fallbacks: [] };
+  return {
+    primary: resolvePrimaryEntry({
+      entry: block.model,
+      defaultQualifier: block[prefersVariantSpelling(harness) ? "variant" : "thinking_level"],
+      harness
+    }),
+    fallbacks: resolveFallbackEntries(block.fallback_models, harness)
+  };
+}
+function resolveDreamerTaskModel(args) {
+  const dreamer = asRecord(asRecord(args.config)?.dreamer);
+  const harnessBlock = resolveHarnessBlock(dreamer, args.harness);
+  const taskBlock = asRecord(asRecord(harnessBlock?.tasks)?.[args.task]);
+  const schedulingTask = asRecord(asRecord(dreamer?.tasks)?.[args.task]);
+  if (!harnessBlock) {
+    return {
+      fallbacks: [],
+      schedule: readString(schedulingTask?.schedule),
+      timeoutMinutes: typeof taskBlock?.timeout_minutes === "number" ? taskBlock.timeout_minutes : undefined,
+      promotionThreshold: typeof schedulingTask?.promotion_threshold === "number" ? schedulingTask.promotion_threshold : undefined
     };
-    const model = task === "compress-cues" ? t.model : t.model ?? dreamer.model;
-    const fallbackModels = resolveFallbackChain(t.fallback_models ?? dreamer.fallback_models);
-    const thinkingLevel = t.thinking_level ?? dreamer.thinking_level;
+  }
+  const taskQualifier = taskBlock?.[prefersVariantSpelling(args.harness) ? "variant" : "thinking_level"];
+  const harnessQualifier = harnessBlock[prefersVariantSpelling(args.harness) ? "variant" : "thinking_level"] ?? normalizeModelEntry(harnessBlock.model, args.harness)?.qualifier;
+  const taskHasModel = taskBlock !== undefined && hasOwn(taskBlock, "model");
+  const usesMuralModel = !taskHasModel && args.task === "compress-cues" && Boolean(readString(args.muralModel));
+  const primarySource = taskHasModel ? taskBlock?.model : usesMuralModel ? args.muralModel : harnessBlock.model;
+  const fallbackSource = taskBlock !== undefined && hasOwn(taskBlock, "fallback_models") ? taskBlock.fallback_models : harnessBlock.fallback_models;
+  return {
+    primary: resolvePrimaryEntry({
+      entry: primarySource,
+      defaultQualifier: usesMuralModel ? harnessQualifier : taskQualifier ?? harnessQualifier,
+      harness: args.harness
+    }),
+    fallbacks: resolveFallbackEntries(fallbackSource, args.harness),
+    schedule: readString(schedulingTask?.schedule),
+    timeoutMinutes: typeof taskBlock?.timeout_minutes === "number" ? taskBlock.timeout_minutes : undefined,
+    promotionThreshold: typeof schedulingTask?.promotion_threshold === "number" ? schedulingTask.promotion_threshold : undefined
+  };
+}
+
+// ../plugin/src/features/magic-context/dreamer/task-config.ts
+function buildDreamTaskRuntimeConfigs(dreamer, harness, language, muralModel) {
+  return CANONICAL_DREAM_TASKS.map((task) => {
+    const resolved = resolveDreamerTaskModel({
+      config: { dreamer },
+      harness,
+      task,
+      muralModel
+    });
     return {
       task,
-      schedule: t.schedule,
-      model,
-      fallbackModels,
-      thinkingLevel,
+      schedule: resolved.schedule ?? "",
+      model: resolved.primary,
+      fallbackModels: resolved.fallbacks,
+      thinkingLevel: harness === "pi" ? resolved.primary?.qualifier : undefined,
       language,
-      timeoutMinutes: t.timeout_minutes ?? 20,
-      promotionThreshold: t.promotion_threshold
+      timeoutMinutes: resolved.timeoutMinutes ?? 20,
+      promotionThreshold: resolved.promotionThreshold
     };
   });
 }
@@ -4825,7 +5680,7 @@ function summarizeDreamSchedule(dreamer) {
 
 // ../plugin/src/features/magic-context/dreamer/task-executor.ts
 import { createHash as createHash8 } from "node:crypto";
-import { existsSync as existsSync5 } from "node:fs";
+import { existsSync as existsSync6 } from "node:fs";
 
 // ../plugin/src/agents/dreamer.ts
 var DREAMER_AGENT = "dreamer";
@@ -4835,10 +5690,6 @@ var DREAMER_MEMORY_MAPPER_AGENT = "dreamer-memory-mapper";
 var DREAMER_CLASSIFIER_AGENT = "dreamer-classifier";
 var DREAMER_DOCS_AGENT = "dreamer-docs";
 var DREAMER_REVIEWER_AGENT = "dreamer-reviewer";
-
-// ../plugin/src/features/magic-context/fail-closed-block.ts
-var FAIL_CLOSED_DOCTOR_COMMAND = "npx @cortexkit/magic-context@latest doctor";
-var OPENCODE_INTERNAL_AGENT_NAMES = new Set(["title", "summary", "compaction"]);
 
 // ../plugin/src/features/magic-context/schema-fence-probe.ts
 var STALE_CHILD_SPAWN_FAILURE = "stale_schema_fence";
@@ -4892,155 +5743,6 @@ function probeChildSpawnFence(db) {
   return { allowSpawn: true };
 }
 
-// ../plugin/src/hooks/magic-context/send-session-notification.ts
-var MAX_QUEUED_IGNORED_NOTIFICATIONS = 16;
-var queuedIgnoredNotifications = new Map;
-var flushingIgnoredNotifications = new Set;
-var midTurnDetector = (sessionId) => isMidTurn(undefined, sessionId);
-function queueIgnoredNotification(notification) {
-  const queued = queuedIgnoredNotifications.get(notification.sessionId) ?? [];
-  queued.push(notification);
-  if (queued.length > MAX_QUEUED_IGNORED_NOTIFICATIONS) {
-    queued.splice(0, queued.length - MAX_QUEUED_IGNORED_NOTIFICATIONS);
-    sessionLog(notification.sessionId, `ignored notification queue full; dropped oldest entries (kept newest ${MAX_QUEUED_IGNORED_NOTIFICATIONS})`);
-  }
-  queuedIgnoredNotifications.set(notification.sessionId, queued);
-}
-async function trySendTuiToast(sessionId, text, params, forcePersist) {
-  if (forcePersist)
-    return false;
-  const title = extractToastTitle(text);
-  const message = text.length > 200 ? `${text.slice(0, 200)}…` : text;
-  const toastVariant = inferToastVariant(text);
-  const duration = params.toastDurationMs ?? 5000;
-  const { isTuiConnected: checkTui } = await import("./rpc-notifications-jxy30tgz.js");
-  if (!checkTui(sessionId))
-    return false;
-  try {
-    const { pushNotification } = await import("./rpc-notifications-jxy30tgz.js");
-    pushNotification("toast", {
-      title,
-      message,
-      variant: toastVariant,
-      duration
-    }, sessionId);
-    return true;
-  } catch {
-    sessionLog(sessionId, "TUI RPC toast enqueue failed, falling back to ignored message");
-    return false;
-  }
-}
-function hasNotificationSessionClient(client) {
-  if (client === null || typeof client !== "object")
-    return false;
-  const candidate = client;
-  if (candidate.session === undefined)
-    return true;
-  if (candidate.session === null || typeof candidate.session !== "object")
-    return false;
-  const session = candidate.session;
-  return (session.prompt === undefined || typeof session.prompt === "function") && (session.promptAsync === undefined || typeof session.promptAsync === "function");
-}
-function inferToastVariant(text) {
-  const lower = text.toLowerCase();
-  if (lower.includes("error") || lower.includes("failed") || lower.includes("alert"))
-    return "error";
-  if (lower.includes("warning") || lower.includes("⚠"))
-    return "warning";
-  if (lower.includes("complete") || lower.includes("success") || lower.includes("✓") || lower.includes("finished"))
-    return "success";
-  return "info";
-}
-function extractToastTitle(text) {
-  const headingMatch = text.match(/^#+\s+(.+)/m);
-  if (headingMatch)
-    return headingMatch[1].trim();
-  const firstLine = text.split(`
-`)[0].trim();
-  if (firstLine.length <= 80)
-    return firstLine;
-  return "Magic Context";
-}
-async function sendIgnoredMessageNow(client, sessionId, text, params, forcePersist) {
-  if (midTurnDetector(sessionId)) {
-    queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
-    return "queued";
-  }
-  const { waitForSafeNotificationTarget } = await import("./safe-notification-target-vv32wjdc.js");
-  if (await waitForSafeNotificationTarget(client, sessionId) === "skip") {
-    sessionLog(sessionId, "notification skipped (session not titled yet)");
-    return "skipped";
-  }
-  if (midTurnDetector(sessionId)) {
-    queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
-    return "queued";
-  }
-  if (!hasNotificationSessionClient(client)) {
-    sessionLog(sessionId, "session prompt API unavailable for notification");
-    return "failed";
-  }
-  const c = client;
-  let agent = params.agent || undefined;
-  let variant = params.variant || undefined;
-  let model = params.providerId && params.modelId ? { providerID: params.providerId, modelID: params.modelId } : undefined;
-  if (!agent || !model || !variant) {
-    try {
-      const { resolvePromptContext } = await import("./prompt-context-g3abnc66.js");
-      const resolved = await resolvePromptContext(client, sessionId);
-      if (resolved) {
-        agent = agent ?? resolved.agent;
-        model = model ?? resolved.model;
-        variant = variant ?? resolved.variant;
-      }
-    } catch {}
-  }
-  if (midTurnDetector(sessionId)) {
-    queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
-    return "queued";
-  }
-  const input = {
-    path: { id: sessionId },
-    body: {
-      noReply: true,
-      agent,
-      model,
-      variant,
-      parts: [
-        {
-          type: "text",
-          text,
-          ignored: true
-        }
-      ]
-    }
-  };
-  try {
-    if (typeof c.session?.prompt === "function") {
-      await Promise.resolve(c.session.prompt(input));
-      return "sent";
-    }
-    if (typeof c.session?.promptAsync === "function") {
-      await c.session.promptAsync(input);
-      return "sent";
-    }
-    sessionLog(sessionId, "session prompt API unavailable for notification");
-    return "failed";
-  } catch (error) {
-    const msg = getErrorMessage(error);
-    sessionLog(sessionId, "failed to send notification:", msg);
-    return "failed";
-  }
-}
-async function sendIgnoredMessage(client, sessionId, text, params, forcePersist = false) {
-  if (await trySendTuiToast(sessionId, text, params, forcePersist))
-    return "sent";
-  if (midTurnDetector(sessionId)) {
-    queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
-    return "queued";
-  }
-  return sendIgnoredMessageNow(client, sessionId, text, params, forcePersist);
-}
-
 // ../plugin/src/hooks/magic-context/child-session-spawn.ts
 var STALE_PLUGIN_RESTART_NOTICE = "Magic Context: plugin build is older than its database — restart OpenCode";
 var SCHEMA_PROBE_FAILURE_NOTICE = `Magic Context: unable to verify the database schema before spawning a child — run ${FAIL_CLOSED_DOCTOR_COMMAND}`;
@@ -5065,7 +5767,6 @@ async function surfaceSchemaFenceFailure(args, failure) {
       duration: 1e4
     }, args.parentSessionId);
     pushNotification2("action", { action: "refresh-sidebar" }, args.parentSessionId);
-    await sendIgnoredMessage(args.client, args.parentSessionId, notice, args.notificationParams ?? {}, true);
   } catch (error) {
     sessionLog(args.parentSessionId, `schema-fence warning delivery failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -5091,6 +5792,18 @@ async function createChildSessionWithFence(args) {
     },
     query: { directory: args.directory }
   });
+}
+
+// ../plugin/src/hooks/magic-context/compartment-runner-types.ts
+class HiddenCompletionRefusal extends Error {
+  code;
+  terminal;
+  constructor(code, message, terminal = false) {
+    super(`${code}: ${message}`);
+    this.code = code;
+    this.terminal = terminal;
+    this.name = "HiddenCompletionRefusal";
+  }
 }
 
 // ../plugin/src/shared/assistant-message-extractor.ts
@@ -5147,13 +5860,599 @@ function hasLengthCappedOutput(value) {
   return Object.values(value).some((item) => hasLengthCappedOutput(item));
 }
 
-// ../plugin/src/features/magic-context/mural/compress-cues.ts
-import { createHash as createHash3 } from "node:crypto";
-
 // ../plugin/src/shared/keep-subagents.ts
 var keepSubagents = false;
 function shouldKeepSubagents() {
   return keepSubagents;
+}
+
+// ../plugin/src/shared/child-session-teardown.ts
+async function teardownChildSession(args) {
+  const { client, sessionId, sessionDirectory, promptSettled, privacySensitive, context, log } = args;
+  if (!sessionId)
+    return;
+  const request = {
+    path: { id: sessionId },
+    ...sessionDirectory ? { query: { directory: sessionDirectory } } : {}
+  };
+  if (promptSettled && (privacySensitive || !shouldKeepSubagents())) {
+    await client.session.delete(request).catch((error) => {
+      log(`${context}: session cleanup failed: ${String(error)}`);
+    });
+    return;
+  }
+  if (!promptSettled) {
+    const archiveSession = client.session;
+    await archiveSession.update?.({
+      ...request,
+      body: { time: { archived: Date.now() } }
+    }).catch(() => {});
+    log(`${context}: prompt unsettled — session ${sessionId} left to the age-gated sweep`);
+  }
+}
+
+// ../plugin/src/features/magic-context/mural/compress-cues.ts
+import { createHash as createHash3 } from "node:crypto";
+
+// ../plugin/src/hooks/magic-context/compartment-runner-historian.ts
+import { mkdirSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join2 } from "node:path";
+
+// ../plugin/src/agents/historian.ts
+var HISTORIAN_AGENT = "historian";
+var HISTORIAN_RECOMP_AGENT = "historian-recomp";
+var HISTORIAN_EDITOR_AGENT = "historian-editor";
+
+// ../plugin/src/features/magic-context/subagent-token-capture.ts
+function asNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function tokenObjectFromMessage(message) {
+  const info = message.info;
+  if (info && typeof info === "object") {
+    const tokens = info.tokens;
+    if (tokens && typeof tokens === "object")
+      return tokens;
+  }
+  const tokens = message.tokens;
+  if (tokens && typeof tokens === "object")
+    return tokens;
+  const usage = message.usage;
+  if (usage && typeof usage === "object")
+    return usage;
+  return null;
+}
+function isAssistantMessage(message) {
+  if (!message || typeof message !== "object")
+    return false;
+  const record = message;
+  const info = record.info;
+  if (info && typeof info === "object") {
+    return info.role === "assistant";
+  }
+  return record.role === "assistant";
+}
+function modelFromMessage(message) {
+  const info = message.info;
+  const source = info && typeof info === "object" ? info : message;
+  return {
+    providerId: typeof source.providerID === "string" ? source.providerID : typeof source.providerId === "string" ? source.providerId : null,
+    modelId: typeof source.modelID === "string" ? source.modelID : typeof source.modelId === "string" ? source.modelId : null
+  };
+}
+function emptyTokenTotals() {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+function sumTokensFromChildMessages(messages) {
+  const totals = emptyTokenTotals();
+  for (const message of messages) {
+    if (!isAssistantMessage(message))
+      continue;
+    const tokens = tokenObjectFromMessage(message);
+    if (!tokens)
+      continue;
+    const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : {};
+    totals.input += asNumber(tokens.input);
+    totals.output += asNumber(tokens.output);
+    totals.cacheRead += asNumber(cache.read ?? tokens.cacheRead ?? tokens.cache_read);
+    totals.cacheWrite += asNumber(cache.write ?? tokens.cacheWrite ?? tokens.cache_write);
+  }
+  return totals;
+}
+function findLastAssistantModel(messages) {
+  for (let index = messages.length - 1;index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isAssistantMessage(message))
+      return modelFromMessage(message);
+  }
+  return { providerId: null, modelId: null };
+}
+function recordChildInvocation(input) {
+  if (!input.db)
+    return null;
+  const tokens = input.tokens ?? sumTokensFromChildMessages(input.messages ?? []);
+  const model = input.providerId !== undefined || input.modelId !== undefined ? { providerId: input.providerId ?? null, modelId: input.modelId ?? null } : findLastAssistantModel(input.messages ?? []);
+  try {
+    return recordSubagentInvocation(input.db, {
+      sessionId: input.parentSessionId,
+      harness: input.harness,
+      subagent: input.subagent,
+      task: input.task ?? null,
+      providerId: model.providerId,
+      modelId: model.modelId,
+      startedAt: input.startedAt,
+      endedAt: input.endedAt ?? Date.now(),
+      status: input.status,
+      inputTokens: tokens.input,
+      outputTokens: tokens.output,
+      cacheReadTokens: tokens.cacheRead,
+      cacheWriteTokens: tokens.cacheWrite,
+      error: input.error ? describeError(input.error).brief : null,
+      parentInvocationId: input.parentInvocationId ?? null
+    });
+  } catch (error) {
+    sessionLog(input.parentSessionId, "subagent token accounting failed:", describeError(error).brief);
+    return null;
+  }
+}
+
+// ../plugin/src/hooks/magic-context/compartment-runner-historian.ts
+function historianResponseDumpDir(directory) {
+  return getProjectMagicContextHistorianDir(directory);
+}
+var MAX_HISTORIAN_RETRIES = 2;
+var HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
+function extractLatestHistorianReasoning(messages) {
+  if (!Array.isArray(messages))
+    return null;
+  const latest = messages.filter((message) => isRecord(message) && isRecord(message.info) && message.info.role === "assistant").sort((left, right) => historianMessageCreatedAt(right) - historianMessageCreatedAt(left))[0];
+  if (!latest || !Array.isArray(latest.parts))
+    return null;
+  return latest.parts.filter(isHistorianReasoningPart).map((part) => part.text).join(`
+`) || null;
+}
+function isHistorianReasoningPart(part) {
+  return isRecord(part) && typeof part.type === "string" && HISTORIAN_REASONING_PART_TYPES.has(part.type) && typeof part.text === "string" && part.text.length > 0;
+}
+function historianMessageCreatedAt(message) {
+  if (!isRecord(message.info) || !isRecord(message.info.time))
+    return 0;
+  return typeof message.info.time.created === "number" ? message.info.time.created : 0;
+}
+function createV1HiddenCompletionExecutor(client, db, directory) {
+  return {
+    capabilities: { tools: true, harness: getHarness() },
+    async open(run) {
+      if (!client)
+        throw new Error("Hidden completion client is unavailable");
+      const response = await createChildSessionWithFence({
+        client,
+        db,
+        parentSessionId: run.parentSessionId,
+        title: run.title,
+        directory: run.directory
+      });
+      const created = normalizeSDKResponse(response, null, {
+        preferResponseOnMissingData: true
+      });
+      const id = typeof created?.id === "string" ? created.id : "";
+      return { id, childSessionId: id || undefined };
+    },
+    async attempt(_handle, request) {
+      if (!client)
+        throw new Error("Hidden completion client is unavailable");
+      await client.session.prompt(request);
+    },
+    async collect(handle, limit) {
+      if (!client)
+        throw new Error("Hidden completion client is unavailable");
+      const response = await client.session.messages({
+        path: { id: handle.id },
+        query: { directory, limit }
+      });
+      const messages = normalizeSDKResponse(response, [], {
+        preferResponseOnMissingData: true
+      });
+      const text = extractLatestAssistantText(messages);
+      return {
+        messages,
+        text,
+        reasoning: text ? null : extractLatestHistorianReasoning(messages),
+        lengthCapped: hasLengthCappedOutput(messages),
+        usage: sumTokensFromChildMessages(messages)
+      };
+    },
+    async close(handle, settlement) {
+      if (!client)
+        return;
+      await teardownChildSession({
+        client,
+        sessionId: handle?.id || null,
+        sessionDirectory: directory,
+        ...settlement
+      });
+    }
+  };
+}
+async function runValidatedHistorianPass(args) {
+  const firstRun = await runHistorianPrompt({
+    ...args,
+    dumpLabel: `${args.dumpLabelBase}-initial`,
+    modelOverride: args.model,
+    agentId: args.agentId
+  });
+  if (!firstRun.ok || !firstRun.result) {
+    if (firstRun.refusal?.terminal)
+      return { ok: false, error: firstRun.error ?? firstRun.refusal.message };
+    return runFallbackHistorianPass({
+      ...args,
+      prompt: args.prompt,
+      error: firstRun.error ?? "historian run failed",
+      dumpPaths: [firstRun.dumpPath]
+    });
+  }
+  const firstValidation = validateHistorianOutput(firstRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
+  if (firstValidation.ok) {
+    const finalResult = args.twoPass ? await runEditorPassOrFallback({
+      ...args,
+      draftXml: firstRun.result,
+      draftValidation: firstValidation,
+      draftDumpPath: firstRun.dumpPath,
+      draftInvocationId: firstRun.invocationId ?? null
+    }) : { ...firstValidation, invocationId: firstRun.invocationId ?? null };
+    cleanupHistorianDump(args.parentSessionId, firstRun.dumpPath);
+    return finalResult;
+  }
+  await args.callbacks?.onRepairRetry?.(firstValidation.error ?? "invalid compartment output");
+  const repairPrompt = buildHistorianRepairPrompt(args.prompt, firstRun.result, firstValidation.error ?? "invalid compartment output", args.language);
+  const repairRun = await runHistorianPrompt({
+    ...args,
+    prompt: repairPrompt,
+    dumpLabel: `${args.dumpLabelBase}-repair`,
+    modelOverride: args.model,
+    agentId: args.agentId
+  });
+  if (!repairRun.ok || !repairRun.result) {
+    if (repairRun.refusal?.terminal)
+      return { ok: false, error: repairRun.error ?? repairRun.refusal.message };
+    return runFallbackHistorianPass({
+      ...args,
+      prompt: repairPrompt,
+      error: repairRun.error ?? "historian repair run failed",
+      dumpPaths: [firstRun.dumpPath, repairRun.dumpPath]
+    });
+  }
+  const repairValidation = validateHistorianOutput(repairRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
+  if (repairValidation.ok) {
+    const finalResult = args.twoPass ? await runEditorPassOrFallback({
+      ...args,
+      draftXml: repairRun.result,
+      draftValidation: repairValidation,
+      draftDumpPath: repairRun.dumpPath,
+      draftInvocationId: repairRun.invocationId ?? null
+    }) : { ...repairValidation, invocationId: repairRun.invocationId ?? null };
+    cleanupHistorianDump(args.parentSessionId, repairRun.dumpPath);
+    return finalResult;
+  }
+  return runFallbackHistorianPass({
+    ...args,
+    prompt: repairPrompt,
+    error: repairValidation.error ?? "invalid compartment output",
+    dumpPaths: [firstRun.dumpPath, repairRun.dumpPath]
+  });
+}
+async function runEditorPassOrFallback(args) {
+  sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
+  const editorRun = await runHistorianPrompt({
+    client: args.client,
+    hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+    db: args.db,
+    parentSessionId: args.parentSessionId,
+    sessionDirectory: args.sessionDirectory,
+    prompt: buildHistorianEditorPrompt(args.draftXml),
+    timeoutMs: args.timeoutMs,
+    maxOutputTokens: args.maxOutputTokens,
+    language: args.language,
+    dumpLabel: `${args.dumpLabelBase}-editor`,
+    agentId: HISTORIAN_EDITOR_AGENT,
+    parentInvocationId: args.draftInvocationId ?? null,
+    modelOverride: args.model
+  });
+  if (!editorRun.ok || !editorRun.result) {
+    sessionLog(args.parentSessionId, "historian two-pass: editor call failed", {
+      error: editorRun.error
+    });
+    return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
+  }
+  const editorValidation = validateHistorianOutput(editorRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
+  if (!editorValidation.ok) {
+    sessionLog(args.parentSessionId, "historian two-pass: editor validation failed, falling back to draft", { error: editorValidation.error });
+    return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
+  }
+  cleanupHistorianDump(args.parentSessionId, editorRun.dumpPath);
+  sessionLog(args.parentSessionId, "historian two-pass: editor accepted");
+  return { ...editorValidation, invocationId: editorRun.invocationId ?? null };
+}
+async function runHistorianPrompt(args) {
+  const {
+    client,
+    db,
+    parentSessionId,
+    sessionDirectory,
+    prompt,
+    timeoutMs,
+    dumpLabel,
+    modelOverride,
+    agentId = HISTORIAN_AGENT,
+    fallbackModels,
+    subagentKind,
+    parentInvocationId
+  } = args;
+  let agentSessionId = null;
+  let handle = null;
+  let completion;
+  const executor = args.hiddenCompletionExecutor ?? createV1HiddenCompletionExecutor(client, db, sessionDirectory);
+  let promptSettled = false;
+  let hadUnsettledPrompt = false;
+  const startedAt = Date.now();
+  let invocationRecorded = false;
+  const recordInvocation = (params) => {
+    if (invocationRecorded)
+      return null;
+    invocationRecorded = true;
+    return recordChildInvocation({
+      db: openDatabase(),
+      parentSessionId,
+      harness: executor.capabilities.harness,
+      subagent: agentId === HISTORIAN_EDITOR_AGENT ? "historian_editor" : subagentKind ?? "historian",
+      startedAt,
+      status: params.status,
+      messages: params.messages,
+      ...completion && !completion.messages ? {
+        tokens: completion.usage,
+        providerId: completion.providerId,
+        modelId: completion.modelId
+      } : {},
+      error: params.error,
+      parentInvocationId: agentId === HISTORIAN_EDITOR_AGENT ? parentInvocationId ?? null : null
+    });
+  };
+  try {
+    sessionLog(parentSessionId, `historian: creating child session (agent=${toModelEntry(modelOverride)?.model ?? `agent:${agentId}`})`);
+    handle = await executor.open({
+      parentSessionId,
+      parentInvocationId,
+      agent: agentId,
+      kind: agentId === HISTORIAN_EDITOR_AGENT ? "historian-editor" : "historian",
+      system: withContentLanguageDirective(agentId === HISTORIAN_EDITOR_AGENT ? HISTORIAN_EDITOR_SYSTEM_PROMPT : COMPARTMENT_AGENT_SYSTEM_PROMPT, args.language),
+      maxOutputTokens: args.maxOutputTokens,
+      model: modelOverride,
+      configuredModels: [
+        ...modelOverride ? [modelOverride] : [],
+        ...fallbackModels ?? []
+      ],
+      timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+      title: "magic-context-compartment",
+      directory: sessionDirectory,
+      metadata: { dumpLabel, subagentKind }
+    });
+    agentSessionId = handle.id || null;
+    const opened = handle;
+    if (!agentSessionId) {
+      recordInvocation({
+        status: "failed",
+        error: "Historian could not create its child session."
+      });
+      return { ok: false, error: "Historian could not create its child session." };
+    }
+    for (let retryIndex = 0;retryIndex <= MAX_HISTORIAN_RETRIES; retryIndex += 1) {
+      try {
+        await promptSyncWithModelSuggestionRetry(client, {
+          path: { id: agentSessionId },
+          query: { directory: sessionDirectory },
+          body: {
+            agent: agentId,
+            ...modelBodyField(modelOverride),
+            parts: [{ type: "text", text: prompt, synthetic: true }]
+          }
+        }, {
+          transport: Object.assign((request) => executor.attempt(opened, request), { childSessionId: opened.childSessionId }),
+          timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+          fallbackModels: modelOverride ? undefined : fallbackModels,
+          callContext: agentId === HISTORIAN_EDITOR_AGENT ? "historian:editor" : "historian"
+        });
+        promptSettled = !hadUnsettledPrompt;
+        sessionLog(parentSessionId, `historian: prompt completed (attempt ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES + 1})`);
+        break;
+      } catch (error) {
+        hadUnsettledPrompt = true;
+        promptSettled = false;
+        const errorMsg = getErrorMessage(error);
+        sessionLog(parentSessionId, `historian: prompt attempt ${retryIndex + 1} failed: ${errorMsg}`);
+        const shouldRetry = retryIndex < MAX_HISTORIAN_RETRIES && isTransientHistorianPromptError(errorMsg);
+        if (!shouldRetry) {
+          throw error;
+        }
+        const backoffMs = getHistorianRetryBackoffMs(retryIndex);
+        sessionLog(parentSessionId, `historian retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES} after ${backoffMs}ms: ${errorMsg}`);
+        await sleep(backoffMs);
+      }
+    }
+    completion = await executor.collect(handle, 50);
+    const invocationId = recordInvocation({
+      status: "completed",
+      messages: completion.messages
+    });
+    const lengthCapped = completion.lengthCapped;
+    const textResult = completion.text;
+    const reasoningResult = textResult ? null : completion.reasoning;
+    if (!textResult && reasoningResult && lengthCapped) {
+      const outputTokens = completion.usage.output;
+      return {
+        ok: false,
+        error: `historian output length-capped at ${outputTokens} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`,
+        invocationId: invocationId ?? undefined
+      };
+    }
+    const result = textResult ?? reasoningResult;
+    if (!result) {
+      return {
+        ok: false,
+        error: "Historian returned no assistant output.",
+        invocationId: invocationId ?? undefined
+      };
+    }
+    const dumpPath = dumpHistorianResponse(parentSessionId, sessionDirectory, dumpLabel ?? "historian-response", result);
+    return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
+  } catch (modelError) {
+    const desc = describeError(modelError);
+    sessionLog(parentSessionId, `historian prompt failed: ${desc.brief} promptLength=${prompt.length}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`);
+    recordInvocation({ status: "failed", error: modelError });
+    return {
+      ok: false,
+      error: `Historian failed while processing this session: ${desc.brief}`,
+      ...modelError instanceof HiddenCompletionRefusal ? { refusal: modelError } : {}
+    };
+  } finally {
+    await executor.close(handle, {
+      promptSettled,
+      privacySensitive: false,
+      context: "historian",
+      log: (message) => sessionLog(parentSessionId, message)
+    });
+  }
+}
+async function runFallbackHistorianPass(args) {
+  const seen = new Set;
+  const chain = [];
+  const primary = toModelEntry(args.model);
+  for (const candidateInput of [
+    ...args.fallbackModels ?? [],
+    ...args.fallbackModelId ? [{ model: args.fallbackModelId }] : []
+  ]) {
+    const candidate = toModelEntry(candidateInput);
+    if (!candidate)
+      continue;
+    const key = `${candidate.model}\x00${candidate.qualifier ?? ""}`;
+    if (!candidate.model || seen.has(key))
+      continue;
+    if (primary?.model === candidate.model && primary.qualifier === candidate.qualifier) {
+      continue;
+    }
+    seen.add(key);
+    chain.push(candidate);
+  }
+  if (chain.length === 0) {
+    return { ok: false, error: args.error };
+  }
+  let lastError = args.error;
+  for (let i = 0;i < chain.length; i += 1) {
+    const modelOverride = chain[i];
+    const modelId = modelOverride.model;
+    if (!parseModelOverride(modelId))
+      continue;
+    const isSessionModelLastResort = modelId === args.fallbackModelId && i === chain.length - 1;
+    sessionLog(args.parentSessionId, `compartment agent: retrying historian with ${modelId} (${isSessionModelLastResort ? "session-model last resort" : "configured fallback"} ${i + 1}/${chain.length})`);
+    args.callbacks?.onModelFallback?.(modelId, i + 1, chain.length);
+    const fallbackRun = await runHistorianPrompt({
+      client: args.client,
+      hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+      db: args.db,
+      parentSessionId: args.parentSessionId,
+      sessionDirectory: args.sessionDirectory,
+      prompt: args.prompt,
+      timeoutMs: args.timeoutMs,
+      maxOutputTokens: args.maxOutputTokens,
+      language: args.language,
+      dumpLabel: `${args.dumpLabelBase}-fallback-${i + 1}`,
+      modelOverride,
+      agentId: args.agentId
+    });
+    if (!fallbackRun.ok || !fallbackRun.result) {
+      lastError = fallbackRun.error ?? lastError;
+      continue;
+    }
+    const fallbackValidation = validateHistorianOutput(fallbackRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
+    if (fallbackValidation.ok) {
+      cleanupHistorianDump(args.parentSessionId, fallbackRun.dumpPath);
+      return { ...fallbackValidation, invocationId: fallbackRun.invocationId ?? null };
+    }
+    lastError = fallbackValidation.error ?? lastError;
+  }
+  return { ok: false, error: lastError };
+}
+function parseModelOverride(modelId) {
+  const [providerID, ...modelParts] = modelId.split("/");
+  const modelID = modelParts.join("/");
+  if (!providerID || modelID.length === 0) {
+    return null;
+  }
+  return { providerID, modelID };
+}
+function getHistorianRetryBackoffMs(retryIndex) {
+  if (retryIndex === 0) {
+    return 2000 + Math.floor(Math.random() * 1001);
+  }
+  return 6000 + Math.floor(Math.random() * 2001);
+}
+function isTransientHistorianPromptError(message) {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("invalid request") || normalized.includes("bad request") || normalized.includes("unauthorized") || normalized.includes("forbidden") || normalized.includes("authentication") || normalized.includes("auth") || normalized.includes(" 400") || normalized.startsWith("400")) {
+    return false;
+  }
+  return [
+    "429",
+    "rate limit",
+    "timeout",
+    "econnreset",
+    "etimedout",
+    "503",
+    "502",
+    "500",
+    "overloaded"
+  ].some((token) => normalized.includes(token));
+}
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+function cleanupHistorianDump(sessionId, dumpPath) {
+  if (!dumpPath)
+    return;
+  try {
+    unlinkSync2(dumpPath);
+  } catch (error) {
+    sessionLog(sessionId, "compartment agent: failed to remove historian response dump", {
+      dumpPath,
+      error: getErrorMessage(error)
+    });
+  }
+}
+function dumpHistorianResponse(sessionId, directory, label, text) {
+  try {
+    const dumpDir = historianResponseDumpDir(directory);
+    mkdirSync(dumpDir, { recursive: true });
+    ensureCortexKitArtifactGitignore(directory);
+    const safeSessionId = sanitizeDumpName(sessionId);
+    const safeLabel = sanitizeDumpName(label);
+    const dumpPath = join2(dumpDir, `${safeSessionId}-${safeLabel}-${Date.now()}.xml`);
+    writeFileSync2(dumpPath, text, "utf8");
+    sessionLog(sessionId, "compartment agent: historian response dumped", {
+      label,
+      dumpPath
+    });
+    return dumpPath;
+  } catch (error) {
+    sessionLog(sessionId, "compartment agent: failed to dump historian response", {
+      label,
+      error: getErrorMessage(error)
+    });
+    return;
+  }
+}
+function sanitizeDumpName(value) {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
 // ../plugin/src/features/magic-context/dreamer/manifest-parser.ts
@@ -5186,6 +6485,34 @@ function assertManifestCoversExactly(ids, expectedIds, rootName) {
   for (const id of expectedIds) {
     if (!ids.includes(id))
       throw new Error(`${rootName} manifest missing id ${id}`);
+  }
+}
+var OPEN_TAG_RE = /<([A-Za-z][\w:-]*)\b/;
+function describeUnrecognizedManifestShape(text, expectedRoot, expectedEntry) {
+  const expected = `expected <${expectedRoot}> with <${expectedEntry}> entries`;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    return `JSON ${trimmed.startsWith("[") ? "array" : "object"} unrecognized; ${expected}`;
+  }
+  const firstTag = OPEN_TAG_RE.exec(trimmed)?.[1];
+  if (firstTag && firstTag.toLowerCase() !== expectedRoot.toLowerCase()) {
+    return `root <${firstTag}> unrecognized; ${expected}`;
+  }
+  const escapedRoot = expectedRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bodyMatch = new RegExp(`<${escapedRoot}\\b[^>]*>([\\s\\S]*?)<\\/${escapedRoot}>`, "i").exec(text);
+  const body = (bodyMatch?.[1] ?? "").trim();
+  if (body.startsWith("[") || body.startsWith("{")) {
+    return `JSON ${body.startsWith("[") ? "array" : "object"} unrecognized; ${expected}`;
+  }
+  const innerTag = OPEN_TAG_RE.exec(body)?.[1];
+  if (innerTag && innerTag.toLowerCase() !== expectedEntry.toLowerCase()) {
+    return `root <${innerTag}> unrecognized; ${expected}`;
+  }
+  return `parsed zero entries; ${expected}`;
+}
+function assertParsedManifestNonEmpty(parsedCount, expectedCount, text, expectedRoot, expectedEntry) {
+  if (expectedCount > 0 && parsedCount === 0) {
+    throw new Error(describeUnrecognizedManifestShape(text, expectedRoot, expectedEntry));
   }
 }
 
@@ -5540,25 +6867,31 @@ function isTimeoutClassError(error) {
 }
 async function compressOneChunk(args, chunk, sliceMs, signal) {
   let agentSessionId = null;
+  let handle = null;
+  const executor = args.hiddenCompletionExecutor ?? createV1HiddenCompletionExecutor(args.client, args.db, args.sessionDirectory);
+  let promptSettled = false;
   const startedAt = Date.now();
   try {
     const prompt = buildCompressCuesPrompt({
       projectPath: args.projectIdentity,
       memories: chunk.map(toPromptMemory)
     });
-    const createResponse = await createChildSessionWithFence({
-      client: args.client,
-      db: args.db,
+    handle = await executor.open({
       parentSessionId: args.parentSessionId,
+      agent: DREAMER_CLASSIFIER_AGENT,
+      kind: "dreamer-task",
+      system: COMPRESS_CUES_SYSTEM_PROMPT,
+      model: args.model,
+      configuredModels: [...args.model ? [args.model] : [], ...args.fallbackModels ?? []],
+      timeoutMs: sliceMs,
       title: "magic-context-dream-compress-cues",
-      directory: args.sessionDirectory
+      directory: args.sessionDirectory,
+      metadata: { task: "compress-cues" }
     });
-    const created = normalizeSDKResponse(createResponse, null, {
-      preferResponseOnMissingData: true
-    });
-    agentSessionId = typeof created?.id === "string" ? created.id : null;
+    agentSessionId = handle.id || null;
     if (!agentSessionId)
       throw new Error("Could not create compress-cues session.");
+    const opened = handle;
     const run = await promptSyncWithValidatedOutputRetry(args.client, {
       path: { id: agentSessionId },
       query: { directory: args.sessionDirectory },
@@ -5569,24 +6902,18 @@ async function compressOneChunk(args, chunk, sliceMs, signal) {
         parts: [{ type: "text", text: prompt, synthetic: true }]
       }
     }, {
+      transport: Object.assign((request) => executor.attempt(opened, request), { childSessionId: opened.childSessionId }),
       timeoutMs: sliceMs,
       signal,
       fallbackModels: args.fallbackModels,
       callContext: "dreamer:compress-cues",
-      fetchOutput: async () => {
-        const messagesResponse = await args.client.session.messages({
-          path: { id: agentSessionId },
-          query: { directory: args.sessionDirectory, limit: 50 }
-        });
-        return normalizeSDKResponse(messagesResponse, [], {
-          preferResponseOnMissingData: true
-        });
-      },
-      validateOutput: (messages) => {
-        if (hasLengthCappedOutput(messages)) {
+      fetchOutput: () => executor.collect(opened, 50),
+      validateOutput: (completion) => {
+        const messages = completion.messages ?? [];
+        if (completion.lengthCapped) {
           throw new Error("compress-cues returned length-capped output");
         }
-        const text = extractLatestAssistantText(messages);
+        const text = completion.text;
         if (!text)
           throw new Error("compress-cues returned no output");
         try {
@@ -5600,11 +6927,26 @@ async function compressOneChunk(args, chunk, sliceMs, signal) {
         return text;
       }
     });
+    promptSettled = true;
+    if (args.hiddenCompletionExecutor && args.parentSessionId) {
+      recordChildInvocation({
+        db: args.db,
+        parentSessionId: args.parentSessionId,
+        harness: executor.capabilities.harness,
+        subagent: "dreamer",
+        task: "compress-cues",
+        startedAt,
+        status: "completed",
+        tokens: run.output.usage,
+        providerId: run.output.providerId,
+        modelId: run.output.modelId
+      });
+    }
     return args.moduleRoute ? await applyCuesThroughModule(args, chunk, run.validated, signal) : applyCues(args, chunk, run.validated);
   } catch (error) {
     const desc = describeError(error);
     log(`[dreamer] compress-cues chunk failed: ${desc.brief}`, desc.stackHead ? { stackHead: desc.stackHead } : undefined);
-    if (signal.aborted || error instanceof DreamerProviderOutputFailureError)
+    if (signal.aborted || error instanceof HiddenCompletionRefusal || error instanceof DreamerProviderOutputFailureError)
       throw error;
     return {
       compressed: 0,
@@ -5616,14 +6958,12 @@ async function compressOneChunk(args, chunk, sliceMs, signal) {
       }
     };
   } finally {
-    if (agentSessionId && !shouldKeepSubagents()) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] compress-cues session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await executor.close(handle, {
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] compress-cues",
+      log
+    });
   }
 }
 function applyCues(args, chunk, manifestText) {
@@ -5764,96 +7104,6 @@ async function applyCuesThroughModule(args, chunk, manifestText, signal) {
   }, { compressed: 0, skipped: 0 });
 }
 
-// ../plugin/src/features/magic-context/subagent-token-capture.ts
-function asNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-function tokenObjectFromMessage(message) {
-  const info = message.info;
-  if (info && typeof info === "object") {
-    const tokens = info.tokens;
-    if (tokens && typeof tokens === "object")
-      return tokens;
-  }
-  const tokens = message.tokens;
-  if (tokens && typeof tokens === "object")
-    return tokens;
-  return null;
-}
-function isAssistantMessage(message) {
-  if (!message || typeof message !== "object")
-    return false;
-  const record = message;
-  const info = record.info;
-  if (info && typeof info === "object") {
-    return info.role === "assistant";
-  }
-  return record.role === "assistant";
-}
-function modelFromMessage(message) {
-  const info = message.info;
-  const source = info && typeof info === "object" ? info : message;
-  return {
-    providerId: typeof source.providerID === "string" ? source.providerID : typeof source.providerId === "string" ? source.providerId : null,
-    modelId: typeof source.modelID === "string" ? source.modelID : typeof source.modelId === "string" ? source.modelId : null
-  };
-}
-function emptyTokenTotals() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-}
-function sumTokensFromChildMessages(messages) {
-  const totals = emptyTokenTotals();
-  for (const message of messages) {
-    if (!isAssistantMessage(message))
-      continue;
-    const tokens = tokenObjectFromMessage(message);
-    if (!tokens)
-      continue;
-    const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : {};
-    totals.input += asNumber(tokens.input);
-    totals.output += asNumber(tokens.output);
-    totals.cacheRead += asNumber(cache.read ?? tokens.cacheRead ?? tokens.cache_read);
-    totals.cacheWrite += asNumber(cache.write ?? tokens.cacheWrite ?? tokens.cache_write);
-  }
-  return totals;
-}
-function findLastAssistantModel(messages) {
-  for (let index = messages.length - 1;index >= 0; index -= 1) {
-    const message = messages[index];
-    if (isAssistantMessage(message))
-      return modelFromMessage(message);
-  }
-  return { providerId: null, modelId: null };
-}
-function recordChildInvocation(input) {
-  if (!input.db)
-    return null;
-  const tokens = input.tokens ?? sumTokensFromChildMessages(input.messages ?? []);
-  const model = input.providerId !== undefined || input.modelId !== undefined ? { providerId: input.providerId ?? null, modelId: input.modelId ?? null } : findLastAssistantModel(input.messages ?? []);
-  try {
-    return recordSubagentInvocation(input.db, {
-      sessionId: input.parentSessionId,
-      harness: input.harness,
-      subagent: input.subagent,
-      task: input.task ?? null,
-      providerId: model.providerId,
-      modelId: model.modelId,
-      startedAt: input.startedAt,
-      endedAt: input.endedAt ?? Date.now(),
-      status: input.status,
-      inputTokens: tokens.input,
-      outputTokens: tokens.output,
-      cacheReadTokens: tokens.cacheRead,
-      cacheWriteTokens: tokens.cacheWrite,
-      error: input.error ? describeError(input.error).brief : null,
-      parentInvocationId: input.parentInvocationId ?? null
-    });
-  } catch (error) {
-    sessionLog(input.parentSessionId, "subagent token accounting failed:", describeError(error).brief);
-    return null;
-  }
-}
-
 // ../plugin/src/features/magic-context/dreamer/task-prompts.ts
 var PROJECT_MEMORY_TAXONOMY = `## Memory taxonomy (5 categories)
 
@@ -5864,15 +7114,15 @@ Project memory uses exactly 5 categories. Every memory belongs to one:
 - **CONFIG_VALUES** — stable configuration keys/values and conventions. Not transient measurements (test counts, sizes, versions).
 - **NAMING** — naming conventions and canonical names. Not inventories.
 
-**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with \`action="update"\` (or \`merge\`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit (otherwise archive — our own fixed bugs are not world facts). USER_DIRECTIVES / USER_PREFERENCES are NOT project categories — they live in the global user profile; archive project copies only when they add zero project-specific detail.`;
+**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with \`action="update"\` (or \`merge\`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit. USER_DIRECTIVES / USER_PREFERENCES are NOT project categories. Do not compare project memories with the global user profile or use it to justify an archive.`;
 var CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic-context system. You run during a scheduled dream window to keep a project's cross-session memory store lean and well-formed.
 
 ## Memory operations (ctx_memory)
 - \`action="list"\` — browse active memories, optionally filter by category
 - \`action="merge", ids=[N,M,...], content="...", category="..."\` — consolidate duplicates into one canonical memory
-- \`action="update", ids=[N], content="..."\` — rewrite a memory's content
+- \`action="update", ids=[N], content="...", superseded_by=M\` — rewrite content; name where removed detail survives when cutting more than half
 - \`action="write", category="...", content="..."\` — create a memory (SPLITS ONLY — never mint new facts)
-- \`action="archive", ids=[N], reason="..."\` — soft-archive a stale or low-value memory
+- \`action="archive", ids=[N], superseded_by=M, reason="..."\` — consolidate a redundant memory into the named active same-category survivor
 
 ## Rules
 1. **Assume the pool is accurate.** A separate verify task checks memories against code. You handle QUALITY only — duplicates, wording, low-value entries — never correctness, and you do NOT read the codebase.
@@ -5915,34 +7165,27 @@ Mapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
 
 `);
 }
-function formatUserProfileList(userMemories) {
-  if (!userMemories || userMemories.length === 0)
-    return;
-  return userMemories.map((um) => `- [U${um.id}] ${um.content}`).join(`
-`);
-}
 function buildCuratePrompt(args) {
   return `## Task: Curate Project Memory Pool (hygiene)
 
 **Project:** ${args.projectPath}
 
-The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and archive low-value entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
+This run covers the whole of the \`${args.category}\` category (the other categories run in later windows).
 
-Work ALL THREE phases below in order (A → B → C) over the whole pool. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
+The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and consolidate redundant entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
+
+Work ALL THREE phases below in order (A → B → C) over this category. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
 
 ### Phase A — Consolidate duplicates
-Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates (one is miscategorized — archive the redundant one in Phase C instead). One fact per memory.
+Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates; do not archive either as a consolidation. One fact per memory.
 
 ### Phase B — Improve wording
-Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. \`write\` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
+Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. A rewrite that removes more than half the content must name the active same-category memory preserving that detail with \`superseded_by\`. \`write\` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
 
-### Phase C — Archive stale / low-value
-Archive (with a specific reason) memories that: restate code without rationale · are redundant with a better memory · are stale implementation detail (line numbers/internals) · low signal (seen_count=1, retrieval_count=0, no constraint language) · bare config value · transient measurement · a solved bug in OUR OWN code · redundant with the global user profile (zero added project detail).
+### Phase C — Archive only into a surviving project memory
+Archive a redundant memory only when a better ACTIVE memory in the same project and category preserves its information; name that survivor with \`superseded_by\`. A bare "redundant" verdict is deletion and will be refused. Leave standalone low-value or stale entries unchanged for a human to review. The global user profile describes the operator and is never a substitute for project knowledge, so it cannot justify an archive.
 KEEP (overrides archive): constraint/rule language (must/never/always) · explains WHY (because/so that/to prevent) · EXTERNAL-system limit (CONSTRAINTS: archive only if word-for-word duplicated) · path/config WITH context · retrieval_count>0 · priority/philosophy.
-${args.userProfile ? `
-### Global user profile (for the redundancy check)
-${args.userProfile}
-` : ""}
+
 ### Memory pool
 ${renderMemoryList(args.memories)}`;
 }
@@ -6151,8 +7394,8 @@ function buildDreamTaskPrompt(task, args) {
     case "curate":
       return buildCuratePrompt({
         projectPath: args.projectPath,
-        memories: args.curate?.memories ?? [],
-        userProfile: formatUserProfileList(args.userMemories)
+        category: args.curate?.category ?? "PROJECT_RULES",
+        memories: args.curate?.memories ?? []
       });
     case "maintain-docs":
       return buildMaintainDocsPrompt(args.projectPath, args.lastDreamAt ?? null, args.existingDocs ?? { architecture: false, structure: false });
@@ -6221,6 +7464,7 @@ Return valid JSON (no markdown fencing):
 
 If no promotions are warranted, return empty arrays. Always consume reviewed candidates so they don't accumulate indefinitely.`;
   let agentSessionId = null;
+  let promptSettled = false;
   const startedAt = Date.now();
   let invocationRecorded = false;
   const recordInvocation = (params) => {
@@ -6302,6 +7546,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         }
       }
     });
+    promptSettled = true;
     recordInvocation({ status: "completed", messages: reviewRun.output });
     const parsed = reviewRun.validated;
     const promotions = (parsed.promote ?? []).map((p) => ({
@@ -6355,14 +7600,15 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
     throw error;
   } finally {
     heartbeat.stop();
-    if (agentSessionId) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] user-memories: session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: agentSessionId,
+      sessionDirectory: args.sessionDirectory,
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] user-memories",
+      log
+    });
   }
 }
 
@@ -6381,153 +7627,6 @@ function isRustAuthorityDrainingError(error) {
     current = record.cause ?? record.error ?? record.result;
   }
   return error instanceof Error && error.message.includes("authority_draining");
-}
-
-// ../plugin/src/shared/redaction.ts
-import { homedir as homedir2, userInfo } from "node:os";
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-var SECRET_WORDS = [
-  "key",
-  "token",
-  "secret",
-  "password",
-  "auth",
-  "authorization",
-  "bearer",
-  "credential"
-];
-var SECRET_SEGMENT_PATTERN = new RegExp(`^(?:${SECRET_WORDS.map((w) => `${w}s?`).join("|")})$`, "i");
-var TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
-function redactionTypeForKey(key) {
-  const normalized = key.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
-  const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
-  return suffix || "secret";
-}
-function isNonSecretScalarValue(value) {
-  const v = value.trim();
-  if (v === "true" || v === "false" || v === "null" || v === "undefined")
-    return true;
-  return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
-}
-var SECRET_QUALIFIERS = new Set([
-  "api",
-  "access",
-  "private",
-  "client",
-  "auth",
-  "authorization",
-  "secret",
-  "bearer",
-  "session",
-  "refresh",
-  "service",
-  "x",
-  "openai",
-  "anthropic",
-  "google",
-  "github",
-  "huggingface",
-  "aws",
-  "azure"
-]);
-function sanitizePathString(value) {
-  const home = homedir2();
-  const username = userInfo().username;
-  let sanitized = value;
-  if (home) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
-  }
-  sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
-  sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
-  sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
-  if (username) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
-  }
-  return sanitized;
-}
-var SECRET_TEXT_PATTERNS = [
-  {
-    pattern: /\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}/g,
-    replacement: "<ANTHROPIC_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/g,
-    replacement: "<OPENAI_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-    replacement: "<GITHUB_PAT_REDACTED>"
-  },
-  {
-    pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}/g,
-    replacement: "<GITHUB_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\bhf_[A-Za-z0-9]{30,}/g,
-    replacement: "<HUGGINGFACE_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-    replacement: "<AWS_ACCESS_KEY_ID_REDACTED>"
-  },
-  {
-    pattern: /\bxox[abprsuvc]-[A-Za-z0-9-]{10,}/g,
-    replacement: "<SLACK_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
-    replacement: "<GOOGLE_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\b(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
-    replacement: (_full, prefix) => `${prefix}<REDACTED:bearer>`
-  },
-  {
-    pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
-    replacement: "<JWT_REDACTED>"
-  },
-  {
-    pattern: /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
-    replacement: (full, quote, key, separator, valueQuote, value) => isNonSecretScalarValue(value) ? full : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`
-  },
-  {
-    pattern: /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
-    replacement: (full, key, value) => isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`
-  }
-];
-function redactSecretText(value) {
-  let redacted = value;
-  for (const { pattern, replacement } of SECRET_TEXT_PATTERNS) {
-    if (typeof replacement === "string") {
-      redacted = redacted.replace(pattern, replacement);
-    } else {
-      redacted = redacted.replace(pattern, replacement);
-    }
-  }
-  return redacted;
-}
-function sanitizeDiagnosticText(value) {
-  return redactSecretText(sanitizePathString(value));
-}
-var SHAREABILITY_SENSITIVE_PATTERNS = [
-  /\bC:\/Users\/[^/\s]+/i,
-  /(?:^|\s)~\/[^\s]+/,
-  /\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*\S+/i,
-  /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\b/i,
-  /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
-  /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
-  /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/
-];
-function hasShareabilitySensitiveText(text) {
-  try {
-    if (sanitizeDiagnosticText(text) !== text)
-      return true;
-    return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
-  } catch {
-    return true;
-  }
 }
 
 // ../plugin/src/features/magic-context/dreamer/classify-prompt.ts
@@ -6596,9 +7695,19 @@ ${renderAnchors(args.anchors ?? [])}### Memory pool to classify
 ${renderPool2(args.memories)}`;
 }
 var SCOPES = new Set(["project", "ecosystem", "universe"]);
+function classifyBody(text) {
+  try {
+    return extractCompleteManifestBody(text, "classify");
+  } catch (error) {
+    const described = describeUnrecognizedManifestShape(text, "classify", "memory");
+    if (!described.startsWith("parsed zero entries"))
+      throw new Error(described);
+    throw error;
+  }
+}
 function parseClassifyManifest(text) {
   const out = [];
-  const body = extractCompleteManifestBody(text, "classify");
+  const body = classifyBody(text);
   for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
     const attrs = m[1];
     const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
@@ -6631,8 +7740,17 @@ function parseClassifyManifest(text) {
     }
     out.push(entry);
   }
+  if (out.length === 0 && body.trim().length > 0) {
+    throw new Error(describeUnrecognizedManifestShape(text, "classify", "memory"));
+  }
   assertNoDuplicateManifestIds(out.map((entry) => entry.id), "classify");
   return out;
+}
+function validateClassifyManifest(text, expectedIds) {
+  const parsed = parseClassifyManifest(text);
+  assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "classify", "memory");
+  assertManifestCoversExactly(parsed.map((entry) => entry.id), expectedIds, "classify");
+  return parsed;
 }
 
 // ../plugin/src/features/magic-context/dreamer/classify.ts
@@ -6775,6 +7893,9 @@ async function runClassify(args) {
 }
 async function classifyOneChunk(args, chunk, anchors, sliceMs, signal) {
   let agentSessionId = null;
+  let handle = null;
+  const executor = args.hiddenCompletionExecutor ?? createV1HiddenCompletionExecutor(args.client, args.db, args.sessionDirectory);
+  let promptSettled = false;
   const startedAt = Date.now();
   const moduleRoute = isModuleRoute(args);
   try {
@@ -6788,51 +7909,48 @@ async function classifyOneChunk(args, chunk, anchors, sliceMs, signal) {
       recordInvocation(args, startedAt, { status: "completed" });
       return run;
     }
-    const createResponse = await createChildSessionWithFence({
-      client: args.client,
-      db: args.db,
+    handle = await executor.open({
       parentSessionId: args.parentSessionId,
+      agent: DREAMER_CLASSIFIER_AGENT,
+      kind: "dreamer-task",
+      system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
+      model: args.model,
+      configuredModels: [...args.model ? [args.model] : [], ...args.fallbackModels ?? []],
+      timeoutMs: sliceMs,
       title: "magic-context-dream-classify",
-      directory: args.sessionDirectory
+      directory: args.sessionDirectory,
+      metadata: { task: "classify-memories" }
     });
-    const created = normalizeSDKResponse(createResponse, null, {
-      preferResponseOnMissingData: true
-    });
-    agentSessionId = typeof created?.id === "string" ? created.id : null;
+    agentSessionId = handle.id || null;
     if (!agentSessionId)
       throw new Error("Could not create classify session.");
+    const opened = handle;
     const run = await promptSyncWithValidatedOutputRetry(args.client, {
       path: { id: agentSessionId },
       query: { directory: args.sessionDirectory },
       body: {
         agent: DREAMER_CLASSIFIER_AGENT,
-        system: CLASSIFY_SYSTEM_PROMPT,
+        system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
         ...modelBodyField(args.model),
         parts: [{ type: "text", text: prompt, synthetic: true }]
       }
     }, {
+      transport: Object.assign((request) => executor.attempt(opened, request), { childSessionId: opened.childSessionId }),
       timeoutMs: sliceMs,
       signal,
       fallbackModels: args.fallbackModels,
       callContext: "dreamer:classify-memories",
-      fetchOutput: async () => {
-        const messagesResponse = await args.client.session.messages({
-          path: { id: agentSessionId },
-          query: { directory: args.sessionDirectory, limit: 50 }
-        });
-        return normalizeSDKResponse(messagesResponse, [], {
-          preferResponseOnMissingData: true
-        });
-      },
-      validateOutput: (messages) => {
-        if (hasLengthCappedOutput(messages)) {
+      fetchOutput: () => executor.collect(opened, 50),
+      validateOutput: (completion) => {
+        const messages = completion.messages ?? [];
+        if (completion.lengthCapped) {
           throw new Error("classify returned length-capped output");
         }
-        const text = extractLatestAssistantText(messages);
+        const text = completion.text;
         if (!text)
           throw new Error("classify returned no output");
         try {
-          parseClassifyManifest(text);
+          validateClassifyManifest(text, new Set(chunk.map((candidate) => candidate.id)));
         } catch (error) {
           const providerFailure = providerOutputFailureFromInvalidManifest(messages, text);
           if (providerFailure)
@@ -6842,25 +7960,28 @@ async function classifyOneChunk(args, chunk, anchors, sliceMs, signal) {
         return text;
       }
     });
-    recordInvocation(args, startedAt, { status: "completed", messages: run.output });
+    promptSettled = true;
+    recordInvocation(args, startedAt, {
+      status: "completed",
+      messages: run.output.messages,
+      completion: run.output
+    });
     return applyClassifications(args, chunk.map((candidate) => candidate.contextMemory), run.validated);
   } catch (error) {
     const failure = moduleRoute ? new ClassifyModuleFailureError("module", error) : error;
     const desc = describeError(failure);
     log(`[dreamer] classify chunk failed: ${desc.brief}`, desc.stackHead ? { stackHead: desc.stackHead } : undefined);
     recordInvocation(args, startedAt, { status: "failed", error: failure });
-    if (moduleRoute || signal.aborted || failure instanceof DreamerProviderOutputFailureError)
+    if (moduleRoute || failure instanceof HiddenCompletionRefusal || signal.aborted || failure instanceof DreamerProviderOutputFailureError || getPromptFailureDetail(failure)?.failureClass !== "parse_failed" && getPromptFailureDetail(failure) !== null)
       throw failure;
     return { classified: 0, changed: 0 };
   } finally {
-    if (agentSessionId && !shouldKeepSubagents()) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] classify session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await executor.close(handle, {
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] classify",
+      log
+    });
   }
 }
 async function runClassifyThroughModule(args, chunk, anchors, signal) {
@@ -6869,6 +7990,8 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
     memories: chunk.map(toPromptMemory2),
     anchors
   });
+  const modelChain = [args.model, ...args.fallbackModels ?? []].map(toModelEntry).filter((entry) => entry !== undefined).map((entry) => entry.model);
+  const resolvedModelChain = [...new Set(modelChain)];
   const response = await args.moduleClient?.call({
     sessionId: args.moduleSessionId,
     projectRoot: args.moduleProjectRoot,
@@ -6880,6 +8003,7 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
       task: "classify",
       command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash4("sha256").update(chunk.map((candidate) => candidate.id).join(",")).digest("hex").slice(0, 24)}`,
       authority_generation: args.moduleAuthorityGeneration,
+      ...resolvedModelChain.length > 0 ? { model_chain: resolvedModelChain } : {},
       payload: {
         prompt_body: prompt,
         items: chunk.map((candidate) => ({
@@ -6900,8 +8024,7 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
   if (result.truncated === true) {
     throw new Error("classify returned length-capped output");
   }
-  const parsed = parseClassifyManifest(manifestText);
-  assertManifestCoversExactly(parsed.map((entry) => entry.id), new Set(chunk.map((candidate) => candidate.id)), "classify");
+  const parsed = validateClassifyManifest(manifestText, new Set(chunk.map((candidate) => candidate.id)));
   const rows = parsed.map((entry) => {
     const candidate = chunk.find((item) => item.id === entry.id);
     if (!candidate)
@@ -6933,12 +8056,12 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
     });
   } catch (error) {
     if (isRustAuthorityDrainingError(error)) {
-      throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+      throw new Error(renderCapabilityRefusal("memory_write"));
     }
     throw error;
   }
   if (isRustAuthorityDrainingError(applied)) {
-    throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+    throw new Error(renderCapabilityRefusal("memory_write"));
   }
   const applyResult = applied?.result ?? applied;
   if (!applyResult || typeof applyResult !== "object") {
@@ -7007,14 +8130,49 @@ function recordInvocation(args, startedAt, params) {
   recordChildInvocation({
     db: args.db,
     parentSessionId: args.parentSessionId,
-    harness: getHarness(),
+    harness: args.hiddenCompletionExecutor?.capabilities.harness ?? getHarness(),
     subagent: "dreamer",
     task: "classify-memories",
     startedAt,
     status: params.status,
     messages: params.messages,
+    ...params.completion && !params.completion.messages ? {
+      tokens: params.completion.usage,
+      providerId: params.completion.providerId,
+      modelId: params.completion.modelId
+    } : {},
     error: params.error
   });
+}
+
+// ../plugin/src/features/magic-context/dreamer/memory-claim-safety.ts
+var POLICY_SENTENCE_START = /(?:^|[.!?]\s+|\n\s*)(?:[-*]\s+|\d+[.)]\s+)?(?:you\s+|we\s+)?(?:must(?:\s+not)?|never|always|do\s+not|don't|shall\s+not)\b/i;
+var ACTOR_POLICY = /\b(?:you|we|agents?|masons?|workers?|operators?|users?|maintainers?)\s+(?:must(?:\s+not)?|should(?:\s+not)?|need\s+to|shall(?:\s+not)?|cannot|can't|may\s+not)\b/i;
+var BEHAVIORAL_WHEN_CLAUSE = /\bwhen\s+(?:you(?:'re|\s+are)?|we(?:'re|\s+are)?|told|asked|requested|working|debugging|reviewing|checking|verifying|investigating|using|running|editing|changing)\b/i;
+var WORKFLOW_IMPERATIVE = /(?:^|[.!?]\s+|\n\s*)(?:[-*]\s+|\d+[.)]\s+)?(?:please\s+)?(?:run|use|check|ask|avoid|prefer|ensure|keep|follow|brief|report|inspect|search|open|read|review|validate|confirm|delegate|stop|start|remember)\b/i;
+var DECISION_AUTHORITY = /\b(?:the\s+)?(?:user|operator|maintainer|owner)\s+(?:decides|chooses|approves|has\s+(?:the\s+)?final\s+say)\b/i;
+function isDirectiveShapedProjectRule(category, content) {
+  if (category !== "PROJECT_RULES")
+    return false;
+  const text = content.trim();
+  if (!text)
+    return false;
+  return POLICY_SENTENCE_START.test(text) || ACTOR_POLICY.test(text) || BEHAVIORAL_WHEN_CLAUSE.test(text) || WORKFLOW_IMPERATIVE.test(text) || DECISION_AUTHORITY.test(text);
+}
+
+// ../plugin/src/features/magic-context/dreamer/curate-memory-safety.ts
+var PROJECT_SCOPED_CATEGORIES = new Set([
+  "PROJECT_RULES",
+  "ARCHITECTURE",
+  "CONSTRAINTS",
+  "CONFIG_VALUES",
+  "NAMING"
+]);
+var refusalCountsBySession = new Map;
+function takeCurateSafetyRefusalCount(sessionId) {
+  const count = refusalCountsBySession.get(sessionId) ?? 0;
+  refusalCountsBySession.delete(sessionId);
+  return count;
 }
 
 // ../plugin/src/agents/smart-note-compiler.ts
@@ -7550,25 +8708,73 @@ Output schema:
 
 // ../plugin/src/features/magic-context/smart-notes/sandbox-runner.ts
 var asyncModulePromise = null;
+var asyncModuleLoaded = false;
 function getAsyncModule() {
   asyncModulePromise ??= (async () => {
     const [{ default: singlefileAsyncifyVariant }, { newQuickJSAsyncWASMModuleFromVariant }] = await Promise.all([
       import("./index-n1mty2y8.js").then((m)=>__toESM(m.default,1)),
       import("./index-v6t0tg85.js")
     ]);
-    return newQuickJSAsyncWASMModuleFromVariant(singlefileAsyncifyVariant);
+    const module = await newQuickJSAsyncWASMModuleFromVariant(singlefileAsyncifyVariant);
+    asyncModuleLoaded = true;
+    return module;
   })();
   return asyncModulePromise;
 }
+function acquireSandboxModule(signal) {
+  const modulePromise = getAsyncModule();
+  if (!signal)
+    return modulePromise;
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new Error("smart-note check aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason ?? new Error("smart-note check aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    modulePromise.then((module) => {
+      cleanup();
+      resolve(module);
+    }, (error) => {
+      cleanup();
+      reject(error);
+    });
+  });
+}
 var sandboxRunChain = Promise.resolve();
-function withSandboxLock(fn) {
-  const run = sandboxRunChain.then(fn, fn);
+function withSandboxLock(fn, signal, cancelled) {
+  const start = () => signal?.aborted && cancelled ? cancelled() : fn();
+  const run = sandboxRunChain.then(start, start);
   sandboxRunChain = run.then(() => {
     return;
   }, () => {
     return;
   });
-  return run;
+  return resolveBeforeAbort(run, signal, cancelled);
+}
+function resolveBeforeAbort(run, signal, cancelled) {
+  if (!signal || !cancelled)
+    return run;
+  if (signal.aborted)
+    return Promise.resolve(cancelled());
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const abort = () => {
+      cleanup();
+      resolve(cancelled());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    run.then((result) => {
+      cleanup();
+      resolve(result);
+    }, (error) => {
+      cleanup();
+      reject(error);
+    });
+  });
 }
 var DEFAULT_TIMEOUT_MS = 2000;
 var DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -7595,9 +8801,17 @@ async function runCompiledSmartNoteCheck(options) {
   if (Buffer.byteLength(options.compiledCheck, "utf8") > MAX_COMPILED_CHECK_BYTES) {
     return failureResult("compiled check exceeds 64 KiB", false);
   }
-  return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
+  let quickjs;
+  try {
+    quickjs = await acquireSandboxModule(options.signal);
+  } catch (error) {
+    if (options.signal?.aborted)
+      return cancelledResult(options.signal.reason);
+    return failureResult(formatSandboxError(error), false);
+  }
+  return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options, quickjs), options.signal, () => cancelledResult(options.signal?.reason));
 }
-async function runCompiledSmartNoteCheckLocked(options) {
+async function runCompiledSmartNoteCheckLocked(options, quickjs) {
   if (options.signal?.aborted)
     return cancelledResult(options.signal.reason);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -7617,8 +8831,6 @@ async function runCompiledSmartNoteCheckLocked(options) {
     throwIfRunAborted(controller.signal);
     const capabilities = resolveCapabilitiesForRun(options, controller.signal);
     const deadline = Date.now() + timeoutMs;
-    const quickjs = await getAsyncModule();
-    throwIfRunAborted(controller.signal);
     const context = quickjs.newContext();
     try {
       context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
@@ -7755,6 +8967,7 @@ surface_condition (UNTRUSTED DATA): ${JSON.stringify(args.note.surfaceCondition)
 Remember: output only the JSON object described by the system prompt.`;
   const startedAt = Date.now();
   let childSessionId = null;
+  let promptSettled = false;
   let invocationRecorded = false;
   const recordInvocation = (params) => {
     if (!args.db || !args.parentSessionId || invocationRecorded)
@@ -7815,6 +9028,7 @@ Remember: output only the JSON object described by the system prompt.`;
       },
       validateOutput: (messages) => parseCompilerOutput(extractLatestAssistantText(messages))
     });
+    promptSettled = true;
     const response = run.validated;
     const compiledCheck = normalizeCompiledCheck(response.compiled_check);
     const manifest = normalizeManifest(response.manifest);
@@ -7852,9 +9066,15 @@ Remember: output only the JSON object described by the system prompt.`;
     recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
     return { ok: false, cancelled, error: message };
   } finally {
-    if (childSessionId) {
-      await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: childSessionId,
+      sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+      promptSettled,
+      privacySensitive: true,
+      context: `[dreamer] smart note #${args.note.id} compiler`,
+      log
+    });
   }
 }
 function parseCompilerOutput(output) {
@@ -8017,6 +9237,63 @@ function deterministicJitterMs(intervalMs, noteId, hash) {
   return unsigned % (max * 2 + 1) - max;
 }
 
+// ../plugin/src/features/magic-context/smart-notes/wake-plane.ts
+import { join as join3 } from "node:path";
+var WAKE_PLANE_CAPABILITY = "wake.create";
+var WAKE_PLANE_STATUS_TTL_MS = 5 * 60 * 1000;
+var WAKE_PLANE_HANDSHAKE_TIMEOUT_MS = 2000;
+var cachedStatus = null;
+var inFlightProbe = null;
+var catalogProbe = probeWakePlaneCatalog;
+var now = () => Date.now();
+function connectionFile() {
+  return join3(getDataDir(), "cortexkit", "run", "subc-connection.json");
+}
+async function probeWakePlaneCatalog() {
+  const file = connectionFile();
+  if (!await connectionFileExists(file)) {
+    throw new Error("subc connection is not configured");
+  }
+  const client = await SubcClient.connect({
+    connectionFile: file,
+    handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS
+  });
+  try {
+    return await client.catalogList();
+  } finally {
+    client.close();
+  }
+}
+function catalogHasWakePlane(entries) {
+  return entries.some((entry) => Array.isArray(entry.control_ops) && entry.control_ops.includes(WAKE_PLANE_CAPABILITY));
+}
+async function probeStatus() {
+  try {
+    return catalogHasWakePlane(await catalogProbe()) ? "present" : "absent";
+  } catch {
+    return "unknown";
+  }
+}
+async function wakePlaneStatus() {
+  const cached = cachedStatus;
+  if (cached && now() < cached.expiresAt)
+    return cached.status;
+  if (inFlightProbe)
+    return await inFlightProbe;
+  const startedAt = now();
+  const probe = probeStatus().then((status) => {
+    cachedStatus = { status, expiresAt: startedAt + WAKE_PLANE_STATUS_TTL_MS };
+    return status;
+  });
+  inFlightProbe = probe;
+  try {
+    return await probe;
+  } finally {
+    if (inFlightProbe === probe)
+      inFlightProbe = null;
+  }
+}
+
 // ../plugin/src/features/magic-context/smart-notes/runner.ts
 function inferEvaluateSmartNotesLeaseHeld(db, projectIdentity) {
   const leaseKey = leaseKeyFor("evaluate-smart-notes", projectIdentity);
@@ -8029,6 +9306,9 @@ var DEFAULT_MAX_CHECKS = 10;
 var DEFAULT_SWEEP_BUDGET_MS = 15000;
 var MAX_FAILURES_BEFORE_REAUTHOR = 3;
 async function runDueCompiledSmartNoteChecks(args) {
+  if (await wakePlaneStatus() === "present") {
+    return { ran: 0, surfaced: 0, failed: 0, networkFailed: 0 };
+  }
   const startedAt = Date.now();
   const now = args.now ?? startedAt;
   const due = getDueCompiledSmartNoteChecks(args.db, args.projectIdentity, now, args.maxChecks ?? DEFAULT_MAX_CHECKS, args.retinaHandoff);
@@ -8158,6 +9438,11 @@ function createPromptAbortSignal(parent, timeoutMs, timeoutMessage) {
   };
 }
 async function evaluateSmartNotes(args) {
+  if (await wakePlaneStatus() === "present") {
+    const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
+    log("[dreamer] evaluate-smart-notes: skipped (wake plane active)");
+    return { surfaced: 0, pending, ran: false };
+  }
   const projectRoot = args.sessionDirectory ?? args.projectIdentity;
   const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
   await moduleBridge?.sync();
@@ -8215,7 +9500,7 @@ async function evaluateSmartNotes(args) {
       projectIdentity: args.projectIdentity,
       projectRoot,
       maxChecks: 10,
-      sweepBudgetMs: 1e4,
+      sweepBudgetMs: args.sweepBudgetMs ?? 1e4,
       leaseHeld,
       signal: leaseAbortController.signal,
       retinaHandoff: args.retinaHandoff
@@ -8395,6 +9680,7 @@ function compiledCheckExpectation(note, compiledCheck) {
 }
 async function confirmReadOnly(args, noteId, content, surfaceCondition, leaseSignal) {
   let childSessionId = null;
+  let promptSettled = false;
   const startedAt = Date.now();
   let invocationRecorded = false;
   const recordInvocation = (params) => {
@@ -8476,6 +9762,7 @@ Output exactly JSON: {"met": false}`;
           return parsed.met;
         }
       });
+      promptSettled = true;
     } finally {
       promptSignal.cleanup();
     }
@@ -8486,15 +9773,131 @@ Output exactly JSON: {"met": false}`;
     log(`[dreamer] smart note #${noteId}: read-only confirmation failed — ${error}`);
     return false;
   } finally {
-    if (childSessionId) {
-      await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: childSessionId,
+      sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+      promptSettled,
+      privacySensitive: true,
+      context: `[dreamer] smart note #${noteId} confirmation`,
+      log
+    });
   }
 }
 
+// ../plugin/src/features/magic-context/dreamer/expire-memories.ts
+var MODULE_ARCHIVE_BATCH_SIZE = 100;
+var EXPIRED_ARCHIVE_REASON = "expired";
+function getExpiredActiveMemoryIds(db, projectIdentity, now = Date.now()) {
+  const rows = db.prepare(`SELECT id
+               FROM memories
+              WHERE project_path = ?
+                AND status = 'active'
+                AND expires_at IS NOT NULL
+                AND expires_at <= ?
+              ORDER BY id`).all(projectIdentity, now);
+  return rows.map((row) => row.id);
+}
+function assertSuccessfulModuleArchive(response) {
+  const result = response && typeof response === "object" && "result" in response ? response.result : response;
+  if (result && typeof result === "object") {
+    const record = result;
+    if (record.ok === false || record.error) {
+      throw new Error("module rejected expired-memory archive");
+    }
+  }
+}
+async function archiveExpiredThroughModule(args) {
+  if (!args.moduleRoute.moduleClient.mirrorPull) {
+    throw new DreamerModuleFailureError("mirror.pull expired archive", new Error("Rust dreamer client omitted the memory mirror route"));
+  }
+  for (let offset = 0;offset < args.expiredContextIds.length; offset += MODULE_ARCHIVE_BATCH_SIZE) {
+    if (!leaseOwnershipMatches(args.db, args.holderId, args.leaseAcquisition.generation, args.leaseKey)) {
+      throw new Error("Dream lease lost before expired-memory archive");
+    }
+    const contextBatch = args.expiredContextIds.slice(offset, offset + MODULE_ARCHIVE_BATCH_SIZE);
+    const identities = getModuleMemoryIdentities(args.db, args.projectIdentity, contextBatch);
+    if (identities.size !== contextBatch.length) {
+      throw new DreamerModuleFailureError("ctx_memory expired archive", new Error("expired memory is missing its module mirror identity"));
+    }
+    const moduleBatch = contextBatch.map((id) => {
+      const identity = identities.get(id);
+      if (!identity)
+        throw new Error(`missing module identity for expired memory ${id}`);
+      return identity.moduleId;
+    });
+    try {
+      const response = await args.moduleRoute.moduleClient.call({
+        sessionId: args.moduleRoute.moduleSessionId,
+        projectRoot: args.moduleRoute.moduleProjectRoot,
+        method: "ctx_memory",
+        body: {
+          name: "ctx_memory",
+          arguments: {
+            action: "archive",
+            memory_project: args.projectIdentity,
+            ids: moduleBatch,
+            reason: EXPIRED_ARCHIVE_REASON,
+            command_id: `${args.moduleRoute.moduleCommandId}:expire:${offset / MODULE_ARCHIVE_BATCH_SIZE}`
+          }
+        }
+      });
+      assertSuccessfulModuleArchive(response);
+    } catch (error) {
+      throw new DreamerModuleFailureError("ctx_memory expired archive", error);
+    }
+  }
+  const mirrorPull = args.moduleRoute.moduleClient.mirrorPull;
+  const drained = await drainMirrorPages({
+    db: args.db,
+    module: {
+      mirrorPull: (request) => mirrorPull({ ...request, projectRoot: args.moduleRoute.moduleProjectRoot })
+    },
+    domain: "memories",
+    limit: 1000
+  });
+  if (!drained.complete) {
+    throw new DreamerModuleFailureError("mirror.pull expired archive", new Error("memory mirror did not reach the module cursor"));
+  }
+  if (!leaseOwnershipMatches(args.db, args.holderId, args.leaseAcquisition.generation, args.leaseKey)) {
+    throw new Error("Dream lease lost during expired-memory archive");
+  }
+  return args.expiredContextIds.length;
+}
+async function archiveExpiredMemories(args) {
+  const expiredContextIds = getExpiredActiveMemoryIds(args.db, args.projectIdentity, args.now);
+  if (expiredContextIds.length === 0) {
+    if (!leaseOwnershipMatches(args.db, args.holderId, args.leaseAcquisition.generation, args.leaseKey)) {
+      throw new Error("Dream lease lost before expired-memory probe");
+    }
+    return 0;
+  }
+  if (args.moduleRoute) {
+    return archiveExpiredThroughModule({
+      ...args,
+      expiredContextIds,
+      moduleRoute: args.moduleRoute
+    });
+  }
+  const selectedIds = new Set(expiredContextIds);
+  return runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+    const stillExpired = getExpiredActiveMemoryIds(args.db, args.projectIdentity, args.now).filter((id) => selectedIds.has(id));
+    for (const id of stillExpired) {
+      archiveMemory(args.db, id, EXPIRED_ARCHIVE_REASON);
+      queueMemoryMutation(args.db, {
+        projectPath: args.projectIdentity,
+        mutationType: "archive",
+        targetMemoryId: id,
+        queuedAt: args.now
+      });
+    }
+    return stillExpired.length;
+  });
+}
+
 // ../plugin/src/features/magic-context/dreamer/maintain-docs-protected-enforcement.ts
-import { existsSync as existsSync3, readFileSync as readFileSync3, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync as existsSync4, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { join as join4 } from "node:path";
 
 // ../plugin/src/features/magic-context/dreamer/protected-regions.ts
 var PROTECTED_START_TOKEN = "mc:protected START";
@@ -8595,9 +9998,9 @@ var MAINTAIN_DOCS_SNAPSHOT_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"];
 function snapshotMaintainDocsFiles(docsDir) {
   const snapshot = new Map;
   for (const name of MAINTAIN_DOCS_SNAPSHOT_FILES) {
-    const path = join(docsDir, name);
+    const path = join4(docsDir, name);
     try {
-      if (existsSync3(path)) {
+      if (existsSync4(path)) {
         snapshot.set(name, readFileSync3(path, "utf8"));
       }
     } catch {}
@@ -8606,14 +10009,14 @@ function snapshotMaintainDocsFiles(docsDir) {
 }
 function enforceMaintainDocsProtectedRegions(args) {
   for (const [fileName, original] of args.snapshot) {
-    const path = join(args.docsDir, fileName);
+    const path = join4(args.docsDir, fileName);
     try {
       const current = readFileSync3(path, "utf8");
       const { text, violated } = enforceProtectedRegions(original, current);
       if (!violated) {
         continue;
       }
-      writeFileSync(path, text, "utf8");
+      writeFileSync3(path, text, "utf8");
       log(`[dreamer] maintain-docs altered a protected region in ${fileName} — restored from pre-task snapshot`);
     } catch (error) {
       log(`[dreamer] maintain-docs protected-region enforcement failed for ${fileName}: ${error}`);
@@ -8625,7 +10028,7 @@ function enforceMaintainDocsProtectedRegions(args) {
 import { createHash as createHash6 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/dreamer/map-memories-prompt.ts
-import { existsSync as existsSync4, statSync } from "node:fs";
+import { existsSync as existsSync5, statSync as statSync2 } from "node:fs";
 import path2 from "node:path";
 var MAP_MEMORIES_SYSTEM_PROMPT = `You are a memory mapper for the magic-context system. You map project memories to the repository files that back them.
 
@@ -8635,7 +10038,7 @@ Tools (read-only): read, grep, glob, aft_search, aft_outline, aft_zoom. Each mem
 
 For each memory decide ONE of:
 - Backing files found → the COMPLETE set of repo-relative paths whose code the memory is about.
-- File-independent → the memory describes EXTERNAL behavior (a provider / API / platform / protocol limit, e.g. "Anthropic returns 400 on empty content"), or a pure process / workflow / philosophy rule, with NO specific local file that backs it.
+- File-independent → the memory describes EXTERNAL behavior (a provider / API / platform / protocol limit, e.g. "Anthropic returns 400 on empty content"), or a pure process / workflow / philosophy rule, with NO specific local file that backs it. A BEHAVIORAL claim (when to act, how to work, who decides, or tool-usage discipline) is file-independent even when it cites file paths or commands as examples: a named file is not the file backing the rule.
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <mappings>
@@ -8646,7 +10049,7 @@ Output ONE XML manifest at the very end and NOTHING else — no narration, no pe
 Rules:
 - Every input memory id MUST appear exactly once.
 - files: repo-relative, comma-separated, no spaces inside a path. Only files that actually exist and genuinely back the memory.
-- A BACKING FILE is CODE that implements or handles the claim — not a file that merely mentions it. A markdown doc (.md), a PARITY/notes file, or a test that only DESCRIBES an external fact is NOT a backing file. If the only place a memory's fact appears is prose/docs/a test (no code implements or handles it), mark it independent="true".
+- A BACKING FILE is CODE that implements or handles the claim — not a file that merely mentions it. A path named inside a process directive is an action target or example, not evidence that the file backs the directive. A markdown doc (.md), a PARITY/notes file, or a test that only DESCRIBES an external fact is NOT a backing file. If the only place a memory's fact appears is prose/docs/a test (no code implements or handles it), mark it independent="true".
 - Many CONSTRAINTS are HYBRID: "external system does X, and OUR code handles it here." Map those to the HANDLING code (you can verify the handling, even though you can't verify the external behavior). Only mark independent when there is NO local code that implements or handles the fact.
 - Prefer the most specific file(s); do not pad with tangential files. Most memories map to one file; some to a few.
 - When you genuinely cannot find any local backing and it is not clearly external, still emit the memory with independent="true" (do not drop it).`;
@@ -8663,7 +10066,7 @@ function extractMemoryCandidatePaths(content, repoDir) {
     if (!abs.startsWith(`${root}/`))
       continue;
     try {
-      if (existsSync4(abs) && statSync(abs).isFile())
+      if (existsSync5(abs) && statSync2(abs).isFile())
         found.add(rel);
     } catch {}
     if (found.size >= MAX_SEED_PATHS_PER_MEMORY)
@@ -8684,17 +10087,39 @@ ${m.content}${seed}`;
 
 Project: ${projectPath}
 
-For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. When "Likely files" are listed, those paths are named in the memory and confirmed to exist — START there: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Then output ONE <mappings> manifest covering every id.
+For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. Behavioral process/workflow directives stay file-independent even when they name files. When "Likely files" are listed, those paths are named in the memory and confirmed to exist — START there only for code claims: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Then output ONE <mappings> manifest covering every id.
 
 <memories>
 ${list}
 </memories>`;
 }
+var MEMORY_ELEMENT_PATTERN = "<memory\\b([^>]*)(?:\\/>|>([\\s\\S]*?)<\\/memory>)";
+var NESTED_FILE_PATTERN = "<file\\b([^>]*)\\/?>";
+function extractNestedFilePaths(inner) {
+  const files = [];
+  for (const match of inner.matchAll(new RegExp(NESTED_FILE_PATTERN, "gi"))) {
+    const pathMatch = match[1].match(/\bpath\s*=\s*"([^"]+)"/);
+    if (pathMatch)
+      files.push(pathMatch[1].trim());
+  }
+  return files.filter(Boolean);
+}
+function mappingsBody(text) {
+  try {
+    return extractCompleteManifestBody(text, "mappings");
+  } catch (error) {
+    const described = describeUnrecognizedManifestShape(text, "mappings", "memory");
+    if (!described.startsWith("parsed zero entries"))
+      throw new Error(described);
+    throw error;
+  }
+}
 function parseMapMemoriesManifest(text) {
   const out = [];
-  const body = extractCompleteManifestBody(text, "mappings");
-  for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
+  const body = mappingsBody(text);
+  for (const m of body.matchAll(new RegExp(MEMORY_ELEMENT_PATTERN, "gi"))) {
     const attrs = m[1];
+    const inner = m[2];
     const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
     if (!idMatch)
       throw new Error("mappings manifest entry missing numeric id");
@@ -8703,24 +10128,76 @@ function parseMapMemoriesManifest(text) {
       throw new Error("mappings manifest entry missing numeric id");
     const independent = /\bindependent\s*=\s*"(?:true|1)"/i.test(attrs);
     const filesMatch = attrs.match(/\bfiles\s*=\s*"([^"]*)"/);
-    const files = filesMatch ? filesMatch[1].split(",").map((f) => f.trim()).filter(Boolean) : [];
-    out.push({ id, files, independent: independent || files.length === 0 });
+    const attrFiles = filesMatch ? filesMatch[1].split(",").map((f) => f.trim()).filter(Boolean) : [];
+    const nestedFiles = inner ? extractNestedFilePaths(inner) : [];
+    const files = attrFiles.length > 0 ? attrFiles : nestedFiles;
+    if (!independent && files.length === 0) {
+      throw new Error(`mappings manifest entry ${id} has neither files nor independent="true"`);
+    }
+    out.push({
+      id,
+      files: independent && files.length === 0 ? [] : files,
+      independent: independent && files.length === 0
+    });
   }
-  assertNoDuplicateManifestIds(out.map((entry) => entry.id), "mappings");
+  if (out.length === 0 && body.trim().length > 0) {
+    throw new Error(describeUnrecognizedManifestShape(text, "mappings", "memory"));
+  }
   return out;
+}
+function validateMapMemoriesManifest(text, expectedIds) {
+  const parsed = parseMapMemoriesManifest(text);
+  assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "mappings", "memory");
+  assertNoDuplicateManifestIds(parsed.filter((entry) => expectedIds.has(entry.id)).map((entry) => entry.id), "mappings");
+  return parsed;
 }
 
 // ../plugin/src/features/magic-context/dreamer/map-memories.ts
 var MAP_BATCH_SIZE = 80;
-function loadUnmappedInputs(db, projectIdentity, repoDir) {
+var MAP_BATCH_FLOOR_MS = 240000;
+var CONSECUTIVE_TIMEOUT_LIMIT2 = 2;
+var MAX_INDEPENDENT_REQUEUE_PER_RUN = MAP_BATCH_SIZE;
+function computeMapBatchSliceMs(remainingMs, batchesRemaining) {
+  return Math.min(remainingMs, Math.max(MAP_BATCH_FLOOR_MS, Math.floor(remainingMs / batchesRemaining)));
+}
+function isTimeoutClassError2(error) {
+  return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+}
+function shouldRequeueIndependentMapping(state, content, repoDir) {
+  if (!state.hasSentinel || state.files.length > 0)
+    return false;
+  if (state.mappingOrigin === "host_rejected_fallback")
+    return false;
+  return extractMemoryCandidatePaths(content, repoDir).length > 0;
+}
+function toMapInput(memory, repoDir) {
+  return {
+    id: memory.id,
+    category: memory.category,
+    content: memory.content,
+    candidates: extractMemoryCandidatePaths(memory.content, repoDir)
+  };
+}
+function selectMapMemoryInputs(db, projectIdentity, repoDir) {
   const active = getMemoriesByProject(db, projectIdentity);
-  const unmapped = new Set(getUnmappedMemoryIds(db, active.map((m) => m.id)));
-  return active.filter((m) => unmapped.has(m.id)).map((m) => ({
-    id: m.id,
-    category: m.category,
-    content: m.content,
-    candidates: extractMemoryCandidatePaths(m.content, repoDir)
-  }));
+  const activeIds = active.map((m) => m.id);
+  const unmapped = new Set(getUnmappedMemoryIds(db, activeIds));
+  const verifications = getMemoryVerifications(db, activeIds);
+  const unmappedInputs = active.filter((m) => unmapped.has(m.id)).map((m) => toMapInput(m, repoDir));
+  const requeue = [];
+  for (const memory of active) {
+    if (unmapped.has(memory.id))
+      continue;
+    const state = verifications.get(memory.id);
+    if (!state)
+      continue;
+    if (!shouldRequeueIndependentMapping(state, memory.content, repoDir))
+      continue;
+    requeue.push(toMapInput(memory, repoDir));
+    if (requeue.length >= MAX_INDEPENDENT_REQUEUE_PER_RUN)
+      break;
+  }
+  return [...unmappedInputs, ...requeue];
 }
 async function mapMemories(args) {
   const result = {
@@ -8730,32 +10207,69 @@ async function mapMemories(args) {
     remaining: 0,
     complete: true
   };
-  const inputs = loadUnmappedInputs(args.db, args.projectIdentity, args.sessionDirectory);
+  const inputs = selectMapMemoryInputs(args.db, args.projectIdentity, args.sessionDirectory);
   if (inputs.length === 0)
     return result;
   const batches = [];
   for (let i = 0;i < inputs.length; i += MAP_BATCH_SIZE) {
-    batches.push(inputs.slice(i, i + MAP_BATCH_SIZE));
+    batches.push({ inputs: inputs.slice(i, i + MAP_BATCH_SIZE), isOmissionRetry: false });
   }
   result.remaining = inputs.length;
   const abortController = new AbortController;
   const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () => abortController.abort(), args.leaseAcquisition);
   try {
+    let consecutiveTimeouts = 0;
+    let timeoutStreakElapsedMs = [];
     for (let i = 0;i < batches.length; i += 1) {
       const remainingMs = Math.max(0, args.deadline - Date.now());
-      if (remainingMs <= 0)
+      if (remainingMs <= 0) {
+        result.stopReason = "deadline";
         break;
-      const batchesRemaining = batches.length - i;
-      const sliceMs = Math.max(1, Math.floor(remainingMs / batchesRemaining));
-      const counts = await mapOneBatch(args, batches[i], sliceMs, abortController.signal);
-      result.mapped += counts.mapped;
-      result.independent += counts.independent;
-      result.remaining -= counts.mapped + counts.independent;
-      result.batches += 1;
-      args.onProgress?.(result.mapped + result.independent);
+      }
+      if (remainingMs < MAP_BATCH_FLOOR_MS) {
+        result.stopReason = "deadline";
+        log(`[dreamer] map-memories: stopping before batch ${i + 1}/${batches.length} — remaining budget ${remainingMs}ms is below the ${MAP_BATCH_FLOOR_MS}ms batch floor; banking ${result.mapped + result.independent} mapping(s)`);
+        break;
+      }
+      const sliceMs = computeMapBatchSliceMs(remainingMs, batches.length - i);
+      const batch = batches[i];
+      if (!batch)
+        break;
+      const outcome = await mapOneBatch(args, batch.inputs, sliceMs, abortController.signal);
+      const committed = outcome.mapped + outcome.independent;
+      result.mapped += outcome.mapped;
+      result.independent += outcome.independent;
+      result.remaining -= committed;
+      if (committed > 0) {
+        result.batches += 1;
+        args.onProgress?.(result.mapped + result.independent);
+      }
+      if (outcome.requeue?.length) {
+        if (!batch.isOmissionRetry) {
+          batches.splice(i + 1, 0, {
+            inputs: outcome.requeue,
+            isOmissionRetry: true
+          });
+          log(`[dreamer] map-memories: committed ${committed}/${batch.inputs.length} mapping(s); requeueing ${outcome.requeue.length} omitted id(s) in a targeted retry`);
+        } else {
+          log(`[dreamer] map-memories: targeted retry still omitted ${outcome.requeue.length} id(s); leaving them unmapped for the next run`);
+        }
+      }
+      if (outcome.failure?.class === "timeout") {
+        consecutiveTimeouts += 1;
+        timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
+        if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT2) {
+          result.stopReason = "timeout-circuit-breaker";
+          log(`[dreamer] map-memories starvation: circuit breaker tripped after ${consecutiveTimeouts} consecutive batch timeouts (model too slow for its time slice); per-batch elapsed [${timeoutStreakElapsedMs.join("ms, ")}ms] vs ${sliceMs}ms slice; stopping with ${result.remaining} mapping(s) remaining`);
+          break;
+        }
+      } else {
+        consecutiveTimeouts = 0;
+        timeoutStreakElapsedMs = [];
+      }
     }
     result.complete = result.remaining === 0;
-    log(`[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`);
+    log(`[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`);
     return result;
   } finally {
     heartbeat.stop();
@@ -8763,6 +10277,7 @@ async function mapMemories(args) {
 }
 async function mapOneBatch(args, batch, sliceMs, signal) {
   let agentSessionId = null;
+  let promptSettled = false;
   const startedAt = Date.now();
   try {
     const createResponse = await createChildSessionWithFence({
@@ -8809,12 +10324,17 @@ async function mapOneBatch(args, batch, sliceMs, signal) {
         const text = extractLatestAssistantText(messages);
         if (!text)
           throw new Error("map-memories returned no output");
-        parseMapMemoriesManifest(text);
-        return text;
+        return validateMapMemoriesManifest(text, new Set(batch.map((memory) => memory.id)));
       }
     });
+    promptSettled = true;
     recordInvocation2(args, startedAt, { status: "completed", messages: run.output });
-    return await applyBatchMappings(args, batch, run.validated);
+    const outcome = await applyParsedBatchMappings(args, batch, run.validated);
+    const returnedIds = new Set(run.validated.filter((entry) => batch.some((memory) => memory.id === entry.id)).map((entry) => entry.id));
+    return {
+      ...outcome,
+      requeue: batch.filter((memory) => !returnedIds.has(memory.id))
+    };
   } catch (error) {
     const desc = describeError(error);
     log(`[dreamer] map-memories batch failed: ${desc.brief}`, desc.stackHead ? { stackHead: desc.stackHead } : undefined);
@@ -8823,37 +10343,85 @@ async function mapOneBatch(args, batch, sliceMs, signal) {
       throw error;
     if (signal.aborted)
       throw error;
-    return { mapped: 0, independent: 0 };
+    return {
+      mapped: 0,
+      independent: 0,
+      failure: {
+        class: isTimeoutClassError2(error) ? "timeout" : "other",
+        elapsedMs: Date.now() - startedAt
+      }
+    };
   } finally {
-    if (agentSessionId && !shouldKeepSubagents()) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] map-memories session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: agentSessionId,
+      sessionDirectory: args.sessionDirectory,
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] map-memories",
+      log
+    });
   }
 }
-async function applyBatchMappings(args, batch, manifestText) {
-  const batchIds = new Set(batch.map((m) => m.id));
-  const parsed = parseMapMemoriesManifest(manifestText);
-  assertManifestCoversExactly(parsed.map((entry) => entry.id), batchIds, "mappings");
-  if (parsed.length === 0)
+async function applyParsedBatchMappings(args, batch, parsed) {
+  const batchIds = new Set(batch.map((memory) => memory.id));
+  const valid = parsed.filter((entry) => batchIds.has(entry.id));
+  const unknown = parsed.filter((entry) => !batchIds.has(entry.id));
+  if (unknown.length > 0) {
+    log(`[dreamer] map-memories warning: dropping ${unknown.length} unknown mapping entr${unknown.length === 1 ? "y" : "ies"} outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`);
+  }
+  assertNoDuplicateManifestIds(valid.map((entry) => entry.id), "mappings");
+  if (valid.length * 2 < batch.length) {
+    throw new Error(`mappings manifest covers ${valid.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`);
+  }
+  if (valid.length === 0)
     return { mapped: 0, independent: 0 };
   const planned = [];
-  for (const p of parsed) {
-    if (p.independent || p.files.length === 0) {
-      planned.push({ id: p.id, files: [], independent: true });
+  const batchById = new Map(batch.map((memory) => [memory.id, memory]));
+  for (const p of valid) {
+    const memory = batchById.get(p.id);
+    if (!p.independent && p.files.length > 0 && memory && isDirectiveShapedProjectRule(memory.category, memory.content)) {
+      log(`[dreamer] map-memories safety override: memory_id=${p.id} verdict=file-mapping replacement=independent mapping_origin=host_rejected_fallback reason=directive-shaped-project-rule`);
+      planned.push({
+        id: p.id,
+        files: [],
+        independent: true,
+        mappingOrigin: "host_rejected_fallback"
+      });
       continue;
+    }
+    if (p.independent) {
+      planned.push({
+        id: p.id,
+        files: [],
+        independent: true,
+        mappingOrigin: "mapper"
+      });
+      continue;
+    }
+    if (p.files.length === 0) {
+      throw new Error(`mapping entry ${p.id} has no files and no independent sentinel`);
     }
     const normalized = await normalizeVerificationFiles({
       cwd: args.sessionDirectory,
       files: p.files
     });
-    if (normalized.files.length === 0)
+    if (normalized.files.length === 0) {
+      log(`[dreamer] map-memories: all ${p.files.length} path(s) for memory ${p.id} were rejected; recording host_rejected_fallback`);
+      planned.push({
+        id: p.id,
+        files: [],
+        independent: true,
+        mappingOrigin: "host_rejected_fallback"
+      });
       continue;
-    planned.push({ id: p.id, files: normalized.files, independent: false });
+    }
+    planned.push({
+      id: p.id,
+      files: normalized.files,
+      independent: false,
+      mappingOrigin: "mapper"
+    });
   }
   if (planned.length === 0)
     return { mapped: 0, independent: 0 };
@@ -8868,7 +10436,8 @@ async function applyBatchMappings(args, batch, manifestText) {
       return {
         memory_id: identity.moduleId,
         content_hash_at_prompt: identity.normalizedHash,
-        mapped_files: item.independent ? null : item.files
+        mapped_files: item.independent ? null : item.files,
+        mapping_origin: item.mappingOrigin
       };
     });
     let response;
@@ -8905,7 +10474,7 @@ async function applyBatchMappings(args, batch, manifestText) {
   const now = Date.now();
   runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
     for (const item of planned) {
-      recordMemoryMapping(args.db, item.id, item.files, now);
+      recordMemoryMapping(args.db, item.id, item.files, now, item.mappingOrigin);
       item.independent ? independent += 1 : mapped += 1;
     }
   });
@@ -9381,6 +10950,7 @@ async function refreshOnePrimer(args, primer, sliceMs, signal) {
     }
   });
   let agentSessionId = null;
+  let promptSettled = false;
   const startedAt = Date.now();
   try {
     const createResponse = await createChildSessionWithFence({
@@ -9422,6 +10992,7 @@ async function refreshOnePrimer(args, primer, sliceMs, signal) {
       },
       validateOutput: (messages) => parseAnswer(messages, primer.answer)
     });
+    promptSettled = true;
     recordInvocation3(args, startedAt, { status: "completed", messages: run.output });
     const answer = run.validated.trim();
     if (!answer)
@@ -9440,14 +11011,15 @@ async function refreshOnePrimer(args, primer, sliceMs, signal) {
     recordInvocation3(args, startedAt, { status: "failed", error });
     throw error;
   } finally {
-    if (agentSessionId) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] refresh-primers session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: agentSessionId,
+      sessionDirectory: args.sessionDirectory,
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] refresh-primers",
+      log
+    });
   }
 }
 function originSessionIdForPrimer(args, primer) {
@@ -9685,6 +11257,9 @@ async function readRetrospectiveScanWindow(provider, projectIdentity, watermarkM
 }
 
 // ../plugin/src/features/magic-context/dreamer/storage-dream-runs.ts
+function formatDreamRunFailure(failure) {
+  return renderDreamFailure(failure.failure_class);
+}
 var insertDreamRunStatements = new WeakMap;
 var getDreamRunsByProjectStatements = new Map;
 function getInsertDreamRunStatement(db) {
@@ -9825,24 +11400,29 @@ Each memory below comes with its backing file(s) — the code it makes a claim a
 
 Tools (read-only): read, grep, glob, aft_search, aft_outline, aft_zoom. You read code to check claims; you change nothing.
 
-Decide ONE of three outcomes per memory:
+Decide ONE of four outcomes per memory:
 - VERIFIED — still accurate. Keep it as-is.
-- UPDATE — the underlying fact is still true but a DETAIL drifted (a renamed symbol, moved file, changed number/name). Provide corrected content in terse present tense ("X uses Y", not "X was changed to Y"). Only update for genuine drift, not style.
-- ARCHIVE — the code CLEARLY contradicts the memory, or the thing it describes no longer exists.
+- UPDATE — a CODE FACT is still true but a file-falsifiable DETAIL drifted (a renamed symbol, moved file, changed number/name). Provide corrected content in terse present tense ("X uses Y", not "X was changed to Y"). Only update for genuine drift, not style. If a legitimate update intentionally consolidates the old claim into much shorter content, set consolidation="true" explicitly.
+- ARCHIVE — a CODE FACT is positively falsified: the code clearly contradicts it, or the API/symbol/path it describes no longer exists.
+- SKIP — the claim is not a code fact, or code cannot decide it. Keep it unchanged and do not claim verification.
 
-BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you cannot find the code, or you are unsure, or it might still be true somewhere you didn't look: mark it VERIFIED, never archived. Archive ONLY when you have positive evidence the code contradicts it.
+UPDATE and ARCHIVE are ONLY for claims a repository file can falsify, such as an API that no longer exists, a path that moved, or a constant that changed. Behavioral directives (when to act, how to work, who decides, tool-usage discipline) can only be VERIFIED or SKIPPED. A named path inside a directive does not make the directive a code fact, and a file's failure to corroborate a behavioral rule is never grounds to update or archive it.
+
+BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you cannot find the code, or you are unsure, or it might still be true somewhere you didn't look: mark it VERIFIED or SKIPPED, never archived. Archive ONLY when you have positive evidence the code contradicts a code fact.
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <verify>
 <verified id="N" files="path/a.ts,path/b.ts"/>
 <update id="M" files="path/c.ts">corrected present-tense content</update>
+<update id="C" files="path/d.ts" consolidation="true">intentionally consolidated content</update>
 <archive id="K" reason="specific evidence the code contradicts it"/>
+<skip id="S" reason="behavioral directive; code cannot decide it"/>
 </verify>
 
 Rules:
-- Every input memory id MUST appear exactly once, in exactly one of verified/update/archive.
+- Every input memory id MUST appear exactly once, in exactly one of verified/update/archive/skip.
 - files = the COMPLETE current backing set (repo-relative, comma-separated). It may differ from the given mapping if a file moved — record what you actually verified against.
-- Default to VERIFIED. update and archive are the exceptions, not the norm.`;
+- Default to VERIFIED. skip when code cannot decide the claim. update and archive are the exceptions, not the norm.`;
 function buildVerifyPrompt(projectPath, memories) {
   const list = memories.map((m) => `[${m.id}] ${m.category}
 Content: ${m.content}
@@ -9853,7 +11433,7 @@ Backing files: ${m.mappedFiles.join(", ")}`).join(`
 
 Project: ${projectPath}
 
-Read each memory's backing files, decide verified / update / archive (default verified; be conservative about archiving), then output ONE <verify> manifest covering every id.
+Read each memory's backing files, decide verified / update / archive / skip (default verified; behavioral directives only permit verified or skip), then output ONE <verify> manifest covering every id.
 
 <memories>
 ${list}
@@ -9866,9 +11446,22 @@ function attrOf(s, name) {
 function filesOf(s) {
   return (attrOf(s, "files") ?? "").split(",").map((f) => f.trim()).filter(Boolean);
 }
+function verifyIds(parsed) {
+  return [...parsed.verified, ...parsed.updated, ...parsed.archived, ...parsed.skipped].map((entry) => entry.id);
+}
+function verifyBody(text) {
+  try {
+    return extractCompleteManifestBody(text, "verify");
+  } catch (error) {
+    const described = describeUnrecognizedManifestShape(text, "verify", "verified");
+    if (!described.startsWith("parsed zero entries"))
+      throw new Error(described);
+    throw error;
+  }
+}
 function parseVerifyManifest(text) {
-  const out = { verified: [], updated: [], archived: [] };
-  const body = extractCompleteManifestBody(text, "verify");
+  const out = { verified: [], updated: [], archived: [], skipped: [] };
+  const body = verifyBody(text);
   for (const m of body.matchAll(/<verified\b([^>]*)\/?>/g)) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
     if (!Number.isInteger(id))
@@ -9879,7 +11472,12 @@ function parseVerifyManifest(text) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
     if (!Number.isInteger(id))
       throw new Error("verify manifest entry missing numeric id");
-    out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
+    out.updated.push({
+      id,
+      files: filesOf(m[1]),
+      content: (m[2] ?? "").trim(),
+      consolidation: attrOf(m[1], "consolidation")?.toLowerCase() === "true"
+    });
   }
   for (const m of body.matchAll(/<archive\b([^>]*)\/?>/g)) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
@@ -9887,8 +11485,23 @@ function parseVerifyManifest(text) {
       throw new Error("verify manifest entry missing numeric id");
     out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
   }
-  assertNoDuplicateManifestIds([...out.verified, ...out.updated, ...out.archived].map((entry) => entry.id), "verify");
+  for (const m of body.matchAll(/<skip\b([^>]*)\/?>/g)) {
+    const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
+    if (!Number.isInteger(id))
+      throw new Error("verify manifest entry missing numeric id");
+    out.skipped.push({ id, reason: attrOf(m[1], "reason") ?? "" });
+  }
+  if (verifyIds(out).length === 0 && body.trim().length > 0) {
+    throw new Error(describeUnrecognizedManifestShape(text, "verify", "verified"));
+  }
   return out;
+}
+function validateVerifyManifest(text, expectedIds) {
+  const parsed = parseVerifyManifest(text);
+  const ids = verifyIds(parsed);
+  assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "verify", "verified");
+  assertNoDuplicateManifestIds(ids.filter((id) => expectedIds.has(id)), "verify");
+  return parsed;
 }
 
 // ../plugin/src/features/magic-context/dreamer/verify.ts
@@ -9917,6 +11530,8 @@ async function runVerify(args) {
     verified: 0,
     updated: 0,
     archived: 0,
+    skipped: 0,
+    refused: 0,
     batches: 0,
     inScope: 0,
     remaining: 0,
@@ -9961,9 +11576,12 @@ async function runVerify(args) {
       result.verified += counts.verified;
       result.updated += counts.updated;
       result.archived += counts.archived;
-      result.remaining -= counts.verified + counts.updated + counts.archived;
+      result.skipped += counts.skipped;
+      result.refused += counts.refused;
+      const batchProcessed = counts.verified + counts.updated + counts.archived + counts.skipped + counts.refused;
+      result.remaining -= batchProcessed;
       result.batches += 1;
-      args.onProgress?.(result.verified + result.updated + result.archived);
+      args.onProgress?.(result.verified + result.updated + result.archived + result.skipped + result.refused, result.refused);
       if (counts.providerFailure) {
         lastProviderFailure = counts.providerFailure;
         if (counts.providerFailure.fingerprint === priorProviderFailureFingerprint) {
@@ -9986,7 +11604,7 @@ async function runVerify(args) {
     result.complete = result.remaining === 0;
     if (result.complete)
       closeBroadCycle(args, gate.broadCycleStartAt);
-    log(`[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: verified=${result.verified} updated=${result.updated} archived=${result.archived} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`);
+    log(`[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: verified=${result.verified} updated=${result.updated} archived=${result.archived} skipped=${result.skipped} refused=${result.refused} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`);
     return result;
   } finally {
     heartbeat.stop();
@@ -9994,6 +11612,7 @@ async function runVerify(args) {
 }
 async function verifyOneBatch(args, batch, sliceMs, signal) {
   let agentSessionId = null;
+  let promptSettled = false;
   const startedAt = Date.now();
   try {
     const createResponse = await createChildSessionWithFence({
@@ -10040,53 +11659,96 @@ async function verifyOneBatch(args, batch, sliceMs, signal) {
         const text = extractLatestAssistantText(messages);
         if (!text)
           throw new Error("verify returned no output");
-        try {
-          parseVerifyManifest(text);
-        } catch (error) {
-          const providerFailure = providerOutputFailureFromInvalidManifest(messages, text);
-          if (providerFailure)
-            throw providerFailure;
-          throw error;
-        }
-        return text;
+        const providerFailure = providerOutputFailureFromInvalidManifest(messages, text);
+        if (providerFailure)
+          throw providerFailure;
+        return validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
       }
     });
+    promptSettled = true;
     recordInvocation4(args, startedAt, { status: "completed", messages: run.output });
-    return await applyVerifyManifest(args, batch, run.validated);
+    return await applyParsedVerifyManifest(args, batch, run.validated);
   } catch (error) {
     const desc = describeError(error);
     const providerFailure = error instanceof DreamerProviderOutputFailureError ? error : undefined;
+    const promptFailure = getPromptFailureDetail(error);
     log(`[dreamer] verify batch ${providerFailure ? "provider failure" : "failed"}: ${desc.brief}`, desc.stackHead ? { stackHead: desc.stackHead } : undefined);
     recordInvocation4(args, startedAt, { status: "failed", error });
-    if (error instanceof DreamerModuleFailureError || signal.aborted)
+    if (error instanceof DreamerModuleFailureError || signal.aborted || promptFailure !== null && promptFailure.failureClass !== "parse_failed" && !providerFailure)
       throw error;
-    return { verified: 0, updated: 0, archived: 0, providerFailure };
+    return {
+      verified: 0,
+      updated: 0,
+      archived: 0,
+      skipped: 0,
+      refused: 0,
+      providerFailure
+    };
   } finally {
-    if (agentSessionId && !shouldKeepSubagents()) {
-      await args.client.session.delete({
-        path: { id: agentSessionId },
-        query: { directory: args.sessionDirectory }
-      }).catch((e) => {
-        log(`[dreamer] verify session cleanup failed: ${getErrorMessage(e)}`);
-      });
-    }
+    await teardownChildSession({
+      client: args.client,
+      sessionId: agentSessionId,
+      sessionDirectory: args.sessionDirectory,
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] verify",
+      log
+    });
   }
 }
-async function applyVerifyManifest(args, batch, manifestText) {
+async function applyParsedVerifyManifest(args, batch, parsed) {
   const batchIds = new Set(batch.map((m) => m.id));
-  const parsed = parseVerifyManifest(manifestText);
-  assertManifestCoversExactly([...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id), batchIds, "verify");
+  const batchById = new Map(batch.map((memory) => [memory.id, memory]));
+  const valid = {
+    verified: parsed.verified.filter((entry) => batchIds.has(entry.id)),
+    updated: parsed.updated.filter((entry) => batchIds.has(entry.id)),
+    archived: parsed.archived.filter((entry) => batchIds.has(entry.id)),
+    skipped: parsed.skipped.filter((entry) => batchIds.has(entry.id))
+  };
+  const unknown = [
+    ...parsed.verified,
+    ...parsed.updated,
+    ...parsed.archived,
+    ...parsed.skipped
+  ].filter((entry) => !batchIds.has(entry.id));
+  if (unknown.length > 0) {
+    log(`[dreamer] verify warning: dropping ${unknown.length} unknown verification entr${unknown.length === 1 ? "y" : "ies"} outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`);
+  }
+  const validIds = [...valid.verified, ...valid.updated, ...valid.archived, ...valid.skipped].map((entry) => entry.id);
+  assertNoDuplicateManifestIds(validIds, "verify");
+  if (validIds.length * 2 < batch.length) {
+    throw new Error(`verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`);
+  }
+  if (validIds.length === 0) {
+    return { verified: 0, updated: 0, archived: 0, skipped: 0, refused: 0 };
+  }
   const now = Date.now();
   const writes = [];
-  for (const v of parsed.verified) {
+  let refused = 0;
+  const skipped = valid.skipped.length;
+  for (const v of valid.verified) {
     const files = await normalizeFiles(args, v.files);
     writes.push({ kind: "verify", id: v.id, files });
   }
-  for (const u of parsed.updated) {
+  for (const u of valid.updated) {
+    const original = batchById.get(u.id);
+    if (!original)
+      continue;
+    if (isDirectiveShapedProjectRule(original.category, original.content)) {
+      log(`[dreamer] verify safety refusal: memory_id=${u.id} verdict=update reason=directive-shaped-project-rule`);
+      refused += 1;
+      continue;
+    }
     const content = u.content.trim();
     if (!content || content.length > 20000) {
       const files = await normalizeFiles(args, u.files);
       writes.push({ kind: "verify", id: u.id, files });
+      continue;
+    }
+    const originalLength = original.content.trim().length;
+    if (!u.consolidation && content.length * 2 < originalLength) {
+      log(`[dreamer] verify safety refusal: memory_id=${u.id} verdict=update reason=content-loss original_chars=${originalLength} replacement_chars=${content.length}`);
+      refused += 1;
       continue;
     }
     const files = await normalizeFiles(args, u.files);
@@ -10098,14 +11760,22 @@ async function applyVerifyManifest(args, batch, manifestText) {
       hash: computeNormalizedHash(content)
     });
   }
-  for (const a of parsed.archived) {
+  for (const a of valid.archived) {
+    const original = batchById.get(a.id);
+    if (!original)
+      continue;
+    if (isDirectiveShapedProjectRule(original.category, original.content)) {
+      log(`[dreamer] verify safety refusal: memory_id=${a.id} verdict=archive reason=directive-shaped-project-rule`);
+      refused += 1;
+      continue;
+    }
     writes.push({ kind: "archive", id: a.id, reason: a.reason });
   }
-  if (writes.length === 0)
-    return { verified: 0, updated: 0, archived: 0 };
   let verified = 0;
   let updated = 0;
   let archived = 0;
+  if (writes.length === 0)
+    return { verified, updated, archived, skipped, refused };
   if (args.moduleRoute) {
     const identities = getModuleMemoryIdentities(args.db, args.projectIdentity, writes.map((write) => write.id));
     const rows = writes.map((write) => {
@@ -10155,7 +11825,7 @@ async function applyVerifyManifest(args, batch, manifestText) {
       else
         archived += 1;
     }
-    return { verified, updated, archived };
+    return { verified, updated, archived, skipped, refused };
   }
   runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
     for (const w of writes) {
@@ -10186,7 +11856,7 @@ async function applyVerifyManifest(args, batch, manifestText) {
       }
     }
   });
-  return { verified, updated, archived };
+  return { verified, updated, archived, skipped, refused };
 }
 async function normalizeFiles(args, rawFiles) {
   if (rawFiles.length === 0)
@@ -10229,6 +11899,30 @@ function recordInvocation4(args, startedAt, params) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/task-executor.ts
+function dreamRunFailureDetail(error) {
+  const prompt = getPromptFailureDetail(error);
+  if (prompt) {
+    return {
+      failure_class: prompt.failureClass,
+      model_attempted: prompt.modelAttempted,
+      models_tried: prompt.modelsTried,
+      provider_error: prompt.providerError,
+      timeout_ms: prompt.timeoutMs,
+      child_session_id: prompt.childSessionId
+    };
+  }
+  const described = describeError(error);
+  const message = described.brief;
+  const providerFailure = error instanceof HiddenCompletionRefusal || error instanceof Error && error.name === "DreamerProviderOutputFailureError";
+  return {
+    failure_class: providerFailure ? "provider_error" : /no models?|model chain is empty/i.test(message) ? "no_models" : "unknown",
+    model_attempted: null,
+    models_tried: [],
+    provider_error: providerFailure ? sanitizeDiagnosticText(message).slice(0, 500) : null,
+    timeout_ms: null,
+    child_session_id: null
+  };
+}
 function classifyFailure(error) {
   const described = describeError(error);
   const brief = described.brief;
@@ -10261,13 +11955,68 @@ function loadActiveMemoryPromptMemories(db, projectIdentity) {
   const verificationById = getMemoryVerifications(db, memories.map((memory) => memory.id));
   return memories.map((memory) => toCuratePromptMemory(memory, verificationById));
 }
+var TEXTUAL_CURATE_TOOL_CALL_PATTERNS = [
+  /\[\s*historical tool call\s*\][\s\S]*?(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+  /(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+  /(?:^|\n)\s*(?:```[^\n]*\n\s*)?ctx_memory\s*\(\s*action\s*=/im,
+  /["']name["']\s*:\s*["']ctx_memory["'][\s\S]*?["']arguments["']\s*:/i
+];
+function validateCurateAssistantText(text) {
+  if (TEXTUAL_CURATE_TOOL_CALL_PATTERNS.some((pattern) => pattern.test(text))) {
+    throw new Error("Curate returned an unresolved textual ctx_memory tool call.");
+  }
+  return text;
+}
+function inspectCurateMemoryOperations(messages) {
+  const summary = { totalCalls: 0, completedActions: [] };
+  if (!Array.isArray(messages))
+    return summary;
+  for (const message of messages) {
+    if (!isRecord(message) || !isRecord(message.info) || message.info.role !== "assistant") {
+      continue;
+    }
+    if (!Array.isArray(message.parts))
+      continue;
+    for (const part of message.parts) {
+      if (!isRecord(part) || part.type !== "tool")
+        continue;
+      const toolName = part.tool ?? part.name;
+      if (toolName !== "ctx_memory")
+        continue;
+      summary.totalCalls += 1;
+      if (!isRecord(part.state) || part.state.status !== "completed")
+        continue;
+      const input = isRecord(part.state.input) ? part.state.input : null;
+      summary.completedActions.push(typeof input?.action === "string" ? input.action : "unknown");
+    }
+  }
+  return summary;
+}
+function formatExpiredArchiveProgress(count) {
+  return `curate: archived ${count} expired ${count === 1 ? "memory" : "memories"}`;
+}
+function formatCurateMemoryOperations(actions) {
+  const actionCounts = new Map;
+  for (const action of actions)
+    actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
+  const actionDetail = [...actionCounts].map(([action, count]) => count === 1 ? action : `${action} ×${count}`).join(", ");
+  const noun = actions.length === 1 ? "operation" : "operations";
+  return `curate: ${actions.length} memory ${noun} applied${actionDetail ? ` (${actionDetail})` : ""}`;
+}
+function requireDreamClient(client) {
+  if (!client)
+    throw new HiddenCompletionRefusal("hidden_tools_unsupported", "This dream task requires the child-session tool transport", true);
+  return client;
+}
 function createDreamTaskExecutor(deps) {
   let parentSessionIdPromise;
   const resolveParentSessionId = () => {
+    if (deps.hiddenCompletionExecutor)
+      return Promise.resolve(deps.parentSessionId);
     if (!parentSessionIdPromise) {
       parentSessionIdPromise = (async () => {
         try {
-          const listResponse = await deps.client.session.list({
+          const listResponse = await requireDreamClient(deps.client).session.list({
             query: { directory: deps.sessionDirectory }
           });
           const sessions = normalizeSDKResponse(listResponse, [], { preferResponseOnMissingData: true });
@@ -10287,12 +12036,14 @@ function createDreamTaskExecutor(deps) {
     })();
     const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
     const backlogAtStart = getDreamTaskBacklog(db, projectIdentity, config.task);
-    const reportProgress = (processed) => {
+    const reportProgress = (processed, refused) => {
       deps.onProgress?.({
         task: config.task,
         processed: Math.max(0, processed),
         total: backlogAtStart.pending,
-        startedAt
+        startedAt,
+        ...backlogAtStart.category ? { category: backlogAtStart.category } : {},
+        ...refused === undefined ? {} : { refused: Math.max(0, refused) }
       });
     };
     reportProgress(0);
@@ -10302,7 +12053,7 @@ function createDreamTaskExecutor(deps) {
     };
     const parent = await resolveParentSessionId();
     let moduleRoute;
-    if (config.task === "map-memories" || config.task === "compress-cues" || config.task === "classify-memories" || config.task === "verify" || config.task === "verify-broad" || config.task === "retrospective") {
+    if (config.task === "curate" || config.task === "map-memories" || config.task === "compress-cues" || config.task === "classify-memories" || config.task === "verify" || config.task === "verify-broad" || config.task === "retrospective") {
       try {
         moduleRoute = await resolveDreamerModuleRoute({
           db,
@@ -10331,7 +12082,11 @@ function createDreamTaskExecutor(deps) {
               name: config.task,
               durationMs: Date.now() - startedAt,
               resultChars: 0,
-              ...error ? { error } : {},
+              ...status === "failed" && error ? { error } : {},
+              ...status === "failed" ? {
+                failure: extra?.failure ?? dreamRunFailureDetail(error ?? "unknown dreamer failure")
+              } : {},
+              ...extra?.progress ? { progress: extra.progress } : {},
               backlog: (() => {
                 const end = extra?.backlogAfter ?? getDreamTaskBacklog(db, projectIdentity, config.task);
                 const processed = processedDreamTaskItems(backlogAtStart.pending, end.pending);
@@ -10340,7 +12095,8 @@ function createDreamTaskExecutor(deps) {
                   totalAtStart: backlogAtStart.total,
                   pendingAtEnd: end.pending,
                   totalAtEnd: end.total,
-                  processed
+                  processed,
+                  ...backlogAtStart.category ? { category: backlogAtStart.category } : {}
                 };
                 return value;
               })()
@@ -10376,6 +12132,9 @@ function createDreamTaskExecutor(deps) {
       return writtenIds.length || deletedIds.length || archivedIds.length || mergedIds.length ? changes : null;
     }
     try {
+      if (deps.hiddenCompletionExecutor?.capabilities.tools === false && DREAM_TASK_CAPABILITIES[config.task].requiresTools) {
+        throw new HiddenCompletionRefusal("hidden_tools_unsupported", `${config.task} requires tools; opencode2 hidden completions have no tool loop`, true);
+      }
       if (config.task === "compress-cues") {
         if (deps.mural?.enabled !== true) {
           log("[dreamer] compress-cues: skipped (mural is not enabled)");
@@ -10385,6 +12144,7 @@ function createDreamTaskExecutor(deps) {
         const result = await runCompressCues({
           db,
           client: deps.client,
+          hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10392,7 +12152,7 @@ function createDreamTaskExecutor(deps) {
           leaseKey,
           deadline,
           leaseAcquisition,
-          model: config.model ?? deps.mural.model ?? deps.dreamerModel,
+          model: config.model,
           fallbackModels: config.fallbackModels,
           moduleRoute,
           onProgress: (processed) => reportProgress(processed)
@@ -10409,7 +12169,7 @@ function createDreamTaskExecutor(deps) {
       if (config.task === "review-user-memories") {
         const result = await reviewUserMemories({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
           holderId,
@@ -10428,7 +12188,7 @@ function createDreamTaskExecutor(deps) {
       if (config.task === "map-memories") {
         const result = await mapMemories({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10441,8 +12201,19 @@ function createDreamTaskExecutor(deps) {
           moduleRoute,
           onProgress: (processed) => reportProgress(processed)
         });
-        log(`[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`);
+        log(`[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`);
         if (!result.complete) {
+          if (result.stopReason === "timeout-circuit-breaker") {
+            const error = `map-memories starvation: timeout circuit breaker stopped the run with ${result.remaining} remain`;
+            recordRun("failed", error);
+            return { status: "failed", transient: true, error };
+          }
+          const processed = result.mapped + result.independent;
+          if (processed > 0) {
+            const progress = `map-memories: committed ${processed} mapping(s) (mapped ${result.mapped}, independent ${result.independent}); ${result.remaining} remain`;
+            recordRun("completed", null, { progress });
+            return { status: "completed" };
+          }
           const error = incompleteMessage(result.remaining);
           recordRun("failed", error);
           return { status: "failed", transient: true, error };
@@ -10454,7 +12225,7 @@ function createDreamTaskExecutor(deps) {
         const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
         const result = await runVerify({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10467,31 +12238,35 @@ function createDreamTaskExecutor(deps) {
           fallbackModels: config.fallbackModels,
           language: config.language ?? deps.language,
           moduleRoute,
-          onProgress: (processed) => reportProgress(processed)
+          onProgress: (processed, refused) => reportProgress(processed, refused)
         });
-        const processed = result.verified + result.updated + result.archived;
-        const broadProgress = config.task === "verify-broad" ? `verify-broad cycle ${result.broadCycleStartAt ?? "open"}: verified ${processed}, ${result.remaining} remain` : null;
+        const processed = result.verified + result.updated + result.archived + result.skipped + result.refused;
+        const verificationProgress = `${config.task}${config.task === "verify-broad" ? ` cycle ${result.broadCycleStartAt ?? "open"}` : ""}: processed ${processed} (verified ${result.verified}, updated ${result.updated}, archived ${result.archived}, skipped ${result.skipped}, refused ${result.refused}); ${result.remaining} remain`;
+        const broadProgress = config.task === "verify-broad" ? verificationProgress : null;
         const backlogAfter = config.task === "verify-broad" ? { pending: result.remaining, total: backlogAtStart.total } : undefined;
         if (!result.complete) {
           if (broadProgress && processed > 0) {
-            recordRun("completed", broadProgress, {
+            recordRun("completed", null, {
+              progress: broadProgress,
               memoryChanges: computeMemoryDelta(memoryBefore),
               backlogAfter
             });
-            return { status: "completed", error: broadProgress };
+            return { status: "completed" };
           }
           const error = incompleteMessage(result.remaining);
           recordRun("failed", error, {
+            progress: verificationProgress,
             memoryChanges: computeMemoryDelta(memoryBefore),
             backlogAfter
           });
           return { status: "failed", transient: true, error };
         }
-        recordRun("completed", broadProgress, {
+        recordRun("completed", null, {
+          progress: verificationProgress,
           memoryChanges: computeMemoryDelta(memoryBefore),
           backlogAfter
         });
-        return broadProgress ? { status: "completed", error: broadProgress } : { status: "completed" };
+        return { status: "completed" };
       }
       if (config.task === "classify-memories") {
         let moduleArgs;
@@ -10508,6 +12283,7 @@ function createDreamTaskExecutor(deps) {
         const result = await runClassify({
           db,
           client: deps.client,
+          hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10517,6 +12293,7 @@ function createDreamTaskExecutor(deps) {
           leaseAcquisition,
           model: config.model,
           fallbackModels: config.fallbackModels,
+          language: config.language ?? deps.language,
           ...moduleArgs,
           onProgress: (processed) => reportProgress(processed)
         });
@@ -10532,7 +12309,7 @@ function createDreamTaskExecutor(deps) {
       if (config.task === "promote-primers") {
         const result = await promotePrimers({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           projectIdentity,
           sessionDirectory: deps.sessionDirectory,
           holderId,
@@ -10549,7 +12326,7 @@ function createDreamTaskExecutor(deps) {
       if (config.task === "refresh-primers") {
         const result = await refreshPrimers({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10570,7 +12347,7 @@ function createDreamTaskExecutor(deps) {
       if (config.task === "evaluate-smart-notes") {
         const result = await evaluateSmartNotes({
           db,
-          client: deps.client,
+          client: requireDreamClient(deps.client),
           projectIdentity,
           parentSessionId: parent,
           sessionDirectory: deps.sessionDirectory,
@@ -10610,13 +12387,22 @@ function createDreamTaskExecutor(deps) {
         deadline,
         parent,
         recordRun,
-        computeMemoryDelta
+        computeMemoryDelta,
+        reportProgress,
+        leaseAcquisition,
+        moduleRoute
       });
     } catch (error) {
       const { transient, brief } = classifyFailure(error);
-      recordRun("failed", brief);
-      log(`[dreamer] task ${config.task} failed (transient=${transient}): ${brief}`);
-      return { status: "failed", transient, error: brief };
+      const failure = dreamRunFailureDetail(error);
+      recordRun("failed", brief, { failure });
+      log(`[dreamer] task ${config.task} failed code=${dreamFailureCode(failure.failure_class)} (transient=${transient}): ${brief}`);
+      return {
+        status: "failed",
+        transient,
+        error: brief,
+        failureDetail: formatDreamRunFailure(failure)
+      };
     } finally {
       deps.onProgress?.(null, config.task);
     }
@@ -10725,9 +12511,10 @@ async function runRetrospectiveTask(config, ctx, helpers) {
     abortController.abort();
   }, ctx.leaseAcquisition);
   let childSessionId = null;
+  let promptSettled = false;
   try {
     const createResponse = await createChildSessionWithFence({
-      client: deps.client,
+      client: requireDreamClient(deps.client),
       db,
       parentSessionId: parent ?? undefined,
       title: "magic-context-dream-retrospective",
@@ -10740,7 +12527,8 @@ async function runRetrospectiveTask(config, ctx, helpers) {
     const sessionId = childSessionId;
     const runChildTurn = async (system, userText) => {
       const remainingMs = Math.max(0, deadline - Date.now());
-      return promptSyncWithValidatedOutputRetry(deps.client, {
+      promptSettled = false;
+      const run = await promptSyncWithValidatedOutputRetry(requireDreamClient(deps.client), {
         path: { id: sessionId },
         query: { directory: deps.sessionDirectory },
         body: {
@@ -10755,7 +12543,7 @@ async function runRetrospectiveTask(config, ctx, helpers) {
         fallbackModels: config.fallbackModels,
         callContext: "dreamer:retrospective",
         fetchOutput: async () => {
-          const messagesResponse = await deps.client.session.messages({
+          const messagesResponse = await requireDreamClient(deps.client).session.messages({
             path: { id: sessionId },
             query: { directory: deps.sessionDirectory, limit: 50 }
           });
@@ -10770,6 +12558,8 @@ async function runRetrospectiveTask(config, ctx, helpers) {
           return text;
         }
       });
+      promptSettled = true;
+      return run;
     };
     const finish = (run, watermark) => {
       if (parent && run) {
@@ -10877,9 +12667,15 @@ async function runRetrospectiveTask(config, ctx, helpers) {
     return finish(deepenRun, scan.maxScannedTs);
   } finally {
     heartbeat.stop();
-    if (childSessionId) {
-      await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-    }
+    await teardownChildSession({
+      client: requireDreamClient(deps.client),
+      sessionId: childSessionId,
+      sessionDirectory: deps.sessionDirectory,
+      promptSettled,
+      privacySensitive: true,
+      context: "[dreamer] retrospective",
+      log
+    });
   }
 }
 async function runAgenticTask(config, ctx, helpers) {
@@ -10892,22 +12688,9 @@ async function runAgenticTask(config, ctx, helpers) {
   const lastRunAt = getTaskScheduleState(db, projectIdentity, config.task)?.lastRunAt ?? null;
   const maintainDocsSnapshot = task === "maintain-docs" ? snapshotMaintainDocsFiles(docsDir) : undefined;
   const existingDocs = task === "maintain-docs" ? {
-    architecture: existsSync5(`${docsDir}/ARCHITECTURE.md`),
-    structure: existsSync5(`${docsDir}/STRUCTURE.md`)
+    architecture: existsSync6(`${docsDir}/ARCHITECTURE.md`),
+    structure: existsSync6(`${docsDir}/STRUCTURE.md`)
   } : undefined;
-  const userMemories = task === "curate" ? getActiveUserMemories(db).map((um) => ({ id: um.id, content: um.content })) : undefined;
-  let curateMemories;
-  if (task === "curate") {
-    curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
-    log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
-  }
-  const taskPrompt = buildDreamTaskPrompt(task, {
-    projectPath: projectIdentity,
-    lastDreamAt: lastRunAt ? String(lastRunAt) : null,
-    existingDocs,
-    userMemories,
-    curate: curateMemories ? { memories: curateMemories } : undefined
-  });
   const abortController = new AbortController;
   let leaseLost = false;
   const heartbeat = startLeaseHeartbeat(db, holderId, leaseKey, () => {
@@ -10915,9 +12698,43 @@ async function runAgenticTask(config, ctx, helpers) {
     abortController.abort();
   }, ctx.leaseAcquisition);
   let childSessionId = null;
+  let promptSettled = false;
+  let expiredArchived = 0;
   try {
+    let curateMemories;
+    let curateCategory;
+    if (task === "curate") {
+      expiredArchived = await archiveExpiredMemories({
+        db,
+        projectIdentity,
+        holderId,
+        leaseKey,
+        leaseAcquisition: helpers.leaseAcquisition,
+        moduleRoute: helpers.moduleRoute
+      });
+      if (leaseLost)
+        throw new Error("Dream lease lost during expired-memory archive");
+      const scope = beginCurateCategoryRun(db, projectIdentity, loadActiveMemoryPromptMemories(db, projectIdentity));
+      curateMemories = scope?.memories ?? [];
+      curateCategory = scope?.category;
+      log(`[dreamer] curate pool: category=${curateCategory ?? "none"} in_scope=${curateMemories.length} expired_archived=${expiredArchived}`);
+      if (curateMemories.length === 0) {
+        const progress = expiredArchived > 0 ? formatExpiredArchiveProgress(expiredArchived) : "curate: no populated project-memory category";
+        helpers.recordRun("completed", null, {
+          memoryChanges: helpers.computeMemoryDelta(memoryBefore),
+          progress
+        });
+        return { status: "completed", detail: progress };
+      }
+    }
+    const taskPrompt = buildDreamTaskPrompt(task, {
+      projectPath: projectIdentity,
+      lastDreamAt: lastRunAt ? String(lastRunAt) : null,
+      existingDocs,
+      curate: curateMemories && curateCategory ? { category: curateCategory, memories: curateMemories } : undefined
+    });
     const createResponse = await createChildSessionWithFence({
-      client: deps.client,
+      client: requireDreamClient(deps.client),
       db,
       parentSessionId: parent ?? undefined,
       title: `magic-context-dream-${task}`,
@@ -10931,7 +12748,7 @@ async function runAgenticTask(config, ctx, helpers) {
       throw new Error("Dreamer could not create its child session.");
     const sessionId = childSessionId;
     const remainingMs = Math.max(0, deadline - Date.now());
-    const run = await promptSyncWithValidatedOutputRetry(deps.client, {
+    const run = await promptSyncWithValidatedOutputRetry(requireDreamClient(deps.client), {
       path: { id: sessionId },
       query: { directory: docsDir },
       body: {
@@ -10946,9 +12763,12 @@ async function runAgenticTask(config, ctx, helpers) {
       fallbackModels: config.fallbackModels,
       callContext: `dreamer:${task}`,
       fetchOutput: async () => {
-        const messagesResponse = await deps.client.session.messages({
+        const messagesResponse = await requireDreamClient(deps.client).session.messages({
           path: { id: sessionId },
-          query: { directory: docsDir, limit: 50 }
+          query: {
+            directory: docsDir,
+            ...task === "curate" ? {} : { limit: 50 }
+          }
         });
         return normalizeSDKResponse(messagesResponse, [], {
           preferResponseOnMissingData: true
@@ -10956,13 +12776,33 @@ async function runAgenticTask(config, ctx, helpers) {
       },
       validateOutput: (messages) => {
         const text = extractLatestAssistantText(messages);
+        if (task !== "curate") {
+          if (!text)
+            throw new Error("Dreamer returned no assistant output.");
+          return text;
+        }
+        const memoryOperations = inspectCurateMemoryOperations(messages);
+        if (text)
+          validateCurateAssistantText(text);
+        if (memoryOperations.completedActions.length > 0) {
+          return { text, memoryOperations };
+        }
         if (!text)
           throw new Error("Dreamer returned no assistant output.");
-        return text;
+        if (memoryOperations.totalCalls > 0) {
+          throw new Error("Curate returned no completed ctx_memory tool result.");
+        }
+        return { text, memoryOperations };
       }
     });
+    promptSettled = true;
     if (leaseLost)
       throw new Error("Dream lease lost during task");
+    const curateRefused = task === "curate" ? takeCurateSafetyRefusalCount(sessionId) : 0;
+    if (curateRefused > 0) {
+      helpers.reportProgress(curateRefused, curateRefused);
+      log(`[dreamer] curate safety summary: refused=${curateRefused}`);
+    }
     if (parent) {
       recordChildInvocation({
         db,
@@ -10982,15 +12822,48 @@ async function runAgenticTask(config, ctx, helpers) {
         log(`[dreamer] maintain-docs protected-region enforcement failed: ${e}`);
       }
     }
+    const curateOutput = task === "curate" ? run.validated : undefined;
+    const curateScopeProgress = task === "curate" && curateCategory && curateMemories ? `curate: ${curateCategory} (${curateMemories.length})` : null;
+    const progress = [
+      curateScopeProgress,
+      expiredArchived > 0 ? formatExpiredArchiveProgress(expiredArchived) : null,
+      curateOutput && curateOutput.memoryOperations.completedActions.length > 0 ? formatCurateMemoryOperations(curateOutput.memoryOperations.completedActions) : null,
+      curateRefused > 0 ? `curate: refused ${curateRefused} unsafe mutation(s)` : null
+    ].filter((value) => Boolean(value)).join("; ");
+    const curateCount = task === "curate" && curateCategory ? loadActiveMemoryPromptMemories(db, projectIdentity).filter((memory) => curateCategoryForMemoryCategory(memory.category) === curateCategory).length : undefined;
+    const curateBacklog = curateCount !== undefined && curateCategory ? {
+      pending: curateCount,
+      total: curateCount,
+      category: curateCategory
+    } : undefined;
     helpers.recordRun("completed", null, {
-      memoryChanges: helpers.computeMemoryDelta(memoryBefore)
+      memoryChanges: helpers.computeMemoryDelta(memoryBefore),
+      progress: progress || null,
+      backlogAfter: curateBacklog
     });
-    return { status: "completed" };
+    return {
+      status: "completed",
+      ...progress ? { detail: progress } : {},
+      ...curateBacklog ? { backlog: curateBacklog } : {},
+      ...curateCategory ? {
+        schedulePatch: {
+          taskStateJson: curateTaskStateAfterSuccess(db, projectIdentity, curateCategory)
+        }
+      } : {}
+    };
   } finally {
     heartbeat.stop();
-    if (childSessionId) {
-      await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-    }
+    if (childSessionId)
+      takeCurateSafetyRefusalCount(childSessionId);
+    await teardownChildSession({
+      client: requireDreamClient(deps.client),
+      sessionId: childSessionId,
+      sessionDirectory: docsDir,
+      promptSettled,
+      privacySensitive: true,
+      context: `[dreamer] ${task}`,
+      log
+    });
   }
 }
 
@@ -11181,7 +13054,7 @@ async function runDreamTick(db, projectIdentity, executor, state, log) {
     const ran = await runDueTasksForProject({
       db,
       projectIdentity,
-      tasks: buildDreamTaskRuntimeConfigs(state.coreConfig),
+      tasks: buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS),
       executor
     });
     if (ran > 0)
@@ -11266,7 +13139,7 @@ function dshDreamSeams(ctx, deps) {
   const state = dreamerRuntime.get(ctx) ?? defaultState();
   const facade = state.facade ??= createDshDreamClient(ctx, deps);
   const executor = buildDreamExecutor(facade, state);
-  const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig).filter((task) => task.schedule.trim() !== "");
+  const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS).filter((task) => task.schedule.trim() !== "");
   const runnable = state.enabled && !readDreamerCompactionOff(deps);
   return {
     tasks,
@@ -11283,8 +13156,10 @@ function readDreamerCompactionOff(deps) {
 function createLiveSessionState() {
   return {
     liveModelBySession: new Map,
+    latestAssistantMessageIdBySession: new Map,
     variantBySession: new Map,
     agentBySession: new Map,
+    channel1StateBySession: new Map,
     historyRefreshSessions: new Set,
     deferredHistoryRefreshSessions: new Set,
     systemPromptRefreshSessions: new Set,
@@ -11296,11 +13171,6 @@ function createLiveSessionState() {
     internalChildSessions: new Set
   };
 }
-
-// ../plugin/src/agents/historian.ts
-var HISTORIAN_AGENT = "historian";
-var HISTORIAN_RECOMP_AGENT = "historian-recomp";
-var HISTORIAN_EDITOR_AGENT = "historian-editor";
 
 // ../plugin/src/features/magic-context/memory/memory-migration.ts
 function memoryMigrationGuardKey(projectPath) {
@@ -11414,15 +13284,16 @@ async function runMemoryMigration(deps) {
     }
   }
   let agentSessionId = null;
+  let promptSettled = false;
   const cleanupChildSession = async (sid) => {
-    if (!sid)
-      return;
-    if (shouldKeepSubagents()) {
-      sessionLog(parentSessionId, `memory-migration: KEEPING child session ${sid} (keep_subagents)`);
-      return;
-    }
-    await client.session.delete({ path: { id: sid } }).catch((e) => {
-      sessionLog(parentSessionId, `memory-migration: child cleanup failed: ${String(e)}`);
+    await teardownChildSession({
+      client,
+      sessionId: sid,
+      sessionDirectory: directory,
+      promptSettled,
+      privacySensitive: false,
+      context: "memory-migration",
+      log: (message) => sessionLog(parentSessionId, message)
     });
   };
   try {
@@ -11432,6 +13303,7 @@ async function runMemoryMigration(deps) {
       const modelOverride = modelId ? parseProviderModel(modelId) : null;
       await cleanupChildSession(agentSessionId);
       agentSessionId = null;
+      promptSettled = false;
       const createResponse = await createChildSessionWithFence({
         client,
         db,
@@ -11467,6 +13339,7 @@ async function runMemoryMigration(deps) {
           fallbackModels: undefined,
           callContext: `memory-migration:${parentSessionId.slice(0, 12)}`
         });
+        promptSettled = true;
       } catch (error) {
         sessionLog(parentSessionId, `memory-migration: model ${modelId ?? "primary"} threw: ${String(error)}`);
         continue;
@@ -11544,7 +13417,10 @@ async function embedAndStoreCompartmentChunks(db, sessionId, projectPath, compar
   for (const compartment of compartments) {
     try {
       const fromMemory = compartment.sourceChunkText ? canonicalizeInMemoryChunkTextForEmbedding(compartment.sourceChunkText, compartment.startMessage, compartment.endMessage) : "";
-      const canonicalText = fromMemory || buildCanonicalChunkTextFromFts(db, sessionId, compartment.startMessage, compartment.endMessage) || buildCompartmentSummaryFallbackText(db, compartment.id);
+      const mappedText = fromMemory ? fromMemory : buildCanonicalChunkTextFromFts(db, sessionId, compartment.startMessage, compartment.endMessage);
+      if (mappedText === null)
+        continue;
+      const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, compartment.id);
       if (canonicalText.length === 0)
         continue;
       const windows = chunkCanonicalText(canonicalText, compartment.startMessage, compartment.endMessage, maxInputTokens);
@@ -11584,380 +13460,116 @@ async function embedAndStoreCompartmentChunks(db, sessionId, projectPath, compar
       }
     } catch (error) {
       sessionLog(sessionId, `compartment chunk embedding failed for compartment ${compartment.id}:`, error);
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 }
 
 // ../plugin/src/hooks/magic-context/historian-state-file.ts
-import { mkdirSync, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { mkdirSync as mkdirSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 function cleanupHistorianStateFile(path) {
   if (!path)
     return;
   try {
-    unlinkSync(path);
+    unlinkSync3(path);
   } catch {}
 }
-// ../plugin/src/hooks/magic-context/compartment-runner-historian.ts
-import { mkdirSync as mkdirSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
-import { join as join2 } from "node:path";
-function historianResponseDumpDir(directory) {
-  return getProjectMagicContextHistorianDir(directory);
-}
-var MAX_HISTORIAN_RETRIES = 2;
-var HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
-function extractLatestHistorianReasoning(messages) {
-  if (!Array.isArray(messages))
-    return null;
-  const latest = messages.filter((message) => isRecord(message) && isRecord(message.info) && message.info.role === "assistant").sort((left, right) => historianMessageCreatedAt(right) - historianMessageCreatedAt(left))[0];
-  if (!latest || !Array.isArray(latest.parts))
-    return null;
-  return latest.parts.filter(isHistorianReasoningPart).map((part) => part.text).join(`
-`) || null;
-}
-function isHistorianReasoningPart(part) {
-  return isRecord(part) && typeof part.type === "string" && HISTORIAN_REASONING_PART_TYPES.has(part.type) && typeof part.text === "string" && part.text.length > 0;
-}
-function historianMessageCreatedAt(message) {
-  if (!isRecord(message.info) || !isRecord(message.info.time))
-    return 0;
-  return typeof message.info.time.created === "number" ? message.info.time.created : 0;
-}
-async function runValidatedHistorianPass(args) {
-  const firstRun = await runHistorianPrompt({
-    ...args,
-    dumpLabel: `${args.dumpLabelBase}-initial`,
-    agentId: args.agentId
-  });
-  if (!firstRun.ok || !firstRun.result) {
-    return runFallbackHistorianPass({
-      ...args,
-      prompt: args.prompt,
-      error: firstRun.error ?? "historian run failed",
-      dumpPaths: [firstRun.dumpPath]
-    });
-  }
-  const firstValidation = validateHistorianOutput(firstRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
-  if (firstValidation.ok) {
-    const finalResult = args.twoPass ? await runEditorPassOrFallback({
-      ...args,
-      draftXml: firstRun.result,
-      draftValidation: firstValidation,
-      draftDumpPath: firstRun.dumpPath,
-      draftInvocationId: firstRun.invocationId ?? null
-    }) : { ...firstValidation, invocationId: firstRun.invocationId ?? null };
-    cleanupHistorianDump(args.parentSessionId, firstRun.dumpPath);
-    return finalResult;
-  }
-  await args.callbacks?.onRepairRetry?.(firstValidation.error ?? "invalid compartment output");
-  const repairPrompt = buildHistorianRepairPrompt(args.prompt, firstRun.result, firstValidation.error ?? "invalid compartment output", args.language);
-  const repairRun = await runHistorianPrompt({
-    ...args,
-    prompt: repairPrompt,
-    dumpLabel: `${args.dumpLabelBase}-repair`,
-    agentId: args.agentId
-  });
-  if (!repairRun.ok || !repairRun.result) {
-    return runFallbackHistorianPass({
-      ...args,
-      prompt: repairPrompt,
-      error: repairRun.error ?? "historian repair run failed",
-      dumpPaths: [firstRun.dumpPath, repairRun.dumpPath]
-    });
-  }
-  const repairValidation = validateHistorianOutput(repairRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
-  if (repairValidation.ok) {
-    const finalResult = args.twoPass ? await runEditorPassOrFallback({
-      ...args,
-      draftXml: repairRun.result,
-      draftValidation: repairValidation,
-      draftDumpPath: repairRun.dumpPath,
-      draftInvocationId: repairRun.invocationId ?? null
-    }) : { ...repairValidation, invocationId: repairRun.invocationId ?? null };
-    cleanupHistorianDump(args.parentSessionId, repairRun.dumpPath);
-    return finalResult;
-  }
-  return runFallbackHistorianPass({
-    ...args,
-    prompt: repairPrompt,
-    error: repairValidation.error ?? "invalid compartment output",
-    dumpPaths: [firstRun.dumpPath, repairRun.dumpPath]
-  });
-}
-async function runEditorPassOrFallback(args) {
-  sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
-  const editorRun = await runHistorianPrompt({
-    client: args.client,
-    db: args.db,
-    parentSessionId: args.parentSessionId,
-    sessionDirectory: args.sessionDirectory,
-    prompt: buildHistorianEditorPrompt(args.draftXml),
-    timeoutMs: args.timeoutMs,
-    dumpLabel: `${args.dumpLabelBase}-editor`,
-    agentId: HISTORIAN_EDITOR_AGENT,
-    parentInvocationId: args.draftInvocationId ?? null
-  });
-  if (!editorRun.ok || !editorRun.result) {
-    sessionLog(args.parentSessionId, "historian two-pass: editor call failed", {
-      error: editorRun.error
-    });
-    return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
-  }
-  const editorValidation = validateHistorianOutput(editorRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
-  if (!editorValidation.ok) {
-    sessionLog(args.parentSessionId, "historian two-pass: editor validation failed, falling back to draft", { error: editorValidation.error });
-    return { ...args.draftValidation, invocationId: args.draftInvocationId ?? null };
-  }
-  cleanupHistorianDump(args.parentSessionId, editorRun.dumpPath);
-  sessionLog(args.parentSessionId, "historian two-pass: editor accepted");
-  return { ...editorValidation, invocationId: editorRun.invocationId ?? null };
-}
-async function runHistorianPrompt(args) {
-  const {
-    client,
-    db,
-    parentSessionId,
-    sessionDirectory,
-    prompt,
-    timeoutMs,
-    dumpLabel,
-    modelOverride,
-    agentId = HISTORIAN_AGENT,
-    fallbackModels,
-    subagentKind,
-    parentInvocationId
-  } = args;
-  let agentSessionId = null;
-  const startedAt = Date.now();
-  let invocationRecorded = false;
-  let outcomeOk = false;
-  const recordInvocation = (params) => {
-    if (invocationRecorded)
-      return null;
-    invocationRecorded = true;
-    return recordChildInvocation({
-      db: openDatabase(),
-      parentSessionId,
-      harness: getHarness(),
-      subagent: agentId === HISTORIAN_EDITOR_AGENT ? "historian_editor" : subagentKind ?? "historian",
-      startedAt,
-      status: params.status,
-      messages: params.messages,
-      error: params.error,
-      parentInvocationId: agentId === HISTORIAN_EDITOR_AGENT ? parentInvocationId ?? null : null
-    });
-  };
-  try {
-    sessionLog(parentSessionId, `historian: creating child session (agent=${agentId}, model=${modelOverride ? `${modelOverride.providerID}/${modelOverride.modelID}` : `agent:${agentId}`})`);
-    const createResponse = await createChildSessionWithFence({
-      client,
-      db,
-      parentSessionId,
-      title: "magic-context-compartment",
-      directory: sessionDirectory
-    });
-    const createdSession = normalizeSDKResponse(createResponse, null, { preferResponseOnMissingData: true });
-    agentSessionId = typeof createdSession?.id === "string" ? createdSession.id : null;
-    if (!agentSessionId) {
-      recordInvocation({
-        status: "failed",
-        error: "Historian could not create its child session."
-      });
-      return { ok: false, error: "Historian could not create its child session." };
-    }
-    for (let retryIndex = 0;retryIndex <= MAX_HISTORIAN_RETRIES; retryIndex += 1) {
-      try {
-        await promptSyncWithModelSuggestionRetry(client, {
-          path: { id: agentSessionId },
-          query: { directory: sessionDirectory },
-          body: {
-            agent: agentId,
-            ...modelOverride ? { model: modelOverride } : {},
-            parts: [{ type: "text", text: prompt, synthetic: true }]
-          }
-        }, {
-          timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
-          fallbackModels: modelOverride ? undefined : fallbackModels,
-          callContext: agentId === HISTORIAN_EDITOR_AGENT ? "historian:editor" : "historian"
-        });
-        sessionLog(parentSessionId, `historian: prompt completed (attempt ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES + 1})`);
-        break;
-      } catch (error) {
-        const errorMsg = getErrorMessage(error);
-        sessionLog(parentSessionId, `historian: prompt attempt ${retryIndex + 1} failed: ${errorMsg}`);
-        const shouldRetry = retryIndex < MAX_HISTORIAN_RETRIES && isTransientHistorianPromptError(errorMsg);
-        if (!shouldRetry) {
-          throw error;
-        }
-        const backoffMs = getHistorianRetryBackoffMs(retryIndex);
-        sessionLog(parentSessionId, `historian retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES} after ${backoffMs}ms: ${errorMsg}`);
-        await sleep(backoffMs);
-      }
-    }
-    const messagesResponse = await client.session.messages({
-      path: { id: agentSessionId },
-      query: { directory: sessionDirectory, limit: 50 }
-    });
-    const messages = normalizeSDKResponse(messagesResponse, [], {
-      preferResponseOnMissingData: true
-    });
-    const invocationId = recordInvocation({ status: "completed", messages });
-    const lengthCapped = hasLengthCappedOutput(messages);
-    const textResult = extractLatestAssistantText(messages);
-    const reasoningResult = textResult ? null : extractLatestHistorianReasoning(messages);
-    if (!textResult && reasoningResult && lengthCapped) {
-      const outputTokens = sumTokensFromChildMessages(messages).output;
-      return {
-        ok: false,
-        error: `historian output length-capped at ${outputTokens} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`,
-        invocationId: invocationId ?? undefined
-      };
-    }
-    const result = textResult ?? reasoningResult;
-    if (!result) {
-      return {
-        ok: false,
-        error: "Historian returned no assistant output.",
-        invocationId: invocationId ?? undefined
-      };
-    }
-    const dumpPath = dumpHistorianResponse(parentSessionId, sessionDirectory, dumpLabel ?? "historian-response", result);
-    outcomeOk = true;
-    return { ok: true, result, dumpPath, invocationId: invocationId ?? undefined };
-  } catch (modelError) {
-    const desc = describeError(modelError);
-    sessionLog(parentSessionId, `historian prompt failed: ${desc.brief} promptLength=${prompt.length}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`);
-    recordInvocation({ status: "failed", error: modelError });
-    return {
-      ok: false,
-      error: `Historian failed while processing this session: ${desc.brief}`
-    };
-  } finally {
-    if (agentSessionId && outcomeOk && !shouldKeepSubagents()) {
-      await client.session.delete({ path: { id: agentSessionId } }).catch((e) => {
-        sessionLog(parentSessionId, "compartment agent: session cleanup failed", getErrorMessage(e));
-      });
-    } else if (agentSessionId && (!outcomeOk || shouldKeepSubagents())) {
-      sessionLog(parentSessionId, `historian: KEEPING child session ${agentSessionId} (${outcomeOk ? "keep_subagents" : "failed"}) — not deleted`);
-    }
-  }
-}
-async function runFallbackHistorianPass(args) {
-  const seen = new Set;
-  const chain = [];
-  for (const candidate of [...args.fallbackModels ?? [], args.fallbackModelId ?? ""]) {
-    if (!candidate || seen.has(candidate))
-      continue;
-    seen.add(candidate);
-    chain.push(candidate);
-  }
-  if (chain.length === 0) {
-    return { ok: false, error: args.error };
-  }
-  let lastError = args.error;
-  for (let i = 0;i < chain.length; i += 1) {
-    const modelId = chain[i];
-    const modelOverride = parseModelOverride(modelId);
-    if (!modelOverride)
-      continue;
-    const isSessionModelLastResort = modelId === args.fallbackModelId && i === chain.length - 1;
-    sessionLog(args.parentSessionId, `compartment agent: retrying historian with ${modelId} (${isSessionModelLastResort ? "session-model last resort" : "configured fallback"} ${i + 1}/${chain.length})`);
-    args.callbacks?.onModelFallback?.(modelId, i + 1, chain.length);
-    const fallbackRun = await runHistorianPrompt({
-      client: args.client,
-      db: args.db,
-      parentSessionId: args.parentSessionId,
-      sessionDirectory: args.sessionDirectory,
-      prompt: args.prompt,
-      timeoutMs: args.timeoutMs,
-      dumpLabel: `${args.dumpLabelBase}-fallback-${i + 1}`,
-      modelOverride,
-      agentId: args.agentId
-    });
-    if (!fallbackRun.ok || !fallbackRun.result) {
-      lastError = fallbackRun.error ?? lastError;
-      continue;
-    }
-    const fallbackValidation = validateHistorianOutput(fallbackRun.result, args.parentSessionId, args.chunk, args.priorCompartments, args.sequenceOffset);
-    if (fallbackValidation.ok) {
-      cleanupHistorianDump(args.parentSessionId, fallbackRun.dumpPath);
-      return { ...fallbackValidation, invocationId: fallbackRun.invocationId ?? null };
-    }
-    lastError = fallbackValidation.error ?? lastError;
-  }
-  return { ok: false, error: lastError };
-}
-function parseModelOverride(modelId) {
-  const [providerID, ...modelParts] = modelId.split("/");
-  const modelID = modelParts.join("/");
-  if (!providerID || modelID.length === 0) {
-    return null;
-  }
-  return { providerID, modelID };
-}
-function getHistorianRetryBackoffMs(retryIndex) {
-  if (retryIndex === 0) {
-    return 2000 + Math.floor(Math.random() * 1001);
-  }
-  return 6000 + Math.floor(Math.random() * 2001);
-}
-function isTransientHistorianPromptError(message) {
-  const normalized = message.toLowerCase();
-  if (normalized.includes("invalid request") || normalized.includes("bad request") || normalized.includes("unauthorized") || normalized.includes("forbidden") || normalized.includes("authentication") || normalized.includes("auth") || normalized.includes(" 400") || normalized.startsWith("400")) {
+// ../plugin/src/hooks/magic-context/persist-filtered-noise.ts
+function persistFilteredNoise(db, sessionId, chunk, eligibleEnd) {
+  const rows = chunk.filteredNoiseLines ?? [];
+  const start = chunk.startIndex;
+  if (chunk.text || chunk.messageCount !== 0 || eligibleEnd <= start || rows.length !== eligibleEnd - start || rows.some((row, index) => row.ordinal !== start + index || !row.messageId))
     return false;
-  }
-  return [
-    "429",
-    "rate limit",
-    "timeout",
-    "econnreset",
-    "etimedout",
-    "503",
-    "502",
-    "500",
-    "overloaded"
-  ].some((token) => normalized.includes(token));
+  const saved = db.transaction(() => {
+    const prior = getCompartments(db, sessionId);
+    const last = prior.at(-1);
+    if ((last?.endMessage ?? 0) + 1 !== start)
+      return false;
+    appendCompartments(db, sessionId, [
+      {
+        sequence: (last?.sequence ?? -1) + 1,
+        startMessage: start,
+        endMessage: eligibleEnd - 1,
+        startMessageId: rows[0].messageId,
+        endMessageId: rows[rows.length - 1].messageId,
+        title: "",
+        content: "",
+        p1: "",
+        p2: "",
+        p3: "",
+        p4: "",
+        episodeType: "filtered-noise",
+        importance: 1
+      }
+    ]);
+    return true;
+  })();
+  if (saved)
+    sessionLog(sessionId, `historian skipped ordinals ${start}-${eligibleEnd - 1}: all ${rows.length} raw rows excluded by chunk filters (no-content boundary marker)`);
+  return saved;
 }
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-function cleanupHistorianDump(sessionId, dumpPath) {
-  if (!dumpPath)
-    return;
-  try {
-    unlinkSync2(dumpPath);
-  } catch (error) {
-    sessionLog(sessionId, "compartment agent: failed to remove historian response dump", {
-      dumpPath,
-      error: getErrorMessage(error)
-    });
-  }
-}
-function dumpHistorianResponse(sessionId, directory, label, text) {
-  try {
-    const dumpDir = historianResponseDumpDir(directory);
-    mkdirSync2(dumpDir, { recursive: true });
-    ensureCortexKitArtifactGitignore(directory);
-    const safeSessionId = sanitizeDumpName(sessionId);
-    const safeLabel = sanitizeDumpName(label);
-    const dumpPath = join2(dumpDir, `${safeSessionId}-${safeLabel}-${Date.now()}.xml`);
-    writeFileSync3(dumpPath, text, "utf8");
-    sessionLog(sessionId, "compartment agent: historian response dumped", {
-      label,
-      dumpPath
-    });
-    return dumpPath;
-  } catch (error) {
-    sessionLog(sessionId, "compartment agent: failed to dump historian response", {
-      label,
-      error: getErrorMessage(error)
-    });
+
+// ../plugin/src/hooks/magic-context/producer-window-guard.ts
+var PRODUCER_WINDOW_REFUSAL_MARGIN = 0.03;
+var HISTORIAN_TRUNCATION_MARKER = "[… tokens truncated by Magic Context to fit the historian window …]";
+function producerInputTokenLimit(contextLimitTokens, maxOutputTokens) {
+  if (typeof contextLimitTokens !== "number" || !Number.isFinite(contextLimitTokens) || contextLimitTokens <= 0 || !Number.isFinite(maxOutputTokens) || maxOutputTokens < 0) {
     return;
   }
+  const usableInputTokens = Math.max(0, Math.floor(contextLimitTokens - maxOutputTokens));
+  return Math.max(0, Math.floor(usableInputTokens * (1 - PRODUCER_WINDOW_REFUSAL_MARGIN)));
 }
-function sanitizeDumpName(value) {
-  return value.replace(/[^a-zA-Z0-9._-]/g, "-");
+function producerWindowFailureReason(input) {
+  const { producerSourceTokens, contextLimitTokens, maxOutputTokens } = input;
+  const producerInputLimitTokens = producerInputTokenLimit(contextLimitTokens, maxOutputTokens);
+  if (producerInputLimitTokens === undefined || typeof contextLimitTokens !== "number" || !Number.isFinite(producerSourceTokens) || producerSourceTokens <= 0) {
+    return null;
+  }
+  const usableInputTokens = Math.max(0, Math.floor(contextLimitTokens - maxOutputTokens));
+  if (producerSourceTokens <= producerInputLimitTokens)
+    return null;
+  return `producer_source_exceeds_window producer_source_tokens=${Math.round(producerSourceTokens)} usable_input_tokens=${usableInputTokens} producer_input_limit_tokens=${producerInputLimitTokens} context_limit_tokens=${Math.round(contextLimitTokens)} max_output_tokens=${Math.round(maxOutputTokens)} estimator_margin=${PRODUCER_WINDOW_REFUSAL_MARGIN}`;
+}
+function splitMarkerPair() {
+  return `
+${HISTORIAN_TRUNCATION_MARKER}
+${HISTORIAN_TRUNCATION_MARKER}
+`;
+}
+function fitAtomicHistorianSourceToProducerWindow(args) {
+  const producerInputLimitTokens = producerInputTokenLimit(args.contextLimitTokens, args.maxOutputTokens);
+  const originalTokens = estimateTokens(args.text);
+  if (producerInputLimitTokens === undefined || originalTokens < producerInputLimitTokens || producerInputLimitTokens <= 0) {
+    return { text: args.text, producerInputLimitTokens, removedTokens: 0 };
+  }
+  const boundary = [...args.resultBoundaries ?? []].filter((candidate) => Number.isFinite(candidate.sourceOffset) && candidate.sourceOffset > 0 && candidate.sourceOffset < args.text.length).sort((a, b) => b.bodyTokens - a.bodyTokens || a.ordinal - b.ordinal)[0];
+  const splitOffset = boundary?.sourceOffset ?? Math.floor(args.text.length / 2);
+  const left = args.text.slice(0, splitOffset);
+  const right = args.text.slice(splitOffset);
+  const markers = splitMarkerPair();
+  const target = producerInputLimitTokens;
+  let lo = 0;
+  let hi = 1;
+  let best = markers;
+  for (let iteration = 0;iteration < 48; iteration++) {
+    const scale = (lo + hi) / 2;
+    const leftLength = Math.floor(left.length * scale);
+    const rightLength = Math.floor(right.length * scale);
+    const candidate = left.slice(0, leftLength) + markers + right.slice(right.length - rightLength);
+    if (estimateTokens(candidate) <= target) {
+      best = candidate;
+      lo = scale;
+    } else {
+      hi = scale;
+    }
+  }
+  return {
+    text: best,
+    producerInputLimitTokens,
+    ...boundary ? { splitBoundaryOrdinal: boundary.ordinal } : {},
+    removedTokens: Math.max(0, originalTokens - estimateTokens(best))
+  };
 }
 
 // ../plugin/src/hooks/magic-context/reference-seeds.generated.ts
@@ -13734,6 +15346,7 @@ ${escapeXmlContent(c.content)}
 </compartment>`;
 }
 function renderSessionReferencesBlock(allCompartments) {
+  allCompartments = allCompartments.filter((c) => !isNoContentCompartment(c));
   if (allCompartments.length === 0)
     return "";
   const recent = allCompartments.slice(-SESSION_REF_WINDOW);
@@ -13752,6 +15365,56 @@ function buildReferenceBlocks(args) {
   };
 }
 
+// ../plugin/src/hooks/magic-context/send-session-notification.ts
+var queuedIgnoredNotifications = new Map;
+var flushingIgnoredNotifications = new Set;
+var idleSessions = new Set;
+var lastDeliveredText = new Map;
+var activityEpoch = new Map;
+function notifyDelivered(sessionId, params) {
+  try {
+    params.onDelivered?.();
+  } catch (error) {
+    sessionLog(sessionId, "notification delivery callback failed:", getErrorMessage(error));
+  }
+}
+function inferToastVariant(text) {
+  const lower = text.toLowerCase();
+  if (lower.includes("error") || lower.includes("failed") || lower.includes("alert"))
+    return "error";
+  if (lower.includes("warning") || lower.includes("⚠"))
+    return "warning";
+  if (lower.includes("complete") || lower.includes("success") || lower.includes("✓") || lower.includes("finished"))
+    return "success";
+  return "info";
+}
+function extractToastTitle(text) {
+  const headingMatch = text.match(/^#+\s+(.+)/m);
+  if (headingMatch)
+    return headingMatch[1].trim();
+  const firstLine = text.split(`
+`)[0].trim();
+  if (firstLine.length <= 80)
+    return firstLine;
+  return "Magic Context";
+}
+async function sendStatusNotification(_client, sessionId, text, params) {
+  try {
+    const { pushNotification } = await import("./rpc-notifications-jxy30tgz.js");
+    pushNotification("toast", {
+      title: extractToastTitle(text),
+      message: text,
+      variant: inferToastVariant(text),
+      duration: params.toastDurationMs ?? 5000
+    }, sessionId);
+    notifyDelivered(sessionId, params);
+    return "sent";
+  } catch (error) {
+    sessionLog(sessionId, "status RPC enqueue failed:", getErrorMessage(error));
+    return "failed";
+  }
+}
+
 // ../plugin/src/hooks/magic-context/compartment-runner-incremental.ts
 var HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 var lastHistorianAlertBySession = new Map;
@@ -13762,6 +15425,25 @@ function shouldSuppressHistorianAlert(sessionId) {
   }
   lastHistorianAlertBySession.set(sessionId, Date.now());
   return false;
+}
+function findDanglingPublicationBoundary(sessionId, compartments, resolveOrdinal = readRawSessionMessageOrdinalById) {
+  for (const compartment of compartments) {
+    if (resolveOrdinal(sessionId, compartment.startMessageId) === null) {
+      return {
+        sequence: compartment.sequence,
+        side: "start",
+        messageId: compartment.startMessageId
+      };
+    }
+    if (resolveOrdinal(sessionId, compartment.endMessageId) === null) {
+      return {
+        sequence: compartment.sequence,
+        side: "end",
+        messageId: compartment.endMessageId
+      };
+    }
+  }
+  return null;
 }
 async function runCompartmentAgent(deps) {
   const {
@@ -13789,7 +15471,7 @@ async function runCompartmentAgent(deps) {
     const invocationId = latest != null && (invocationBaseline == null || latest > invocationBaseline) ? latest : null;
     recordHistorianRun(db, {
       sessionId,
-      harness: getHarness(),
+      harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? getHarness(),
       subagentInvocationId: invocationId,
       runKind: telemetry.runKind ?? "incremental",
       status: telemetry.status ?? "failed",
@@ -13802,7 +15484,9 @@ async function runCompartmentAgent(deps) {
       compartmentIdMax: telemetry.compartmentIdMax ?? null,
       factsEmitted: telemetry.factsEmitted ?? 0,
       factsByCategory: telemetry.factsByCategory ?? null,
+      factsPromoted: telemetry.factsPromoted ?? 0,
       eventsEmitted: telemetry.eventsEmitted ?? 0,
+      eventsPublished: telemetry.eventsPublished ?? 0,
       importanceMin: telemetry.importanceMin ?? null,
       importanceMax: telemetry.importanceMax ?? null,
       importanceAvg: telemetry.importanceAvg ?? null,
@@ -13816,7 +15500,7 @@ async function runCompartmentAgent(deps) {
       sessionLog(sessionId, "historian alert suppressed (cooldown):", message.slice(0, 100));
       return;
     }
-    await sendIgnoredMessage(client, sessionId, message, getNotificationParams?.() ?? {});
+    await sendStatusNotification(client, sessionId, message, getNotificationParams?.() ?? {});
   };
   const truncateHistorianInputIfNeeded = (text, budget) => {
     if (estimateTokens(text) <= budget)
@@ -13845,6 +15529,15 @@ async function runCompartmentAgent(deps) {
   };
   updateSessionMeta(db, sessionId, { compartmentInProgress: true });
   try {
+    const openCodeDbResolution = resolveOpenCodeDbPath();
+    if (!openCodeDbPathExists(openCodeDbResolution) && !hasRawMessageProvider(sessionId)) {
+      telemetry.status = "noop";
+      telemetry.failureReason = "opencode_db_missing";
+      if (claimOpenCodeDbDiagnosticOnce("historian-no-fire", openCodeDbResolution)) {
+        sessionLog(sessionId, `historian no-fire: reason=opencode_db_missing path=${openCodeDbResolution.path} source=${openCodeDbResolution.source}`);
+      }
+      return;
+    }
     const priorCompartments = getCompartments(db, sessionId);
     const existingValidationError = validateStoredCompartments(priorCompartments);
     if (existingValidationError) {
@@ -13897,7 +15590,7 @@ async function runCompartmentAgent(deps) {
     const protectedTailStart = Math.min(boundarySnapshot.protectedTailStart, boundarySnapshot.rawMessageCountAtTrigger + 1);
     const eligibleEndOrdinal = Math.min(boundarySnapshot.eligibleEndOrdinal, protectedTailStart);
     if (protectedTailStart <= offset || eligibleEndOrdinal <= offset) {
-      sessionLog(sessionId, `historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact`);
+      sessionLog(sessionId, `historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact; ${describeBoundaryDiagnostics(boundarySnapshot)}`);
       if (boundarySnapshot.usagePercentage < 80 && !boundarySnapshot.emergencyTailScale) {
         if (!isWrapupInProgress(db, sessionId))
           clearEmergencyRecovery(db, sessionId);
@@ -13924,9 +15617,9 @@ async function runCompartmentAgent(deps) {
       executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage
     });
     if (!reserve.ok) {
-      sessionLog(sessionId, `historian rate-limit skip: ${reserve.skippedReason ?? "quota exhausted"}`);
+      sessionLog(sessionId, describeProtectedTailDrainBudgetSkip(reserve));
       telemetry.status = "noop";
-      telemetry.failureReason = "protected-tail drain quota exhausted";
+      telemetry.failureReason = "internal protected-tail drain budget spent";
       return;
     }
     drainReservation = reserve.reservation;
@@ -13935,6 +15628,13 @@ async function runCompartmentAgent(deps) {
     telemetry.chunkStartOrdinal = chunk.startIndex;
     telemetry.chunkEndOrdinal = chunk.endIndex;
     if (!chunk.text || chunk.messageCount === 0) {
+      if (persistFilteredNoise(db, sessionId, chunk, eligibleEndOrdinal)) {
+        telemetry.status = "noop";
+        telemetry.failureReason = "filtered noise skipped";
+        telemetry.chunkEndOrdinal = eligibleEndOrdinal - 1;
+        rollbackDrainReservation();
+        return;
+      }
       sessionLog(sessionId, `historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${eligibleEndOrdinal - 1}`);
       if (boundarySnapshot.usagePercentage < 80 && !boundarySnapshot.emergencyTailScale) {
         if (!isWrapupInProgress(db, sessionId))
@@ -13948,7 +15648,32 @@ async function runCompartmentAgent(deps) {
       rollbackDrainReservation();
       return;
     }
-    const chunkText = truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+    const fittedAtomicSource = chunk.oversizeAtomicUnit ? fitAtomicHistorianSourceToProducerWindow({
+      text: chunk.text,
+      resultBoundaries: chunk.toolResultBoundaries,
+      contextLimitTokens: deps.historianContextLimit,
+      maxOutputTokens: deps.historianMaxOutputTokens ?? 32000
+    }) : null;
+    const chunkText = chunk.oversizeAtomicUnit ? fittedAtomicSource?.text ?? chunk.text : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+    const producerSourceTokens = estimateTokens(chunkText);
+    if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
+      sessionLog(sessionId, `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`);
+    }
+    if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
+      sessionLog(sessionId, `historian pathological component split: range=${chunk.startIndex}-${chunk.endIndex} resultBoundary=${fittedAtomicSource.splitBoundaryOrdinal ?? "midpoint"} removedTokens=${fittedAtomicSource.removedTokens} producerSourceTokens=${producerSourceTokens} producerInputLimitTokens=${fittedAtomicSource.producerInputLimitTokens ?? "unknown"}`);
+    }
+    const producerWindowFailure = producerWindowFailureReason({
+      producerSourceTokens,
+      contextLimitTokens: deps.historianContextLimit,
+      maxOutputTokens: deps.historianMaxOutputTokens ?? 32000
+    });
+    if (producerWindowFailure) {
+      telemetry.failureReason = producerWindowFailure;
+      retainDrainReservationForRetryThrottle = true;
+      incrementHistorianFailure(db, sessionId, producerWindowFailure);
+      sessionLog(sessionId, `historian oversize admission refused before spawn: ${producerWindowFailure}`);
+      return;
+    }
     if (chunkText !== chunk.text) {
       sessionLog(sessionId, `historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${historianChunkTokens} tokens`);
     }
@@ -13979,7 +15704,7 @@ async function runCompartmentAgent(deps) {
 ${chunkText}`,
       memoryEnabled: deps.memoryEnabled !== false
     });
-    const parentSessionResponse = await client.session.get({ path: { id: sessionId } }).catch(() => null);
+    const parentSessionResponse = await client?.session.get({ path: { id: sessionId } }).catch(() => null);
     const parentSession = normalizeSDKResponse(parentSessionResponse, null, { preferResponseOnMissingData: true });
     const sessionDirectory = parentSession?.directory ?? directory;
     const maxExistingSequence = priorCompartments.reduce((max, c) => c.sequence > max ? c.sequence : max, -1);
@@ -13987,6 +15712,7 @@ ${chunkText}`,
     retainDrainReservationForRetryThrottle = true;
     const validatedPass = await runValidatedHistorianPass({
       client,
+      hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
       db,
       parentSessionId: sessionId,
       sessionDirectory,
@@ -13996,6 +15722,8 @@ ${chunkText}`,
       sequenceOffset,
       dumpLabelBase: `incremental-${sessionId}-${chunk.startIndex}-${chunk.endIndex}`,
       timeoutMs: historianTimeoutMs,
+      maxOutputTokens: deps.historianMaxOutputTokens,
+      model: deps.model,
       fallbackModelId: deps.fallbackModelId,
       fallbackModels: deps.fallbackModels,
       twoPass: deps.historianTwoPass,
@@ -14049,7 +15777,13 @@ ${chunkText}`,
       }
       return true;
     });
+    const unanchoredPromotionSkipReason = discardedLast ? "discarded_last" : weakLookaheadFinalCompartment ? "weak_lookahead_final_compartment" : null;
+    if (unanchoredPromotionSkipReason) {
+      sessionLog(sessionId, `historian unanchored promotion skipped: reason=${unanchoredPromotionSkipReason} facts=${validatedPass.facts?.length ?? 0} user_observations=${validatedPass.userObservations?.length ?? 0} primers=${validatedPass.primerCandidates?.length ?? 0} events_publishable=${publishableEvents.length}/${validatedPass.events?.length ?? 0}`);
+    }
     let promotedFactRefs = [];
+    let promotedFactCount = 0;
+    let publishedEventCount = 0;
     let persistedIds = [];
     const holderId = deps.compartmentLeaseHolderId;
     if (!holderId) {
@@ -14057,7 +15791,19 @@ ${chunkText}`,
       rollbackDrainReservation();
       return;
     }
+    const compartmentTagKeys = await getRawSessionTagKeysThrough(sessionId, lastCompartmentEnd, { db });
+    const danglingBoundary = findDanglingPublicationBoundary(sessionId, newCompartments);
+    if (danglingBoundary) {
+      const reason = `compartment boundary disappeared before publication (sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId})`;
+      telemetry.failureReason = `publish-boundary: ${reason}`;
+      sessionLog(sessionId, `historian publish refused: sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId}; raw snapshot changed during the historian run`);
+      const failCount = incrementHistorianFailure(db, sessionId, reason);
+      await notifyHistorianIssue(buildHistorianFailureNotice(failCount, reason));
+      rollbackDrainReservation();
+      return;
+    }
     let published = false;
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     try {
       if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
@@ -14070,10 +15816,13 @@ ${chunkText}`,
       persistedIds = getCompartments(db, sessionId).slice(-persistedCompartments.length).map((c) => c.id);
       if (promotionActive && !skipUnanchoredPromotion) {
         try {
-          promotedFactRefs = promoteSessionFactsDurable(db, sessionId, promotionProjectIdentity, validatedPass.facts ?? []);
+          const promotion = promoteSessionFactsDurable(db, sessionId, promotionProjectIdentity, validatedPass.facts ?? []);
+          promotedFactRefs = promotion.newMemoryRefs;
+          promotedFactCount = promotion.factsPromoted;
         } catch (error) {
           if (error instanceof ModuleMemoryAuthorityError) {
             promotedFactRefs = [];
+            promotedFactCount = 0;
             sessionLog(sessionId, "fact promotion skipped: project memory is module-managed; compartments publish without facts");
           } else {
             throw error;
@@ -14083,12 +15832,13 @@ ${chunkText}`,
       if (publishableEvents.length > 0) {
         try {
           insertCompartmentEvents(db, sessionId, publishableEvents, persistedIds);
+          publishedEventCount = publishableEvents.length;
           sessionLog(sessionId, `stored ${publishableEvents.length} compartment event(s)`);
         } catch (error) {
           sessionLog(sessionId, "failed to store compartment events:", error);
         }
       }
-      queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
+      queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd, compartmentTagKeys);
       clearHistorianFailureState(db, sessionId);
       clearHistorianDrainFailure(db, sessionId);
       recordProtectedTailPublicationFloor(db, sessionId, lastCompartmentEnd + 1);
@@ -14096,7 +15846,7 @@ ${chunkText}`,
         clearEmergencyRecovery(db, sessionId);
       drainReservation = null;
       if (deferMarkerApplication && lastNewEndMessageId) {
-        setPendingCompactionMarkerState(db, sessionId, {
+        (deps.compactionMarkerStrategy?.setPending ?? setPendingCompactionMarkerState)(db, sessionId, {
           ordinal: lastCompartmentEnd,
           endMessageId: lastNewEndMessageId,
           publishedAt: Date.now()
@@ -14104,6 +15854,7 @@ ${chunkText}`,
       }
       db.exec("COMMIT");
       published = true;
+      logSlowWriteTransaction("historian-publish", transactionStartedAt);
     } finally {
       if (!published) {
         try {
@@ -14118,7 +15869,7 @@ ${chunkText}`,
     if (deferMarkerApplication) {
       deps.onDeferredMarkerPending?.(sessionId);
     } else {
-      updateCompactionMarkerAfterPublication(db, sessionId, lastCompartmentEnd, sessionDirectory);
+      (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(db, sessionId, lastCompartmentEnd, sessionDirectory);
     }
     updateSessionMeta(db, sessionId, { compartmentInProgress: false });
     completedSuccessfully = true;
@@ -14134,7 +15885,9 @@ ${chunkText}`,
       telemetry.compartmentIdMax = validIds.length > 0 ? Math.max(...validIds) : null;
       telemetry.factsEmitted = facts.length;
       telemetry.factsByCategory = facts.length > 0 ? tallyFactsByCategory(facts) : null;
-      telemetry.eventsEmitted = publishableEvents.length;
+      telemetry.factsPromoted = promotedFactCount;
+      telemetry.eventsEmitted = (validatedPass.events ?? []).length;
+      telemetry.eventsPublished = publishedEventCount;
       telemetry.importanceMin = imp.min;
       telemetry.importanceMax = imp.max;
       telemetry.importanceAvg = imp.avg;
@@ -14195,7 +15948,7 @@ ${chunkText}`,
         const stored = insertPrimerCandidates(db, [
           {
             projectPath: promotionProjectIdentity,
-            harness: getHarness(),
+            harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? getHarness(),
             sessionId,
             question: candidate.question,
             sourceCompartmentStart: startC?.startMessage,
@@ -14242,6 +15995,7 @@ function insertRecompCompartmentRows(db, sessionId, compartments, now) {
 }
 function promoteRecompStagingWithM0Mutation(db, sessionId, holderId) {
   const now = Date.now();
+  const transactionStartedAt = performance.now();
   db.exec("BEGIN IMMEDIATE");
   let finished = false;
   try {
@@ -14270,6 +16024,7 @@ function promoteRecompStagingWithM0Mutation(db, sessionId, holderId) {
     clearCachedM0M1(db, sessionId);
     db.exec("COMMIT");
     finished = true;
+    logSlowWriteTransaction("historian-publish:recomp", transactionStartedAt);
     return { compartments: staging.compartments, facts: staging.facts };
   } finally {
     if (!finished) {
@@ -14328,7 +16083,7 @@ No raw history exists, so nothing was rebuilt.`;
     let passAttempt = 1;
     const resumed = existingStaging !== null;
     if (resumed) {
-      await sendIgnoredMessage(client, sessionId, `## Magic Recomp — Resumed
+      await sendStatusNotification(client, sessionId, `## Magic Recomp — Resumed
 
 Found ${existingStaging.compartments.length} staged compartment(s) from ${existingStaging.passCount} previous pass(es), covering messages 1-${existingStaging.lastEndMessage}. Resuming from message ${offset}.`, notifParams());
     }
@@ -14357,6 +16112,8 @@ Found ${existingStaging.compartments.length} staged compartment(s) from ${existi
       if (mergedError)
         return null;
       saveRecompStagingPass(db, sessionId, passCount, candidateCompartments, candidateFacts);
+      const lastCompartmentEnd = candidateCompartments[candidateCompartments.length - 1]?.endMessage ?? 0;
+      const compartmentTagKeys = lastCompartmentEnd > 0 ? await getRawSessionTagKeysThrough(sessionId, lastCompartmentEnd, { db }) : null;
       const promoted = promoteRecompStagingWithM0Mutation(db, sessionId, leaseHolderId);
       if (!promoted)
         return null;
@@ -14376,9 +16133,8 @@ Found ${existingStaging.compartments.length} staged compartment(s) from ${existi
         }));
         embedAndStoreCompartmentChunks(db, sessionId, projectIdentity, chunksToEmbed);
       }
-      const lastCompartmentEnd = promoted.compartments[promoted.compartments.length - 1]?.endMessage ?? 0;
-      if (lastCompartmentEnd > 0) {
-        queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
+      if (lastCompartmentEnd > 0 && compartmentTagKeys) {
+        queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd, compartmentTagKeys);
       }
       deps.onCompartmentStatePublished?.(sessionId);
       if (lastCompartmentEnd > 0) {
@@ -14390,10 +16146,10 @@ Found ${existingStaging.compartments.length} staged compartment(s) from ${existi
           }
         }
       }
+      sessionLog(sessionId, `recomp partial code=${userFacingFailureCode("recomp_unavailable")} reason="${reason}"`);
       return [
-        `Persisted ${promoted.compartments.length} compartment${promoted.compartments.length === 1 ? "" : "s"} from ${passCount} successful pass${passCount === 1 ? "" : "es"}.`,
-        `Covered raw history 1-${lastCompartmentEnd} out of ${rawMessageCount} total messages.`,
-        `Remaining messages ${lastCompartmentEnd + 1}-${protectedTailStart - 1} were not rebuilt (${reason}).`
+        `Rebuilt ${promoted.compartments.length} history block${promoted.compartments.length === 1 ? "" : "s"} across ${passCount} successful pass${passCount === 1 ? "" : "es"}.`,
+        renderUserFacingFailure("recomp_unavailable")
       ].join(`
 `);
     }
@@ -14418,11 +16174,10 @@ Recomp stopped because raw history ${offset}-${protectedTailStart - 1} could not
 
 ${partial}`;
         }
+        sessionLog(sessionId, `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${chunkCoverageError}"`);
         return `## Magic Recomp — Failed
 
-Recomp stopped because the raw chunk could not be represented safely: ${chunkCoverageError}
-
-Nothing was written.`;
+${renderUserFacingFailure("recomp_unavailable")}`;
       }
       const references = buildReferenceBlocks({
         sessionId,
@@ -14439,7 +16194,7 @@ ${chunk.text}`,
         memoryEnabled: false,
         extractionFree: true
       });
-      await sendIgnoredMessage(client, sessionId, `## Magic Recomp
+      await sendStatusNotification(client, sessionId, `## Magic Recomp
 
 Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${chunk.startIndex}-${chunk.endIndex}.`, notifParams());
       emitProgress(`Running historian (pass ${passCount + 1})…`);
@@ -14454,6 +16209,7 @@ Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${c
         sequenceOffset: candidateCompartments.length,
         dumpLabelBase: `recomp-${sessionId}-${chunk.startIndex}-${chunk.endIndex}-pass-${passCount + 1}`,
         timeoutMs: historianTimeoutMs,
+        model: deps.model,
         fallbackModelId: deps.fallbackModelId,
         fallbackModels: deps.fallbackModels,
         twoPass: deps.historianTwoPass,
@@ -14463,11 +16219,10 @@ Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${c
         callbacks: {
           onRepairRetry: async (error) => {
             emitProgress(`Repair retry (pass ${passCount + 1})…`);
-            await sendIgnoredMessage(client, sessionId, `## Magic Recomp
+            sessionLog(sessionId, `recomp retry code=${userFacingFailureCode("recomp_unavailable")} reason="${error}"`);
+            await sendStatusNotification(client, sessionId, `## Magic Recomp
 
-Historian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a repair retry for messages ${chunk.startIndex}-${chunk.endIndex}.
-
-The previous output did not validate: ${error}`, notifParams());
+History compression is retrying this pass. ${renderUserFacingFailure("recomp_unavailable")}`, notifParams());
           },
           onModelFallback: (modelId, index, total) => {
             const short = modelId.includes("/") ? modelId.split("/").pop() : modelId;
@@ -14480,11 +16235,9 @@ The previous output did not validate: ${error}`, notifParams());
         if (reducedBudget !== null) {
           const smallerChunk = readSessionChunk(sessionId, reducedBudget, offset, protectedTailStart);
           if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
-            await sendIgnoredMessage(client, sessionId, `## Magic Recomp
+            await sendStatusNotification(client, sessionId, `## Magic Recomp
 
-Historian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a smaller chunk ending at ${smallerChunk.endIndex} because messages ${chunk.startIndex}-${chunk.endIndex} could not be validated.
-
-Validator result: ${validatedPass.error}`, notifParams());
+History compression is retrying with a smaller set of messages. ${renderUserFacingFailure("recomp_unavailable")}`, notifParams());
             currentTokenBudget = reducedBudget;
             passAttempt += 1;
             continue;
@@ -14501,7 +16254,8 @@ Validator result: ${validatedPass.error}`, notifParams());
           chunkEndOrdinal: chunk.endIndex,
           compartmentsProduced: 0
         });
-        const partial = await promoteAndFinalize(`historian failed to validate messages ${chunk.startIndex}-${chunk.endIndex}: ${validatedPass.error}`);
+        sessionLog(sessionId, `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${validatedPass.error}" messageRange=${chunk.startIndex}-${chunk.endIndex}`);
+        const partial = await promoteAndFinalize(`history model response did not validate for messages ${chunk.startIndex}-${chunk.endIndex}`);
         if (partial) {
           return `## Magic Recomp — Partial
 
@@ -14509,9 +16263,7 @@ ${partial}`;
         }
         return `## Magic Recomp — Failed
 
-Recomp failed while rebuilding messages ${chunk.startIndex}-${chunk.endIndex}: ${validatedPass.error}
-
-Nothing was written.`;
+${renderUserFacingFailure("recomp_unavailable")}`;
       }
       {
         const passComps = validatedPass.compartments ?? [];
@@ -14562,13 +16314,14 @@ Recomp made no forward progress after messages ${chunk.startIndex}-${chunk.endIn
     const mergedValidationError = validateStoredCompartments(candidateCompartments);
     if (mergedValidationError) {
       clearRecompStaging(db, sessionId);
+      sessionLog(sessionId, `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${mergedValidationError}"`);
       return `## Magic Recomp — Failed
 
-Recomp completed ${passCount} pass${passCount === 1 ? "" : "es"} but produced an invalid final compartment set: ${mergedValidationError}
-
-Nothing was written.`;
+${renderUserFacingFailure("recomp_unavailable")}`;
     }
     saveRecompStagingPass(db, sessionId, passCount, candidateCompartments, candidateFacts);
+    const lastCompartmentEnd = candidateCompartments[candidateCompartments.length - 1]?.endMessage ?? 0;
+    const compartmentTagKeys = lastCompartmentEnd > 0 ? await getRawSessionTagKeysThrough(sessionId, lastCompartmentEnd, { db }) : null;
     const promoted = promoteRecompStagingWithM0Mutation(db, sessionId, leaseHolderId);
     if (!promoted) {
       sessionLog(sessionId, "recomp publish skipped: compartment lease no longer held");
@@ -14582,9 +16335,8 @@ Another process acquired the compartment-state lease before recomp could publish
     }
     const finalCompartments = promoted?.compartments ?? candidateCompartments;
     const finalFacts = promoted?.facts ?? candidateFacts;
-    const lastCompartmentEnd = finalCompartments[finalCompartments.length - 1]?.endMessage ?? 0;
-    if (lastCompartmentEnd > 0) {
-      queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
+    if (lastCompartmentEnd > 0 && compartmentTagKeys) {
+      queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd, compartmentTagKeys);
     }
     deps.onCompartmentStatePublished?.(sessionId);
     if (deps.memoryEnabled !== false) {
@@ -14617,11 +16369,10 @@ Another process acquired the compartment-state lease before recomp could publish
 `);
   } catch (error) {
     const message = getErrorMessage(error);
+    sessionLog(sessionId, `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${message}"`);
     return `## Magic Recomp — Failed
 
-Recomp failed unexpectedly: ${message}
-
-Staging data preserved for resume on next attempt.`;
+${renderUserFacingFailure("recomp_unavailable")}`;
   } finally {
     updateSessionMeta(db, sessionId, { compartmentInProgress: false });
     cleanupHistorianStateFile(currentStateFilePath);
@@ -14825,7 +16576,7 @@ ${snapResult.error}`;
     }
     let currentTokenBudget = historianChunkTokens;
     let passAttempt = 1;
-    await sendIgnoredMessage(client, sessionId, resumed ? `## Magic Recomp — Resumed (Partial)
+    await sendStatusNotification(client, sessionId, resumed ? `## Magic Recomp — Resumed (Partial)
 
 Found ${candidateCompartments.length - priorCompartments.length} newly built compartment(s) from ${passCount} previous pass(es), covering messages ${snapStart}-${offset - 1}. Resuming from message ${offset} toward ${snapEnd}.` : `## Magic Recomp — Partial
 
@@ -14839,11 +16590,10 @@ Recomp stopped because raw history ${offset}-${snapEnd} could not be turned into
       }
       const chunkCoverageError = validateChunkCoverage(chunk);
       if (chunkCoverageError) {
+        log(`[magic-context] partial recomp failed session=${sessionId} code=${userFacingFailureCode("recomp_unavailable")} reason="${chunkCoverageError}"`);
         return `## Magic Recomp — Failed
 
-Partial recomp stopped because the raw chunk could not be represented safely: ${chunkCoverageError}
-
-Original state preserved (staging kept for retry).`;
+${renderUserFacingFailure("recomp_unavailable")}`;
       }
       const references = buildReferenceBlocks({
         sessionId,
@@ -14860,7 +16610,7 @@ ${chunk.text}`,
         memoryEnabled: false,
         extractionFree: true
       });
-      await sendIgnoredMessage(client, sessionId, `## Magic Recomp — Partial
+      await sendStatusNotification(client, sessionId, `## Magic Recomp — Partial
 
 Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${chunk.startIndex}-${chunk.endIndex}.`, notifParams());
       const validatedPass = await runValidatedHistorianPass({
@@ -14874,6 +16624,7 @@ Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${c
         sequenceOffset: candidateCompartments.length,
         dumpLabelBase: `partial-recomp-${sessionId}-${chunk.startIndex}-${chunk.endIndex}-pass-${passCount + 1}`,
         timeoutMs: historianTimeoutMs,
+        model: deps.model,
         fallbackModelId: deps.fallbackModelId,
         fallbackModels: deps.fallbackModels,
         twoPass: deps.historianTwoPass,
@@ -14882,11 +16633,10 @@ Historian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${c
         language: deps.language,
         callbacks: {
           onRepairRetry: async (error) => {
-            await sendIgnoredMessage(client, sessionId, `## Magic Recomp — Partial
+            log(`[magic-context] partial recomp retry session=${sessionId} code=${userFacingFailureCode("recomp_unavailable")} reason="${error}"`);
+            await sendStatusNotification(client, sessionId, `## Magic Recomp — Partial
 
-Historian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a repair retry for messages ${chunk.startIndex}-${chunk.endIndex}.
-
-The previous output did not validate: ${error}`, notifParams());
+History compression is retrying this pass. ${renderUserFacingFailure("recomp_unavailable")}`, notifParams());
           }
         }
       });
@@ -14895,21 +16645,18 @@ The previous output did not validate: ${error}`, notifParams());
         if (reducedBudget !== null) {
           const smallerChunk = readSessionChunk(sessionId, reducedBudget, offset, snapEnd + 1);
           if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
-            await sendIgnoredMessage(client, sessionId, `## Magic Recomp — Partial
+            await sendStatusNotification(client, sessionId, `## Magic Recomp — Partial
 
-Historian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a smaller chunk ending at ${smallerChunk.endIndex} because messages ${chunk.startIndex}-${chunk.endIndex} could not be validated.
-
-Validator result: ${validatedPass.error}`, notifParams());
+History compression is retrying with a smaller set of messages. ${renderUserFacingFailure("recomp_unavailable")}`, notifParams());
             currentTokenBudget = reducedBudget;
             passAttempt += 1;
             continue;
           }
         }
+        log(`[magic-context] partial recomp failed session=${sessionId} code=${userFacingFailureCode("recomp_unavailable")} reason="${validatedPass.error}" messageRange=${chunk.startIndex}-${chunk.endIndex}`);
         return `## Magic Recomp — Failed
 
-Partial recomp failed while rebuilding messages ${chunk.startIndex}-${chunk.endIndex}: ${validatedPass.error}
-
-Original state preserved (staging kept for retry).`;
+${renderUserFacingFailure("recomp_unavailable")}`;
       }
       candidateCompartments = [
         ...candidateCompartments,
@@ -14944,11 +16691,10 @@ Partial recomp completed historian passes but the final compartment set failed v
 `);
   } catch (error) {
     const message = getErrorMessage(error);
+    log(`[magic-context] partial recomp failed session=${sessionId} code=${userFacingFailureCode("recomp_unavailable")} reason="${message}"`);
     return `## Magic Recomp — Failed
 
-Partial recomp failed unexpectedly: ${message}
-
-Staging preserved for resume on next attempt.`;
+${renderUserFacingFailure("recomp_unavailable")}`;
   } finally {
     updateSessionMeta(db, sessionId, { compartmentInProgress: false });
     const leftoverStaging = getRecompStaging(db, sessionId);
@@ -15070,8 +16816,14 @@ async function executeContextRecomp(deps, options = {}) {
 // ../plugin/src/hooks/magic-context/lkg-slot.ts
 var LKG_TOTAL_BYTES = 64 * 1024 * 1024;
 var LKG_SINGLE_SLOT_BYTES = 24 * 1024 * 1024;
-var slots = new Map;
+class MagicContextLkgHeapHolder {
+  entries = new Map;
+}
+var lkgHeapHolder = new MagicContextLkgHeapHolder;
 var totalBytes = 0;
+var hydrationPassBySession = new BoundedSessionMap(1000);
+var hydrationAttemptBySession = new BoundedSessionMap(1000);
+var persistenceBackend;
 var LKG_SNAPSHOT_ARRAY = Symbol("array");
 var LKG_SNAPSHOT_OBJECT = Symbol("object");
 var LKG_SNAPSHOT_KEY = Symbol("key");
@@ -15081,11 +16833,22 @@ var LKG_SNAPSHOT_BOOLEAN = Symbol("boolean");
 var LKG_SNAPSHOT_NULL = Symbol("null");
 var LKG_SNAPSHOT_UNDEFINED = Symbol("undefined");
 function dropSlot(sessionId, _reason) {
-  const entry = slots.get(sessionId);
-  if (!entry)
+  const entry = lkgHeapHolder.entries.get(sessionId);
+  if (entry) {
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+  }
+  const backend = persistenceBackend;
+  if (!backend)
     return;
-  slots.delete(sessionId);
-  totalBytes -= entry.bytes;
+  try {
+    backend.clear(sessionId);
+  } catch (error) {
+    sessionLog(sessionId, "LKG durable clear failed:", error);
+  }
+  const pass = hydrationPassBySession.peek(sessionId);
+  if (pass !== undefined)
+    hydrationAttemptBySession.set(sessionId, pass);
 }
 
 // ../plugin/src/hooks/magic-context/recomp-orchestrator.ts
@@ -15166,6 +16929,9 @@ function buildRecompDeps(ctx, sessionId) {
     directory: ctx.directory,
     memoryEnabled: ctx.memoryEnabled,
     autoPromote: ctx.autoPromote,
+    model: ctx.historianModel,
+    historianContextLimit: ctx.historianContextLimit,
+    historianMaxOutputTokens: ctx.historianMaxOutputTokens,
     fallbackModels: ctx.fallbackModels,
     language: ctx.language,
     fallbackModelId: ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
@@ -15215,10 +16981,12 @@ async function runManagedRecomp(ctx, sessionId, options) {
     setRecompTerminal(ctx.liveSessionState, sessionId, terminalPhase, extractRecompReason(message));
     return message;
   } catch (error) {
-    setRecompTerminal(ctx.liveSessionState, sessionId, "failed", `Recomp crashed: ${String(error)}`);
+    const failure = renderUserFacingFailure("recomp_unavailable");
+    sessionLog(sessionId, `recomp failed code=${userFacingFailureCode("recomp_unavailable")}`, error);
+    setRecompTerminal(ctx.liveSessionState, sessionId, "failed", failure);
     return `## Magic Recomp — Failed
 
-Recomp crashed: ${String(error)}`;
+${failure}`;
   }
 }
 async function runManagedUpgrade(ctx, sessionId) {
@@ -15277,10 +17045,12 @@ ${migrationSummary}` : ""
     ].join(`
 `);
   } catch (error) {
-    setRecompTerminal(ctx.liveSessionState, sessionId, "failed", `Upgrade crashed: ${String(error)}`);
+    const failure = renderUserFacingFailure("recomp_unavailable");
+    sessionLog(sessionId, `session upgrade failed code=${userFacingFailureCode("recomp_unavailable")}`, error);
+    setRecompTerminal(ctx.liveSessionState, sessionId, "failed", failure);
     return `## Session Upgrade — Failed
 
-Upgrade crashed: ${String(error)}`;
+${failure}`;
   }
 }
 async function runUpgradeMemoryMigration(ctx, sessionId, migrationDirectory) {
@@ -15304,14 +17074,15 @@ async function runUpgradeMemoryMigration(ctx, sessionId, migrationDirectory) {
       directory: migrationDirectory,
       parentSessionId: sessionId,
       primaryModelId: ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
-      fallbackModels: ctx.fallbackModels,
+      fallbackModels: ctx.fallbackModels.map((entry) => typeof entry === "string" ? entry : entry.model),
       timeoutMs: ctx.historianTimeoutMs,
       userMemoriesEnabled: ctx.userMemoriesEnabled,
       language: ctx.language
     });
     return outcome.summary;
   } catch (error) {
-    return `Memory migration skipped (error): ${String(error)}`;
+    sessionLog(sessionId, `memory migration failed code=${userFacingFailureCode("dream_unknown")}`, error);
+    return renderUserFacingFailure("dream_unknown");
   }
 }
 
@@ -15447,18 +17218,20 @@ async function runOneWrapupIteration(args) {
     boundarySnapshot: plan.snapshot,
     currentContextLimit: ctx.contextLimit,
     directory: ctx.directory,
+    model: ctx.historianModel,
     fallbackModels: ctx.fallbackModels,
     fallbackModelId: ctx.fallbackModelId,
     language: ctx.language,
     historianTwoPass: ctx.historianTwoPass,
     memoryEnabled: ctx.memoryEnabled,
     autoPromote: ctx.autoPromote,
+    experimentalUserMemories: ctx.userMemoriesEnabled,
     ensureProjectRegistered: ctx.ensureProjectRegistered,
     getNotificationParams: () => ctx.getNotificationParams(sessionId),
     preserveInjectionCacheUntilConsumed: true,
     compartmentLeaseHolderId: leaseHolderId,
     forceDrainQuota: true,
-    forceKeepLastCompartment: true,
+    forceKeepLastCompartment: plan.snapshot.eligibleEndOrdinal >= plan.targetEligibleEndOrdinal,
     refreshBoundarySnapshot: () => buildPlan(ctx, sessionId, messagesToKeep, anchorRawMessageCount).snapshot,
     onCompartmentStatePublished: (sid) => {
       markActiveCompartmentRunPublished(sid);
@@ -15475,7 +17248,7 @@ async function runOneWrapupIteration(args) {
     return { ran: true };
   } finally {
     clearInterval(renewal);
-    releaseCompartmentLease(ctx.db, sessionId, leaseHolderId);
+    releaseCompartmentLeaseBestEffort(ctx.db, sessionId, leaseHolderId, sessionLog);
   }
 }
 async function runManagedWrapup(ctx, sessionId, options) {
@@ -15561,7 +17334,7 @@ ${message}`;
     }
     if (!stoppedForFailure) {
       try {
-        sendIgnoredMessage(ctx.client, sessionId, `Magic Wrapup started — compacting about ${plural(expectedChunks, "chunk")} of history. This can take a few minutes; the result posts here when done.`, ctx.getNotificationParams(sessionId));
+        sendStatusNotification(ctx.client, sessionId, `Magic Wrapup started — compacting about ${plural(expectedChunks, "chunk")} of history. This can take a few minutes; the result posts here when done.`, ctx.getNotificationParams(sessionId));
       } catch {}
       try {
         pushNotification2("action", { action: "wrapup-progress-kick" }, sessionId);
@@ -15598,6 +17371,7 @@ ${message}`;
         if (lastEnd + 1 >= plan.targetEligibleEndOrdinal)
           break;
         chunkIndex += 1;
+        sessionLog(sessionId, `wrapup chunk ${chunkIndex}: ${describeBoundaryDiagnostics(plan.snapshot)}`);
         emitWrapupProgress(ctx, sessionId, {
           processedMessages: Math.max(0, lastEnd),
           totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
@@ -15681,26 +17455,26 @@ var HISTORIAN_SYSTEM_PROMPTS = new Map([
   ["historian-recomp", COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT],
   ["historian-editor", HISTORIAN_EDITOR_SYSTEM_PROMPT]
 ]);
-function isRecord2(value) {
+function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function readPromptInput(input) {
-  if (!isRecord2(input))
+  if (!isRecord3(input))
     return {};
-  const path = isRecord2(input.path) ? input.path : undefined;
-  const body = isRecord2(input.body) ? input.body : undefined;
-  const query = isRecord2(input.query) ? input.query : undefined;
+  const path = isRecord3(input.path) ? input.path : undefined;
+  const body = isRecord3(input.body) ? input.body : undefined;
+  const query = isRecord3(input.query) ? input.query : undefined;
   const signal = input.signal instanceof AbortSignal ? input.signal : undefined;
   return { path, query, body, signal };
 }
 function extractPromptText(parts) {
   if (!Array.isArray(parts))
     return "";
-  return parts.map((part) => isRecord2(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
+  return parts.map((part) => isRecord3(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
 `);
 }
 function readBodyModel(model) {
-  if (!isRecord2(model))
+  if (!isRecord3(model))
     return;
   const { providerID, modelID } = model;
   if (typeof providerID === "string" && providerID.length > 0 && typeof modelID === "string" && modelID.length > 0) {
@@ -15827,8 +17601,8 @@ function createDshSessionClient(deps) {
         return { data: directory ? { directory } : {} };
       },
       create: async (input) => {
-        const record = isRecord2(input) ? input : {};
-        const body = isRecord2(record.body) ? record.body : {};
+        const record = isRecord3(input) ? input : {};
+        const body = isRecord3(record.body) ? record.body : {};
         const id = `dsh-magic-context-recomp-${++counter}`;
         const parentID = typeof body.parentID === "string" ? body.parentID : "";
         if (parentID.length > 0)
@@ -16022,110 +17796,6 @@ Upgrade crashed: ${describeError(error).brief}`;
   };
 }
 
-// ../plugin/src/features/magic-context/sidekick/core.ts
-var SIDEKICK_SYSTEM_PROMPT = `You are Sidekick, a focused memory-retrieval subagent for an AI coding assistant.
-
-Your job is to search project memories, session facts, and conversation history and return a concise augmentation for the user's prompt.
-
-Rules:
-- Use ctx_search(query="...") to look up relevant memories, facts, and history before answering.
-- Run targeted searches only; prefer 1-3 precise queries.
-- Return only findings that materially help with the user's prompt.
-- If nothing useful is found, respond with exactly: No relevant memories found.
-- Keep the response focused and concise.
-- Do not invent facts or speculate beyond what memories support.`;
-function stripThinkingBlocks(text) {
-  return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-}
-function isEmptySidekickResult(text) {
-  const trimmed = text.trim().toLowerCase().replace(/[.!]+$/, "");
-  return trimmed.length === 0 || trimmed === "no relevant memories found";
-}
-
-// src/agent/sidekick.ts
-function renderSearchResults(results) {
-  if (results === null || results.length === 0)
-    return "";
-  const lines = results.slice(0, 8).map((result, index) => `[${index + 1}] ${result.snippet ?? ""}`.trim()).filter((line) => line.length > 0);
-  return lines.length === 0 ? "" : lines.join(`
-`);
-}
-async function runDshSidekick(ctx, deps, args) {
-  const log = deps.log ?? (() => {});
-  try {
-    const db = await resolveDb(ctx, deps);
-    const sessionId = deps.canonicalKey !== undefined ? deps.canonicalKey(String(args.agent.id)) : undefined;
-    const projectIdentity = args.projectIdentity ?? (args.cwd !== undefined && args.cwd.length > 0 ? resolveProjectIdentityForSession(args.cwd) || undefined : undefined);
-    let memoryBlock = "";
-    if (sessionId !== undefined && projectIdentity !== undefined && args.cwd !== undefined) {
-      const controller = new AbortController;
-      const timer = setTimeout(() => controller.abort(), deps.searchOptions?.timeoutMs ?? 3000);
-      try {
-        const results = await unifiedSearch(db, sessionId, projectIdentity, args.prompt, {
-          limit: deps.searchOptions?.limit ?? 8,
-          signal: controller.signal,
-          countRetrievals: false
-        });
-        const rendered = renderSearchResults(results);
-        if (rendered.length > 0) {
-          memoryBlock = `
-
-<memories>
-${rendered}
-</memories>`;
-        }
-      } catch {} finally {
-        clearTimeout(timer);
-      }
-    }
-    const llm = ctx.get("llm");
-    if (llm?.stream === undefined) {
-      log("[magic-context] sidekick skipped: llm service unavailable");
-      return null;
-    }
-    const route = (() => {
-      const defaultModel = ctx.get("agentDefaultModel");
-      const selection = defaultModel?.currentSelection?.();
-      return {
-        provider: selection?.provider ?? "deepseek",
-        model: selection?.model ?? "deepseek-chat"
-      };
-    })();
-    const user = magicUserMessage2(`${args.prompt}${memoryBlock}`, magicSource2());
-    let text = "";
-    for await (const chunk of llm.stream({
-      provider: route.provider,
-      model: route.model,
-      system: SIDEKICK_SYSTEM_PROMPT,
-      messages: [user],
-      signal: args.signal
-    })) {
-      if (chunk.type === "text-delta" && typeof chunk.text === "string")
-        text += chunk.text;
-      if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
-        log(`[magic-context] sidekick LLM finished ${chunk.reason.kind}: ${chunk.reason.failure?.message ?? ""}`);
-        return null;
-      }
-    }
-    const stripped = stripThinkingBlocks(text).trim();
-    if (isEmptySidekickResult(stripped))
-      return null;
-    return stripped;
-  } catch (error) {
-    log(`[magic-context] sidekick failed (returns null): ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  }
-}
-function createSidekickSeam(ctx, deps) {
-  return (call) => runDshSidekick(ctx, deps, {
-    agent: call.agent,
-    prompt: call.prompt,
-    cwd: call.cwd,
-    projectIdentity: call.projectIdentity,
-    signal: call.signal
-  });
-}
-
 // ../plugin/src/hooks/magic-context/embed-session-state.ts
 var embedPauseBySession = new Set;
 var embedRunStateBySession = new Map;
@@ -16305,7 +17975,7 @@ function bridgeMagicConfig(config, directory) {
     historian: {
       ...config.historian,
       executeThresholdPercentage: config.historian?.executeThresholdPercentage ?? threshold,
-      model: config.historian?.model ?? (typeof cfg.historian?.model === "string" ? cfg.historian.model : undefined),
+      model: resolveHistorianModel(cfg, DSH_HARNESS).primary?.model,
       commitClusterTrigger: config.historian?.commitClusterTrigger ?? (commitCluster !== undefined ? { enabled: commitCluster.enabled ?? true, min_clusters: commitCluster.min_clusters ?? 3 } : undefined)
     },
     autoSearch: {
@@ -16447,10 +18117,6 @@ function apply(ctx, config = {}) {
     get runUpgrade() {
       return seams.get("recomp")?.runUpgrade;
     },
-    runSidekick: createSidekickSeam(ctx, {
-      canonicalKey: (dshSessionId) => host.canonicalKey(dshSessionId),
-      log: log2
-    }),
     runEmbedDrain: createEmbedSeam({ log: log2 })
   });
   log2(`[magic-context] agent plane ready: knowledge=${config.knowledge?.enabled !== false} ` + `guidance=${config.guidance?.enabled !== false} autoSearch=${config.autoSearch?.enabled !== false} ` + `sessionTracking=${config.sessionTracking?.enabled !== false} directory=${directory}`);

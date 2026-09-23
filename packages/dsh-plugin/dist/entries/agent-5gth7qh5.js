@@ -1,18 +1,470 @@
+// ../plugin/src/shared/logger.ts
+import * as fs from "node:fs";
+import * as path2 from "node:path";
+
+// ../plugin/src/shared/data-path.ts
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+// ../plugin/src/shared/harness.ts
+var currentHarness = "opencode";
+var harnessLocked = false;
+function setHarness(value) {
+  if (harnessLocked && currentHarness !== value) {
+    throw new Error(`Magic Context: harness already locked to "${currentHarness}"; cannot change to "${value}"`);
+  }
+  currentHarness = value;
+  harnessLocked = true;
+}
+function getHarness() {
+  return currentHarness;
+}
+
+// ../plugin/src/shared/data-path.ts
+function getDataDir() {
+  return process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
+}
+function getMagicContextTempDir(harness = getHarness()) {
+  return path.join(os.tmpdir(), harness, "magic-context");
+}
+function getMagicContextLogPath(harness = getHarness()) {
+  const envPath = process.env.MAGIC_CONTEXT_LOG_PATH?.trim();
+  if (envPath)
+    return envPath;
+  return path.join(getMagicContextTempDir(harness), "magic-context.log");
+}
+function getProjectMagicContextDir(directory) {
+  return path.join(directory, ".cortexkit", "magic-context");
+}
+var GITIGNORE_GUARD_OPEN = "# >>> cortexkit:magic-context";
+var GITIGNORE_GUARD_CLOSE = "# <<< cortexkit:magic-context";
+function ensureCortexKitArtifactGitignore(directory) {
+  try {
+    const cortexKitDir = path.join(directory, ".cortexkit");
+    const gitignorePath = path.join(cortexKitDir, ".gitignore");
+    let existing = "";
+    if (existsSync(gitignorePath)) {
+      existing = readFileSync(gitignorePath, "utf8");
+      if (existing.includes(GITIGNORE_GUARD_OPEN))
+        return;
+    }
+    const block = `${GITIGNORE_GUARD_OPEN}
+magic-context/
+${GITIGNORE_GUARD_CLOSE}
+`;
+    const needsLeadingNewline = existing.length > 0 && !existing.endsWith(`
+`);
+    const next = existing + (needsLeadingNewline ? `
+` : "") + block;
+    mkdirSync(cortexKitDir, { recursive: true });
+    writeFileSync(gitignorePath, next, "utf8");
+  } catch {}
+}
+function getProjectMagicContextHistorianDir(directory) {
+  return path.join(getProjectMagicContextDir(directory), "historian");
+}
+function getOpenCodeStorageDir() {
+  return path.join(getDataDir(), "opencode", "storage");
+}
+function getMagicContextStorageResolution() {
+  const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim();
+  if (testDataDir) {
+    const perTestDataHome = process.env.XDG_DATA_HOME?.trim();
+    if (perTestDataHome && path.resolve(perTestDataHome) !== path.resolve(testDataDir)) {
+      return {
+        path: path.join(perTestDataHome, "cortexkit", "magic-context"),
+        source: "test isolation"
+      };
+    }
+    return {
+      path: path.join(testDataDir, "cortexkit", "magic-context"),
+      source: "test isolation"
+    };
+  }
+  if (false) {}
+  const explicitStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR?.trim();
+  if (explicitStorageDir) {
+    if (!path.isAbsolute(explicitStorageDir)) {
+      throw new Error("MAGIC_CONTEXT_STORAGE_DIR must be an absolute path");
+    }
+    return { path: explicitStorageDir, source: "environment override" };
+  }
+  const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+  if (xdgDataHome) {
+    return {
+      path: path.join(xdgDataHome, "cortexkit", "magic-context"),
+      source: "XDG_DATA_HOME"
+    };
+  }
+  return {
+    path: path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
+    source: "platform default"
+  };
+}
+function getMagicContextStorageDir() {
+  return getMagicContextStorageResolution().path;
+}
+function getLegacyOpenCodeMagicContextStorageDir() {
+  return path.join(getOpenCodeStorageDir(), "plugin", "magic-context");
+}
+
+// ../plugin/src/shared/redaction.ts
+import { homedir as homedir2, userInfo } from "node:os";
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+var SECRET_WORDS = [
+  "key",
+  "token",
+  "secret",
+  "password",
+  "auth",
+  "authorization",
+  "bearer",
+  "credential"
+];
+var SECRET_SEGMENT_PATTERN = new RegExp(`^(?:${SECRET_WORDS.map((w) => `${w}s?`).join("|")})$`, "i");
+var TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
+function redactionTypeForKey(key) {
+  const normalized = key.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
+  const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
+  return suffix || "secret";
+}
+function isNonSecretScalarValue(value) {
+  const v = value.trim();
+  if (v === "true" || v === "false" || v === "null" || v === "undefined")
+    return true;
+  return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
+}
+var SECRET_QUALIFIERS = new Set([
+  "api",
+  "access",
+  "private",
+  "client",
+  "auth",
+  "authorization",
+  "secret",
+  "bearer",
+  "session",
+  "refresh",
+  "service",
+  "x",
+  "openai",
+  "anthropic",
+  "google",
+  "github",
+  "huggingface",
+  "aws",
+  "azure"
+]);
+function isSecretKey(key) {
+  const segments = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[._-]+/).filter(Boolean);
+  if (segments.length === 0)
+    return false;
+  if (segments.length === 1) {
+    const first = segments[0];
+    return Boolean(first && SECRET_SEGMENT_PATTERN.test(first));
+  }
+  for (let i = 0;i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg || !SECRET_SEGMENT_PATTERN.test(seg))
+      continue;
+    let trailingOk = true;
+    for (let j = i + 1;j < segments.length; j++) {
+      const tail = segments[j];
+      if (!tail)
+        continue;
+      if (TRAILING_DESCRIPTORS.has(tail))
+        continue;
+      if (SECRET_SEGMENT_PATTERN.test(tail))
+        continue;
+      trailingOk = false;
+      break;
+    }
+    if (!trailingOk)
+      continue;
+    for (let k = i - 1;k >= 0; k--) {
+      const lead = segments[k];
+      if (lead && SECRET_QUALIFIERS.has(lead))
+        return true;
+    }
+  }
+  return false;
+}
+function sanitizePathString(value) {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir2();
+  const username = userInfo().username;
+  let sanitized = value;
+  if (home) {
+    sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
+  }
+  sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
+  sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
+  sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+  if (username) {
+    sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
+  }
+  return sanitized;
+}
+var SECRET_TEXT_PATTERNS = [
+  {
+    pattern: /\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}/g,
+    replacement: "<ANTHROPIC_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}/g,
+    replacement: "<OPENAI_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+    replacement: "<GITHUB_PAT_REDACTED>"
+  },
+  {
+    pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}/g,
+    replacement: "<GITHUB_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\bhf_[A-Za-z0-9]{30,}/g,
+    replacement: "<HUGGINGFACE_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    replacement: "<AWS_ACCESS_KEY_ID_REDACTED>"
+  },
+  {
+    pattern: /\bxox[abprsuvc]-[A-Za-z0-9-]{10,}/g,
+    replacement: "<SLACK_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+    replacement: "<GOOGLE_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\b(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
+    replacement: (_full, prefix) => `${prefix}<REDACTED:bearer>`
+  },
+  {
+    pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+    replacement: "<JWT_REDACTED>"
+  },
+  {
+    pattern: /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
+    replacement: (full, quote, key, separator, valueQuote, value) => isNonSecretScalarValue(value) ? full : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`
+  },
+  {
+    pattern: /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
+    replacement: (full, key, value) => isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`
+  }
+];
+function redactSecretText(value) {
+  let redacted = value;
+  for (const { pattern, replacement } of SECRET_TEXT_PATTERNS) {
+    if (typeof replacement === "string") {
+      redacted = redacted.replace(pattern, replacement);
+    } else {
+      redacted = redacted.replace(pattern, replacement);
+    }
+  }
+  return redacted;
+}
+function sanitizeDiagnosticText(value) {
+  return redactSecretText(sanitizePathString(value));
+}
+var SHAREABILITY_SENSITIVE_PATTERNS = [
+  /\bC:\/Users\/[^/\s]+/i,
+  /(?:^|\s)~\/[^\s]+/,
+  /\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*\S+/i,
+  /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\b/i,
+  /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
+  /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
+  /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/
+];
+function hasShareabilitySensitiveText(text) {
+  try {
+    if (sanitizeDiagnosticText(text) !== text)
+      return true;
+    return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
+  } catch {
+    return true;
+  }
+}
+function sanitizeConfigValue(value, keyPath = []) {
+  if (value === null || typeof value === "number" || typeof value === "boolean")
+    return value;
+  const key = keyPath.at(-1) ?? "";
+  if (key && isSecretKey(key)) {
+    return `<REDACTED:${redactionTypeForKey(key)}>`;
+  }
+  if (typeof value === "string")
+    return sanitizeDiagnosticText(value);
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => sanitizeConfigValue(entry, [...keyPath, String(index)]));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entry]) => [
+      entryKey,
+      sanitizeConfigValue(entry, [...keyPath, entryKey])
+    ]));
+  }
+  return value;
+}
+
+// ../plugin/src/shared/logger.ts
+var isTestEnv = false;
+var buffer = [];
+var flushTimer = null;
+var FLUSH_INTERVAL_MS = 500;
+var BUFFER_SIZE_LIMIT = 50;
+var MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
+var SIZE_CHECK_INTERVAL_FLUSHES = 64;
+var activeLogFile = null;
+var activeLogSize = null;
+var flushesSinceSizeCheck = 0;
+var swallowedWriteCount = 0;
+var lastErrorMessage = null;
+var lastErrorTime = null;
+function recordSwallowedWrite(error) {
+  try {
+    swallowedWriteCount++;
+    lastErrorMessage = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+    lastErrorTime = new Date().toISOString();
+  } catch {}
+}
+function ensureDir(filePath) {
+  fs.mkdirSync(path2.dirname(filePath), { recursive: true });
+}
+function isMissingFile(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+function getCurrentLogSize(logFile) {
+  if (activeLogFile === logFile && activeLogSize !== null && flushesSinceSizeCheck < SIZE_CHECK_INTERVAL_FLUSHES) {
+    return activeLogSize;
+  }
+  try {
+    const stat = fs.statSync(logFile);
+    if (!stat.isFile()) {
+      throw new Error(`Magic Context log path is not a regular file: ${logFile}`);
+    }
+    fs.chmodSync(logFile, 384);
+    activeLogFile = logFile;
+    activeLogSize = stat.size;
+    flushesSinceSizeCheck = 0;
+    return stat.size;
+  } catch (error) {
+    if (!isMissingFile(error))
+      throw error;
+    activeLogFile = logFile;
+    activeLogSize = 0;
+    flushesSinceSizeCheck = 0;
+    return 0;
+  }
+}
+function capLogData(data) {
+  if (Buffer.byteLength(data) <= MAX_LOG_FILE_BYTES)
+    return data;
+  let bounded = Buffer.from(data).subarray(0, MAX_LOG_FILE_BYTES).toString("utf8");
+  while (Buffer.byteLength(bounded) > MAX_LOG_FILE_BYTES) {
+    bounded = bounded.slice(0, -1);
+  }
+  return bounded;
+}
+function writeBoundedPredecessor(logFile, predecessorPath, size) {
+  const predecessorFd = fs.openSync(predecessorPath, "w", 384);
+  try {
+    fs.fchmodSync(predecessorFd, 384);
+    const bytesToCopy = Math.min(size, MAX_LOG_FILE_BYTES);
+    const sourceFd = fs.openSync(logFile, "r");
+    try {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, bytesToCopy));
+      let remaining = bytesToCopy;
+      let position = Math.max(0, size - bytesToCopy);
+      while (remaining > 0) {
+        const bytesRead = fs.readSync(sourceFd, chunk, 0, Math.min(chunk.length, remaining), position);
+        if (bytesRead === 0)
+          break;
+        fs.writeSync(predecessorFd, chunk, 0, bytesRead);
+        remaining -= bytesRead;
+        position += bytesRead;
+      }
+    } finally {
+      fs.closeSync(sourceFd);
+    }
+  } finally {
+    fs.closeSync(predecessorFd);
+  }
+}
+function rotateLogFile(logFile, size) {
+  const predecessorPath = `${logFile}.1`;
+  writeBoundedPredecessor(logFile, predecessorPath, size);
+  fs.truncateSync(logFile, 0);
+  activeLogSize = 0;
+  flushesSinceSizeCheck = 0;
+}
+function flush() {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (buffer.length === 0)
+    return;
+  const bufferedData = buffer.join("");
+  buffer = [];
+  try {
+    const data = capLogData(bufferedData);
+    const logFile = getMagicContextLogPath();
+    ensureDir(logFile);
+    let currentSize = getCurrentLogSize(logFile);
+    const dataSize = Buffer.byteLength(data);
+    if (currentSize > 0 && currentSize + dataSize > MAX_LOG_FILE_BYTES) {
+      rotateLogFile(logFile, currentSize);
+      currentSize = 0;
+    }
+    fs.appendFileSync(logFile, data, { encoding: "utf8", mode: 384 });
+    activeLogFile = logFile;
+    activeLogSize = currentSize + dataSize;
+    flushesSinceSizeCheck++;
+  } catch (error) {
+    activeLogFile = null;
+    activeLogSize = null;
+    flushesSinceSizeCheck = 0;
+    recordSwallowedWrite(error);
+  }
+}
+function scheduleFlush() {
+  if (flushTimer)
+    return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    flush();
+  }, FLUSH_INTERVAL_MS);
+}
+function log(message, data) {
+  if (isTestEnv)
+    return;
+  try {
+    const timestamp = new Date().toISOString();
+    const serialized = data === undefined ? "" : data instanceof Error ? ` ${sanitizeDiagnosticText(`${data.message}${data.stack ? `
+${data.stack}` : ""}`)}` : ` ${JSON.stringify(sanitizeConfigValue(data))}`;
+    buffer.push(`[${timestamp}] ${sanitizeDiagnosticText(message)}${serialized}
+`);
+    if (buffer.length >= BUFFER_SIZE_LIMIT) {
+      flush();
+    } else {
+      scheduleFlush();
+    }
+  } catch {}
+}
+function sessionLog(sessionId, message, data) {
+  log(`[magic-context][${sessionId}] ${message}`, data);
+}
+if (!isTestEnv) {
+  process.on("exit", flush);
+}
+
 // ../plugin/src/config/migrate-config-location.ts
-import {
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync
-} from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { homedir as homedir3 } from "node:os";
+import { basename, dirname as dirname2, isAbsolute as isAbsolute2, join as join2 } from "node:path";
 
 // ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/scanner.js
 function createScanner(text, ignoreTrivia = false) {
@@ -462,6 +914,249 @@ var cachedBreakLinesWithSpaces = {
     })
   }
 };
+var supportedEols = [`
+`, "\r", `\r
+`];
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/format.js
+function format(documentText, range, options) {
+  let initialIndentLevel;
+  let formatText;
+  let formatTextStart;
+  let rangeStart;
+  let rangeEnd;
+  if (range) {
+    rangeStart = range.offset;
+    rangeEnd = rangeStart + range.length;
+    formatTextStart = rangeStart;
+    while (formatTextStart > 0 && !isEOL(documentText, formatTextStart - 1)) {
+      formatTextStart--;
+    }
+    let endOffset = rangeEnd;
+    while (endOffset < documentText.length && !isEOL(documentText, endOffset)) {
+      endOffset++;
+    }
+    formatText = documentText.substring(formatTextStart, endOffset);
+    initialIndentLevel = computeIndentLevel(formatText, options);
+  } else {
+    formatText = documentText;
+    initialIndentLevel = 0;
+    formatTextStart = 0;
+    rangeStart = 0;
+    rangeEnd = documentText.length;
+  }
+  const eol = getEOL(options, documentText);
+  const eolFastPathSupported = supportedEols.includes(eol);
+  let numberLineBreaks = 0;
+  let indentLevel = 0;
+  let indentValue;
+  if (options.insertSpaces) {
+    indentValue = cachedSpaces[options.tabSize || 4] ?? repeat(cachedSpaces[1], options.tabSize || 4);
+  } else {
+    indentValue = "\t";
+  }
+  const indentType = indentValue === "\t" ? "\t" : " ";
+  let scanner = createScanner(formatText, false);
+  let hasError = false;
+  function newLinesAndIndent() {
+    if (numberLineBreaks > 1) {
+      return repeat(eol, numberLineBreaks) + repeat(indentValue, initialIndentLevel + indentLevel);
+    }
+    const amountOfSpaces = indentValue.length * (initialIndentLevel + indentLevel);
+    if (!eolFastPathSupported || amountOfSpaces > cachedBreakLinesWithSpaces[indentType][eol].length) {
+      return eol + repeat(indentValue, initialIndentLevel + indentLevel);
+    }
+    if (amountOfSpaces <= 0) {
+      return eol;
+    }
+    return cachedBreakLinesWithSpaces[indentType][eol][amountOfSpaces];
+  }
+  function scanNext() {
+    let token = scanner.scan();
+    numberLineBreaks = 0;
+    while (token === 15 || token === 14) {
+      if (token === 14 && options.keepLines) {
+        numberLineBreaks += 1;
+      } else if (token === 14) {
+        numberLineBreaks = 1;
+      }
+      token = scanner.scan();
+    }
+    hasError = token === 16 || scanner.getTokenError() !== 0;
+    return token;
+  }
+  const editOperations = [];
+  function addEdit(text, startOffset, endOffset) {
+    if (!hasError && (!range || startOffset < rangeEnd && endOffset > rangeStart) && documentText.substring(startOffset, endOffset) !== text) {
+      editOperations.push({ offset: startOffset, length: endOffset - startOffset, content: text });
+    }
+  }
+  let firstToken = scanNext();
+  if (options.keepLines && numberLineBreaks > 0) {
+    addEdit(repeat(eol, numberLineBreaks), 0, 0);
+  }
+  if (firstToken !== 17) {
+    let firstTokenStart = scanner.getTokenOffset() + formatTextStart;
+    let initialIndent = indentValue.length * initialIndentLevel < 20 && options.insertSpaces ? cachedSpaces[indentValue.length * initialIndentLevel] : repeat(indentValue, initialIndentLevel);
+    addEdit(initialIndent, formatTextStart, firstTokenStart);
+  }
+  while (firstToken !== 17) {
+    let firstTokenEnd = scanner.getTokenOffset() + scanner.getTokenLength() + formatTextStart;
+    let secondToken = scanNext();
+    let replaceContent = "";
+    let needsLineBreak = false;
+    while (numberLineBreaks === 0 && (secondToken === 12 || secondToken === 13)) {
+      let commentTokenStart = scanner.getTokenOffset() + formatTextStart;
+      addEdit(cachedSpaces[1], firstTokenEnd, commentTokenStart);
+      firstTokenEnd = scanner.getTokenOffset() + scanner.getTokenLength() + formatTextStart;
+      needsLineBreak = secondToken === 12;
+      replaceContent = needsLineBreak ? newLinesAndIndent() : "";
+      secondToken = scanNext();
+    }
+    if (secondToken === 2) {
+      if (firstToken !== 1) {
+        indentLevel--;
+      }
+      if (options.keepLines && numberLineBreaks > 0 || !options.keepLines && firstToken !== 1) {
+        replaceContent = newLinesAndIndent();
+      } else if (options.keepLines) {
+        replaceContent = cachedSpaces[1];
+      }
+    } else if (secondToken === 4) {
+      if (firstToken !== 3) {
+        indentLevel--;
+      }
+      if (options.keepLines && numberLineBreaks > 0 || !options.keepLines && firstToken !== 3) {
+        replaceContent = newLinesAndIndent();
+      } else if (options.keepLines) {
+        replaceContent = cachedSpaces[1];
+      }
+    } else {
+      switch (firstToken) {
+        case 3:
+        case 1:
+          indentLevel++;
+          if (options.keepLines && numberLineBreaks > 0 || !options.keepLines) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 5:
+          if (options.keepLines && numberLineBreaks > 0 || !options.keepLines) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 12:
+          replaceContent = newLinesAndIndent();
+          break;
+        case 13:
+          if (numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (!needsLineBreak) {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 6:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (!needsLineBreak) {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 10:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (secondToken === 6 && !needsLineBreak) {
+            replaceContent = "";
+          }
+          break;
+        case 7:
+        case 8:
+        case 9:
+        case 11:
+        case 2:
+        case 4:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            if ((secondToken === 12 || secondToken === 13) && !needsLineBreak) {
+              replaceContent = cachedSpaces[1];
+            } else if (secondToken !== 5 && secondToken !== 17) {
+              hasError = true;
+            }
+          }
+          break;
+        case 16:
+          hasError = true;
+          break;
+      }
+      if (numberLineBreaks > 0 && (secondToken === 12 || secondToken === 13)) {
+        replaceContent = newLinesAndIndent();
+      }
+    }
+    if (secondToken === 17) {
+      if (options.keepLines && numberLineBreaks > 0) {
+        replaceContent = newLinesAndIndent();
+      } else {
+        replaceContent = options.insertFinalNewline ? eol : "";
+      }
+    }
+    const secondTokenStart = scanner.getTokenOffset() + formatTextStart;
+    addEdit(replaceContent, firstTokenEnd, secondTokenStart);
+    firstToken = secondToken;
+  }
+  return editOperations;
+}
+function repeat(s, count) {
+  let result = "";
+  for (let i = 0;i < count; i++) {
+    result += s;
+  }
+  return result;
+}
+function computeIndentLevel(content, options) {
+  let i = 0;
+  let nChars = 0;
+  const tabSize = options.tabSize || 4;
+  while (i < content.length) {
+    let ch = content.charAt(i);
+    if (ch === cachedSpaces[1]) {
+      nChars++;
+    } else if (ch === "\t") {
+      nChars += tabSize;
+    } else {
+      break;
+    }
+    i++;
+  }
+  return Math.floor(nChars / tabSize);
+}
+function getEOL(options, text) {
+  for (let i = 0;i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (ch === "\r") {
+      if (i + 1 < text.length && text.charAt(i + 1) === `
+`) {
+        return `\r
+`;
+      }
+      return "\r";
+    } else if (ch === `
+`) {
+      return `
+`;
+    }
+  }
+  return options && options.eol || `
+`;
+}
+function isEOL(text, offset) {
+  return `\r
+`.indexOf(text.charAt(offset)) !== -1;
+}
 
 // ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/parser.js
 var ParseOptions;
@@ -470,6 +1165,49 @@ var ParseOptions;
     allowTrailingComma: false
   };
 })(ParseOptions || (ParseOptions = {}));
+function parse2(text, errors = [], options = ParseOptions.DEFAULT) {
+  let currentProperty = null;
+  let currentParent = [];
+  const previousParents = [];
+  function onValue(value) {
+    if (Array.isArray(currentParent)) {
+      currentParent.push(value);
+    } else if (currentProperty !== null) {
+      currentParent[currentProperty] = value;
+    }
+  }
+  const visitor = {
+    onObjectBegin: () => {
+      const object = {};
+      onValue(object);
+      previousParents.push(currentParent);
+      currentParent = object;
+      currentProperty = null;
+    },
+    onObjectProperty: (name) => {
+      currentProperty = name;
+    },
+    onObjectEnd: () => {
+      currentParent = previousParents.pop();
+    },
+    onArrayBegin: () => {
+      const array = [];
+      onValue(array);
+      previousParents.push(currentParent);
+      currentParent = array;
+      currentProperty = null;
+    },
+    onArrayEnd: () => {
+      currentParent = previousParents.pop();
+    },
+    onLiteralValue: onValue,
+    onError: (error, offset, length) => {
+      errors.push({ error, offset, length });
+    }
+  };
+  visit(text, visitor, options);
+  return currentParent[0];
+}
 function parseTree(text, errors = [], options = ParseOptions.DEFAULT) {
   let currentParent = { type: "array", offset: -1, length: -1, children: [], parent: undefined };
   function ensurePropertyComplete(endOffset) {
@@ -854,6 +1592,150 @@ function getNodeType(value) {
   }
 }
 
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/edit.js
+function setProperty(text, originalPath, value, options) {
+  const path = originalPath.slice();
+  const errors = [];
+  const root = parseTree(text, errors);
+  let parent = undefined;
+  let lastSegment = undefined;
+  while (path.length > 0) {
+    lastSegment = path.pop();
+    parent = findNodeAtLocation(root, path);
+    if (parent === undefined && value !== undefined) {
+      if (typeof lastSegment === "string") {
+        value = { [lastSegment]: value };
+      } else {
+        value = [value];
+      }
+    } else {
+      break;
+    }
+  }
+  if (!parent) {
+    if (value === undefined) {
+      throw new Error("Can not delete in empty document");
+    }
+    return withFormatting(text, { offset: root ? root.offset : 0, length: root ? root.length : 0, content: JSON.stringify(value) }, options);
+  } else if (parent.type === "object" && typeof lastSegment === "string" && Array.isArray(parent.children)) {
+    const existing = findNodeAtLocation(parent, [lastSegment]);
+    if (existing !== undefined) {
+      if (value === undefined) {
+        if (!existing.parent) {
+          throw new Error("Malformed AST");
+        }
+        const propertyIndex = parent.children.indexOf(existing.parent);
+        let removeBegin;
+        let removeEnd = existing.parent.offset + existing.parent.length;
+        if (propertyIndex > 0) {
+          let previous = parent.children[propertyIndex - 1];
+          removeBegin = previous.offset + previous.length;
+        } else {
+          removeBegin = parent.offset + 1;
+          if (parent.children.length > 1) {
+            let next = parent.children[1];
+            removeEnd = next.offset;
+          }
+        }
+        return withFormatting(text, { offset: removeBegin, length: removeEnd - removeBegin, content: "" }, options);
+      } else {
+        return withFormatting(text, { offset: existing.offset, length: existing.length, content: JSON.stringify(value) }, options);
+      }
+    } else {
+      if (value === undefined) {
+        return [];
+      }
+      const newProperty = `${JSON.stringify(lastSegment)}: ${JSON.stringify(value)}`;
+      const index = options.getInsertionIndex ? options.getInsertionIndex(parent.children.map((p) => p.children[0].value)) : parent.children.length;
+      let edit;
+      if (index > 0) {
+        let previous = parent.children[index - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      } else if (parent.children.length === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty };
+      } else {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty + "," };
+      }
+      return withFormatting(text, edit, options);
+    }
+  } else if (parent.type === "array" && typeof lastSegment === "number" && Array.isArray(parent.children)) {
+    const insertIndex = lastSegment;
+    if (insertIndex === -1) {
+      const newProperty = `${JSON.stringify(value)}`;
+      let edit;
+      if (parent.children.length === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty };
+      } else {
+        const previous = parent.children[parent.children.length - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      }
+      return withFormatting(text, edit, options);
+    } else if (value === undefined && parent.children.length >= 0) {
+      const removalIndex = lastSegment;
+      const toRemove = parent.children[removalIndex];
+      let edit;
+      if (parent.children.length === 1) {
+        edit = { offset: parent.offset + 1, length: parent.length - 2, content: "" };
+      } else if (parent.children.length - 1 === removalIndex) {
+        let previous = parent.children[removalIndex - 1];
+        let offset = previous.offset + previous.length;
+        let parentEndOffset = parent.offset + parent.length;
+        edit = { offset, length: parentEndOffset - 2 - offset, content: "" };
+      } else {
+        edit = { offset: toRemove.offset, length: parent.children[removalIndex + 1].offset - toRemove.offset, content: "" };
+      }
+      return withFormatting(text, edit, options);
+    } else if (value !== undefined) {
+      let edit;
+      const newProperty = `${JSON.stringify(value)}`;
+      if (!options.isArrayInsertion && parent.children.length > lastSegment) {
+        const toModify = parent.children[lastSegment];
+        edit = { offset: toModify.offset, length: toModify.length, content: newProperty };
+      } else if (parent.children.length === 0 || lastSegment === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: parent.children.length === 0 ? newProperty : newProperty + "," };
+      } else {
+        const index = lastSegment > parent.children.length ? parent.children.length : lastSegment;
+        const previous = parent.children[index - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      }
+      return withFormatting(text, edit, options);
+    } else {
+      throw new Error(`Can not ${value === undefined ? "remove" : options.isArrayInsertion ? "insert" : "modify"} Array index ${insertIndex} as length is not sufficient`);
+    }
+  } else {
+    throw new Error(`Can not add ${typeof lastSegment !== "number" ? "index" : "property"} to parent of type ${parent.type}`);
+  }
+}
+function withFormatting(text, edit, options) {
+  if (!options.formattingOptions) {
+    return [edit];
+  }
+  let newText = applyEdit(text, edit);
+  let begin = edit.offset;
+  let end = edit.offset + edit.content.length;
+  if (edit.length === 0 || edit.content.length === 0) {
+    while (begin > 0 && !isEOL(newText, begin - 1)) {
+      begin--;
+    }
+    while (end < newText.length && !isEOL(newText, end)) {
+      end++;
+    }
+  }
+  const edits = format(newText, { offset: begin, length: end - begin }, { ...options.formattingOptions, keepLines: false });
+  for (let i = edits.length - 1;i >= 0; i--) {
+    const edit = edits[i];
+    newText = applyEdit(newText, edit);
+    begin = Math.min(begin, edit.offset);
+    end = Math.max(end, edit.offset + edit.length);
+    end += edit.content.length - edit.length;
+  }
+  const editLength = text.length - (newText.length - end) - begin;
+  return [{ offset: begin, length: editLength, content: newText.substring(begin, end) }];
+}
+function applyEdit(text, edit) {
+  return text.substring(0, edit.offset) + edit.content + text.substring(edit.offset + edit.length);
+}
+
 // ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/main.js
 var createScanner2 = createScanner;
 var ScanError;
@@ -886,6 +1768,7 @@ var SyntaxKind;
   SyntaxKind[SyntaxKind["Unknown"] = 16] = "Unknown";
   SyntaxKind[SyntaxKind["EOF"] = 17] = "EOF";
 })(SyntaxKind || (SyntaxKind = {}));
+var parse = parse2;
 var parseTree2 = parseTree;
 var findNodeAtLocation2 = findNodeAtLocation;
 var getNodeValue2 = getNodeValue;
@@ -908,6 +1791,66 @@ var ParseErrorCode;
   ParseErrorCode[ParseErrorCode["InvalidEscapeCharacter"] = 15] = "InvalidEscapeCharacter";
   ParseErrorCode[ParseErrorCode["InvalidCharacter"] = 16] = "InvalidCharacter";
 })(ParseErrorCode || (ParseErrorCode = {}));
+function printParseErrorCode(code) {
+  switch (code) {
+    case 1:
+      return "InvalidSymbol";
+    case 2:
+      return "InvalidNumberFormat";
+    case 3:
+      return "PropertyNameExpected";
+    case 4:
+      return "ValueExpected";
+    case 5:
+      return "ColonExpected";
+    case 6:
+      return "CommaExpected";
+    case 7:
+      return "CloseBraceExpected";
+    case 8:
+      return "CloseBracketExpected";
+    case 9:
+      return "EndOfFileExpected";
+    case 10:
+      return "InvalidCommentToken";
+    case 11:
+      return "UnexpectedEndOfComment";
+    case 12:
+      return "UnexpectedEndOfString";
+    case 13:
+      return "UnexpectedEndOfNumber";
+    case 14:
+      return "InvalidUnicode";
+    case 15:
+      return "InvalidEscapeCharacter";
+    case 16:
+      return "InvalidCharacter";
+  }
+  return "<unknown ParseErrorCode>";
+}
+function modify(text, path, value, options) {
+  return setProperty(text, path, value, options);
+}
+function applyEdits(text, edits) {
+  let sortedEdits = edits.slice(0).sort((a, b) => {
+    const diff = a.offset - b.offset;
+    if (diff === 0) {
+      return a.length - b.length;
+    }
+    return diff;
+  });
+  let lastModifiedOffset = text.length;
+  for (let i = sortedEdits.length - 1;i >= 0; i--) {
+    let e = sortedEdits[i];
+    if (e.offset + e.length <= lastModifiedOffset) {
+      text = applyEdit(text, e);
+    } else {
+      throw new Error("Overlapping edit");
+    }
+    lastModifiedOffset = e.offset;
+  }
+  return text;
+}
 
 // ../plugin/src/shared/jsonc-edit.ts
 var TOKEN_COMMA = 5;
@@ -939,6 +1882,16 @@ function findComma(text, start, end) {
       };
     }
   }
+}
+function setJsoncValue(text, path, value) {
+  const node = findNode(text, path);
+  if (node) {
+    if (Object.is(getNodeValue2(node), value))
+      return text;
+    const serialized = JSON.stringify(value);
+    return text.slice(0, node.offset) + serialized + text.slice(node.offset + node.length);
+  }
+  return applyEdits(text, modify(text, path, value, {}));
 }
 function removeObjectProperty(text, object, key) {
   const properties = object.children ?? [];
@@ -989,30 +1942,26 @@ function removeJsoncValue(text, path) {
 
 // ../plugin/src/config/migrate-config-location.ts
 var CONFIG_FILE_BASENAME = "magic-context";
-var MOVED_MARKER_SUFFIX = ".MOVED_READPLEASE";
 function homeDir() {
   if (process.platform === "win32") {
-    return process.env.USERPROFILE || process.env.HOME || homedir();
+    return process.env.USERPROFILE || process.env.HOME || homedir3();
   }
-  return process.env.HOME || homedir();
+  return process.env.HOME || homedir3();
 }
 function configHome() {
   const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg && isAbsolute(xdg))
+  if (xdg && isAbsolute2(xdg))
     return xdg;
-  return join(homeDir(), ".config");
+  return join2(homeDir(), ".config");
 }
 function cortexKitUserConfigBasePath() {
-  return join(configHome(), "cortexkit", CONFIG_FILE_BASENAME);
+  return join2(configHome(), "cortexkit", CONFIG_FILE_BASENAME);
 }
 function cortexKitProjectConfigBasePath(directory) {
-  return join(directory, ".cortexkit", CONFIG_FILE_BASENAME);
+  return join2(directory, ".cortexkit", CONFIG_FILE_BASENAME);
 }
 function resolveCortexKitUserConfigPath() {
   return `${cortexKitUserConfigBasePath()}.jsonc`;
-}
-function resolveCortexKitProjectConfigPath(directory) {
-  return `${cortexKitProjectConfigBasePath(directory)}.jsonc`;
 }
 function legacySourcesForBase(basePath, label) {
   return [
@@ -1024,384 +1973,538 @@ function userScopeConfigPaths() {
   return new Set([
     `${cortexKitUserConfigBasePath()}.jsonc`,
     `${cortexKitUserConfigBasePath()}.json`,
-    join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
-    join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
-    join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
-    join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`)
+    join2(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
+    join2(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
+    join2(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
+    join2(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`)
   ]);
 }
 function resolveLegacyConfigSources(directory) {
   const userPaths = userScopeConfigPaths();
   return {
     user: [
-      ...legacySourcesForBase(join(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
-      ...legacySourcesForBase(join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user")
+      ...legacySourcesForBase(join2(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
+      ...legacySourcesForBase(join2(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user")
     ],
     project: [
-      ...legacySourcesForBase(join(directory, CONFIG_FILE_BASENAME), "project root"),
-      ...legacySourcesForBase(join(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project"),
-      ...legacySourcesForBase(join(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
+      ...legacySourcesForBase(join2(directory, CONFIG_FILE_BASENAME), "project root"),
+      ...legacySourcesForBase(join2(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project"),
+      ...legacySourcesForBase(join2(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
     ].filter((source) => !userPaths.has(source.path))
   };
 }
-function stripJsoncForParse(input) {
-  let out = "";
-  let inString = false;
-  let escaped = false;
-  for (let i = 0;i < input.length; i++) {
-    const ch = input[i];
-    const next = input[i + 1];
-    if (inString) {
-      out += ch;
-      if (escaped)
-        escaped = false;
-      else if (ch === "\\")
-        escaped = true;
-      else if (ch === '"')
-        inString = false;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      continue;
-    }
-    if (ch === "/" && next === "/") {
-      while (i < input.length && input[i] !== `
-`)
-        i++;
-      out += `
-`;
-      continue;
-    }
-    if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < input.length && !(input[i] === "*" && input[i + 1] === "/"))
-        i++;
-      i++;
-      out += " ";
-      continue;
-    }
-    out += ch;
-  }
-  let withoutTrailingCommas = "";
-  inString = false;
-  escaped = false;
-  for (let i = 0;i < out.length; i++) {
-    const ch = out[i];
-    if (inString) {
-      withoutTrailingCommas += ch;
-      if (escaped)
-        escaped = false;
-      else if (ch === "\\")
-        escaped = true;
-      else if (ch === '"')
-        inString = false;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      withoutTrailingCommas += ch;
-      continue;
-    }
-    if (ch === ",") {
-      let j = i + 1;
-      while (j < out.length && /\s/.test(out[j]))
-        j++;
-      if (out[j] === "}" || out[j] === "]")
-        continue;
-    }
-    withoutTrailingCommas += ch;
-  }
-  return withoutTrailingCommas;
-}
-function sortJson(value) {
-  if (Array.isArray(value))
-    return value.map(sortJson);
-  if (value && typeof value === "object") {
-    const sorted = {};
-    for (const key of Object.keys(value).sort()) {
-      if (key === "protected_tags")
-        continue;
-      sorted[key] = sortJson(value[key]);
-    }
-    return sorted;
-  }
-  return value;
-}
-function normalizedJsoncSemantics(content) {
-  return JSON.stringify(sortJson(JSON.parse(stripJsoncForParse(content))));
-}
-function fileSemanticsMatch(a, b) {
-  try {
-    return normalizedJsoncSemantics(a) === normalizedJsoncSemantics(b);
-  } catch {
-    return a === b;
-  }
-}
-var CONFIG_LOCK_STALE_MS = 4000;
-function acquireConfigMigrationLock(lockDir) {
-  for (let attempt = 0;attempt < 2; attempt++) {
-    try {
-      mkdirSync(lockDir, { recursive: false });
-      return () => {
-        try {
-          rmSync(lockDir, { recursive: true, force: true });
-        } catch {}
-      };
-    } catch (err) {
-      const code = err?.code;
-      if (code !== "EEXIST")
-        throw err;
-      try {
-        const ageMs = Date.now() - statSync(lockDir).mtimeMs;
-        if (ageMs > CONFIG_LOCK_STALE_MS) {
-          rmSync(lockDir, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      return null;
-    }
-  }
-  return null;
-}
-function atomicWriteConfigFile(targetPath, content) {
-  mkdirSync(dirname(targetPath), { recursive: true });
-  const tmpPath = join(dirname(targetPath), `.${basename(targetPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
-  let fd = null;
-  try {
-    fd = openSync(tmpPath, "wx", 384);
-    writeFileSync(fd, content);
-    closeSync(fd);
-    fd = null;
-    renameSync(tmpPath, targetPath);
-  } catch (err) {
-    if (fd !== null) {
-      try {
-        closeSync(fd);
-      } catch {}
-    }
-    try {
-      unlinkSync(tmpPath);
-    } catch {}
-    throw err;
-  }
-}
-function movedMarkerContent(targetPath, originalName, originalContent) {
-  const header = [
-    "// Magic Context configuration moved.",
-    "//",
-    "// Magic Context now reads its configuration from one shared CortexKit",
-    "// location instead of a per-agent path. The settings that were in this",
-    "// file have been moved to:",
-    "//",
-    `//     ${targetPath}`,
-    "//",
-    "// Edit that file to change Magic Context settings. This location is no",
-    "// longer read by Magic Context.",
-    "//",
-    `// To undo, rename this file back to "${originalName}" (and remove the`,
-    "// CortexKit copy above if you want this location to take precedence).",
-    "//",
-    "// Your original settings are preserved below for reference.",
-    "",
-    ""
-  ].join(`
-`);
-  return `${header}${originalContent}`;
-}
-function markLegacySourcesMovedAside(sources, targetPath, logger) {
-  const warnings = [];
-  const info = logger?.info ?? logger?.log;
-  for (const source of sources) {
-    const markerPath = `${source.path}${MOVED_MARKER_SUFFIX}`;
-    try {
-      const original = readFileSync(source.path, "utf-8");
-      atomicWriteConfigFile(markerPath, movedMarkerContent(targetPath, basename(source.path), original));
-      unlinkSync(source.path);
-      info?.(`Moved legacy Magic Context config ${source.path} aside to ${markerPath}; now reading ${targetPath}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`Magic Context could not move legacy config ${source.path} aside (${msg}); it is now stale and ignored. Delete it manually — config is read from ${targetPath}.`);
-      logger?.warn?.(`Could not move legacy Magic Context config ${source.path} aside (${msg}); reading ${targetPath}`);
-    }
-  }
-  return warnings;
-}
-function visibleConfigMigrationWarning(scope, targetPath, paths, reason) {
-  const uniquePaths = [...new Set([targetPath, ...paths])];
-  return `Magic Context ${scope} config migration refused: ${reason}. ` + `Legacy and CortexKit config paths collapse to one file, but Magic Context will not overwrite or merge them automatically. ` + `Please consolidate manually into ${targetPath}. Paths: ${uniquePaths.join(" ; ")}`;
-}
-function migrateConfigFile(opts) {
-  const warnings = [];
-  const existingSources = opts.legacySources.filter((source) => existsSync(source.path));
-  const info = opts.logger?.info ?? opts.logger?.log;
-  if (existingSources.length === 0) {
-    return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
-  }
-  mkdirSync(dirname(opts.targetPath), { recursive: true });
-  const release = acquireConfigMigrationLock(`${opts.targetPath}.lock`);
-  if (!release) {
-    warnings.push(`Config migration for ${opts.scope} skipped this run (another instance is migrating); will retry on next start.`);
-    return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
-  }
-  try {
-    const sources = existingSources.map((source) => ({
-      ...source,
-      content: readFileSync(source.path, "utf-8")
-    }));
-    if (existsSync(opts.targetPath)) {
-      const targetContent = readFileSync(opts.targetPath, "utf-8");
-      const differing = sources.filter((source) => !fileSemanticsMatch(source.content, targetContent));
-      if (differing.length > 0) {
-        const message = visibleConfigMigrationWarning(opts.scope, opts.targetPath, differing.map((source) => source.path), "the CortexKit target already exists with different settings");
-        warnings.push(message);
-        opts.logger?.warn?.(message);
-        return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
-      }
-      info?.(`Magic Context ${opts.scope} config already present at ${opts.targetPath}; legacy copies match`);
-      warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
-      return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
-    }
-    const first = sources[0];
-    const differing = sources.filter((source) => !fileSemanticsMatch(source.content, first.content));
-    if (differing.length > 0) {
-      const message = visibleConfigMigrationWarning(opts.scope, opts.targetPath, sources.map((source) => source.path), "multiple legacy sources have different settings");
-      warnings.push(message);
-      opts.logger?.warn?.(message);
-      return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
-    }
-    let migratedContent = first.content;
-    let strippedProtectedTags = false;
-    try {
-      const stripped = removeJsoncValue(first.content, ["protected_tags"]);
-      if (stripped !== first.content) {
-        migratedContent = stripped;
-        strippedProtectedTags = true;
-      }
-    } catch {}
-    atomicWriteConfigFile(opts.targetPath, migratedContent);
-    if (strippedProtectedTags) {
-      info?.(`Stripped deprecated "protected_tags" key during config location migration`);
-    }
-    info?.(`Migrated Magic Context ${opts.scope} config from ${first.path} to ${opts.targetPath}`);
-    warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
+function resolveLegacyConfigSourcesForHarness(directory, harness) {
+  if (harness === "pi") {
     return {
-      migrated: true,
-      conflict: false,
-      sourcePath: first.path,
-      targetPath: opts.targetPath,
-      warnings
-    };
-  } catch (err) {
-    const message = visibleConfigMigrationWarning(opts.scope, opts.targetPath, existingSources.map((source) => source.path), `migration failed (${err instanceof Error ? err.message : String(err)})`);
-    warnings.push(message);
-    opts.logger?.warn?.(message);
-    return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
-  } finally {
-    release();
-  }
-}
-function migrateMagicContextConfigLocations(directory, logger) {
-  const warnings = [];
-  const legacy = resolveLegacyConfigSources(directory);
-  try {
-    warnings.push(...migrateConfigFile({
-      scope: "user",
-      targetPath: resolveCortexKitUserConfigPath(),
-      legacySources: legacy.user,
-      logger
-    }).warnings);
-    warnings.push(...migrateConfigFile({
-      scope: "project",
-      targetPath: resolveCortexKitProjectConfigPath(directory),
-      legacySources: legacy.project,
-      logger
-    }).warnings);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger?.warn?.(`Magic Context config-location migration error (continuing): ${msg}`);
-    warnings.push(`Magic Context config-location migration error: ${msg}`);
-  }
-  return warnings;
-}
-
-// ../plugin/src/shared/data-path.ts
-import * as os from "node:os";
-import * as path from "node:path";
-
-// ../plugin/src/shared/harness.ts
-var currentHarness = "opencode";
-var harnessLocked = false;
-function setHarness(value) {
-  if (harnessLocked && currentHarness !== value) {
-    throw new Error(`Magic Context: harness already locked to "${currentHarness}"; cannot change to "${value}"`);
-  }
-  currentHarness = value;
-  harnessLocked = true;
-}
-function getHarness() {
-  return currentHarness;
-}
-
-// ../plugin/src/shared/data-path.ts
-function getDataDir() {
-  return process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
-}
-function getMagicContextTempDir(harness = getHarness()) {
-  return path.join(os.tmpdir(), harness, "magic-context");
-}
-function getMagicContextLogPath(harness = getHarness()) {
-  const envPath = process.env.MAGIC_CONTEXT_LOG_PATH?.trim();
-  if (envPath)
-    return envPath;
-  return path.join(getMagicContextTempDir(harness), "magic-context.log");
-}
-function getOpenCodeStorageDir() {
-  return path.join(getDataDir(), "opencode", "storage");
-}
-function getMagicContextStorageResolution() {
-  const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim();
-  if (testDataDir) {
-    const perTestDataHome = process.env.XDG_DATA_HOME?.trim();
-    if (perTestDataHome && path.resolve(perTestDataHome) !== path.resolve(testDataDir)) {
-      return {
-        path: path.join(perTestDataHome, "cortexkit", "magic-context"),
-        source: "test isolation"
-      };
-    }
-    return {
-      path: path.join(testDataDir, "cortexkit", "magic-context"),
-      source: "test isolation"
-    };
-  }
-  if (false) {}
-  const explicitStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR?.trim();
-  if (explicitStorageDir) {
-    if (!path.isAbsolute(explicitStorageDir)) {
-      throw new Error("MAGIC_CONTEXT_STORAGE_DIR must be an absolute path");
-    }
-    return { path: explicitStorageDir, source: "environment override" };
-  }
-  const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
-  if (xdgDataHome) {
-    return {
-      path: path.join(xdgDataHome, "cortexkit", "magic-context"),
-      source: "XDG_DATA_HOME"
+      user: legacySourcesForBase(join2(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user"),
+      project: legacySourcesForBase(join2(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
     };
   }
   return {
-    path: path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
-    source: "platform default"
+    user: legacySourcesForBase(join2(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
+    project: [
+      ...legacySourcesForBase(join2(directory, CONFIG_FILE_BASENAME), "project root"),
+      ...legacySourcesForBase(join2(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project")
+    ]
   };
 }
-function getMagicContextStorageDir() {
-  return getMagicContextStorageResolution().path;
+
+// ../plugin/src/features/magic-context/memory/constants.ts
+var V2_MEMORY_CATEGORIES = [
+  "PROJECT_RULES",
+  "ARCHITECTURE",
+  "CONSTRAINTS",
+  "CONFIG_VALUES",
+  "NAMING"
+];
+var PROMOTABLE_CATEGORIES = [
+  "PROJECT_RULES",
+  "ARCHITECTURE",
+  "CONSTRAINTS",
+  "CONFIG_VALUES",
+  "NAMING",
+  "ARCHITECTURE_DECISIONS",
+  "CONFIG_DEFAULTS",
+  "USER_PREFERENCES",
+  "USER_DIRECTIVES",
+  "ENVIRONMENT",
+  "WORKFLOW_RULES",
+  "KNOWN_ISSUES"
+];
+var CATEGORY_PRIORITY = [
+  "PROJECT_RULES",
+  "ARCHITECTURE",
+  "CONSTRAINTS",
+  "CONFIG_VALUES",
+  "NAMING",
+  "USER_DIRECTIVES",
+  "USER_PREFERENCES",
+  "CONFIG_DEFAULTS",
+  "ARCHITECTURE_DECISIONS",
+  "ENVIRONMENT",
+  "WORKFLOW_RULES",
+  "KNOWN_ISSUES"
+];
+var MEMORY_CATEGORY_ORDER_UNKNOWN = 99;
+var MEMORY_CATEGORY_ORDER_PRIORITY = CATEGORY_PRIORITY.reduce((acc, category, index) => {
+  acc[category] = index;
+  return acc;
+}, {});
+var MEMORY_CATEGORY_ORDER_SQL = `CASE category ${CATEGORY_PRIORITY.map((category, index) => `WHEN '${category}' THEN ${index}`).join(" ")} ELSE ${MEMORY_CATEGORY_ORDER_UNKNOWN} END`;
+function getMemoryCategoryOrder(category) {
+  return MEMORY_CATEGORY_ORDER_PRIORITY[category] ?? MEMORY_CATEGORY_ORDER_UNKNOWN;
 }
-function getLegacyOpenCodeMagicContextStorageDir() {
-  return path.join(getOpenCodeStorageDir(), "plugin", "magic-context");
+var CATEGORY_DEFAULT_TTL = {
+  WORKFLOW_RULES: 90 * 24 * 60 * 60 * 1000,
+  KNOWN_ISSUES: 30 * 24 * 60 * 60 * 1000
+};
+
+// ../plugin/src/features/magic-context/memory/project-identity.ts
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync as existsSync2, realpathSync, statSync as statSync2 } from "node:fs";
+import { homedir as homedir4 } from "node:os";
+import path3 from "node:path";
+var GIT_TIMEOUT_MS = 5000;
+var TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+var identityCache = new Map;
+var linkedGitWorktreeCache = new Map;
+var lastKnownGitIdentityCache = new Map;
+var directoryFallbackCache = new Map;
+var transientFailureCooldown = new Map;
+var dubiousOwnershipFallbackDirectories = new Set;
+var dubiousOwnershipLoggedDirectories = new Set;
+var dubiousOwnershipWarnedDirectories = new Set;
+var transientGitIdentityReuseLoggedDirectories = new Set;
+var sessionIdentityCache = new Map;
+var execFileSyncForIdentity = execFileSync;
+var userHomeDirectoryForIdentity = () => homedir4();
+var nowMs = () => Date.now();
+var filesystemProbeObserverForTests;
+
+class ProjectIdentityError extends Error {
+  errorClass;
+  rawDirectory;
+  constructor(errorClass, rawDirectory, message, cause) {
+    super(message);
+    this.name = "ProjectIdentityError";
+    this.errorClass = errorClass;
+    this.rawDirectory = rawDirectory;
+    if (cause) {
+      this.cause = cause;
+    }
+  }
+}
+function asError(error) {
+  return error instanceof Error ? error : undefined;
+}
+function getErrorCode(error) {
+  if (error === null || typeof error !== "object" || !("code" in error)) {
+    return;
+  }
+  const code = error.code;
+  return typeof code === "string" ? code : undefined;
+}
+function getErrorSignal(error) {
+  if (error === null || typeof error !== "object" || !("signal" in error)) {
+    return;
+  }
+  const signal = error.signal;
+  return typeof signal === "string" ? signal : undefined;
+}
+function getErrorKilled(error) {
+  if (error === null || typeof error !== "object" || !("killed" in error)) {
+    return false;
+  }
+  return error.killed === true;
+}
+function getErrorStderr(error) {
+  if (error === null || typeof error !== "object" || !("stderr" in error)) {
+    return "";
+  }
+  const stderr = error.stderr;
+  if (typeof stderr === "string") {
+    return stderr;
+  }
+  if (Buffer.isBuffer(stderr)) {
+    return stderr.toString("utf8");
+  }
+  return "";
+}
+function directoryFallback(directory) {
+  const canonical = path3.resolve(directory);
+  const hash = createHash("md5").update(canonical, "utf8").digest("hex").slice(0, 12);
+  return `dir:${hash}`;
+}
+function assertDirectoryUsable(canonicalDirectory, rawDirectory) {
+  try {
+    const stat = statSync2(canonicalDirectory);
+    if (!stat.isDirectory()) {
+      throw new ProjectIdentityError("unknown", rawDirectory, `Project path is not a directory: ${canonicalDirectory}`);
+    }
+  } catch (error) {
+    if (error instanceof ProjectIdentityError) {
+      throw error;
+    }
+    const code = getErrorCode(error);
+    if (code === "EACCES" || code === "EPERM") {
+      throw new ProjectIdentityError("permission_denied", rawDirectory, `Permission denied while accessing project directory: ${canonicalDirectory}`, asError(error));
+    }
+    throw new ProjectIdentityError("unknown", rawDirectory, `Unable to access project directory: ${canonicalDirectory}`, asError(error));
+  }
+}
+function isGitTimeoutError(error) {
+  const code = getErrorCode(error);
+  const signal = getErrorSignal(error);
+  return code === "ETIMEDOUT" || signal === "SIGTERM" || signal === "SIGKILL" || getErrorKilled(error);
+}
+function classifyGitError(error, rawDirectory) {
+  if (isGitTimeoutError(error)) {
+    return new ProjectIdentityError("git_timeout", rawDirectory, `git rev-list timed out after ${GIT_TIMEOUT_MS}ms`, asError(error));
+  }
+  const code = getErrorCode(error);
+  if (code === "ENOENT") {
+    return new ProjectIdentityError("git_missing", rawDirectory, "git binary is not available in PATH", asError(error));
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return new ProjectIdentityError("permission_denied", rawDirectory, "Permission denied while spawning git", asError(error));
+  }
+  const stderr = getErrorStderr(error).toLowerCase();
+  if (stderr.includes("detected dubious ownership")) {
+    return new ProjectIdentityError("dubious_ownership", rawDirectory, "git refused to read the repository because it detected dubious ownership", asError(error));
+  }
+  if (stderr.includes("not a git repository") || stderr.includes("does not have any commits yet") || stderr.includes("ambiguous argument 'head'") || stderr.includes("unknown revision or path")) {
+    return new ProjectIdentityError("not_git_repo", rawDirectory, "Directory has no git root commit; caller may use directory fallback", asError(error));
+  }
+  return new ProjectIdentityError("unknown", rawDirectory, "git rev-list failed while resolving project identity", asError(error));
+}
+function resolveProjectIdentityStrict(directory) {
+  const canonical = path3.resolve(directory);
+  const cached = identityCache.get(canonical);
+  if (cached !== undefined) {
+    return cached;
+  }
+  assertDirectoryUsable(canonical, directory);
+  if (!hasGitDir(canonical)) {
+    throw new ProjectIdentityError("not_git_repo", directory, "Directory has no git metadata; caller may use directory fallback");
+  }
+  let output;
+  try {
+    output = execFileSyncForIdentity("git", ["rev-list", "--max-parents=0", "HEAD"], {
+      cwd: canonical,
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", LANG: "C" },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: GIT_TIMEOUT_MS
+    });
+  } catch (error) {
+    throw classifyGitError(error, directory);
+  }
+  const rootCommit = output.split(`
+`).map((line) => line.trim().slice(0, 64)).filter((line) => /^[0-9a-f]{7,64}$/.test(line)).sort()[0];
+  if (!rootCommit) {
+    throw new ProjectIdentityError("unknown", directory, "git rev-list returned no valid root commit hash");
+  }
+  const identity = `git:${rootCommit}`;
+  identityCache.set(canonical, identity);
+  lastKnownGitIdentityCache.set(canonical, identity);
+  transientFailureCooldown.delete(canonical);
+  dubiousOwnershipFallbackDirectories.delete(canonical);
+  transientGitIdentityReuseLoggedDirectories.delete(canonical);
+  return identity;
+}
+function shouldUseDirectoryFallback(error) {
+  return error.errorClass !== "permission_denied";
+}
+function getActiveCooldown(canonical) {
+  const until = transientFailureCooldown.get(canonical);
+  if (until === undefined)
+    return;
+  if (nowMs() < until)
+    return until;
+  transientFailureCooldown.delete(canonical);
+  return;
+}
+function lastKnownGitIdentity(canonical) {
+  return lastKnownGitIdentityCache.get(canonical) ?? identityCache.get(canonical);
+}
+function nearestLastKnownGitIdentity(canonical) {
+  const visited = new Set;
+  const walk = (start) => {
+    let current = start;
+    while (!visited.has(current)) {
+      visited.add(current);
+      const cached = lastKnownGitIdentity(current);
+      if (cached !== undefined)
+        return { identity: cached, source: current };
+      const parent = path3.dirname(current);
+      if (parent === current)
+        break;
+      current = parent;
+    }
+    return;
+  };
+  const exactOrAncestor = walk(canonical);
+  if (exactOrAncestor)
+    return exactOrAncestor;
+  try {
+    const realCanonical = realpathSync.native(canonical);
+    if (realCanonical !== canonical)
+      return walk(realCanonical);
+  } catch {}
+  return;
+}
+function reuseLastKnownGitIdentity(canonical) {
+  const cached = nearestLastKnownGitIdentity(canonical);
+  if (cached === undefined)
+    return;
+  if (!transientGitIdentityReuseLoggedDirectories.has(canonical)) {
+    transientGitIdentityReuseLoggedDirectories.add(canonical);
+    const sourceNote = cached.source === canonical ? "" : ` from ancestor ${cached.source}`;
+    log(`[magic-context] git identity resolution is temporarily unavailable for ${canonical}; reusing the last successful project identity${sourceNote} to avoid splitting project-scoped memory`);
+  }
+  return cached.identity;
+}
+function formatDubiousOwnershipWarning(canonical) {
+  return `Magic Context: git refused to read ${canonical} (dubious ownership — the repo is owned by a different user). Using a directory-based project identity for now, which keeps memory separate from this repo's normal identity. Fix: git config --global --add safe.directory ${canonical}`;
+}
+function recordDubiousOwnershipFallback(canonical) {
+  dubiousOwnershipFallbackDirectories.add(canonical);
+  if (dubiousOwnershipLoggedDirectories.has(canonical))
+    return;
+  dubiousOwnershipLoggedDirectories.add(canonical);
+  log(`[magic-context] ${formatDubiousOwnershipWarning(canonical)}`);
+}
+function canonicalUserHomeDirectory() {
+  const homeDirectory = userHomeDirectoryForIdentity();
+  try {
+    return realpathSync.native(homeDirectory);
+  } catch {
+    return homeDirectory;
+  }
+}
+function isUserHomeDirectory(directory) {
+  try {
+    return realpathSync.native(path3.resolve(directory)) === canonicalUserHomeDirectory();
+  } catch {
+    return false;
+  }
+}
+function resolveProjectIdentity2(directory) {
+  const canonical = path3.resolve(directory);
+  const cachedFallback = directoryFallbackCache.get(canonical);
+  if (cachedFallback !== undefined) {
+    if (!hasGitDir(canonical)) {
+      return cachedFallback;
+    }
+    directoryFallbackCache.delete(canonical);
+  }
+  if (getActiveCooldown(canonical) !== undefined) {
+    if (hasGitDir(canonical)) {
+      const cachedGitIdentity = reuseLastKnownGitIdentity(canonical);
+      if (cachedGitIdentity !== undefined) {
+        return cachedGitIdentity;
+      }
+    }
+    return directoryFallback(canonical);
+  }
+  try {
+    return resolveProjectIdentityStrict(directory);
+  } catch (error) {
+    if (error instanceof ProjectIdentityError && shouldUseDirectoryFallback(error)) {
+      const fallback = directoryFallback(canonical);
+      const hasGitMetadata = hasGitDir(canonical);
+      if (!hasGitMetadata) {
+        directoryFallbackCache.set(canonical, fallback);
+        transientFailureCooldown.delete(canonical);
+      } else {
+        transientFailureCooldown.set(canonical, nowMs() + TRANSIENT_FAILURE_COOLDOWN_MS);
+        const cachedGitIdentity = reuseLastKnownGitIdentity(canonical);
+        if (cachedGitIdentity !== undefined) {
+          return cachedGitIdentity;
+        }
+      }
+      if (error.errorClass === "dubious_ownership") {
+        recordDubiousOwnershipFallback(canonical);
+      }
+      return fallback;
+    }
+    throw error;
+  }
+}
+function resolveProjectIdentityOrFallback(directory) {
+  try {
+    return resolveProjectIdentity2(directory);
+  } catch (error) {
+    const canonical = path3.resolve(directory);
+    const fallback = directoryFallback(canonical);
+    const message = error instanceof Error ? error.message : String(error);
+    log(`[magic-context] project identity resolution failed for ${canonical}; using directory fallback ${fallback}: ${message}`);
+    return fallback;
+  }
+}
+function hasGitDir(canonical) {
+  if (hasGitDirInAncestorChain(canonical)) {
+    return true;
+  }
+  try {
+    const realCanonical = realpathSync.native(canonical);
+    return realCanonical !== canonical && hasGitDirInAncestorChain(realCanonical);
+  } catch {
+    return false;
+  }
+}
+function gitRootInAncestorChain(startDirectory) {
+  let current = startDirectory;
+  while (true) {
+    if (existsSync2(path3.join(current, ".git"))) {
+      try {
+        return realpathSync.native(current);
+      } catch {
+        return path3.resolve(current);
+      }
+    }
+    const parent = path3.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+function hasGitDirInAncestorChain(startDirectory) {
+  return gitRootInAncestorChain(startDirectory) !== null;
+}
+function gitRootDirectory(canonical) {
+  const direct = gitRootInAncestorChain(canonical);
+  if (direct)
+    return direct;
+  try {
+    const realCanonical = realpathSync.native(canonical);
+    return realCanonical === canonical ? null : gitRootInAncestorChain(realCanonical);
+  } catch {
+    return null;
+  }
+}
+function resolveProjectIdentityForSession(directory, allowHomeProject = false) {
+  const resolvedDirectory = path3.resolve(directory);
+  const cacheKey = `${allowHomeProject ? "1" : "0"}\x00${resolvedDirectory}`;
+  const cached = sessionIdentityCache.get(cacheKey);
+  if (cached && (cached.revalidateAt === null || nowMs() < cached.revalidateAt)) {
+    return cached.identity;
+  }
+  sessionIdentityCache.delete(cacheKey);
+  filesystemProbeObserverForTests?.();
+  const canonicalHome = canonicalUserHomeDirectory();
+  const canonicalDirectory = (() => {
+    try {
+      filesystemProbeObserverForTests?.();
+      return realpathSync.native(resolvedDirectory);
+    } catch {
+      return resolvedDirectory;
+    }
+  })();
+  filesystemProbeObserverForTests?.();
+  const inheritsHomeRepository = gitRootDirectory(canonicalDirectory) === canonicalHome;
+  let identity;
+  if (canonicalDirectory === canonicalHome || inheritsHomeRepository) {
+    identity = allowHomeProject ? directoryFallback(canonicalHome) : undefined;
+  } else {
+    identity = resolveProjectIdentityOrFallback(directory);
+  }
+  sessionIdentityCache.set(cacheKey, {
+    identity,
+    revalidateAt: identity?.startsWith("git:") === true ? null : nowMs() + TRANSIENT_FAILURE_COOLDOWN_MS
+  });
+  return identity;
+}
+function normalizeStoredProjectPath(rawOrStored) {
+  if (rawOrStored.startsWith("git:") || rawOrStored.startsWith("dir:")) {
+    return rawOrStored;
+  }
+  try {
+    return resolveProjectIdentity2(rawOrStored);
+  } catch {
+    return directoryFallback(rawOrStored);
+  }
+}
+function storedPathBelongsToIdentity(storedProjectPath, projectIdentity) {
+  return storedProjectPath === projectIdentity || normalizeStoredProjectPath(storedProjectPath) === projectIdentity;
+}
+
+// ../plugin/src/shared/error-message.ts
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function readString(value) {
+  if (typeof value === "string" && value.length > 0)
+    return value;
+  if (typeof value === "number")
+    return String(value);
+  return;
+}
+function clip(value, max) {
+  if (value.length <= max)
+    return value;
+  return `${value.slice(0, max)}…`;
+}
+function describeError(error) {
+  const stringForm = clip(safeString(error), 400);
+  if (!(error instanceof Error) && !(error && typeof error === "object")) {
+    return {
+      name: typeof error,
+      message: "",
+      stringForm,
+      brief: stringForm || "<empty>"
+    };
+  }
+  const obj = error;
+  const nameFromField = readString(obj.name);
+  const nameFromCtor = error?.constructor?.name;
+  const name = nameFromField ?? nameFromCtor ?? "Error";
+  const message = readString(obj.message) ?? "";
+  const status = readString(obj.status) ?? readString(obj.statusCode);
+  const code = readString(obj.code);
+  let causeName;
+  const cause = obj.cause;
+  if (cause && typeof cause === "object") {
+    const causeRecord = cause;
+    causeName = readString(causeRecord.name) ?? cause.constructor?.name;
+  }
+  const stack = readString(obj.stack);
+  const stackHead = stack ? stack.split(`
+`).slice(0, 4).map((l) => l.trim()).filter((l) => l.length > 0).join(" | ") : undefined;
+  const briefParts = [];
+  if (name)
+    briefParts.push(name);
+  if (message)
+    briefParts.push(`message="${clip(message, 200)}"`);
+  if (status)
+    briefParts.push(`status=${status}`);
+  if (code)
+    briefParts.push(`code=${code}`);
+  if (causeName)
+    briefParts.push(`cause=${causeName}`);
+  if (!message && stringForm && stringForm !== name) {
+    briefParts.push(`str="${clip(stringForm, 200)}"`);
+  }
+  const brief = briefParts.join(" ") || stringForm || name;
+  return {
+    name,
+    message,
+    ...status ? { status } : {},
+    ...code ? { code } : {},
+    ...causeName ? { causeName } : {},
+    ...stackHead ? { stackHead } : {},
+    stringForm,
+    brief
+  };
+}
+function safeString(value) {
+  try {
+    return String(value);
+  } catch {
+    return "<unstringifiable>";
+  }
 }
 
 // ../plugin/src/features/magic-context/storage-db.ts
@@ -1409,12 +2512,12 @@ import {
   chmodSync as chmodSync2,
   copyFileSync,
   cpSync,
-  existsSync as existsSync4,
+  existsSync as existsSync5,
   mkdirSync as mkdirSync3,
   readdirSync as readdirSync2,
   readFileSync as readFileSync3,
   statSync as statSync4,
-  unlinkSync as unlinkSync2
+  unlinkSync
 } from "node:fs";
 import { basename as basename2, dirname as dirname3, join as join4, resolve as resolve2 } from "node:path";
 
@@ -1429,349 +2532,8 @@ function scheduleAfterBootQuiet(task, additionalDelayMs = 0) {
   return timer;
 }
 
-// ../plugin/src/shared/error-message.ts
-function getErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-// ../plugin/src/shared/logger.ts
-import * as fs from "node:fs";
-import * as path2 from "node:path";
-
-// ../plugin/src/shared/redaction.ts
-import { homedir as homedir3, userInfo } from "node:os";
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-var SECRET_WORDS = [
-  "key",
-  "token",
-  "secret",
-  "password",
-  "auth",
-  "authorization",
-  "bearer",
-  "credential"
-];
-var SECRET_SEGMENT_PATTERN = new RegExp(`^(?:${SECRET_WORDS.map((w) => `${w}s?`).join("|")})$`, "i");
-var TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
-function redactionTypeForKey(key) {
-  const normalized = key.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
-  const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
-  return suffix || "secret";
-}
-function isNonSecretScalarValue(value) {
-  const v = value.trim();
-  if (v === "true" || v === "false" || v === "null" || v === "undefined")
-    return true;
-  return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
-}
-var SECRET_QUALIFIERS = new Set([
-  "api",
-  "access",
-  "private",
-  "client",
-  "auth",
-  "authorization",
-  "secret",
-  "bearer",
-  "session",
-  "refresh",
-  "service",
-  "x",
-  "openai",
-  "anthropic",
-  "google",
-  "github",
-  "huggingface",
-  "aws",
-  "azure"
-]);
-function isSecretKey(key) {
-  const segments = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[._-]+/).filter(Boolean);
-  if (segments.length === 0)
-    return false;
-  if (segments.length === 1) {
-    const first = segments[0];
-    return Boolean(first && SECRET_SEGMENT_PATTERN.test(first));
-  }
-  for (let i = 0;i < segments.length; i++) {
-    const seg = segments[i];
-    if (!seg || !SECRET_SEGMENT_PATTERN.test(seg))
-      continue;
-    let trailingOk = true;
-    for (let j = i + 1;j < segments.length; j++) {
-      const tail = segments[j];
-      if (!tail)
-        continue;
-      if (TRAILING_DESCRIPTORS.has(tail))
-        continue;
-      if (SECRET_SEGMENT_PATTERN.test(tail))
-        continue;
-      trailingOk = false;
-      break;
-    }
-    if (!trailingOk)
-      continue;
-    for (let k = i - 1;k >= 0; k--) {
-      const lead = segments[k];
-      if (lead && SECRET_QUALIFIERS.has(lead))
-        return true;
-    }
-  }
-  return false;
-}
-function sanitizePathString(value) {
-  const home = process.env.HOME || process.env.USERPROFILE || homedir3();
-  const username = userInfo().username;
-  let sanitized = value;
-  if (home) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
-  }
-  sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
-  sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
-  sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
-  if (username) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
-  }
-  return sanitized;
-}
-var SECRET_TEXT_PATTERNS = [
-  {
-    pattern: /\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}/g,
-    replacement: "<ANTHROPIC_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}/g,
-    replacement: "<OPENAI_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-    replacement: "<GITHUB_PAT_REDACTED>"
-  },
-  {
-    pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}/g,
-    replacement: "<GITHUB_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\bhf_[A-Za-z0-9]{30,}/g,
-    replacement: "<HUGGINGFACE_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-    replacement: "<AWS_ACCESS_KEY_ID_REDACTED>"
-  },
-  {
-    pattern: /\bxox[abprsuvc]-[A-Za-z0-9-]{10,}/g,
-    replacement: "<SLACK_TOKEN_REDACTED>"
-  },
-  {
-    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
-    replacement: "<GOOGLE_API_KEY_REDACTED>"
-  },
-  {
-    pattern: /\b(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
-    replacement: (_full, prefix) => `${prefix}<REDACTED:bearer>`
-  },
-  {
-    pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
-    replacement: "<JWT_REDACTED>"
-  },
-  {
-    pattern: /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
-    replacement: (full, quote, key, separator, valueQuote, value) => isNonSecretScalarValue(value) ? full : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`
-  },
-  {
-    pattern: /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
-    replacement: (full, key, value) => isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`
-  }
-];
-function redactSecretText(value) {
-  let redacted = value;
-  for (const { pattern, replacement } of SECRET_TEXT_PATTERNS) {
-    if (typeof replacement === "string") {
-      redacted = redacted.replace(pattern, replacement);
-    } else {
-      redacted = redacted.replace(pattern, replacement);
-    }
-  }
-  return redacted;
-}
-function sanitizeDiagnosticText(value) {
-  return redactSecretText(sanitizePathString(value));
-}
-function sanitizeConfigValue(value, keyPath = []) {
-  if (value === null || typeof value === "number" || typeof value === "boolean")
-    return value;
-  const key = keyPath.at(-1) ?? "";
-  if (key && isSecretKey(key)) {
-    return `<REDACTED:${redactionTypeForKey(key)}>`;
-  }
-  if (typeof value === "string")
-    return sanitizeDiagnosticText(value);
-  if (Array.isArray(value)) {
-    return value.map((entry, index) => sanitizeConfigValue(entry, [...keyPath, String(index)]));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([entryKey, entry]) => [
-      entryKey,
-      sanitizeConfigValue(entry, [...keyPath, entryKey])
-    ]));
-  }
-  return value;
-}
-
-// ../plugin/src/shared/logger.ts
-var isTestEnv = false;
-var buffer = [];
-var flushTimer = null;
-var FLUSH_INTERVAL_MS = 500;
-var BUFFER_SIZE_LIMIT = 50;
-var MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
-var SIZE_CHECK_INTERVAL_FLUSHES = 64;
-var activeLogFile = null;
-var activeLogSize = null;
-var flushesSinceSizeCheck = 0;
-var swallowedWriteCount = 0;
-var lastErrorMessage = null;
-var lastErrorTime = null;
-function recordSwallowedWrite(error) {
-  try {
-    swallowedWriteCount++;
-    lastErrorMessage = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
-    lastErrorTime = new Date().toISOString();
-  } catch {}
-}
-function ensureDir(filePath) {
-  fs.mkdirSync(path2.dirname(filePath), { recursive: true });
-}
-function isMissingFile(error) {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-function getCurrentLogSize(logFile) {
-  if (activeLogFile === logFile && activeLogSize !== null && flushesSinceSizeCheck < SIZE_CHECK_INTERVAL_FLUSHES) {
-    return activeLogSize;
-  }
-  try {
-    const stat = fs.statSync(logFile);
-    if (!stat.isFile()) {
-      throw new Error(`Magic Context log path is not a regular file: ${logFile}`);
-    }
-    fs.chmodSync(logFile, 384);
-    activeLogFile = logFile;
-    activeLogSize = stat.size;
-    flushesSinceSizeCheck = 0;
-    return stat.size;
-  } catch (error) {
-    if (!isMissingFile(error))
-      throw error;
-    activeLogFile = logFile;
-    activeLogSize = 0;
-    flushesSinceSizeCheck = 0;
-    return 0;
-  }
-}
-function capLogData(data) {
-  if (Buffer.byteLength(data) <= MAX_LOG_FILE_BYTES)
-    return data;
-  let bounded = Buffer.from(data).subarray(0, MAX_LOG_FILE_BYTES).toString("utf8");
-  while (Buffer.byteLength(bounded) > MAX_LOG_FILE_BYTES) {
-    bounded = bounded.slice(0, -1);
-  }
-  return bounded;
-}
-function writeBoundedPredecessor(logFile, predecessorPath, size) {
-  const predecessorFd = fs.openSync(predecessorPath, "w", 384);
-  try {
-    fs.fchmodSync(predecessorFd, 384);
-    const bytesToCopy = Math.min(size, MAX_LOG_FILE_BYTES);
-    const sourceFd = fs.openSync(logFile, "r");
-    try {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, bytesToCopy));
-      let remaining = bytesToCopy;
-      let position = Math.max(0, size - bytesToCopy);
-      while (remaining > 0) {
-        const bytesRead = fs.readSync(sourceFd, chunk, 0, Math.min(chunk.length, remaining), position);
-        if (bytesRead === 0)
-          break;
-        fs.writeSync(predecessorFd, chunk, 0, bytesRead);
-        remaining -= bytesRead;
-        position += bytesRead;
-      }
-    } finally {
-      fs.closeSync(sourceFd);
-    }
-  } finally {
-    fs.closeSync(predecessorFd);
-  }
-}
-function rotateLogFile(logFile, size) {
-  const predecessorPath = `${logFile}.1`;
-  writeBoundedPredecessor(logFile, predecessorPath, size);
-  fs.truncateSync(logFile, 0);
-  activeLogSize = 0;
-  flushesSinceSizeCheck = 0;
-}
-function flush() {
-  if (flushTimer) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
-  if (buffer.length === 0)
-    return;
-  const bufferedData = buffer.join("");
-  buffer = [];
-  try {
-    const data = capLogData(bufferedData);
-    const logFile = getMagicContextLogPath();
-    ensureDir(logFile);
-    let currentSize = getCurrentLogSize(logFile);
-    const dataSize = Buffer.byteLength(data);
-    if (currentSize > 0 && currentSize + dataSize > MAX_LOG_FILE_BYTES) {
-      rotateLogFile(logFile, currentSize);
-      currentSize = 0;
-    }
-    fs.appendFileSync(logFile, data, { encoding: "utf8", mode: 384 });
-    activeLogFile = logFile;
-    activeLogSize = currentSize + dataSize;
-    flushesSinceSizeCheck++;
-  } catch (error) {
-    activeLogFile = null;
-    activeLogSize = null;
-    flushesSinceSizeCheck = 0;
-    recordSwallowedWrite(error);
-  }
-}
-function scheduleFlush() {
-  if (flushTimer)
-    return;
-  flushTimer = setTimeout(() => {
-    flushTimer = null;
-    flush();
-  }, FLUSH_INTERVAL_MS);
-}
-function log(message, data) {
-  if (isTestEnv)
-    return;
-  try {
-    const timestamp = new Date().toISOString();
-    const serialized = data === undefined ? "" : data instanceof Error ? ` ${sanitizeDiagnosticText(`${data.message}${data.stack ? `
-${data.stack}` : ""}`)}` : ` ${JSON.stringify(sanitizeConfigValue(data))}`;
-    buffer.push(`[${timestamp}] ${sanitizeDiagnosticText(message)}${serialized}
-`);
-    if (buffer.length >= BUFFER_SIZE_LIMIT) {
-      flush();
-    } else {
-      scheduleFlush();
-    }
-  } catch {}
-}
-if (!isTestEnv) {
-  process.on("exit", flush);
-}
-
 // ../plugin/src/shared/rpc-utils.ts
-import { execFileSync } from "node:child_process";
+import { execFileSync as execFileSync2 } from "node:child_process";
 import { readFileSync as readFileSync2 } from "node:fs";
 
 // ../plugin/src/shared/pi-executable.ts
@@ -1812,9 +2574,9 @@ var PI_HARNESS_ARC_MARKERS = [
   "dist/bundle/cli"
 ];
 var rpcIdentityReadFileSync = readFileSync2;
-var rpcIdentityExecFileSync = execFileSync;
+var rpcIdentityExecFileSync = execFileSync2;
 var rpcIdentityProcessKill = process.kill;
-var rpcProcessListExecFileSync = execFileSync;
+var rpcProcessListExecFileSync = execFileSync2;
 var rpcIdentityPlatform = process.platform;
 var rpcIdentityNowMs = () => Date.now();
 function parseLinuxProcessStartTime(statContent, uptimeContent) {
@@ -2554,9 +3316,13 @@ function logSlowWriteTransaction(site, startedAt, thresholdMs = SLOW_WRITE_TRANS
 }
 
 // ../plugin/src/features/magic-context/context-authority.ts
-import { createHash, randomUUID } from "node:crypto";
+import { createHash as createHash2, randomUUID } from "node:crypto";
+var AUTHORITY_DOMAINS = ["memories", "notes"];
 var observedAuthorityRoutingByProject = new Map;
 var moduleNoteEvaluationBridges = new Map;
+function getModuleNoteEvaluationBridge(projectPath) {
+  return moduleNoteEvaluationBridges.get(projectPath);
+}
 function getContextStoreUuid(db) {
   const row = db.prepare("SELECT value FROM context_store_meta WHERE key = 'store_uuid'").get();
   return typeof row?.value === "string" && row.value.length > 0 ? row.value : null;
@@ -2573,10 +3339,814 @@ function ensureContextStoreUuid(db) {
   });
   return getContextStoreUuid(db) ?? minted;
 }
+function bumpDomainMutationEpoch(db, projectPath, domain) {
+  db.prepare(`INSERT INTO domain_mutation_epoch(project_path, domain, epoch) VALUES (?, ?, 1)
+         ON CONFLICT(project_path, domain) DO UPDATE SET epoch = epoch + 1`).run(projectPath, domain);
+}
 var MAX_AUTHORITY_SEED_FRAME_BYTES = 900 * 1024;
+function getMirrorCursor(db, domain) {
+  const row = db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = ?").get(domain);
+  return typeof row?.cursor === "number" ? row.cursor : 0;
+}
+function rowNumber(row, key, fallback = 0) {
+  const value = row[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function rowString(row, key, fallback = "") {
+  const value = row[key];
+  return typeof value === "string" ? value : fallback;
+}
+function rowNullableString(row, key) {
+  const value = row[key];
+  return typeof value === "string" ? value : null;
+}
+var MEMORY_SNAPSHOT_COLUMNS = [
+  "id",
+  "project_path",
+  "category",
+  "content",
+  "normalized_hash",
+  "importance",
+  "scope",
+  "shareable",
+  "source_session_id",
+  "source_type",
+  "seen_count",
+  "retrieval_count",
+  "first_seen_at",
+  "created_at",
+  "updated_at",
+  "last_seen_at",
+  "last_retrieved_at",
+  "status",
+  "expires_at",
+  "verification_status",
+  "verified_at",
+  "classified_at",
+  "superseded_by_memory_id",
+  "merged_from",
+  "metadata_json",
+  "context_store_uuid",
+  "context_row_id",
+  "mural_cue",
+  "mural_cue_hash",
+  "mural_cue_at",
+  "mural_cue_rejection_count"
+];
+var IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS = ["project_path", "first_seen_at", "created_at"];
+var CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+  "importance",
+  "scope",
+  "shareable",
+  "source_type",
+  "classified_at"
+];
+var VERIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+  "verification_status",
+  "verified_at",
+  "mapping",
+  "mapping_origin"
+];
+var MURAL_MEMORY_SNAPSHOT_COLUMNS = [
+  "mural_cue",
+  "mural_cue_hash",
+  "mural_cue_at",
+  "mural_cue_rejection_count"
+];
+var UPDATED_MEMORY_SNAPSHOT_COLUMNS = [
+  "category",
+  "content",
+  "normalized_hash",
+  "source_session_id",
+  "seen_count",
+  "retrieval_count",
+  "updated_at",
+  "last_seen_at",
+  "last_retrieved_at",
+  "status",
+  "expires_at",
+  "superseded_by_memory_id",
+  "merged_from",
+  "metadata_json"
+];
+function memorySnapshotTimestamp(row, key) {
+  const value = row[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function parsedMemorySnapshot(snapshotJson, fallback) {
+  try {
+    const parsed = JSON.parse(snapshotJson);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function guardMemorySnapshotByRecency(args) {
+  const effectiveRow = { ...args.row };
+  if (!args.existing) {
+    return { effectiveRow, hostUpdatedNewer: false, hostVerificationNewer: false };
+  }
+  const existing = args.existing;
+  const preserve = (columns) => {
+    for (const column of columns) {
+      if (Object.hasOwn(existing, column)) {
+        effectiveRow[column] = existing[column];
+      }
+    }
+  };
+  preserve(IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS);
+  const hostUpdatedNewer = memorySnapshotTimestamp(existing, "updated_at") > memorySnapshotTimestamp(args.snapshot, "updated_at");
+  const hostClassificationNewer = hostUpdatedNewer || memorySnapshotTimestamp(existing, "classified_at") > memorySnapshotTimestamp(args.snapshot, "classified_at");
+  const snapshotCarriesUpdatedAt = hasSnapshotField(args.snapshot, "updated_at");
+  const hostVerificationNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+  const hostMuralNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+  if (hostUpdatedNewer)
+    preserve(UPDATED_MEMORY_SNAPSHOT_COLUMNS);
+  if (hostClassificationNewer)
+    preserve(CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+  if (hostVerificationNewer)
+    preserve(VERIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+  if (hostMuralNewer)
+    preserve(MURAL_MEMORY_SNAPSHOT_COLUMNS);
+  return { effectiveRow, hostUpdatedNewer, hostVerificationNewer };
+}
+function hasSnapshotField(row, key) {
+  return Object.prototype.hasOwnProperty.call(row, key);
+}
+function isCompleteMemorySnapshot(row) {
+  return MEMORY_SNAPSHOT_COLUMNS.every((column) => hasSnapshotField(row, column));
+}
+function memoryResnapshotState(db) {
+  const row = db.prepare("SELECT status, generation, updated_at FROM mirror_resnapshot_state WHERE domain = 'memories'").get();
+  return row ?? null;
+}
+function casMemoryResnapshotState(db, observed, status, generation) {
+  const result = db.prepare(`UPDATE mirror_resnapshot_state
+                SET status = ?, generation = ?, updated_at = ?
+              WHERE domain = 'memories'
+                AND status = ?
+                AND generation IS ?`).run(status, generation, Date.now(), observed.status, observed.generation);
+  return result.changes === 1;
+}
+function upgradeMemoryMirrorNeedsResnapshot(db) {
+  const missingLive = db.prepare(`SELECT 1
+               FROM mirror_identity identity
+              WHERE identity.domain = 'memories'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM mirror_live_memory_rows live
+                     WHERE live.module_project = identity.module_project
+                       AND live.module_row_id = identity.module_row_id
+                )
+              LIMIT 1`).get();
+  if (missingLive)
+    return true;
+  const orphanedLive = db.prepare(`SELECT 1
+               FROM mirror_live_memory_rows live
+              WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM mirror_identity identity
+                     WHERE identity.domain = 'memories'
+                       AND identity.module_project = live.module_project
+                       AND identity.module_row_id = live.module_row_id
+              )
+              LIMIT 1`).get();
+  return Boolean(orphanedLive);
+}
+function stageLiveMemorySnapshotPage(db, generation, rows) {
+  const owned = db.prepare(`SELECT 1
+               FROM mirror_resnapshot_state
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`).get(generation);
+  if (!owned)
+    return false;
+  const insert = db.prepare(`INSERT OR IGNORE INTO mirror_live_staging(
+             generation, module_project, module_row_id, category, normalized_hash, full_row_snapshot
+          ) VALUES (?, ?, ?, ?, ?, ?)`);
+  for (const feed of rows) {
+    const row = feed.full_row_snapshot;
+    const moduleProject = rowString(row, "project_path");
+    const normalizedHash = rowString(row, "normalized_hash");
+    if (!moduleProject || !normalizedHash) {
+      throw new Error("live memory snapshot omitted project_path or normalized_hash");
+    }
+    insert.run(generation, moduleProject, feed.module_row_id, rowString(row, "category", "CONSTRAINTS"), normalizedHash, JSON.stringify(row));
+  }
+  return true;
+}
+function installStagedLiveMemorySnapshot(db, generation) {
+  const owned = db.prepare(`SELECT 1
+               FROM mirror_resnapshot_state
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`).get(generation);
+  if (!owned)
+    return false;
+  db.prepare("DELETE FROM mirror_live_memory_rows").run();
+  db.prepare(`INSERT INTO mirror_live_memory_rows(
+            module_project, module_row_id, category, normalized_hash, full_row_snapshot
+         )
+         SELECT module_project, module_row_id, category, normalized_hash, full_row_snapshot
+           FROM mirror_live_staging
+          WHERE generation = ?`).run(generation);
+  const completed = db.prepare(`UPDATE mirror_resnapshot_state
+                SET status = 'complete', updated_at = ?
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`).run(Date.now(), generation);
+  if (completed.changes !== 1) {
+    throw new Error("live memory resnapshot ownership changed inside its install transaction");
+  }
+  db.prepare("DELETE FROM mirror_live_staging WHERE generation = ?").run(generation);
+  return true;
+}
+function ensureMemoryRepairState(db) {
+  db.exec(`
+        CREATE TABLE IF NOT EXISTS mirror_memory_repair_state (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0, 1)),
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+    `);
+  db.prepare("INSERT OR IGNORE INTO mirror_memory_repair_state(id, dirty, updated_at) VALUES (1, 0, 0)").run();
+}
+function markMemoryRepairPending(db) {
+  ensureMemoryRepairState(db);
+  db.prepare("UPDATE mirror_memory_repair_state SET dirty = 1, updated_at = ? WHERE id = 1").run(Date.now());
+}
+function prepareMirrorPageStatements(db) {
+  return {
+    identityByModule: db.prepare("SELECT context_row_id FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?"),
+    insertIdentity: db.prepare("INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)"),
+    deleteIdentityByContext: db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?"),
+    deleteLiveMemory: db.prepare("DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?"),
+    deletePendingReferencesForMemory: db.prepare("DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)"),
+    deleteIdentity: db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?"),
+    sharedIdentity: db.prepare("SELECT 1 FROM mirror_identity WHERE domain = ? AND context_row_id = ? LIMIT 1"),
+    memoryById: db.prepare(`SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
+                    source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                    created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                     verification_status, verified_at, classified_at, superseded_by_memory_id,
+                     merged_from, metadata_json, mural_cue, mural_cue_hash, mural_cue_at,
+                     mural_cue_rejection_count
+                FROM memories WHERE id = ?`),
+    memoryIdByStoreId: db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?"),
+    memoryCandidates: db.prepare("SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id"),
+    insertMemory: db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, '', '', 0, 0, 0, 0)"),
+    liveMemoryMatches: db.prepare(`SELECT module_project, module_row_id FROM mirror_live_memory_rows
+              WHERE module_project = ? AND category = ? AND normalized_hash = ?
+              ORDER BY module_row_id LIMIT 2`),
+    deleteMemoryEmbeddings: db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?"),
+    deleteMemory: db.prepare("DELETE FROM memories WHERE id = ?"),
+    liveMemorySnapshot: db.prepare("SELECT full_row_snapshot FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?"),
+    upsertLiveMemory: db.prepare(`INSERT INTO mirror_live_memory_rows(
+                 module_project, module_row_id, category, normalized_hash, full_row_snapshot
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(module_project, module_row_id) DO UPDATE SET
+                 category = excluded.category,
+                 normalized_hash = excluded.normalized_hash,
+                 full_row_snapshot = excluded.full_row_snapshot`),
+    updateMemory: db.prepare(`UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
+             importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
+             seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
+             last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
+              verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
+              merged_from = ?, metadata_json = ?, mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?,
+              mural_cue_rejection_count = ? WHERE id = ?`),
+    updateSuperseded: db.prepare("UPDATE memories SET superseded_by_memory_id = ?, updated_at = ? WHERE id = ?"),
+    deletePendingReference: db.prepare("DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?"),
+    upsertPendingReference: db.prepare("INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET target_module_row_id = excluded.target_module_row_id"),
+    deleteMemoryVerifications: db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?"),
+    insertMemoryVerification: db.prepare("INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at, mapping_origin) VALUES (?, ?, ?, ?, ?)"),
+    noteById: db.prepare("SELECT * FROM notes WHERE id = ?"),
+    noteIdByStoreId: db.prepare("SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?"),
+    insertNote: db.prepare("INSERT INTO notes (type, status, content, project_path, session_id, created_at, updated_at) VALUES ('smart', 'active', '', ?, ?, 0, 0)"),
+    deleteNote: db.prepare("DELETE FROM notes WHERE id = ?"),
+    deleteNoteRevisions: db.prepare("DELETE FROM mirror_note_revisions WHERE module_project = ? AND module_row_id = ?"),
+    updateNote: db.prepare(`UPDATE notes SET type = ?, status = ?, project_path = ?, session_id = ?, content = ?,
+             surface_condition = ?, compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?,
+             ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
+             check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
+             check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
+             check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
+             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`),
+    upsertNoteRevision: db.prepare("INSERT OR REPLACE INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?)"),
+    translateMemoryReferences: db.prepare(`UPDATE memories
+                SET superseded_by_memory_id = (
+                    SELECT target.context_row_id
+                      FROM mirror_pending_references pending
+                      JOIN mirror_identity source
+                        ON source.domain = pending.domain
+                       AND source.module_project = pending.module_project
+                       AND source.module_row_id = pending.module_row_id
+                      JOIN mirror_identity target
+                        ON target.domain = pending.domain
+                       AND target.module_project = pending.module_project
+                       AND target.module_row_id = pending.target_module_row_id
+                     WHERE pending.domain = 'memories'
+                       AND source.context_row_id = memories.id
+                ),
+                    updated_at = ?
+              WHERE id IN (
+                    SELECT source.context_row_id
+                      FROM mirror_pending_references pending
+                      JOIN mirror_identity source
+                        ON source.domain = pending.domain
+                       AND source.module_project = pending.module_project
+                       AND source.module_row_id = pending.module_row_id
+                      JOIN mirror_identity target
+                        ON target.domain = pending.domain
+                       AND target.module_project = pending.module_project
+                       AND target.module_row_id = pending.target_module_row_id
+                     WHERE pending.domain = 'memories'
+              )`),
+    clearTranslatedReferences: db.prepare(`DELETE FROM mirror_pending_references
+              WHERE domain = 'memories'
+                AND EXISTS (
+                    SELECT 1
+                      FROM mirror_identity source
+                      JOIN mirror_identity target
+                        ON target.domain = source.domain
+                       AND target.module_project = source.module_project
+                       AND target.module_row_id = mirror_pending_references.target_module_row_id
+                     WHERE source.domain = mirror_pending_references.domain
+                       AND source.module_project = mirror_pending_references.module_project
+                       AND source.module_row_id = mirror_pending_references.module_row_id
+                )`),
+    repairPending: db.prepare("SELECT dirty FROM mirror_memory_repair_state WHERE id = 1"),
+    markRepairPending: db.prepare("UPDATE mirror_memory_repair_state SET dirty = 1, updated_at = ? WHERE id = 1"),
+    clearRepairPending: db.prepare("UPDATE mirror_memory_repair_state SET dirty = 0, updated_at = ? WHERE id = 1"),
+    repairCandidates: db.prepare(`SELECT memory.id, memory.updated_at, memory.classified_at, live.full_row_snapshot
+               FROM memories memory
+               JOIN mirror_identity identity
+                 ON identity.domain = 'memories'
+                AND identity.context_row_id = memory.id
+               JOIN mirror_live_memory_rows live
+                 ON live.module_project = identity.module_project
+                AND live.module_row_id = identity.module_row_id
+               JOIN authority_managed managed
+                 ON managed.project_path = memory.project_path
+                  OR managed.project_path = identity.module_project
+              WHERE (memory.source_type IS NULL OR memory.importance IS NULL)
+                AND live.full_row_snapshot IS NOT NULL`),
+    repairMemory: db.prepare(`UPDATE memories
+                SET source_type = COALESCE(source_type, ?),
+                    importance = COALESCE(importance, ?),
+                    updated_at = ?
+              WHERE id = ?
+                AND COALESCE(updated_at, 0) <= ?
+                AND COALESCE(classified_at, 0) <= ?
+                AND ((source_type IS NULL AND ? IS NOT NULL)
+                  OR (importance IS NULL AND ? IS NOT NULL))`),
+    updateCursor: db.prepare("INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at"),
+    contextStoreUuid: getContextStoreUuid(db)
+  };
+}
+function mirrorIdentity(db, domain, moduleProject, moduleRowId, statements) {
+  return (statements?.identityByModule ?? db.prepare("SELECT context_row_id FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?")).get(domain, moduleProject, moduleRowId) ?? null;
+}
+function rememberIdentity(db, domain, moduleProject, moduleRowId, contextRowId, statements, replaceContextIdentity = domain === "notes") {
+  const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
+  if (existing?.context_row_id === contextRowId)
+    return;
+  if (existing) {
+    if (!replaceContextIdentity)
+      return;
+    (statements?.deleteIdentity ?? db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?")).run(domain, moduleProject, moduleRowId);
+  }
+  if (replaceContextIdentity) {
+    (statements?.deleteIdentityByContext ?? db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?")).run(domain, contextRowId);
+  }
+  (statements?.insertIdentity ?? db.prepare("INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)")).run(domain, moduleProject, moduleRowId, contextRowId);
+}
+function contextMemoryId(db, domain, moduleProject, row, moduleRowId, statements) {
+  const mapped = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
+  if (mapped)
+    return { contextId: mapped.context_row_id, inserted: false };
+  const sourceUuid = rowNullableString(row, "context_store_uuid");
+  const sourceId = rowNumber(row, "context_row_id", -1);
+  const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
+  if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
+    const existing = (statements?.memoryIdByStoreId ?? db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")).get(sourceId, moduleProject);
+    if (existing?.id !== undefined) {
+      rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements, true);
+      return { contextId: existing.id, inserted: false };
+    }
+  }
+  const normalizedHash = rowString(row, "normalized_hash");
+  const category = rowString(row, "category", "CONSTRAINTS");
+  if (normalizedHash) {
+    const candidates = (statements?.memoryCandidates ?? db.prepare("SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id")).all(moduleProject, category, normalizedHash);
+    if (candidates.length === 1 && candidates[0]?.id !== undefined) {
+      rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id, statements);
+      return { contextId: candidates[0].id, inserted: false };
+    }
+  }
+  const result = (statements?.insertMemory ?? db.prepare("INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, '', '', 0, 0, 0, 0)")).run(moduleProject, rowString(row, "category", "CONSTRAINTS"));
+  const contextId = Number(result.lastInsertRowid);
+  rememberIdentity(db, domain, moduleProject, moduleRowId, contextId, statements);
+  return { contextId, inserted: true };
+}
+function applyMemoryRow(db, feed, statements) {
+  const row = feed.full_row_snapshot;
+  const moduleProject = rowString(row, "project_path");
+  if (!moduleProject)
+    throw new Error("memory feed snapshot has no project_path");
+  if (feed.op === "tombstone") {
+    statements.deleteLiveMemory.run(moduleProject, feed.module_row_id);
+    statements.deletePendingReferencesForMemory.run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
+    const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id, statements);
+    if (!mapped)
+      return;
+    statements.deleteIdentity.run(feed.domain, moduleProject, feed.module_row_id);
+    const shared = statements.sharedIdentity.get(feed.domain, mapped.context_row_id);
+    if (shared)
+      return;
+    const contextRow = statements.memoryById.get(mapped.context_row_id);
+    if (contextRow?.project_path && contextRow.category && contextRow.normalized_hash) {
+      const liveMatches = statements.liveMemoryMatches.all(contextRow.project_path, contextRow.category, contextRow.normalized_hash);
+      if (liveMatches.length === 1 && liveMatches[0]) {
+        rememberIdentity(db, feed.domain, liveMatches[0].module_project, liveMatches[0].module_row_id, mapped.context_row_id, statements);
+        return;
+      }
+    }
+    statements.deleteMemoryEmbeddings.run(mapped.context_row_id);
+    statements.deleteMemory.run(mapped.context_row_id);
+    return;
+  }
+  const storedLive = statements.liveMemorySnapshot.get(moduleProject, feed.module_row_id);
+  const snapshotJson = !isCompleteMemorySnapshot(row) && storedLive?.full_row_snapshot ? storedLive.full_row_snapshot : JSON.stringify(row);
+  statements.upsertLiveMemory.run(moduleProject, feed.module_row_id, rowString(row, "category", "CONSTRAINTS"), rowString(row, "normalized_hash"), snapshotJson);
+  const metadataClobberRisk = hasSnapshotField(row, "source_type") && rowNullableString(row, "source_type") === null || hasSnapshotField(row, "importance") && !(typeof row.importance === "number" && Number.isFinite(row.importance));
+  if (metadataClobberRisk)
+    statements.markRepairPending.run(Date.now());
+  const { contextId, inserted } = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id, statements);
+  const existing = statements.memoryById.get(contextId);
+  if (existing && existing.project_path !== moduleProject) {
+    log(`[magic-context] skipping memory mirror update for module ${moduleProject}/${feed.module_row_id}: context row ${contextId} belongs to ${existing.project_path}`);
+    return;
+  }
+  const retainedRecencySnapshot = parsedMemorySnapshot(snapshotJson, row);
+  const recencySnapshot = hasSnapshotField(row, "updated_at") ? row : hasSnapshotField(row, "classified_at") ? { ...retainedRecencySnapshot, classified_at: row.classified_at } : retainedRecencySnapshot;
+  const recencyGuard = guardMemorySnapshotByRecency({
+    row,
+    snapshot: recencySnapshot,
+    existing: inserted ? undefined : existing
+  });
+  const projectedRow = recencyGuard.effectiveRow;
+  const has = (key) => hasSnapshotField(row, key);
+  const nullableNumber = (key, previous) => has(key) ? typeof projectedRow[key] === "number" && Number.isFinite(projectedRow[key]) ? projectedRow[key] : null : previous ?? null;
+  const nullableString = (key, previous) => has(key) ? rowNullableString(projectedRow, key) : previous ?? null;
+  const hasSuperseded = has("superseded_by_memory_id") && !recencyGuard.hostUpdatedNewer;
+  const previousHash = existing?.normalized_hash;
+  statements.updateMemory.run(has("project_path") ? rowString(projectedRow, "project_path") : existing?.project_path ?? moduleProject, has("category") ? rowString(projectedRow, "category", "CONSTRAINTS") : existing?.category ?? "CONSTRAINTS", has("content") ? rowString(projectedRow, "content") : existing?.content ?? "", has("normalized_hash") ? rowString(projectedRow, "normalized_hash") : existing?.normalized_hash ?? "", has("importance") ? typeof projectedRow.importance === "number" && Number.isFinite(projectedRow.importance) ? projectedRow.importance : null : existing?.importance ?? null, has("scope") ? rowString(projectedRow, "scope", "project") : existing?.scope ?? "project", has("shareable") ? rowNumber(projectedRow, "shareable") : existing?.shareable ?? 0, nullableString("source_session_id", existing?.source_session_id), nullableString("source_type", existing?.source_type), has("seen_count") ? rowNumber(projectedRow, "seen_count", 1) : existing?.seen_count ?? 1, has("retrieval_count") ? rowNumber(projectedRow, "retrieval_count") : existing?.retrieval_count ?? 0, has("first_seen_at") ? rowNumber(projectedRow, "first_seen_at") : existing?.first_seen_at ?? 0, has("created_at") ? rowNumber(projectedRow, "created_at") : existing?.created_at ?? 0, has("updated_at") ? rowNumber(projectedRow, "updated_at") : existing?.updated_at ?? 0, has("last_seen_at") ? rowNumber(projectedRow, "last_seen_at") : existing?.last_seen_at ?? 0, nullableNumber("last_retrieved_at", existing?.last_retrieved_at), has("status") ? rowString(projectedRow, "status", "active") : existing?.status ?? "active", nullableNumber("expires_at", existing?.expires_at), has("verification_status") ? rowString(projectedRow, "verification_status", "unverified") : existing?.verification_status ?? "unverified", nullableNumber("verified_at", existing?.verified_at), nullableNumber("classified_at", existing?.classified_at), hasSuperseded ? null : existing?.superseded_by_memory_id ?? null, nullableString("merged_from", existing?.merged_from), nullableString("metadata_json", existing?.metadata_json), nullableString("mural_cue", existing?.mural_cue), nullableString("mural_cue_hash", existing?.mural_cue_hash), nullableNumber("mural_cue_at", existing?.mural_cue_at), has("mural_cue_rejection_count") ? rowNumber(projectedRow, "mural_cue_rejection_count") : existing?.mural_cue_rejection_count ?? 0, contextId);
+  if (hasSuperseded && typeof projectedRow.superseded_by_memory_id === "number") {
+    const translated = mirrorIdentity(db, "memories", moduleProject, projectedRow.superseded_by_memory_id, statements);
+    if (translated) {
+      statements.updateSuperseded.run(translated.context_row_id, Date.now(), contextId);
+      statements.deletePendingReference.run(moduleProject, feed.module_row_id);
+    } else {
+      statements.upsertPendingReference.run(moduleProject, feed.module_row_id, projectedRow.superseded_by_memory_id);
+    }
+  } else if (hasSuperseded) {
+    statements.deletePendingReference.run(moduleProject, feed.module_row_id);
+  }
+  const appliedHash = has("normalized_hash") ? rowString(projectedRow, "normalized_hash") : previousHash;
+  if (previousHash !== appliedHash && appliedHash !== undefined) {
+    statements.deleteMemoryEmbeddings.run(contextId);
+  }
+  if (has("mapping") && !recencyGuard.hostVerificationNewer) {
+    statements.deleteMemoryVerifications.run(contextId);
+    if (Array.isArray(projectedRow.mapping)) {
+      const files = [
+        ...new Set(projectedRow.mapping.filter((file) => typeof file === "string").sort())
+      ];
+      const verifiedAt = rowNumber(projectedRow, "verified_at");
+      const mappedAt = rowNumber(projectedRow, "updated_at", Date.now());
+      const mappingOrigin = projectedRow.mapping_origin === "host_rejected_fallback" ? "host_rejected_fallback" : "mapper";
+      for (const file of files.length > 0 ? files : [""]) {
+        statements.insertMemoryVerification.run(contextId, file, verifiedAt, mappedAt, mappingOrigin);
+      }
+    }
+  }
+}
+function repairNullClobberedMemoryRows(statements) {
+  const pending = statements.repairPending.get();
+  if (pending?.dirty !== 1)
+    return;
+  const candidates = statements.repairCandidates.all();
+  for (const candidate of candidates) {
+    if (!candidate.full_row_snapshot)
+      continue;
+    let snapshot;
+    try {
+      const parsed = JSON.parse(candidate.full_row_snapshot);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        continue;
+      snapshot = parsed;
+    } catch {
+      continue;
+    }
+    const sourceType = hasSnapshotField(snapshot, "source_type") && typeof snapshot.source_type === "string" ? snapshot.source_type : null;
+    const importance = hasSnapshotField(snapshot, "importance") && typeof snapshot.importance === "number" && Number.isFinite(snapshot.importance) ? snapshot.importance : null;
+    if (sourceType === null && importance === null)
+      continue;
+    const snapshotVintage = Math.max(memorySnapshotTimestamp(snapshot, "updated_at"), memorySnapshotTimestamp(snapshot, "classified_at"));
+    const hostVintage = Math.max(candidate.updated_at ?? 0, candidate.classified_at ?? 0);
+    if (hostVintage > snapshotVintage)
+      continue;
+    statements.repairMemory.run(sourceType, importance, Date.now(), candidate.id, snapshotVintage, snapshotVintage, sourceType, importance);
+  }
+  statements.clearRepairPending.run(Date.now());
+}
+function contextNoteId(db, feed, moduleProject, statements) {
+  const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id, statements);
+  if (mapped)
+    return mapped.context_row_id;
+  const row = feed.full_row_snapshot;
+  const sourceId = rowNumber(row, "context_row_id", -1);
+  const sourceUuid = rowNullableString(row, "context_store_uuid");
+  const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
+  if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
+    const existing = (statements?.noteIdByStoreId ?? db.prepare("SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?")).get(sourceId, moduleProject);
+    if (existing?.id !== undefined) {
+      rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, existing.id, statements);
+      return existing.id;
+    }
+  }
+  const result = (statements?.insertNote ?? db.prepare("INSERT INTO notes (type, status, content, project_path, session_id, created_at, updated_at) VALUES ('smart', 'active', '', ?, ?, 0, 0)")).run(moduleProject, rowNullableString(row, "session_id"));
+  const contextId = Number(result.lastInsertRowid);
+  rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, contextId, statements);
+  return contextId;
+}
+function translateMemoryReferences(statements) {
+  statements.translateMemoryReferences.run(Date.now());
+  statements.clearTranslatedReferences.run();
+}
+function applyNoteRow(db, feed, statements) {
+  const row = feed.full_row_snapshot;
+  const moduleProject = rowString(row, "project_path");
+  if (!moduleProject)
+    throw new Error("note feed snapshot has no project_path");
+  if (feed.op === "tombstone") {
+    const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id, statements);
+    if (!mapped)
+      return;
+    statements.deleteNote.run(mapped.context_row_id);
+    statements.deleteIdentity.run(feed.domain, moduleProject, feed.module_row_id);
+    statements.deleteNoteRevisions.run(moduleProject, feed.module_row_id);
+    return;
+  }
+  const contextId = contextNoteId(db, feed, moduleProject, statements);
+  const existing = statements.noteById.get(contextId);
+  const effectiveRow = { ...existing ?? {}, ...row };
+  if (!hasSnapshotField(row, "created_at_ms") && existing?.created_at !== undefined) {
+    effectiveRow.created_at_ms = existing.created_at;
+  }
+  if (!hasSnapshotField(row, "updated_at_ms") && existing?.updated_at !== undefined) {
+    effectiveRow.updated_at_ms = existing.updated_at;
+  }
+  const moduleStatus = rowString(effectiveRow, "status", "active");
+  const contextStatus = moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
+  statements.updateNote.run(rowString(effectiveRow, "type", "smart"), contextStatus, moduleProject, rowNullableString(effectiveRow, "session_id"), rowString(effectiveRow, "content"), rowNullableString(effectiveRow, "surface_condition"), rowNullableString(effectiveRow, "compiled_provider"), rowNullableString(effectiveRow, "compiled_config"), typeof effectiveRow.compiled_at === "number" ? effectiveRow.compiled_at : null, rowNullableString(effectiveRow, "compile_status"), typeof effectiveRow.ready_at === "number" ? effectiveRow.ready_at : null, rowNullableString(effectiveRow, "ready_reason"), rowNullableString(effectiveRow, "manifest_json"), rowNullableString(effectiveRow, "compiled_check"), rowNullableString(effectiveRow, "check_hash"), rowNullableString(effectiveRow, "check_cron"), rowNumber(effectiveRow, "check_failure_count"), rowNumber(effectiveRow, "check_network_failure_count"), typeof effectiveRow.check_quarantined_until === "number" ? effectiveRow.check_quarantined_until : null, typeof effectiveRow.check_next_due_at === "number" ? effectiveRow.check_next_due_at : null, typeof effectiveRow.check_compiled_at === "number" ? effectiveRow.check_compiled_at : null, typeof effectiveRow.check_false_since_at === "number" ? effectiveRow.check_false_since_at : null, typeof effectiveRow.check_last_liveness_at === "number" ? effectiveRow.check_last_liveness_at : null, typeof effectiveRow.last_checked_at === "number" ? effectiveRow.last_checked_at : null, rowString(effectiveRow, "check_status", "uncompiled"), rowNumber(effectiveRow, "check_version"), rowNumber(effectiveRow, "policy_version", 1), rowNullableString(effectiveRow, "anchor_block_id"), typeof effectiveRow.anchor_ordinal === "number" ? effectiveRow.anchor_ordinal : null, rowNumber(effectiveRow, "created_at_ms"), rowNumber(effectiveRow, "updated_at_ms"), contextId);
+  statements.upsertNoteRevision.run(moduleProject, feed.module_row_id, contextId, rowNumber(effectiveRow, "status_version"));
+}
+function applyMirrorPage(args) {
+  const { db, page } = args;
+  if (!AUTHORITY_DOMAINS.includes(page.domain))
+    throw new Error("unknown mirror domain");
+  const durableCursor = getMirrorCursor(db, page.domain);
+  if (page.cursor !== durableCursor) {
+    throw new Error(`mirror cursor mismatch for ${page.domain}: expected ${durableCursor}, got ${page.cursor}`);
+  }
+  if (page.next_cursor < durableCursor) {
+    throw new Error("mirror page moved its cursor backwards");
+  }
+  const resnapshotState = page.domain === "memories" ? memoryResnapshotState(db) : null;
+  const hasNewRows = page.rows.some((feed) => feed.domain === page.domain && feed.feed_seq > durableCursor);
+  const replayMustRun = page.domain === "memories" && resnapshotState !== null && resnapshotState.status !== "complete" && (durableCursor === 0 || page.rows.some((feed) => feed.op === "tombstone"));
+  if (!hasNewRows && !replayMustRun) {
+    if (page.next_cursor <= durableCursor)
+      return durableCursor;
+    withPrivilegedWriter(db, () => {
+      db.prepare("INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at").run(page.domain, page.next_cursor, Date.now());
+    });
+    return page.next_cursor;
+  }
+  let nextCursor = durableCursor;
+  withPrivilegedWriter(db, () => {
+    db.transaction(() => {
+      ensureMemoryRepairState(db);
+      const statements = prepareMirrorPageStatements(db);
+      const currentResnapshotState = page.domain === "memories" ? memoryResnapshotState(db) : null;
+      let resnapshotStatus = page.domain === "memories" ? currentResnapshotState?.status ?? null : "complete";
+      if (page.domain === "memories" && durableCursor === 0 && currentResnapshotState && resnapshotStatus !== "complete") {
+        statements.markRepairPending.run(Date.now());
+        if (!casMemoryResnapshotState(db, currentResnapshotState, "complete", currentResnapshotState.generation)) {
+          throw new Error("memory mirror resnapshot ownership changed during replay");
+        }
+        resnapshotStatus = "complete";
+      }
+      if (page.domain === "memories" && resnapshotStatus !== "complete" && page.rows.some((feed) => feed.op === "tombstone")) {
+        throw new Error("memory mirror resnapshot must complete before tombstones");
+      }
+      if (page.domain === "memories") {
+        for (const feed of page.rows) {
+          if (feed.domain !== "memories" || feed.op === "tombstone" || feed.feed_seq <= durableCursor) {
+            continue;
+          }
+          const row = feed.full_row_snapshot;
+          const moduleProject = rowString(row, "project_path");
+          const sourceUuid = rowNullableString(row, "context_store_uuid");
+          const sourceId = rowNumber(row, "context_row_id", -1);
+          if (!moduleProject || !sourceUuid || sourceUuid !== statements.contextStoreUuid || sourceId < 0) {
+            continue;
+          }
+          const existing = statements.memoryIdByStoreId.get(sourceId, moduleProject);
+          if (existing?.id === undefined)
+            continue;
+          rememberIdentity(db, "memories", moduleProject, feed.module_row_id, existing.id, statements, true);
+        }
+      }
+      const touchedProjects = new Set;
+      for (const feed of page.rows) {
+        if (feed.domain !== page.domain || feed.feed_seq <= nextCursor)
+          continue;
+        const projectPath = rowString(feed.full_row_snapshot, "project_path");
+        if (projectPath)
+          touchedProjects.add(projectPath);
+        if (feed.domain === "memories")
+          applyMemoryRow(db, feed, statements);
+        else
+          applyNoteRow(db, feed, statements);
+        nextCursor = feed.feed_seq;
+      }
+      if (page.domain === "memories") {
+        translateMemoryReferences(statements);
+        repairNullClobberedMemoryRows(statements);
+      }
+      for (const projectPath of touchedProjects) {
+        bumpDomainMutationEpoch(db, projectPath, page.domain);
+      }
+      if (page.next_cursor < nextCursor) {
+        throw new Error("mirror page moved its cursor backwards");
+      }
+      nextCursor = Math.max(nextCursor, page.next_cursor);
+      statements.updateCursor.run(page.domain, nextCursor, Date.now());
+    }).immediate();
+  });
+  return nextCursor;
+}
+async function ensureLiveMemoryResnapshot(args) {
+  let adoptedWinner = false;
+  let generation;
+  while (true) {
+    const observed = memoryResnapshotState(args.db);
+    if (!observed || observed.status === "complete")
+      return;
+    if (observed.status === "resnapshotting") {
+      withPrivilegedWriter(args.db, () => markMemoryRepairPending(args.db));
+    }
+    if (observed.status === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
+      let completed = false;
+      withPrivilegedWriter(args.db, () => {
+        args.db.transaction(() => {
+          markMemoryRepairPending(args.db);
+          completed = casMemoryResnapshotState(args.db, observed, "complete", observed.generation);
+          if (completed) {
+            args.db.prepare("DELETE FROM mirror_live_staging WHERE generation IS NOT ?").run(observed.generation);
+          }
+        }).immediate();
+      });
+      if (completed)
+        return;
+      continue;
+    }
+    if (!args.module.mirrorPull) {
+      throw new Error("memory mirror resnapshot requires the mirror.pull module route");
+    }
+    const now = Date.now();
+    generation = `${now.toString(36)}:${crypto.randomUUID()}`;
+    let claimed = false;
+    withPrivilegedWriter(args.db, () => {
+      args.db.transaction(() => {
+        claimed = casMemoryResnapshotState(args.db, observed, "resnapshotting", generation);
+        if (claimed) {
+          markMemoryRepairPending(args.db);
+          args.db.prepare("DELETE FROM mirror_live_staging WHERE generation != ?").run(generation);
+        }
+      }).immediate();
+    });
+    if (claimed)
+      break;
+    const winner = memoryResnapshotState(args.db);
+    if (!adoptedWinner && winner?.status === "resnapshotting" && typeof winner.generation === "string" && winner.generation.length > 0) {
+      generation = winner.generation;
+      adoptedWinner = true;
+      break;
+    }
+  }
+  let cursor = 0;
+  while (true) {
+    const response = await args.module.mirrorPull({
+      domain: "memories",
+      cursor,
+      limit: args.limit,
+      live_only: true
+    });
+    const page = response.page;
+    if (page.domain !== "memories" || page.cursor !== cursor) {
+      throw new Error("live memory resnapshot returned a mismatched page");
+    }
+    let staged = false;
+    withPrivilegedWriter(args.db, () => {
+      args.db.transaction(() => {
+        staged = stageLiveMemorySnapshotPage(args.db, generation, page.rows);
+      }).immediate();
+    });
+    if (!staged)
+      return;
+    if (!page.has_more)
+      break;
+    if (page.next_cursor <= cursor) {
+      throw new Error("live memory resnapshot did not advance its cursor");
+    }
+    cursor = page.next_cursor;
+  }
+  withPrivilegedWriter(args.db, () => {
+    args.db.transaction(() => {
+      installStagedLiveMemorySnapshot(args.db, generation);
+    }).immediate();
+  });
+}
+async function pullAndApplyMirrorPageWithStatus(args) {
+  if (!args.module.mirrorPull) {
+    throw new Error("memory mirror consumer requires the mirror.pull module route");
+  }
+  const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
+  if (args.domain === "memories") {
+    await ensureLiveMemoryResnapshot({ db: args.db, module: args.module, limit });
+  }
+  const cursor = getMirrorCursor(args.db, args.domain);
+  const response = await args.module.mirrorPull({
+    domain: args.domain,
+    cursor,
+    limit
+  });
+  const nextCursor = applyMirrorPage({ db: args.db, page: response.page });
+  if (args.domain === "memories" && args.module.memoryIdentityAck) {
+    const rowsByProject = new Map;
+    for (const feed of response.page.rows) {
+      if (feed.domain !== "memories" || feed.op === "tombstone")
+        continue;
+      const project = rowString(feed.full_row_snapshot, "project_path");
+      if (!project)
+        continue;
+      const identity = mirrorIdentity(args.db, "memories", project, feed.module_row_id);
+      if (!identity)
+        continue;
+      const rows = rowsByProject.get(project) ?? [];
+      rows.push({
+        module_row_id: feed.module_row_id,
+        context_row_id: identity.context_row_id
+      });
+      rowsByProject.set(project, rows);
+    }
+    for (const [project, rows] of rowsByProject) {
+      await args.module.memoryIdentityAck({ project, rows });
+    }
+  }
+  return {
+    cursor: nextCursor,
+    hasMore: response.page.has_more,
+    rowsApplied: response.page.rows.filter((row) => row.domain === args.domain && row.feed_seq > cursor).length
+  };
+}
+async function drainMirrorPages(args) {
+  const pageBudget = args.pageBudget === undefined ? Number.MAX_SAFE_INTEGER : Math.max(1, Math.floor(args.pageBudget));
+  let pagesPulled = 0;
+  let rowsApplied = 0;
+  let cursor = getMirrorCursor(args.db, args.domain);
+  while (pagesPulled < pageBudget) {
+    const priorCursor = cursor;
+    const page = await pullAndApplyMirrorPageWithStatus(args);
+    pagesPulled += 1;
+    rowsApplied += page.rowsApplied;
+    cursor = page.cursor;
+    if (!page.hasMore) {
+      return { cursor, pagesPulled, rowsApplied, complete: true, budgetExhausted: false };
+    }
+    if (cursor === priorCursor) {
+      return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: false };
+    }
+  }
+  return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: true };
+}
 var mirrorFlights = new WeakMap;
 
 // ../plugin/src/features/magic-context/fail-closed-block.ts
+var FAIL_CLOSED_DOCTOR_COMMAND = "npx @cortexkit/magic-context@latest doctor";
 function attachFailClosedBlockingProcessEvidence(process2, evidence) {
   Object.defineProperties(process2, {
     startTime: { configurable: true, value: evidence.startTime },
@@ -2587,10 +4157,10 @@ function attachFailClosedBlockingProcessEvidence(process2, evidence) {
 var OPENCODE_INTERNAL_AGENT_NAMES = new Set(["title", "summary", "compaction"]);
 
 // ../plugin/src/features/magic-context/message-fts-rowid-map.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 var MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE = 500;
 var BACKFILL_STATE_ID = 1;
-var EMPTY_INDEX_CONTENT_HASH = createHash2("sha256").update("").digest("hex");
+var EMPTY_INDEX_CONTENT_HASH = createHash3("sha256").update("").digest("hex");
 var upsertMapStatements = new WeakMap;
 var rangeReadyStatements = new WeakMap;
 var activeBackfills = new WeakMap;
@@ -2685,8 +4255,45 @@ function startMessageFtsRowidMapBackfill(db) {
   activeBackfills.set(db, run);
   return run;
 }
+function messageFtsOrdinalRangeIsMapped(db, sessionId, startOrdinal, endOrdinal) {
+  if (endOrdinal < startOrdinal)
+    return true;
+  if (getBackfillState(db).completed)
+    return true;
+  let statement = rangeReadyStatements.get(db);
+  if (!statement) {
+    statement = db.prepare(`SELECT COUNT(DISTINCT source.message_ordinal) AS sourceOrdinalCount,
+                    COUNT(DISTINCT CASE
+                        WHEN source.role IN ('user', 'assistant')
+                         AND source.normalized_content_hash != ?
+                        THEN source.message_ordinal
+                    END) AS expectedMapCount,
+                    COUNT(DISTINCT CASE
+                        WHEN source.role IN ('user', 'assistant')
+                         AND source.normalized_content_hash != ?
+                         AND map.fts_rowid IS NOT NULL
+                        THEN source.message_ordinal
+                    END) AS mappedCount
+             FROM message_history_source AS source
+             LEFT JOIN message_fts_rowid_map AS map
+               ON map.session_id = source.session_id
+              AND map.message_ordinal = source.message_ordinal
+             WHERE source.session_id = ?
+               AND source.message_ordinal BETWEEN ? AND ?`);
+    rangeReadyStatements.set(db, statement);
+  }
+  const row = statement.get(EMPTY_INDEX_CONTENT_HASH, EMPTY_INDEX_CONTENT_HASH, sessionId, startOrdinal, endOrdinal);
+  const ordinalCount = endOrdinal - startOrdinal + 1;
+  return row?.sourceOrdinalCount === ordinalCount && row.expectedMapCount === row.mappedCount;
+}
 
 // ../plugin/src/hooks/magic-context/compartment-parser.ts
+var COMPARTMENT_REGEX = /<compartment\s+([^>]*?)\s*>(.*?)<\/compartment>/gs;
+var ATTR_START_REGEX = /\bstart="(\d+)"/;
+var ATTR_END_REGEX = /\bend="(\d+)"/;
+var ATTR_TITLE_REGEX = /\btitle="([^"]*)"/;
+var ATTR_EPISODE_REGEX = /\bepisode_type="([^"]*)"/;
+var ATTR_IMPORTANCE_REGEX = /\bimportance="(\d+)"/;
 function makeTierOpenRegex(n) {
   return new RegExp(`<p${n}\\s*(/?)>`);
 }
@@ -2698,6 +4305,18 @@ var TIER_OPEN_REGEXES = [
 ];
 var TIER_CLOSE_ANY_REGEX = /<\/p\d/;
 var TIER_OPEN_ANY_REGEX = /<p\d/;
+var CATEGORY_BLOCK_REGEX = /<(PROJECT_RULES|ARCHITECTURE|CONSTRAINTS|CONFIG_VALUES|NAMING)>(.*?)<\/\1>/gs;
+var FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
+var UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
+var USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
+var USER_OBS_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
+var PRIMER_CANDIDATES_REGEX = /<primer_candidates>(.*?)<\/primer_candidates>/s;
+var PRIMER_ELEMENT_REGEX = /<primer\s+at_compartment="(\d+)"\s*>(.*?)<\/primer>/gs;
+var PRIMER_ITEM_REGEX = /^\s*(?:\*|-|\d+\.)\s*(.+)$/gm;
+var FACTS_BLOCK_REGEX = /<facts>(.*?)<\/facts>/s;
+var EVENTS_BLOCK_REGEX = /<events>(.*?)<\/events>/s;
+var EVENT_ELEMENT_REGEX = /<([a-z_]+)\s+at_compartment="(\d+)"\s*>(.*?)<\/\1>/gs;
+var EVENT_FIELD_REGEX = /<([a-z_]+)\s*>(.*?)<\/\1>/gs;
 function extractTier(inner, index) {
   const openMatch = TIER_OPEN_REGEXES[index].exec(inner);
   if (!openMatch)
@@ -2719,6 +4338,128 @@ function extractTiersFromInner(inner) {
     p3: extractTier(inner, 2),
     p4: extractTier(inner, 3)
   };
+}
+function parseCompartmentOutput(text) {
+  const compartments = [];
+  const facts = [];
+  for (const match of text.matchAll(COMPARTMENT_REGEX)) {
+    const attrs = match[1];
+    const inner = match[2];
+    const startMatch = attrs.match(ATTR_START_REGEX);
+    const endMatch = attrs.match(ATTR_END_REGEX);
+    const titleMatch = attrs.match(ATTR_TITLE_REGEX);
+    if (!startMatch || !endMatch || !titleMatch)
+      continue;
+    const startMessage = parseInt(startMatch[1], 10);
+    const endMessage = parseInt(endMatch[1], 10);
+    const title = unescapeXml(titleMatch[1]);
+    if (Number.isNaN(startMessage) || Number.isNaN(endMessage) || !title)
+      continue;
+    const episodeMatch = attrs.match(ATTR_EPISODE_REGEX);
+    const importanceMatch = attrs.match(ATTR_IMPORTANCE_REGEX);
+    const episodeType = episodeMatch ? unescapeXml(episodeMatch[1]) : undefined;
+    const importance = importanceMatch ? parseInt(importanceMatch[1], 10) : undefined;
+    const p1 = extractTier(inner, 0);
+    if (typeof p1 === "string" && p1.length > 0) {
+      const p2 = extractTier(inner, 1);
+      const p3 = extractTier(inner, 2);
+      const p4 = extractTier(inner, 3);
+      compartments.push({
+        startMessage,
+        endMessage,
+        title,
+        content: p1,
+        p1,
+        p2: typeof p2 === "string" ? p2 : p1,
+        p3: typeof p3 === "string" ? p3 : typeof p2 === "string" ? p2 : p1,
+        p4: typeof p4 === "string" ? p4 : "",
+        importance,
+        episodeType
+      });
+      continue;
+    }
+    const content = unescapeXml(inner.trim());
+    if (content) {
+      compartments.push({
+        startMessage,
+        endMessage,
+        title,
+        content,
+        importance,
+        episodeType
+      });
+    }
+  }
+  const factsBlockMatch = text.match(FACTS_BLOCK_REGEX);
+  const factsScope = factsBlockMatch ? factsBlockMatch[1] : text.replace(EVENTS_BLOCK_REGEX, "").replace(/<compartment\s+[^>]*?\s*>.*?<\/compartment>/gs, "");
+  for (const categoryMatch of factsScope.matchAll(CATEGORY_BLOCK_REGEX)) {
+    const category = categoryMatch[1];
+    const blockContent = categoryMatch[2];
+    for (const itemMatch of blockContent.matchAll(FACT_ITEM_REGEX)) {
+      const content = unescapeXml(itemMatch[1].trim());
+      if (content) {
+        facts.push({ category, content });
+      }
+    }
+  }
+  const unprocessedMatch = text.match(UNPROCESSED_REGEX);
+  const unprocessedFrom = unprocessedMatch ? parseInt(unprocessedMatch[1], 10) : null;
+  const userObservations = [];
+  const userObsMatch = text.match(USER_OBSERVATIONS_REGEX);
+  if (userObsMatch) {
+    for (const itemMatch of userObsMatch[1].matchAll(USER_OBS_ITEM_REGEX)) {
+      const obs = unescapeXml(itemMatch[1].trim());
+      if (obs)
+        userObservations.push(obs);
+    }
+  }
+  const primerCandidates = [];
+  const primerMatch = text.match(PRIMER_CANDIDATES_REGEX);
+  if (primerMatch) {
+    const block = primerMatch[1];
+    let sawElement = false;
+    for (const el of block.matchAll(PRIMER_ELEMENT_REGEX)) {
+      sawElement = true;
+      const question = unescapeXml(el[2].trim());
+      if (question) {
+        primerCandidates.push({
+          question,
+          originCompartmentIndex: Number.parseInt(el[1], 10)
+        });
+      }
+    }
+    if (!sawElement) {
+      for (const itemMatch of block.matchAll(PRIMER_ITEM_REGEX)) {
+        const question = unescapeXml(itemMatch[1].trim());
+        if (question)
+          primerCandidates.push({ question });
+      }
+    }
+  }
+  const events = parseEvents(text);
+  compartments.sort((a, b) => a.startMessage - b.startMessage);
+  return { compartments, facts, events, unprocessedFrom, userObservations, primerCandidates };
+}
+function parseEvents(text) {
+  const blockMatch = text.match(EVENTS_BLOCK_REGEX);
+  if (!blockMatch)
+    return [];
+  const block = blockMatch[1];
+  const events = [];
+  for (const elMatch of block.matchAll(EVENT_ELEMENT_REGEX)) {
+    const kind = elMatch[1];
+    const atRaw = parseInt(elMatch[2], 10);
+    const atCompartment = Number.isNaN(atRaw) ? null : atRaw;
+    const fields = {};
+    for (const fieldMatch of elMatch[3].matchAll(EVENT_FIELD_REGEX)) {
+      const name = fieldMatch[1];
+      const value = unescapeXml(fieldMatch[2].trim());
+      if (value)
+        fields[name] = value;
+    }
+    events.push({ kind, atCompartment, fields });
+  }
+  return events;
 }
 function unescapeXml(s) {
   return s.replace(/&amp;/g, "&").replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">");
@@ -2818,59 +4559,217 @@ function healMissingMemoryBlockIds(db, columns) {
   db.prepare("UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0").run();
 }
 
-// ../plugin/src/features/magic-context/memory/constants.ts
-var V2_MEMORY_CATEGORIES = [
-  "PROJECT_RULES",
-  "ARCHITECTURE",
-  "CONSTRAINTS",
-  "CONFIG_VALUES",
-  "NAMING"
-];
-var CATEGORY_PRIORITY = [
-  "PROJECT_RULES",
-  "ARCHITECTURE",
-  "CONSTRAINTS",
-  "CONFIG_VALUES",
-  "NAMING",
-  "USER_DIRECTIVES",
-  "USER_PREFERENCES",
-  "CONFIG_DEFAULTS",
-  "ARCHITECTURE_DECISIONS",
-  "ENVIRONMENT",
-  "WORKFLOW_RULES",
-  "KNOWN_ISSUES"
-];
-var MEMORY_CATEGORY_ORDER_UNKNOWN = 99;
-var MEMORY_CATEGORY_ORDER_PRIORITY = CATEGORY_PRIORITY.reduce((acc, category, index) => {
-  acc[category] = index;
-  return acc;
-}, {});
-var MEMORY_CATEGORY_ORDER_SQL = `CASE category ${CATEGORY_PRIORITY.map((category, index) => `WHEN '${category}' THEN ${index}`).join(" ")} ELSE ${MEMORY_CATEGORY_ORDER_UNKNOWN} END`;
-var CATEGORY_DEFAULT_TTL = {
-  WORKFLOW_RULES: 90 * 24 * 60 * 60 * 1000,
-  KNOWN_ISSUES: 30 * 24 * 60 * 60 * 1000
-};
-
-// ../plugin/src/features/magic-context/memory/project-identity.ts
-var TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
-var identityCache = new Map;
-var linkedGitWorktreeCache = new Map;
-var lastKnownGitIdentityCache = new Map;
-var directoryFallbackCache = new Map;
-var transientFailureCooldown = new Map;
-var dubiousOwnershipFallbackDirectories = new Set;
-var dubiousOwnershipLoggedDirectories = new Set;
-var dubiousOwnershipWarnedDirectories = new Set;
-var transientGitIdentityReuseLoggedDirectories = new Set;
-var sessionIdentityCache = new Map;
 // ../plugin/src/features/magic-context/workspaces.ts
+import { createHash as createHash4 } from "node:crypto";
 var VALID_SHARE_CATEGORIES = new Set(V2_MEMORY_CATEGORIES);
+var DEFAULT_WORKSPACE_SHARE_CATEGORIES = ["CONSTRAINTS"];
+function tableExists(db, tableName) {
+  const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1").get(tableName);
+  return Boolean(row);
+}
+function columnExists(db, tableName, columnName) {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  return rows.some((row) => row.name === columnName);
+}
 function uniqueSorted(values) {
   return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+function placeholders(values) {
+  return values.map(() => "?").join(", ");
+}
+function defaultWorkspaceShareCategories() {
+  return [...DEFAULT_WORKSPACE_SHARE_CATEGORIES];
+}
+function warnInvalidShareCategories(reason, raw) {
+  log("[magic-context] WARN: invalid workspace share_categories; sharing no foreign memory categories", {
+    reason,
+    raw
+  });
+}
+function normalizeShareCategories(raw) {
+  if (raw === null || raw === undefined) {
+    return defaultWorkspaceShareCategories();
+  }
+  if (typeof raw !== "string") {
+    warnInvalidShareCategories("not a string", raw);
+    return [];
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    warnInvalidShareCategories("malformed JSON", raw);
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    warnInvalidShareCategories("not a JSON array", raw);
+    return [];
+  }
+  const categories = [];
+  for (const value of parsed) {
+    if (typeof value !== "string" || !VALID_SHARE_CATEGORIES.has(value)) {
+      warnInvalidShareCategories("unknown category", raw);
+      return [];
+    }
+    if (!categories.includes(value))
+      categories.push(value);
+  }
+  return categories.sort((left, right) => left.localeCompare(right));
+}
+function selectWorkspaceShareCategories(db, identities) {
+  const candidates = uniqueSorted(identities.filter((identity) => identity.length > 0));
+  if (candidates.length === 0 || !tableExists(db, "workspace_members")) {
+    return null;
+  }
+  const hasMembership = Boolean(db.prepare(`SELECT 1
+                   FROM workspace_members
+                  WHERE project_path IN (${placeholders(candidates)})
+                  LIMIT 1`).get(...candidates));
+  if (!hasMembership)
+    return null;
+  if (!tableExists(db, "workspaces")) {
+    log("[magic-context] WARN: workspace member has no workspaces table; sharing no foreign memory categories");
+    return [];
+  }
+  if (!columnExists(db, "workspaces", "share_categories")) {
+    return defaultWorkspaceShareCategories();
+  }
+  const row = db.prepare(`SELECT workspace.share_categories AS shareCategories
+               FROM workspace_members AS member
+               JOIN workspaces AS workspace ON workspace.id = member.workspace_id
+              WHERE member.project_path IN (${placeholders(candidates)})
+              ORDER BY workspace.id ASC
+              LIMIT 1`).get(...candidates);
+  if (!row) {
+    log("[magic-context] WARN: workspace member has no workspace share_categories row; sharing no foreign memory categories");
+    return [];
+  }
+  return normalizeShareCategories(row.shareCategories);
+}
+function resolveWorkspaceShareCategories(db, projectIdentity) {
+  return selectWorkspaceShareCategories(db, [projectIdentity]);
+}
+function resolveWorkspaceIdentitySet(db, projectIdentity) {
+  if (!tableExists(db, "workspace_members")) {
+    return { identities: [projectIdentity], namesByIdentity: new Map };
+  }
+  const rows = db.prepare(`SELECT member.project_path AS identity, member.display_name AS displayName
+               FROM workspace_members AS anchor
+               JOIN workspace_members AS member ON member.workspace_id = anchor.workspace_id
+              WHERE anchor.project_path = ?
+              ORDER BY member.display_name ASC, member.project_path ASC`).all(projectIdentity);
+  if (rows.length === 0) {
+    return { identities: [projectIdentity], namesByIdentity: new Map };
+  }
+  const namesByIdentity = new Map;
+  const identities = [];
+  for (const row of rows) {
+    if (typeof row.identity !== "string" || row.identity.length === 0)
+      continue;
+    if (identities.includes(row.identity))
+      continue;
+    identities.push(row.identity);
+    if (typeof row.displayName === "string" && row.displayName.length > 0) {
+      namesByIdentity.set(row.identity, row.displayName);
+    }
+  }
+  return identities.length > 0 ? { identities, namesByIdentity } : { identities: [projectIdentity], namesByIdentity: new Map };
+}
+function expandWorkspaceIdentitySetWithAliases(db, identities) {
+  const canonical = uniqueSorted(identities.filter((identity) => identity.length > 0));
+  const expanded = new Set(canonical);
+  const canonicalIdentityByStoredPath = new Map;
+  for (const identity of canonical) {
+    canonicalIdentityByStoredPath.set(identity, identity);
+  }
+  if (canonical.length === 0 || !tableExists(db, "v22_identity_rekey_map")) {
+    return { expandedIdentities: [...expanded], canonicalIdentityByStoredPath };
+  }
+  const rows = db.prepare(`SELECT old_project_path AS oldProjectPath, new_project_path AS newProjectPath
+               FROM v22_identity_rekey_map
+              WHERE new_project_path IN (${placeholders(canonical)})
+              ORDER BY old_project_path ASC`).all(...canonical);
+  for (const row of rows) {
+    if (typeof row.oldProjectPath !== "string" || typeof row.newProjectPath !== "string") {
+      continue;
+    }
+    if (!canonicalIdentityByStoredPath.has(row.newProjectPath))
+      continue;
+    expanded.add(row.oldProjectPath);
+    canonicalIdentityByStoredPath.set(row.oldProjectPath, row.newProjectPath);
+  }
+  return { expandedIdentities: [...expanded], canonicalIdentityByStoredPath };
+}
+function resolveStoredPathWorkspaceIdentity(storedProjectPath, memberIdentities, canonicalIdentityByStoredPath) {
+  const direct = canonicalIdentityByStoredPath.get(storedProjectPath);
+  if (direct)
+    return direct;
+  const normalized = normalizeStoredProjectPath(storedProjectPath);
+  const normalizedDirect = canonicalIdentityByStoredPath.get(normalized);
+  if (normalizedDirect)
+    return normalizedDirect;
+  if (memberIdentities.includes(normalized))
+    return normalized;
+  for (const identity of memberIdentities) {
+    if (storedPathBelongsToIdentity(storedProjectPath, identity)) {
+      return identity;
+    }
+  }
+  return null;
+}
+function sourceNameForMemory(storedProjectPath, ownIdentity, memberIdentities, namesByIdentity, canonicalIdentityByStoredPath) {
+  const canonicalIdentity = resolveStoredPathWorkspaceIdentity(storedProjectPath, memberIdentities, canonicalIdentityByStoredPath);
+  if (!canonicalIdentity || canonicalIdentity === ownIdentity)
+    return;
+  return namesByIdentity.get(canonicalIdentity);
+}
+function getEpochMap(db, identities) {
+  if (identities.length === 0)
+    return new Map;
+  const rows = db.prepare(`SELECT project_path AS projectPath, project_memory_epoch AS epoch
+               FROM project_state
+              WHERE project_path IN (${placeholders(identities)})`).all(...identities);
+  const epochs = new Map;
+  for (const row of rows) {
+    if (typeof row.projectPath !== "string" || typeof row.epoch !== "number")
+      continue;
+    epochs.set(row.projectPath, row.epoch);
+  }
+  return epochs;
+}
+function computeWorkspaceEpochFingerprint(db, identities) {
+  const canonical = uniqueSorted(identities.filter((identity) => identity.length > 0));
+  const epochs = getEpochMap(db, canonical);
+  const shareCategories = selectWorkspaceShareCategories(db, canonical);
+  const hash = createHash4("sha256");
+  hash.update("share_categories", "utf8");
+  hash.update("\x00");
+  hash.update(shareCategories === null ? "NO_WORKSPACE" : JSON.stringify(shareCategories), "utf8");
+  hash.update(`
+`);
+  for (const identity of canonical) {
+    hash.update(identity, "utf8");
+    hash.update("\x00");
+    hash.update(String(epochs.get(identity) ?? 0), "utf8");
+    hash.update(`
+`);
+  }
+  return hash.digest("hex");
 }
 function isInTransaction2(db) {
   const candidate = db;
   return candidate.inTransaction === true || candidate.isTransaction === true;
+}
+function workspaceMembersForIdentity(db, identity) {
+  if (!tableExists(db, "workspace_members"))
+    return [identity];
+  const rows = db.prepare(`SELECT member.project_path AS identity
+               FROM workspace_members AS anchor
+               JOIN workspace_members AS member ON member.workspace_id = anchor.workspace_id
+              WHERE anchor.project_path = ?
+              ORDER BY member.project_path ASC`).all(identity);
+  const identities = rows.map((row) => typeof row.identity === "string" ? row.identity : "").filter((value) => value.length > 0);
+  return identities.length > 0 ? uniqueSorted(identities) : [identity];
 }
 function bumpEpochRows(db, identities, now) {
   const stmt = db.prepare(`INSERT INTO project_state
@@ -2881,6 +4780,25 @@ function bumpEpochRows(db, identities, now) {
             updated_at = excluded.updated_at`);
   for (const identity of uniqueSorted(identities)) {
     stmt.run(identity, now);
+  }
+}
+function bumpEpochsForWorkspaceMembers(db, identity, now = Date.now()) {
+  const run = () => bumpEpochRows(db, workspaceMembersForIdentity(db, identity), now);
+  if (isInTransaction2(db)) {
+    run();
+    return;
+  }
+  const transactionStartedAt = performance.now();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    run();
+    db.exec("COMMIT");
+    logSlowWriteTransaction("workspace_epoch_bump", transactionStartedAt);
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw error;
   }
 }
 function bumpEpochsForWorkspaceMemberSet(db, identities, now = Date.now()) {
@@ -2905,8 +4823,6 @@ function bumpEpochsForWorkspaceMemberSet(db, identities, now = Date.now()) {
 
 // ../plugin/src/features/magic-context/migrations.ts
 var FORK_MIGRATION_VERSION_FLOOR = 1e4;
-var MIGRATION_LOCK_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
-
 class MigrationLockBusyError extends Error {
   constructor(message) {
     super(message);
@@ -2921,11 +4837,11 @@ function isSqliteLockError(error) {
     return true;
   return typeof candidate.message === "string" && /database is locked|sqlite_(busy|locked)/i.test(candidate.message);
 }
-function tableExists(db, name) {
+function tableExists2(db, name) {
   return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name));
 }
 function tableHasHarnessColumn(db, name) {
-  if (!tableExists(db, name))
+  if (!tableExists2(db, name))
     return false;
   return db.prepare(`PRAGMA table_info(${name})`).all().some((column) => column.name === "harness");
 }
@@ -3033,7 +4949,7 @@ function relabelOpenCode2HarnessRows(db) {
   }
 }
 function healMismatchedTierClose(db, table, hasLegacy) {
-  if (!tableExists(db, table))
+  if (!tableExists2(db, table))
     return;
   const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
   for (const required of ["content", "p1", "p2", "p3", "p4"]) {
@@ -3083,7 +4999,7 @@ function managedAuthorityNoteRow(row) {
 }
 function installLatestAuthorityTriggers(db) {
   const privilegeCheck = authorityPrivilegeCheck();
-  if (tableExists(db, "memories")) {
+  if (tableExists2(db, "memories")) {
     db.exec(`
             DROP TRIGGER IF EXISTS memories_authority_guard_insert;
             DROP TRIGGER IF EXISTS memories_authority_guard_update;
@@ -3110,7 +5026,7 @@ function installLatestAuthorityTriggers(db) {
             BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
         `);
   }
-  if (tableExists(db, "notes")) {
+  if (tableExists2(db, "notes")) {
     const managedOld = managedAuthorityNoteRow("OLD");
     const managedNew = managedAuthorityNoteRow("NEW");
     db.exec(`
@@ -3595,9 +5511,9 @@ var MIGRATIONS = [
     version: 22,
     description: "v2.0 cache architecture schema foundation",
     up: (db) => {
-      const hasSessionMetaTable = tableExists(db, "session_meta");
-      const hasCompartmentsTable = tableExists(db, "compartments");
-      const hasMemoriesTable = tableExists(db, "memories");
+      const hasSessionMetaTable = tableExists2(db, "session_meta");
+      const hasCompartmentsTable = tableExists2(db, "compartments");
+      const hasMemoriesTable = tableExists2(db, "memories");
       if (hasSessionMetaTable) {
         ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
         ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
@@ -3622,7 +5538,7 @@ var MIGRATIONS = [
         ensureColumn(db, "compartments", "p1_embedding_model_id", "TEXT");
         ensureColumn(db, "compartments", "legacy", "INTEGER NOT NULL DEFAULT 0");
       }
-      const hasRecompCompartmentsTable = tableExists(db, "recomp_compartments");
+      const hasRecompCompartmentsTable = tableExists2(db, "recomp_compartments");
       if (hasRecompCompartmentsTable) {
         ensureColumn(db, "recomp_compartments", "p1", "TEXT");
         ensureColumn(db, "recomp_compartments", "p2", "TEXT");
@@ -4043,7 +5959,7 @@ var MIGRATIONS = [
       db.prepare(`UPDATE workspaces
                     SET share_categories = '["CONSTRAINTS"]'
                   WHERE share_categories IS NULL OR share_categories = ''`).run();
-      if (!tableExists(db, "workspace_members"))
+      if (!tableExists2(db, "workspace_members"))
         return;
       const rows = db.prepare(`SELECT DISTINCT project_path AS identity
                        FROM workspace_members
@@ -4140,7 +6056,7 @@ var MIGRATIONS = [
     version: 40,
     description: "index Pi fallback tool owners for stable-id cutover",
     up: (db) => {
-      if (!tableExists(db, "tags"))
+      if (!tableExists2(db, "tags"))
         return;
       db.exec(`
                 CREATE INDEX IF NOT EXISTS idx_tags_pi_fallback_tool_owner
@@ -4153,7 +6069,7 @@ var MIGRATIONS = [
     version: 41,
     description: "key detected context limits by model",
     up: (db) => {
-      if (!tableExists(db, "session_meta"))
+      if (!tableExists2(db, "session_meta"))
         return;
       ensureColumn(db, "session_meta", "detected_context_limit_model_key", "TEXT");
     }
@@ -4193,7 +6109,7 @@ var MIGRATIONS = [
                 CREATE INDEX IF NOT EXISTS idx_memory_verifications_memory
                     ON memory_verifications(memory_id);
             `);
-      if (tableExists(db, "task_schedule_state")) {
+      if (tableExists2(db, "task_schedule_state")) {
         ensureColumn(db, "task_schedule_state", "last_checked_commit", "TEXT");
         ensureColumn(db, "task_schedule_state", "last_broad_run_at", "INTEGER");
       }
@@ -4203,7 +6119,7 @@ var MIGRATIONS = [
     version: 44,
     description: "memory classification scope and shareability columns",
     up: (db) => {
-      if (!tableExists(db, "memories"))
+      if (!tableExists2(db, "memories"))
         return;
       ensureColumn(db, "memories", "scope", "TEXT NOT NULL DEFAULT 'project'");
       ensureColumn(db, "memories", "shareable", "INTEGER NOT NULL DEFAULT 0");
@@ -4213,7 +6129,7 @@ var MIGRATIONS = [
     version: 45,
     description: "retrospective content watermark and processed-window idempotence",
     up: (db) => {
-      if (tableExists(db, "task_schedule_state")) {
+      if (tableExists2(db, "task_schedule_state")) {
         ensureColumn(db, "task_schedule_state", "retrospective_watermark_ms", "INTEGER");
       }
       db.exec(`
@@ -4305,7 +6221,7 @@ var MIGRATIONS = [
     version: 47,
     description: "compiled smart-note checks and runtime policy state",
     up: (db) => {
-      if (!tableExists(db, "notes"))
+      if (!tableExists2(db, "notes"))
         return;
       ensureColumn(db, "notes", "compiled_check", "TEXT");
       ensureColumn(db, "notes", "manifest_json", "TEXT");
@@ -4335,10 +6251,10 @@ var MIGRATIONS = [
     version: 48,
     description: "DreamerV2 rework: memory→file mapping vs verification split, classify marker",
     up: (db) => {
-      if (tableExists(db, "memory_verifications")) {
+      if (tableExists2(db, "memory_verifications")) {
         ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
       }
-      if (tableExists(db, "memories")) {
+      if (tableExists2(db, "memories")) {
         ensureColumn(db, "memories", "classified_at", "INTEGER");
       }
     }
@@ -4347,13 +6263,13 @@ var MIGRATIONS = [
     version: 49,
     description: "per-model embedding coexistence and active identity tracking",
     up: (db) => {
-      if (tableExists(db, "memory_embeddings")) {
+      if (tableExists2(db, "memory_embeddings")) {
         db.exec(`
                     UPDATE memory_embeddings
                     SET model_id = 'legacy:unknown'
                     WHERE model_id IS NULL;
                 `);
-        if (tableExists(db, "memories")) {
+        if (tableExists2(db, "memories")) {
           db.exec(`
                         DELETE FROM memory_embeddings
                         WHERE memory_id NOT IN (SELECT id FROM memories);
@@ -4375,8 +6291,8 @@ var MIGRATIONS = [
                 `);
         assertForeignKeyIntegrity(db, "memory_embeddings");
       }
-      if (tableExists(db, "git_commit_embeddings")) {
-        if (tableExists(db, "git_commits")) {
+      if (tableExists2(db, "git_commit_embeddings")) {
+        if (tableExists2(db, "git_commits")) {
           db.exec(`
                         DELETE FROM git_commit_embeddings
                         WHERE sha NOT IN (SELECT sha FROM git_commits);
@@ -4400,8 +6316,8 @@ var MIGRATIONS = [
                 `);
         assertForeignKeyIntegrity(db, "git_commit_embeddings");
       }
-      if (tableExists(db, "compartment_chunk_embeddings")) {
-        if (tableExists(db, "compartments")) {
+      if (tableExists2(db, "compartment_chunk_embeddings")) {
+        if (tableExists2(db, "compartments")) {
           db.exec(`
                         DELETE FROM compartment_chunk_embeddings
                         WHERE compartment_id NOT IN (SELECT id FROM compartments);
@@ -4456,7 +6372,7 @@ var MIGRATIONS = [
     version: 50,
     description: "add durable ctx-wrapup session marker",
     up(db) {
-      if (tableExists(db, "session_meta")) {
+      if (tableExists2(db, "session_meta")) {
         ensureColumn(db, "session_meta", "wrapup_in_progress_state", "TEXT");
       }
     }
@@ -4484,7 +6400,7 @@ var MIGRATIONS = [
     version: 52,
     description: "persist emergency recovery origin",
     up(db) {
-      if (tableExists(db, "session_meta")) {
+      if (tableExists2(db, "session_meta")) {
         ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
       }
     }
@@ -4567,8 +6483,8 @@ var MIGRATIONS = [
     version: 54,
     description: "add authority identity, managed-write guards, and mirror cursors",
     up(db) {
-      const memoriesPresent = tableExists(db, "memories");
-      const notesPresent = tableExists(db, "notes");
+      const memoriesPresent = tableExists2(db, "memories");
+      const notesPresent = tableExists2(db, "notes");
       db.exec(`
                 CREATE TABLE IF NOT EXISTS context_store_meta (
                     key TEXT PRIMARY KEY,
@@ -4684,8 +6600,8 @@ var MIGRATIONS = [
     version: 55,
     description: "make managed-write privilege connection-local",
     up(db) {
-      const memoriesPresent = tableExists(db, "memories");
-      const notesPresent = tableExists(db, "notes");
+      const memoriesPresent = tableExists2(db, "memories");
+      const notesPresent = tableExists2(db, "notes");
       const native = db;
       const privilegeCheck = typeof native.function === "function" || typeof native.createFunction === "function" ? "mc_privileged_writer() = 0" : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
       if (memoriesPresent) {
@@ -4794,7 +6710,7 @@ var MIGRATIONS = [
                     PRIMARY KEY(project_path, domain)
                 );
             `);
-      if (tableExists(db, "authority_capture_bounds")) {
+      if (tableExists2(db, "authority_capture_bounds")) {
         ensureColumn(db, "authority_capture_bounds", "mutation_epoch", "INTEGER NOT NULL DEFAULT 0");
       }
     }
@@ -4897,7 +6813,7 @@ var MIGRATIONS = [
     version: 63,
     description: "Add anchor_block_id to notes (module note mirror writes it)",
     up(db) {
-      if (!tableExists(db, "notes"))
+      if (!tableExists2(db, "notes"))
         return;
       const columns = db.prepare("PRAGMA table_info(notes)").all();
       if (!columns.some((column) => column.name === "anchor_block_id")) {
@@ -4931,7 +6847,7 @@ var MIGRATIONS = [
     version: 65,
     description: "Add per-memory mural cue columns for the deterministic cue-compression cutover",
     up(db) {
-      if (!tableExists(db, "memories"))
+      if (!tableExists2(db, "memories"))
         return;
       ensureColumn(db, "memories", "mural_cue", "TEXT");
       ensureColumn(db, "memories", "mural_cue_hash", "TEXT");
@@ -4942,7 +6858,7 @@ var MIGRATIONS = [
     version: 66,
     description: "bound per-session historian upgrade reminders",
     up(db) {
-      if (!tableExists(db, "session_meta"))
+      if (!tableExists2(db, "session_meta"))
         return;
       ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
       ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
@@ -4952,7 +6868,7 @@ var MIGRATIONS = [
     version: 67,
     description: "persist the frozen mural payload with each cached m0 baseline",
     up(db) {
-      if (!tableExists(db, "session_meta"))
+      if (!tableExists2(db, "session_meta"))
         return;
       ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
       ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
@@ -4990,7 +6906,7 @@ var MIGRATIONS = [
                     last_swept_at INTEGER
                 );
             `);
-      if (tableExists(db, "message_history_index")) {
+      if (tableExists2(db, "message_history_index")) {
         const columns = new Set(db.prepare("PRAGMA table_info(message_history_index)").all().map((column) => column.name));
         if (columns.has("session_id") && columns.has("harness") && columns.has("updated_at")) {
           db.exec(`
@@ -5005,7 +6921,7 @@ var MIGRATIONS = [
     version: 69,
     description: "index visibility mutation discovery and target loading",
     up(db) {
-      if (!tableExists(db, "memory_mutation_log"))
+      if (!tableExists2(db, "memory_mutation_log"))
         return;
       db.exec(`
                 CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_visibility
@@ -5034,7 +6950,7 @@ var MIGRATIONS = [
     version: 72,
     description: "add per-session compaction mode record column (issue #266)",
     up(db) {
-      if (tableExists(db, "session_meta")) {
+      if (tableExists2(db, "session_meta")) {
         ensureColumn(db, "session_meta", "compaction_mode_record", "TEXT");
       }
     }
@@ -5043,7 +6959,7 @@ var MIGRATIONS = [
     version: 73,
     description: "persist the last successful todowrite permission verdict",
     up(db) {
-      if (tableExists(db, "session_meta")) {
+      if (tableExists2(db, "session_meta")) {
         ensureColumn(db, "session_meta", "todo_permission_denied", "INTEGER NOT NULL DEFAULT 2");
       }
     }
@@ -5052,7 +6968,7 @@ var MIGRATIONS = [
     version: 74,
     description: "persist detected context-limit provenance",
     up(db) {
-      if (tableExists(db, "session_meta")) {
+      if (tableExists2(db, "session_meta")) {
         ensureColumn(db, "session_meta", "detected_context_limit_provenance", "TEXT NOT NULL DEFAULT 'unknown'");
       }
     }
@@ -5061,7 +6977,7 @@ var MIGRATIONS = [
     version: 75,
     description: "persist mural cue validation rejection latches",
     up(db) {
-      if (!tableExists(db, "memories"))
+      if (!tableExists2(db, "memories"))
         return;
       ensureColumn(db, "memories", "mural_cue_rejection_count", "INTEGER NOT NULL DEFAULT 0");
     }
@@ -5070,7 +6986,7 @@ var MIGRATIONS = [
     version: 76,
     description: "persist retina provider compilation for smart-note conditions",
     up(db) {
-      if (!tableExists(db, "notes"))
+      if (!tableExists2(db, "notes"))
         return;
       ensureColumn(db, "notes", "compiled_provider", "TEXT");
       ensureColumn(db, "notes", "compiled_config", "TEXT");
@@ -5082,10 +6998,10 @@ var MIGRATIONS = [
     version: 77,
     description: "persist scoped provenance for promoted user memories and primers",
     up(db) {
-      if (tableExists(db, "user_memories")) {
+      if (tableExists2(db, "user_memories")) {
         ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
       }
-      if (tableExists(db, "primers")) {
+      if (tableExists2(db, "primers")) {
         ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
       }
     }
@@ -5113,7 +7029,7 @@ var MIGRATIONS = [
     version: 79,
     description: "record m[0] system-hash and model-key comparison telemetry",
     up(db) {
-      if (!tableExists(db, "transform_decisions"))
+      if (!tableExists2(db, "transform_decisions"))
         return;
       ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
       ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
@@ -5125,7 +7041,7 @@ var MIGRATIONS = [
     version: 80,
     description: "record observed m[0] tool-set hash comparisons",
     up(db) {
-      if (!tableExists(db, "transform_decisions"))
+      if (!tableExists2(db, "transform_decisions"))
         return;
       ensureColumn(db, "transform_decisions", "m0_tool_set_hash_prev", "TEXT");
       ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
@@ -5156,7 +7072,7 @@ var MIGRATIONS = [
     version: 82,
     description: "record the origin of memory file-independent mappings",
     up(db) {
-      if (!tableExists(db, "memory_verifications"))
+      if (!tableExists2(db, "memory_verifications"))
         return;
       ensureColumn(db, "memory_verifications", "mapping_origin", "TEXT NOT NULL DEFAULT 'mapper'");
     }
@@ -5189,7 +7105,7 @@ var MIGRATIONS = [
     version: 84,
     description: "persist protected-token floor state per session",
     up(db) {
-      if (!tableExists(db, "session_meta"))
+      if (!tableExists2(db, "session_meta"))
         return;
       ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
       ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
@@ -5305,30 +7221,260 @@ function runMigrations(db) {
     log(`[migrations] upstream migration lane now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
   }
 }
-async function runMigrationsWithRetry(db, options = {}) {
-  const retryDelaysMs = options.retryDelaysMs ?? MIGRATION_LOCK_RETRY_DELAYS_MS;
-  const sleep = options.sleep ?? ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
-  const totalAttempts = retryDelaysMs.length + 1;
-  for (let attempt = 1;attempt <= totalAttempts; attempt += 1) {
-    log(`[migrations] migration lock check attempt ${attempt}/${totalAttempts}`);
-    try {
-      runMigrations(db);
-      return;
-    } catch (error) {
-      if (!(error instanceof MigrationLockBusyError))
-        throw error;
-      const delayMs = retryDelaysMs[attempt - 1];
-      if (delayMs === undefined)
-        throw error;
-      log(`[migrations] migration write lock is busy; retrying attempt ${attempt + 1}/${totalAttempts} in ${delayMs}ms`);
-      await sleep(delayMs);
-    }
-  }
-}
+
+// ../plugin/src/hooks/magic-context/read-session-formatting.ts
+import { createRequire } from "node:module";
 
 // ../plugin/src/shared/commit-detection.ts
 var HASH_HEX = "[0-9a-f]{7,12}";
 var COMMIT_HASH_TEST_PATTERN = new RegExp(`\\b${HASH_HEX}\\b`, "i");
+var COMMIT_VERB_PATTERN = /\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b/i;
+function createCommitHashExtractPattern() {
+  return new RegExp(`\`?\\b(${HASH_HEX})\\b\`?`, "gi");
+}
+
+// ../plugin/src/shared/internal-initiator-marker.ts
+var OMO_INTERNAL_INITIATOR_MARKER = "<!-- OMO_INTERNAL_INITIATOR -->";
+
+// ../plugin/src/shared/system-directive.ts
+var SYSTEM_DIRECTIVE_PREFIX = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
+function isSystemDirective(text) {
+  return text.trimStart().startsWith(SYSTEM_DIRECTIVE_PREFIX);
+}
+function removeSystemReminders(text) {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+}
+
+// ../plugin/src/hooks/magic-context/read-session-formatting.ts
+var MAX_COMMITS_PER_BLOCK = 5;
+function hasMeaningfulUserText(parts) {
+  for (const part of parts) {
+    if (part === null || typeof part !== "object")
+      continue;
+    const candidate = part;
+    if (candidate.type !== "text" || typeof candidate.text !== "string")
+      continue;
+    if (candidate.ignored === true)
+      continue;
+    const cleaned = removeSystemReminders(candidate.text).replace(OMO_INTERNAL_INITIATOR_MARKER, "").trim();
+    if (!cleaned)
+      continue;
+    if (isSystemDirective(cleaned))
+      continue;
+    return true;
+  }
+  return false;
+}
+function extractTexts(parts) {
+  const texts = [];
+  for (const part of parts) {
+    if (part === null || typeof part !== "object")
+      continue;
+    const p = part;
+    if (p.type === "text" && typeof p.text === "string" && p.text.trim().length > 0) {
+      texts.push(p.text.trim());
+    }
+  }
+  return texts;
+}
+function extractToolResultBodyTokens(parts) {
+  let tokens = 0;
+  for (const part of parts) {
+    if (part === null || typeof part !== "object")
+      continue;
+    const p = part;
+    if (p.type !== "tool")
+      continue;
+    const state = p.state;
+    if (!state || typeof state !== "object")
+      continue;
+    const body = state.output ?? state.error;
+    if (body === undefined)
+      continue;
+    const text = typeof body === "string" ? body : JSON.stringify(body);
+    tokens += Math.ceil(text.length / 4);
+  }
+  return tokens;
+}
+function extractToolCallSummaries(parts) {
+  const summaries = [];
+  for (const part of parts) {
+    if (part === null || typeof part !== "object")
+      continue;
+    const p = part;
+    if (p.type !== "tool" || typeof p.tool !== "string")
+      continue;
+    const state = p.state;
+    if (!state || typeof state !== "object")
+      continue;
+    const input = state.input;
+    const metadata = state.metadata;
+    const description = input && typeof input.description === "string" && input.description || metadata && typeof metadata.description === "string" && metadata.description;
+    if (description) {
+      summaries.push(`TC: ${description}`);
+      continue;
+    }
+    const toolName = p.tool;
+    const keyArg = extractKeyArg(toolName, input);
+    summaries.push(keyArg ? `TC: ${toolName}(${keyArg})` : `TC: ${toolName}`);
+  }
+  return summaries;
+}
+function extractKeyArg(_toolName, input) {
+  if (!input)
+    return null;
+  if (typeof input.filePath === "string")
+    return truncateArg(input.filePath);
+  if (typeof input.path === "string")
+    return truncateArg(input.path);
+  if (typeof input.pattern === "string")
+    return truncateArg(input.pattern);
+  if (typeof input.query === "string")
+    return truncateArg(input.query);
+  if (typeof input.symbol === "string")
+    return input.symbol;
+  if (typeof input.module === "string")
+    return input.module;
+  if (typeof input.action === "string")
+    return input.action;
+  return null;
+}
+function truncateArg(value, maxLen = 60) {
+  if (value.length <= maxLen)
+    return value;
+  return `${value.slice(0, maxLen)}…`;
+}
+var tokenizer;
+var tokenizerLoadAttempted = false;
+var tokenizerWarningSent = false;
+var tokenizerEncodingPath;
+var tokenizerSerializedTableBytes;
+function constructTokenizer(tokenizerModule, claudeEncoding) {
+  const typedModule = tokenizerModule;
+  const Tokenizer = typedModule.default ?? typedModule.Tokenizer;
+  if (!Tokenizer) {
+    throw new Error("ai-tokenizer does not expose a Tokenizer constructor");
+  }
+  return new Tokenizer(claudeEncoding);
+}
+function loadTokenizer() {
+  const requireFromThisModule = createRequire(import.meta.url);
+  const encodingSpecifier = "ai-tokenizer/encoding/" + "claude";
+  tokenizerEncodingPath = requireFromThisModule.resolve(encodingSpecifier);
+  tokenizerSerializedTableBytes = undefined;
+  return constructTokenizer(requireFromThisModule("ai-" + "tokenizer"), requireFromThisModule(encodingSpecifier));
+}
+function warnTokenizerFallback(error) {
+  if (tokenizerWarningSent)
+    return;
+  tokenizerWarningSent = true;
+  const reason = error instanceof Error ? error.message : String(error);
+  console.warn("[magic-context] ai-tokenizer is unavailable; using approximate character-based token counts for this process. Token budgets, persisted per-message counts, and protected-tail/compartment boundaries may be less accurate until restart:", reason);
+}
+function getTokenizer() {
+  if (tokenizer || tokenizerLoadAttempted)
+    return tokenizer;
+  tokenizerLoadAttempted = true;
+  try {
+    tokenizer = loadTokenizer();
+  } catch (error) {
+    warnTokenizerFallback(error);
+  }
+  return tokenizer;
+}
+function estimateTokensHeuristically(text) {
+  return Math.ceil(text.length / 3.5);
+}
+function estimateTokens(text) {
+  if (!text)
+    return 0;
+  const activeTokenizer = getTokenizer();
+  if (!activeTokenizer)
+    return estimateTokensHeuristically(text);
+  try {
+    return activeTokenizer.encode(text, "all").length;
+  } catch (error) {
+    tokenizer = undefined;
+    tokenizerLoadAttempted = true;
+    warnTokenizerFallback(error);
+    return estimateTokensHeuristically(text);
+  }
+}
+function normalizeText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function compactRole(role) {
+  if (role === "assistant")
+    return "A";
+  if (role === "user")
+    return "U";
+  return role.slice(0, 1).toUpperCase() || "M";
+}
+function formatBlock(block) {
+  const range = block.startOrdinal === block.endOrdinal ? `[${block.startOrdinal}]` : `[${block.startOrdinal}-${block.endOrdinal}]`;
+  const commitSuffix = block.commitHashes.length > 0 ? ` commits: ${block.commitHashes.join(", ")}` : "";
+  return `${range} ${block.role}:${commitSuffix} ${block.parts.join(" / ")}`;
+}
+function extractCommitHashes(text) {
+  const hashes = [];
+  const seen = new Set;
+  for (const match of text.matchAll(createCommitHashExtractPattern())) {
+    const hash = match[1]?.toLowerCase();
+    if (!hash || seen.has(hash))
+      continue;
+    seen.add(hash);
+    hashes.push(hash);
+    if (hashes.length >= MAX_COMMITS_PER_BLOCK)
+      break;
+  }
+  return hashes;
+}
+function compactTextForSummary(text, role) {
+  const commitHashes = role === "assistant" ? extractCommitHashes(text) : [];
+  if (commitHashes.length === 0 || !COMMIT_VERB_PATTERN.test(text)) {
+    return { text, commitHashes };
+  }
+  const withoutHashes = text.replace(createCommitHashExtractPattern(), "").replace(/\(\s*\)/g, "").replace(/\s+,/g, ",").replace(/,\s*,+/g, ", ").replace(/\s{2,}/g, " ").replace(/\s+([,.;:])/g, "$1").trim();
+  return {
+    text: withoutHashes.length > 0 ? withoutHashes : text,
+    commitHashes
+  };
+}
+function mergeCommitHashes(existing, next) {
+  if (next.length === 0)
+    return existing;
+  const merged = [...existing];
+  for (const hash of next) {
+    if (merged.includes(hash))
+      continue;
+    merged.push(hash);
+    if (merged.length >= MAX_COMMITS_PER_BLOCK)
+      break;
+  }
+  return merged;
+}
+
+// ../plugin/src/shared/stable-json.ts
+function stableStringify(value, seen = new WeakSet) {
+  if (value === undefined)
+    return "undefined";
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value) ?? String(value);
+  if (seen.has(value))
+    return '"[Circular]"';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item, seen)).join(",")}]`;
+  }
+  const entries = Object.entries(value).sort(([a], [b]) => {
+    if (a < b)
+      return -1;
+    if (a > b)
+      return 1;
+    return 0;
+  });
+  return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child, seen)}`).join(",")}}`;
+}
 
 // ../plugin/src/features/magic-context/tool-definition-tokens.ts
 var measurements = new Map;
@@ -5362,16 +7508,17 @@ function loadToolDefinitionMeasurements(db) {
 }
 
 // ../plugin/src/features/magic-context/tool-owner-backfill.ts
-import { existsSync as existsSync3 } from "node:fs";
+import { existsSync as existsSync4 } from "node:fs";
 
 // ../plugin/src/shared/opencode-db-path.ts
-import { existsSync as existsSync2, readdirSync, statSync as statSync3 } from "node:fs";
-import { homedir as homedir4 } from "node:os";
+import { existsSync as existsSync3, readdirSync, statSync as statSync3 } from "node:fs";
+import { homedir as homedir5 } from "node:os";
 import { isAbsolute as isAbsolute3, join as join3 } from "node:path";
 var cachedResolution = null;
+var lastReadFailure = null;
 var claimedDiagnostics = new Set;
 function openCodeDataDir(env = process.env, dataHome) {
-  return join3(dataHome ?? env.XDG_DATA_HOME ?? join3(homedir4(), ".local", "share"), "opencode");
+  return join3(dataHome ?? env.XDG_DATA_HOME ?? join3(homedir5(), ".local", "share"), "opencode");
 }
 function environmentKey(dataDir, hostGeneration, channel, env) {
   return [
@@ -5459,7 +7606,7 @@ function resolveOpenCodeDbPath(hostGeneration = "v1", options = {}) {
   const dataDir = openCodeDataDir(env, options.dataHome);
   const channel = options.channel ?? env.OPENCODE_CHANNEL;
   const key = environmentKey(dataDir, hostGeneration, channel, env);
-  if (cachedResolution?.key === key && (!cachedResolution.existed || existsSync2(cachedResolution.resolution.path))) {
+  if (cachedResolution?.key === key && (!cachedResolution.existed || existsSync3(cachedResolution.resolution.path))) {
     if (cachedResolution.existed)
       return cachedResolution.resolution;
   }
@@ -5467,7 +7614,7 @@ function resolveOpenCodeDbPath(hostGeneration = "v1", options = {}) {
   cachedResolution = {
     key,
     resolution,
-    existed: resolution.path !== ":memory:" && existsSync2(resolution.path)
+    existed: resolution.path !== ":memory:" && existsSync3(resolution.path)
   };
   return resolution;
 }
@@ -5493,6 +7640,51 @@ function assertOpenCodeStoreGeneration(db, expected, path, schema = "main") {
   if (actual === "unknown")
     return;
   throw new Error(`OpenCode store generation mismatch at ${path}: expected ${expected}, found ${actual}; refusing generation-specific database access`);
+}
+function openCodeDbPathExists(resolution = resolveOpenCodeDbPath()) {
+  return resolution.path !== ":memory:" && existsSync3(resolution.path);
+}
+function getOpenCodeDbProbeDescriptions(resolution = resolveOpenCodeDbPath()) {
+  if (resolution.source === "OPENCODE_DB")
+    return [resolution.path];
+  if (resolution.source === "channel" || process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" || process.env.OPENCODE_DISABLE_CHANNEL_DB === "true") {
+    return [resolution.path];
+  }
+  const dataDir = openCodeDataDir();
+  return [
+    join3(dataDir, "opencode.db"),
+    join3(dataDir, "opencode-local.db"),
+    join3(dataDir, "opencode-dev.db"),
+    join3(dataDir, "opencode-<channel>.db")
+  ];
+}
+function lookedForText(resolution) {
+  return getOpenCodeDbProbeDescriptions(resolution).join(", ");
+}
+function formatOpenCodeDbMissingStatusLine(resolution = resolveOpenCodeDbPath()) {
+  return `OpenCode DB: MISSING (looked for ${lookedForText(resolution)}). History compaction (historian) and the mid-turn valve are disabled; set OPENCODE_DB if OpenCode stores it elsewhere.`;
+}
+function formatOpenCodeDbReadFailureStatusLine(failure) {
+  return `OpenCode DB: READ FAILED (path=${failure.path}, source=${failure.source}) — ${failure.message}`;
+}
+function recordOpenCodeDbReadFailure(resolution, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  lastReadFailure = { ...resolution, message };
+  return lastReadFailure;
+}
+function clearOpenCodeDbReadFailure(path) {
+  if (path === undefined || lastReadFailure?.path === path)
+    lastReadFailure = null;
+}
+function getOpenCodeDbReadFailure() {
+  return lastReadFailure;
+}
+function claimOpenCodeDbDiagnosticOnce(surface, resolution) {
+  const key = `${surface}\x00${resolution.path}\x00${resolution.source}`;
+  if (claimedDiagnostics.has(key))
+    return false;
+  claimedDiagnostics.add(key);
+  return true;
 }
 
 // ../plugin/src/features/magic-context/tool-owner-backfill.ts
@@ -5534,7 +7726,7 @@ function runToolOwnerBackfill(db) {
     return result;
   }
   const opencodeDbPath = resolveOpencodeDbPath();
-  if (!existsSync3(opencodeDbPath)) {
+  if (!existsSync4(opencodeDbPath)) {
     log(`[backfill] OpenCode DB not found at ${opencodeDbPath} — marking all unbackfilled sessions as skipped. Lazy adoption (defense-in-depth) handles legacy rows at runtime.`);
     markAllUnbackfilledSessionsSkipped(db);
     result.sessionsSkippedNoOcDb = countSessionsByStatus(db, "skipped");
@@ -5760,9 +7952,6 @@ var lastMigrationOnOpenRefusal = null;
 function getSchemaFenceRejection() {
   return lastSchemaFenceRejection;
 }
-function getMigrationOnOpenRefusal() {
-  return lastMigrationOnOpenRefusal;
-}
 var LATEST_SUPPORTED_VERSION = 85;
 var BOOT_SQLITE_BUSY_TIMEOUT_MS = 5000;
 var PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
@@ -5787,7 +7976,7 @@ function restrictDatabaseFilePermissions(dbPath) {
     return;
   for (const suffix of ["", "-wal", "-shm"]) {
     const file = `${dbPath}${suffix}`;
-    if (!existsSync4(file))
+    if (!existsSync5(file))
       continue;
     try {
       storagePermissionFs.chmodSync(file, 384);
@@ -5815,11 +8004,11 @@ function resolveDatabasePath(dbPathOverride) {
   return { dbDir, dbPath: join4(dbDir, "context.db") };
 }
 function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
-  if (existsSync4(targetDbPath))
+  if (existsSync5(targetDbPath))
     return;
   const legacyDir = getLegacyOpenCodeMagicContextStorageDir();
   const legacyDbPath = join4(legacyDir, "context.db");
-  if (!existsSync4(legacyDbPath))
+  if (!existsSync5(legacyDbPath))
     return;
   log(`[magic-context] migrating legacy plugin storage: ${legacyDir} -> ${targetDbDir} (legacy left in place as backup)`);
   ensureSecureStorageDir(targetDbDir);
@@ -5836,7 +8025,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
   for (const suffix of ["", "-wal", "-shm"]) {
     const src = `${legacyDbPath}${suffix}`;
     const dst = join4(targetDbDir, `context.db${suffix}`);
-    if (existsSync4(src)) {
+    if (existsSync5(src)) {
       try {
         copyFileSync(src, dst);
       } catch (error) {
@@ -5846,7 +8035,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
   }
   const legacyModelsDir = join4(legacyDir, "models");
   const targetModelsDir = join4(targetDbDir, "models");
-  if (existsSync4(legacyModelsDir) && !existsSync4(targetModelsDir)) {
+  if (existsSync5(legacyModelsDir) && !existsSync5(targetModelsDir)) {
     try {
       cpSync(legacyModelsDir, targetModelsDir, { recursive: true });
     } catch (error) {
@@ -5902,7 +8091,7 @@ var defaultRpcDiscoveryFs = {
   readdirSync: (path, options) => options?.withFileTypes ? readdirSync2(path, { withFileTypes: true }) : readdirSync2(path),
   readFileSync: (path, encoding) => String(readFileSync3(path, encoding)),
   statSync: (path) => ({ mtimeMs: statSync4(path).mtimeMs }),
-  unlinkSync: (path) => unlinkSync2(path)
+  unlinkSync: (path) => unlinkSync(path)
 };
 var rpcDiscoveryFs = defaultRpcDiscoveryFs;
 function invalidDiscoveryReason(raw) {
@@ -6143,9 +8332,6 @@ var sqlitePragmaConfig = {
   cacheSizeMb: 64,
   mmapSizeMb: 0
 };
-function setSqlitePragmaConfig(config) {
-  sqlitePragmaConfig = config;
-}
 function applySqliteTuningPragmas(db) {
   db.exec(`PRAGMA cache_size=-${Math.round(sqlitePragmaConfig.cacheSizeMb * 1024)}`);
   db.exec(`PRAGMA mmap_size=${Math.round(sqlitePragmaConfig.mmapSizeMb * 1024 * 1024)}`);
@@ -7338,7 +9524,7 @@ function healWedgedChannel2Claims(db) {
     db.prepare("UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
   } catch {}
 }
-async function openDatabaseAsync(dbPathOrOptions) {
+function openDatabase(dbPathOrOptions) {
   const options = typeof dbPathOrOptions === "string" ? { dbPath: dbPathOrOptions } : dbPathOrOptions;
   const explicitDbPath = options?.dbPath !== undefined;
   const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
@@ -7348,304 +9534,39 @@ async function openDatabaseAsync(dbPathOrOptions) {
   lastMigrationOnOpenRefusal = null;
   const existing = databases.get(dbPath);
   if (existing) {
-    const startedAt = performance.now();
-    const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
-    if (accepted) {
-      if (!persistenceByDatabase.has(existing))
-        persistenceByDatabase.set(existing, true);
-      healWedgedChannel2Claims(existing);
+    if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
+      return null;
     }
-    options?.onBootTimings?.({
-      openMs: performance.now() - startedAt,
-      guardMs: 0,
-      migrateMs: 0
-    });
-    return accepted ? existing : null;
-  }
-  const pending = pendingAsyncOpens.get(dbPath);
-  if (pending)
-    return pending;
-  const opening = (async () => {
-    let db;
-    const openStartedAt = performance.now();
-    let openMs = 0;
-    let guardMs = 0;
-    let migrateMs = 0;
-    let guardStartedAt = null;
-    let migrateStartedAt = null;
-    try {
-      if (!explicitDbPath)
-        migrateLegacyStorageIfNeeded(dbPath, dbDir);
-      ensureSecureStorageDir(dbDir);
-      db = new Database(dbPath);
-      installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
-      openMs = performance.now() - openStartedAt;
-      guardStartedAt = performance.now();
-      if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
-        guardMs = performance.now() - guardStartedAt;
-        closeQuietly(db);
-        return null;
-      }
-      if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
-        guardMs = performance.now() - guardStartedAt;
-        closeQuietly(db);
-        return null;
-      }
-      guardMs = performance.now() - guardStartedAt;
-      migrateStartedAt = performance.now();
-      initializeDatabase(db, busyTimeoutMs);
-      await runMigrationsWithRetry(db);
-      ensureContextStoreUuid(db);
-      const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
-      migrateMs = performance.now() - migrateStartedAt;
-      return opened;
-    } catch (error) {
-      if (db)
-        closeQuietly(db);
-      const detail = getErrorMessage(error);
-      log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
-      throw new Error(`[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`);
-    } finally {
-      if (openMs === 0)
-        openMs = performance.now() - openStartedAt;
-      if (guardStartedAt !== null && guardMs === 0) {
-        guardMs = performance.now() - guardStartedAt;
-      }
-      if (migrateStartedAt !== null && migrateMs === 0) {
-        migrateMs = performance.now() - migrateStartedAt;
-      }
-      options?.onBootTimings?.({ openMs, guardMs, migrateMs });
+    if (!persistenceByDatabase.has(existing)) {
+      persistenceByDatabase.set(existing, true);
     }
-  })();
-  pendingAsyncOpens.set(dbPath, opening);
-  try {
-    return await opening;
-  } finally {
-    if (pendingAsyncOpens.get(dbPath) === opening)
-      pendingAsyncOpens.delete(dbPath);
+    healWedgedChannel2Claims(existing);
+    return existing;
   }
-}
-
-// ../adapter-api/src/harness.ts
-var DSH_HARNESS = "dsh";
-function setDshHarness() {
-  setHarness(DSH_HARNESS);
-}
-var DSH_SESSION_KEY_PREFIX = "dsh";
-var SEP = ":";
-function canonicalSessionKey(homeHash, dshSessionId) {
-  if (homeHash.length === 0)
-    throw new Error("canonicalSessionKey: homeHash must be non-empty");
-  if (dshSessionId.length === 0)
-    throw new Error("canonicalSessionKey: dshSessionId must be non-empty");
-  if (dshSessionId.includes(SEP)) {
-    throw new Error(`canonicalSessionKey: dshSessionId must not contain "${SEP}"`);
-  }
-  return `${DSH_SESSION_KEY_PREFIX}${SEP}${homeHash}${SEP}${dshSessionId}`;
-}
-function parseDshSessionKey(key) {
-  if (typeof key !== "string")
-    return;
-  const first = key.indexOf(SEP);
-  if (first <= 0)
-    return;
-  if (key.slice(0, first) !== DSH_SESSION_KEY_PREFIX)
-    return;
-  const second = key.indexOf(SEP, first + 1);
-  if (second <= first + 1 || second === key.length - 1)
-    return;
-  const homeHash = key.slice(first + 1, second);
-  const dshSessionId = key.slice(second + 1);
-  if (homeHash.length === 0 || dshSessionId.length === 0)
-    return;
-  return { homeHash, dshSessionId };
-}
-// ../adapter-api/src/model-map.ts
-var CANONICAL_DEEPSEEK_PROVIDER = "deepseek";
-var DSH_DEEPSEEK_PROVIDER = "deepseek-official";
-var DSH_TO_CANONICAL_PROVIDER = {
-  [DSH_DEEPSEEK_PROVIDER]: CANONICAL_DEEPSEEK_PROVIDER
-};
-var CANONICAL_TO_DSH_PROVIDER = {
-  [CANONICAL_DEEPSEEK_PROVIDER]: DSH_DEEPSEEK_PROVIDER
-};
-// src/compat/dsh-0.1/liveness.ts
-import { createHash as createHash3 } from "node:crypto";
-import { mkdirSync as mkdirSync4, rmSync as rmSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join5 } from "node:path";
-function projectHash(projectPath) {
-  return createHash3("sha256").update(projectPath).digest("hex").slice(0, 16);
-}
-function markerPath(opts) {
-  return join5(opts.storageDir, "rpc", projectHash(opts.projectPath), `port-${opts.pid}.json`);
-}
-function writeDshLivenessMarker(opts) {
-  const pid = opts.pid ?? process.pid;
-  const record = {
-    port: opts.port,
-    pid,
-    started_at: opts.startedAt ?? Date.now(),
-    ...opts.instanceId === undefined ? {} : { instance_id: `dsh:${opts.instanceId}` }
-  };
-  const path = markerPath({
-    storageDir: opts.storageDir,
-    projectPath: opts.projectPath,
-    pid
-  });
-  mkdirSync4(join5(opts.storageDir, "rpc", projectHash(opts.projectPath)), {
-    recursive: true
-  });
-  writeFileSync2(path, JSON.stringify(record), { encoding: "utf8", mode: 384 });
-  return path;
-}
-function removeDshLivenessMarker(path) {
   try {
-    rmSync2(path, { force: true });
-  } catch {}
-}
-
-// src/agent/outbox.ts
-var ADAPTER_META_KEY = "adapter_schema";
-var ADAPTER_SCHEMA_VERSION = "1";
-function initializeDshAdapterTables(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS dsh_context_outbox (
-      op_id            TEXT PRIMARY KEY,
-      session_id       TEXT NOT NULL,
-      harness          TEXT NOT NULL DEFAULT 'dsh',
-      kind             TEXT NOT NULL,
-      source_watermark INTEGER NOT NULL,
-      input_digest     TEXT NOT NULL,
-      generation       INTEGER NOT NULL,
-      status           TEXT NOT NULL DEFAULT 'pending',
-      dsh_ack_seq      INTEGER,
-      error_detail     TEXT,
-      created_at       INTEGER NOT NULL,
-      updated_at       INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_dsh_outbox_session
-      ON dsh_context_outbox(session_id, status);
-
-    CREATE TABLE IF NOT EXISTS dsh_adapter_meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS dsh_context_compaction_marker (
-      session_id     TEXT PRIMARY KEY,
-      ordinal        INTEGER NOT NULL,
-      end_message_id TEXT NOT NULL,
-      tokens_before  INTEGER NOT NULL,
-      summary        TEXT NOT NULL,
-      published_at   INTEGER NOT NULL,
-      status         TEXT NOT NULL DEFAULT 'pending'
-    );
-
-    CREATE TABLE IF NOT EXISTS dsh_feedback_signals (
-      session_id  TEXT NOT NULL,
-      message_id  TEXT NOT NULL,
-      rated_at    INTEGER NOT NULL,
-      rating      TEXT NOT NULL DEFAULT 'negative',
-      PRIMARY KEY (session_id, message_id)
-    );
-  `);
-  db.prepare(`INSERT INTO dsh_adapter_meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(ADAPTER_META_KEY, ADAPTER_SCHEMA_VERSION);
-}
-
-// src/host/bootstrap.ts
-async function bootstrapDshStorage(opts) {
-  const log = opts.log ?? (() => {});
-  setDshHarness();
-  const migrationLogger = {
-    warn: (message) => log(`[magic-context] config migration: ${message}`)
-  };
-  const migrationWarnings = migrateMagicContextConfigLocations(opts.directory, migrationLogger);
-  for (const warning of migrationWarnings) {
-    log(`[magic-context] config migration warning: ${warning}`);
-  }
-  setSqlitePragmaConfig({ cacheSizeMb: 64, mmapSizeMb: 0 });
-  const storageDir = opts.storageDirOverride ?? getMagicContextStorageDir();
-  const ownLivenessPath = markerPath({
-    storageDir,
-    projectPath: opts.directory,
-    pid: process.pid
-  });
-  try {
-    const db = await openDatabaseAsync(opts.dbPath === undefined ? undefined : { dbPath: opts.dbPath });
-    if (db === null) {
-      const fence = getSchemaFenceRejection();
-      const guard = getMigrationOnOpenRefusal();
-      if (fence !== null) {
-        return { kind: "refused", reason: "schema-fence", detail: fence };
-      }
-      if (guard !== null) {
-        return { kind: "refused", reason: "migration-guard", detail: guard };
-      }
-      return { kind: "refused", reason: "migration-guard", detail: "open returned null" };
+    if (!explicitDbPath) {
+      migrateLegacyStorageIfNeeded(dbPath, dbDir);
     }
-    applySqliteTuningPragmas(db);
-    initializeDshAdapterTables(db);
-    const markerPathOut = writeDshLivenessMarker({
-      storageDir,
-      projectPath: opts.directory,
-      port: opts.port,
-      instanceId: process.pid.toString(16)
-    });
-    log(`[magic-context] dsh liveness marker: ${markerPathOut}`);
-    return { kind: "ok", db, storageDir, livenessPath: markerPathOut };
+    ensureSecureStorageDir(dbDir);
+    const db = new Database(dbPath);
+    installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
+    if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+      closeQuietly(db);
+      return null;
+    }
+    if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+      closeQuietly(db);
+      return null;
+    }
+    initializeDatabase(db, busyTimeoutMs);
+    runMigrations(db);
+    ensureContextStoreUuid(db);
+    return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
   } catch (error) {
-    removeDshLivenessMarker(ownLivenessPath);
-    throw error;
+    const detail = getErrorMessage(error);
+    log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
+    throw new Error(`[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`);
   }
 }
 
-// src/index.ts
-var name = "magic-context-dsh";
-function apply(ctx, config = {}) {
-  const directory = config.directory ?? process.cwd();
-  const homeHash = config.homeHash ?? defaultHomeHash();
-  const ready = bootstrapDshStorage({
-    directory,
-    port: config.port ?? 0,
-    homeHash,
-    log: (message) => ctx.logger?.info?.(message)
-  });
-  let summarizeHook;
-  const host = {
-    ready,
-    canonicalKey(dshSessionId) {
-      return canonicalSessionKey(homeHash, dshSessionId);
-    },
-    parseKey(key) {
-      return parseDshSessionKey(key);
-    },
-    registerSummarizeHook(hook) {
-      summarizeHook = hook;
-    },
-    summarizeHook() {
-      return summarizeHook;
-    }
-  };
-  ctx.provide("magicContextHost", host);
-}
-function defaultHomeHash() {
-  const home = process.env.DSH_HOME ?? requireHome();
-  return hash8(home);
-}
-function requireHome() {
-  return process.env.HOME ?? process.env.USERPROFILE ?? "unknown-home";
-}
-function hash8(input) {
-  let hash = 2166136261;
-  for (let i = 0;i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-export {
-  apply,
-  defaultHomeHash,
-  name
-};
+export { setHarness, getHarness, parse, printParseErrorCode, getDataDir, ensureCortexKitArtifactGitignore, getProjectMagicContextHistorianDir, getMagicContextStorageResolution, getMagicContextStorageDir, sanitizeDiagnosticText, hasShareabilitySensitiveText, log, sessionLog, shouldEnforcePrivateStoragePermissions, setJsoncValue, removeJsoncValue, cortexKitUserConfigBasePath, cortexKitProjectConfigBasePath, resolveCortexKitUserConfigPath, resolveLegacyConfigSources, resolveLegacyConfigSourcesForHarness, logSlowWriteTransaction, V2_MEMORY_CATEGORIES, PROMOTABLE_CATEGORIES, getMemoryCategoryOrder, CATEGORY_DEFAULT_TTL, Database, withPrivilegedWriter, OMO_INTERNAL_INITIATOR_MARKER, removeSystemReminders, hasMeaningfulUserText, extractTexts, extractToolResultBodyTokens, extractToolCallSummaries, estimateTokens, normalizeText, compactRole, formatBlock, compactTextForSummary, mergeCommitHashes, recordMessageFtsRowid, messageFtsOrdinalRangeIsMapped, scheduleAfterBootQuiet, isUserHomeDirectory, resolveProjectIdentity2, resolveProjectIdentityForSession, normalizeStoredProjectPath, storedPathBelongsToIdentity, getModuleNoteEvaluationBridge, getContextStoreUuid, drainMirrorPages, stableStringify, resolveOpenCodeDbPath, assertOpenCodeStoreGeneration, openCodeDbPathExists, formatOpenCodeDbMissingStatusLine, formatOpenCodeDbReadFailureStatusLine, recordOpenCodeDbReadFailure, clearOpenCodeDbReadFailure, getOpenCodeDbReadFailure, claimOpenCodeDbDiagnosticOnce, closeQuietly, parseCompartmentOutput, resolveWorkspaceShareCategories, resolveWorkspaceIdentitySet, expandWorkspaceIdentitySetWithAliases, resolveStoredPathWorkspaceIdentity, sourceNameForMemory, computeWorkspaceEpochFingerprint, bumpEpochsForWorkspaceMembers, getErrorMessage, describeError, FAIL_CLOSED_DOCTOR_COMMAND, getSchemaFenceRejection, LATEST_SUPPORTED_VERSION, getPersistedSchemaVersion, openDatabase };

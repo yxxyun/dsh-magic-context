@@ -4288,6 +4288,1482 @@ var Include = class extends EntryTree {
 // ../plugin/src/config/migrate-config-location.ts
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/scanner.js
+function createScanner(text, ignoreTrivia = false) {
+  const len = text.length;
+  let pos = 0, value = "", tokenOffset = 0, token = 16, lineNumber = 0, lineStartOffset = 0, tokenLineStartOffset = 0, prevTokenLineStartOffset = 0, scanError = 0;
+  function scanHexDigits(count, exact) {
+    let digits = 0;
+    let value = 0;
+    while (digits < count || !exact) {
+      let ch = text.charCodeAt(pos);
+      if (ch >= 48 && ch <= 57) {
+        value = value * 16 + ch - 48;
+      } else if (ch >= 65 && ch <= 70) {
+        value = value * 16 + ch - 65 + 10;
+      } else if (ch >= 97 && ch <= 102) {
+        value = value * 16 + ch - 97 + 10;
+      } else {
+        break;
+      }
+      pos++;
+      digits++;
+    }
+    if (digits < count) {
+      value = -1;
+    }
+    return value;
+  }
+  function setPosition(newPosition) {
+    pos = newPosition;
+    value = "";
+    tokenOffset = 0;
+    token = 16;
+    scanError = 0;
+  }
+  function scanNumber() {
+    let start = pos;
+    if (text.charCodeAt(pos) === 48) {
+      pos++;
+    } else {
+      pos++;
+      while (pos < text.length && isDigit(text.charCodeAt(pos))) {
+        pos++;
+      }
+    }
+    if (pos < text.length && text.charCodeAt(pos) === 46) {
+      pos++;
+      if (pos < text.length && isDigit(text.charCodeAt(pos))) {
+        pos++;
+        while (pos < text.length && isDigit(text.charCodeAt(pos))) {
+          pos++;
+        }
+      } else {
+        scanError = 3;
+        return text.substring(start, pos);
+      }
+    }
+    let end = pos;
+    if (pos < text.length && (text.charCodeAt(pos) === 69 || text.charCodeAt(pos) === 101)) {
+      pos++;
+      if (pos < text.length && text.charCodeAt(pos) === 43 || text.charCodeAt(pos) === 45) {
+        pos++;
+      }
+      if (pos < text.length && isDigit(text.charCodeAt(pos))) {
+        pos++;
+        while (pos < text.length && isDigit(text.charCodeAt(pos))) {
+          pos++;
+        }
+        end = pos;
+      } else {
+        scanError = 3;
+      }
+    }
+    return text.substring(start, end);
+  }
+  function scanString() {
+    let result = "", start = pos;
+    while (true) {
+      if (pos >= len) {
+        result += text.substring(start, pos);
+        scanError = 2;
+        break;
+      }
+      const ch = text.charCodeAt(pos);
+      if (ch === 34) {
+        result += text.substring(start, pos);
+        pos++;
+        break;
+      }
+      if (ch === 92) {
+        result += text.substring(start, pos);
+        pos++;
+        if (pos >= len) {
+          scanError = 2;
+          break;
+        }
+        const ch2 = text.charCodeAt(pos++);
+        switch (ch2) {
+          case 34:
+            result += '"';
+            break;
+          case 92:
+            result += "\\";
+            break;
+          case 47:
+            result += "/";
+            break;
+          case 98:
+            result += "\b";
+            break;
+          case 102:
+            result += "\f";
+            break;
+          case 110:
+            result += `
+`;
+            break;
+          case 114:
+            result += "\r";
+            break;
+          case 116:
+            result += "\t";
+            break;
+          case 117:
+            const ch3 = scanHexDigits(4, true);
+            if (ch3 >= 0) {
+              result += String.fromCharCode(ch3);
+            } else {
+              scanError = 4;
+            }
+            break;
+          default:
+            scanError = 5;
+        }
+        start = pos;
+        continue;
+      }
+      if (ch >= 0 && ch <= 31) {
+        if (isLineBreak(ch)) {
+          result += text.substring(start, pos);
+          scanError = 2;
+          break;
+        } else {
+          scanError = 6;
+        }
+      }
+      pos++;
+    }
+    return result;
+  }
+  function scanNext() {
+    value = "";
+    scanError = 0;
+    tokenOffset = pos;
+    lineStartOffset = lineNumber;
+    prevTokenLineStartOffset = tokenLineStartOffset;
+    if (pos >= len) {
+      tokenOffset = len;
+      return token = 17;
+    }
+    let code = text.charCodeAt(pos);
+    if (isWhiteSpace(code)) {
+      do {
+        pos++;
+        value += String.fromCharCode(code);
+        code = text.charCodeAt(pos);
+      } while (isWhiteSpace(code));
+      return token = 15;
+    }
+    if (isLineBreak(code)) {
+      pos++;
+      value += String.fromCharCode(code);
+      if (code === 13 && text.charCodeAt(pos) === 10) {
+        pos++;
+        value += `
+`;
+      }
+      lineNumber++;
+      tokenLineStartOffset = pos;
+      return token = 14;
+    }
+    switch (code) {
+      case 123:
+        pos++;
+        return token = 1;
+      case 125:
+        pos++;
+        return token = 2;
+      case 91:
+        pos++;
+        return token = 3;
+      case 93:
+        pos++;
+        return token = 4;
+      case 58:
+        pos++;
+        return token = 6;
+      case 44:
+        pos++;
+        return token = 5;
+      case 34:
+        pos++;
+        value = scanString();
+        return token = 10;
+      case 47:
+        const start = pos - 1;
+        if (text.charCodeAt(pos + 1) === 47) {
+          pos += 2;
+          while (pos < len) {
+            if (isLineBreak(text.charCodeAt(pos))) {
+              break;
+            }
+            pos++;
+          }
+          value = text.substring(start, pos);
+          return token = 12;
+        }
+        if (text.charCodeAt(pos + 1) === 42) {
+          pos += 2;
+          const safeLength = len - 1;
+          let commentClosed = false;
+          while (pos < safeLength) {
+            const ch = text.charCodeAt(pos);
+            if (ch === 42 && text.charCodeAt(pos + 1) === 47) {
+              pos += 2;
+              commentClosed = true;
+              break;
+            }
+            pos++;
+            if (isLineBreak(ch)) {
+              if (ch === 13 && text.charCodeAt(pos) === 10) {
+                pos++;
+              }
+              lineNumber++;
+              tokenLineStartOffset = pos;
+            }
+          }
+          if (!commentClosed) {
+            pos++;
+            scanError = 1;
+          }
+          value = text.substring(start, pos);
+          return token = 13;
+        }
+        value += String.fromCharCode(code);
+        pos++;
+        return token = 16;
+      case 45:
+        value += String.fromCharCode(code);
+        pos++;
+        if (pos === len || !isDigit(text.charCodeAt(pos))) {
+          return token = 16;
+        }
+      case 48:
+      case 49:
+      case 50:
+      case 51:
+      case 52:
+      case 53:
+      case 54:
+      case 55:
+      case 56:
+      case 57:
+        value += scanNumber();
+        return token = 11;
+      default:
+        while (pos < len && isUnknownContentCharacter(code)) {
+          pos++;
+          code = text.charCodeAt(pos);
+        }
+        if (tokenOffset !== pos) {
+          value = text.substring(tokenOffset, pos);
+          switch (value) {
+            case "true":
+              return token = 8;
+            case "false":
+              return token = 9;
+            case "null":
+              return token = 7;
+          }
+          return token = 16;
+        }
+        value += String.fromCharCode(code);
+        pos++;
+        return token = 16;
+    }
+  }
+  function isUnknownContentCharacter(code) {
+    if (isWhiteSpace(code) || isLineBreak(code)) {
+      return false;
+    }
+    switch (code) {
+      case 125:
+      case 93:
+      case 123:
+      case 91:
+      case 34:
+      case 58:
+      case 44:
+      case 47:
+        return false;
+    }
+    return true;
+  }
+  function scanNextNonTrivia() {
+    let result;
+    do {
+      result = scanNext();
+    } while (result >= 12 && result <= 15);
+    return result;
+  }
+  return {
+    setPosition,
+    getPosition: () => pos,
+    scan: ignoreTrivia ? scanNextNonTrivia : scanNext,
+    getToken: () => token,
+    getTokenValue: () => value,
+    getTokenOffset: () => tokenOffset,
+    getTokenLength: () => pos - tokenOffset,
+    getTokenStartLine: () => lineStartOffset,
+    getTokenStartCharacter: () => tokenOffset - prevTokenLineStartOffset,
+    getTokenError: () => scanError
+  };
+}
+function isWhiteSpace(ch) {
+  return ch === 32 || ch === 9;
+}
+function isLineBreak(ch) {
+  return ch === 10 || ch === 13;
+}
+function isDigit(ch) {
+  return ch >= 48 && ch <= 57;
+}
+var CharacterCodes;
+(function(CharacterCodes) {
+  CharacterCodes[CharacterCodes["lineFeed"] = 10] = "lineFeed";
+  CharacterCodes[CharacterCodes["carriageReturn"] = 13] = "carriageReturn";
+  CharacterCodes[CharacterCodes["space"] = 32] = "space";
+  CharacterCodes[CharacterCodes["_0"] = 48] = "_0";
+  CharacterCodes[CharacterCodes["_1"] = 49] = "_1";
+  CharacterCodes[CharacterCodes["_2"] = 50] = "_2";
+  CharacterCodes[CharacterCodes["_3"] = 51] = "_3";
+  CharacterCodes[CharacterCodes["_4"] = 52] = "_4";
+  CharacterCodes[CharacterCodes["_5"] = 53] = "_5";
+  CharacterCodes[CharacterCodes["_6"] = 54] = "_6";
+  CharacterCodes[CharacterCodes["_7"] = 55] = "_7";
+  CharacterCodes[CharacterCodes["_8"] = 56] = "_8";
+  CharacterCodes[CharacterCodes["_9"] = 57] = "_9";
+  CharacterCodes[CharacterCodes["a"] = 97] = "a";
+  CharacterCodes[CharacterCodes["b"] = 98] = "b";
+  CharacterCodes[CharacterCodes["c"] = 99] = "c";
+  CharacterCodes[CharacterCodes["d"] = 100] = "d";
+  CharacterCodes[CharacterCodes["e"] = 101] = "e";
+  CharacterCodes[CharacterCodes["f"] = 102] = "f";
+  CharacterCodes[CharacterCodes["g"] = 103] = "g";
+  CharacterCodes[CharacterCodes["h"] = 104] = "h";
+  CharacterCodes[CharacterCodes["i"] = 105] = "i";
+  CharacterCodes[CharacterCodes["j"] = 106] = "j";
+  CharacterCodes[CharacterCodes["k"] = 107] = "k";
+  CharacterCodes[CharacterCodes["l"] = 108] = "l";
+  CharacterCodes[CharacterCodes["m"] = 109] = "m";
+  CharacterCodes[CharacterCodes["n"] = 110] = "n";
+  CharacterCodes[CharacterCodes["o"] = 111] = "o";
+  CharacterCodes[CharacterCodes["p"] = 112] = "p";
+  CharacterCodes[CharacterCodes["q"] = 113] = "q";
+  CharacterCodes[CharacterCodes["r"] = 114] = "r";
+  CharacterCodes[CharacterCodes["s"] = 115] = "s";
+  CharacterCodes[CharacterCodes["t"] = 116] = "t";
+  CharacterCodes[CharacterCodes["u"] = 117] = "u";
+  CharacterCodes[CharacterCodes["v"] = 118] = "v";
+  CharacterCodes[CharacterCodes["w"] = 119] = "w";
+  CharacterCodes[CharacterCodes["x"] = 120] = "x";
+  CharacterCodes[CharacterCodes["y"] = 121] = "y";
+  CharacterCodes[CharacterCodes["z"] = 122] = "z";
+  CharacterCodes[CharacterCodes["A"] = 65] = "A";
+  CharacterCodes[CharacterCodes["B"] = 66] = "B";
+  CharacterCodes[CharacterCodes["C"] = 67] = "C";
+  CharacterCodes[CharacterCodes["D"] = 68] = "D";
+  CharacterCodes[CharacterCodes["E"] = 69] = "E";
+  CharacterCodes[CharacterCodes["F"] = 70] = "F";
+  CharacterCodes[CharacterCodes["G"] = 71] = "G";
+  CharacterCodes[CharacterCodes["H"] = 72] = "H";
+  CharacterCodes[CharacterCodes["I"] = 73] = "I";
+  CharacterCodes[CharacterCodes["J"] = 74] = "J";
+  CharacterCodes[CharacterCodes["K"] = 75] = "K";
+  CharacterCodes[CharacterCodes["L"] = 76] = "L";
+  CharacterCodes[CharacterCodes["M"] = 77] = "M";
+  CharacterCodes[CharacterCodes["N"] = 78] = "N";
+  CharacterCodes[CharacterCodes["O"] = 79] = "O";
+  CharacterCodes[CharacterCodes["P"] = 80] = "P";
+  CharacterCodes[CharacterCodes["Q"] = 81] = "Q";
+  CharacterCodes[CharacterCodes["R"] = 82] = "R";
+  CharacterCodes[CharacterCodes["S"] = 83] = "S";
+  CharacterCodes[CharacterCodes["T"] = 84] = "T";
+  CharacterCodes[CharacterCodes["U"] = 85] = "U";
+  CharacterCodes[CharacterCodes["V"] = 86] = "V";
+  CharacterCodes[CharacterCodes["W"] = 87] = "W";
+  CharacterCodes[CharacterCodes["X"] = 88] = "X";
+  CharacterCodes[CharacterCodes["Y"] = 89] = "Y";
+  CharacterCodes[CharacterCodes["Z"] = 90] = "Z";
+  CharacterCodes[CharacterCodes["asterisk"] = 42] = "asterisk";
+  CharacterCodes[CharacterCodes["backslash"] = 92] = "backslash";
+  CharacterCodes[CharacterCodes["closeBrace"] = 125] = "closeBrace";
+  CharacterCodes[CharacterCodes["closeBracket"] = 93] = "closeBracket";
+  CharacterCodes[CharacterCodes["colon"] = 58] = "colon";
+  CharacterCodes[CharacterCodes["comma"] = 44] = "comma";
+  CharacterCodes[CharacterCodes["dot"] = 46] = "dot";
+  CharacterCodes[CharacterCodes["doubleQuote"] = 34] = "doubleQuote";
+  CharacterCodes[CharacterCodes["minus"] = 45] = "minus";
+  CharacterCodes[CharacterCodes["openBrace"] = 123] = "openBrace";
+  CharacterCodes[CharacterCodes["openBracket"] = 91] = "openBracket";
+  CharacterCodes[CharacterCodes["plus"] = 43] = "plus";
+  CharacterCodes[CharacterCodes["slash"] = 47] = "slash";
+  CharacterCodes[CharacterCodes["formFeed"] = 12] = "formFeed";
+  CharacterCodes[CharacterCodes["tab"] = 9] = "tab";
+})(CharacterCodes || (CharacterCodes = {}));
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/string-intern.js
+var cachedSpaces = new Array(20).fill(0).map((_, index) => {
+  return " ".repeat(index);
+});
+var maxCachedValues = 200;
+var cachedBreakLinesWithSpaces = {
+  " ": {
+    "\n": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return `
+` + " ".repeat(index);
+    }),
+    "\r": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return "\r" + " ".repeat(index);
+    }),
+    "\r\n": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return `\r
+` + " ".repeat(index);
+    })
+  },
+  "\t": {
+    "\n": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return `
+` + "\t".repeat(index);
+    }),
+    "\r": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return "\r" + "\t".repeat(index);
+    }),
+    "\r\n": new Array(maxCachedValues).fill(0).map((_, index) => {
+      return `\r
+` + "\t".repeat(index);
+    })
+  }
+};
+var supportedEols = [`
+`, "\r", `\r
+`];
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/format.js
+function format(documentText, range, options) {
+  let initialIndentLevel;
+  let formatText;
+  let formatTextStart;
+  let rangeStart;
+  let rangeEnd;
+  if (range) {
+    rangeStart = range.offset;
+    rangeEnd = rangeStart + range.length;
+    formatTextStart = rangeStart;
+    while (formatTextStart > 0 && !isEOL(documentText, formatTextStart - 1)) {
+      formatTextStart--;
+    }
+    let endOffset = rangeEnd;
+    while (endOffset < documentText.length && !isEOL(documentText, endOffset)) {
+      endOffset++;
+    }
+    formatText = documentText.substring(formatTextStart, endOffset);
+    initialIndentLevel = computeIndentLevel(formatText, options);
+  } else {
+    formatText = documentText;
+    initialIndentLevel = 0;
+    formatTextStart = 0;
+    rangeStart = 0;
+    rangeEnd = documentText.length;
+  }
+  const eol = getEOL(options, documentText);
+  const eolFastPathSupported = supportedEols.includes(eol);
+  let numberLineBreaks = 0;
+  let indentLevel = 0;
+  let indentValue;
+  if (options.insertSpaces) {
+    indentValue = cachedSpaces[options.tabSize || 4] ?? repeat(cachedSpaces[1], options.tabSize || 4);
+  } else {
+    indentValue = "\t";
+  }
+  const indentType = indentValue === "\t" ? "\t" : " ";
+  let scanner = createScanner(formatText, false);
+  let hasError = false;
+  function newLinesAndIndent() {
+    if (numberLineBreaks > 1) {
+      return repeat(eol, numberLineBreaks) + repeat(indentValue, initialIndentLevel + indentLevel);
+    }
+    const amountOfSpaces = indentValue.length * (initialIndentLevel + indentLevel);
+    if (!eolFastPathSupported || amountOfSpaces > cachedBreakLinesWithSpaces[indentType][eol].length) {
+      return eol + repeat(indentValue, initialIndentLevel + indentLevel);
+    }
+    if (amountOfSpaces <= 0) {
+      return eol;
+    }
+    return cachedBreakLinesWithSpaces[indentType][eol][amountOfSpaces];
+  }
+  function scanNext() {
+    let token = scanner.scan();
+    numberLineBreaks = 0;
+    while (token === 15 || token === 14) {
+      if (token === 14 && options.keepLines) {
+        numberLineBreaks += 1;
+      } else if (token === 14) {
+        numberLineBreaks = 1;
+      }
+      token = scanner.scan();
+    }
+    hasError = token === 16 || scanner.getTokenError() !== 0;
+    return token;
+  }
+  const editOperations = [];
+  function addEdit(text, startOffset, endOffset) {
+    if (!hasError && (!range || startOffset < rangeEnd && endOffset > rangeStart) && documentText.substring(startOffset, endOffset) !== text) {
+      editOperations.push({ offset: startOffset, length: endOffset - startOffset, content: text });
+    }
+  }
+  let firstToken = scanNext();
+  if (options.keepLines && numberLineBreaks > 0) {
+    addEdit(repeat(eol, numberLineBreaks), 0, 0);
+  }
+  if (firstToken !== 17) {
+    let firstTokenStart = scanner.getTokenOffset() + formatTextStart;
+    let initialIndent = indentValue.length * initialIndentLevel < 20 && options.insertSpaces ? cachedSpaces[indentValue.length * initialIndentLevel] : repeat(indentValue, initialIndentLevel);
+    addEdit(initialIndent, formatTextStart, firstTokenStart);
+  }
+  while (firstToken !== 17) {
+    let firstTokenEnd = scanner.getTokenOffset() + scanner.getTokenLength() + formatTextStart;
+    let secondToken = scanNext();
+    let replaceContent = "";
+    let needsLineBreak = false;
+    while (numberLineBreaks === 0 && (secondToken === 12 || secondToken === 13)) {
+      let commentTokenStart = scanner.getTokenOffset() + formatTextStart;
+      addEdit(cachedSpaces[1], firstTokenEnd, commentTokenStart);
+      firstTokenEnd = scanner.getTokenOffset() + scanner.getTokenLength() + formatTextStart;
+      needsLineBreak = secondToken === 12;
+      replaceContent = needsLineBreak ? newLinesAndIndent() : "";
+      secondToken = scanNext();
+    }
+    if (secondToken === 2) {
+      if (firstToken !== 1) {
+        indentLevel--;
+      }
+      if (options.keepLines && numberLineBreaks > 0 || !options.keepLines && firstToken !== 1) {
+        replaceContent = newLinesAndIndent();
+      } else if (options.keepLines) {
+        replaceContent = cachedSpaces[1];
+      }
+    } else if (secondToken === 4) {
+      if (firstToken !== 3) {
+        indentLevel--;
+      }
+      if (options.keepLines && numberLineBreaks > 0 || !options.keepLines && firstToken !== 3) {
+        replaceContent = newLinesAndIndent();
+      } else if (options.keepLines) {
+        replaceContent = cachedSpaces[1];
+      }
+    } else {
+      switch (firstToken) {
+        case 3:
+        case 1:
+          indentLevel++;
+          if (options.keepLines && numberLineBreaks > 0 || !options.keepLines) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 5:
+          if (options.keepLines && numberLineBreaks > 0 || !options.keepLines) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 12:
+          replaceContent = newLinesAndIndent();
+          break;
+        case 13:
+          if (numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (!needsLineBreak) {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 6:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (!needsLineBreak) {
+            replaceContent = cachedSpaces[1];
+          }
+          break;
+        case 10:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else if (secondToken === 6 && !needsLineBreak) {
+            replaceContent = "";
+          }
+          break;
+        case 7:
+        case 8:
+        case 9:
+        case 11:
+        case 2:
+        case 4:
+          if (options.keepLines && numberLineBreaks > 0) {
+            replaceContent = newLinesAndIndent();
+          } else {
+            if ((secondToken === 12 || secondToken === 13) && !needsLineBreak) {
+              replaceContent = cachedSpaces[1];
+            } else if (secondToken !== 5 && secondToken !== 17) {
+              hasError = true;
+            }
+          }
+          break;
+        case 16:
+          hasError = true;
+          break;
+      }
+      if (numberLineBreaks > 0 && (secondToken === 12 || secondToken === 13)) {
+        replaceContent = newLinesAndIndent();
+      }
+    }
+    if (secondToken === 17) {
+      if (options.keepLines && numberLineBreaks > 0) {
+        replaceContent = newLinesAndIndent();
+      } else {
+        replaceContent = options.insertFinalNewline ? eol : "";
+      }
+    }
+    const secondTokenStart = scanner.getTokenOffset() + formatTextStart;
+    addEdit(replaceContent, firstTokenEnd, secondTokenStart);
+    firstToken = secondToken;
+  }
+  return editOperations;
+}
+function repeat(s, count) {
+  let result = "";
+  for (let i = 0;i < count; i++) {
+    result += s;
+  }
+  return result;
+}
+function computeIndentLevel(content, options) {
+  let i = 0;
+  let nChars = 0;
+  const tabSize = options.tabSize || 4;
+  while (i < content.length) {
+    let ch = content.charAt(i);
+    if (ch === cachedSpaces[1]) {
+      nChars++;
+    } else if (ch === "\t") {
+      nChars += tabSize;
+    } else {
+      break;
+    }
+    i++;
+  }
+  return Math.floor(nChars / tabSize);
+}
+function getEOL(options, text) {
+  for (let i = 0;i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (ch === "\r") {
+      if (i + 1 < text.length && text.charAt(i + 1) === `
+`) {
+        return `\r
+`;
+      }
+      return "\r";
+    } else if (ch === `
+`) {
+      return `
+`;
+    }
+  }
+  return options && options.eol || `
+`;
+}
+function isEOL(text, offset) {
+  return `\r
+`.indexOf(text.charAt(offset)) !== -1;
+}
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/parser.js
+var ParseOptions;
+(function(ParseOptions) {
+  ParseOptions.DEFAULT = {
+    allowTrailingComma: false
+  };
+})(ParseOptions || (ParseOptions = {}));
+function parse(text, errors = [], options = ParseOptions.DEFAULT) {
+  let currentProperty = null;
+  let currentParent = [];
+  const previousParents = [];
+  function onValue(value) {
+    if (Array.isArray(currentParent)) {
+      currentParent.push(value);
+    } else if (currentProperty !== null) {
+      currentParent[currentProperty] = value;
+    }
+  }
+  const visitor = {
+    onObjectBegin: () => {
+      const object = {};
+      onValue(object);
+      previousParents.push(currentParent);
+      currentParent = object;
+      currentProperty = null;
+    },
+    onObjectProperty: (name) => {
+      currentProperty = name;
+    },
+    onObjectEnd: () => {
+      currentParent = previousParents.pop();
+    },
+    onArrayBegin: () => {
+      const array = [];
+      onValue(array);
+      previousParents.push(currentParent);
+      currentParent = array;
+      currentProperty = null;
+    },
+    onArrayEnd: () => {
+      currentParent = previousParents.pop();
+    },
+    onLiteralValue: onValue,
+    onError: (error, offset, length) => {
+      errors.push({ error, offset, length });
+    }
+  };
+  visit(text, visitor, options);
+  return currentParent[0];
+}
+function parseTree(text, errors = [], options = ParseOptions.DEFAULT) {
+  let currentParent = { type: "array", offset: -1, length: -1, children: [], parent: undefined };
+  function ensurePropertyComplete(endOffset) {
+    if (currentParent.type === "property") {
+      currentParent.length = endOffset - currentParent.offset;
+      currentParent = currentParent.parent;
+    }
+  }
+  function onValue(valueNode) {
+    currentParent.children.push(valueNode);
+    return valueNode;
+  }
+  const visitor = {
+    onObjectBegin: (offset) => {
+      currentParent = onValue({ type: "object", offset, length: -1, parent: currentParent, children: [] });
+    },
+    onObjectProperty: (name, offset, length) => {
+      currentParent = onValue({ type: "property", offset, length: -1, parent: currentParent, children: [] });
+      currentParent.children.push({ type: "string", value: name, offset, length, parent: currentParent });
+    },
+    onObjectEnd: (offset, length) => {
+      ensurePropertyComplete(offset + length);
+      currentParent.length = offset + length - currentParent.offset;
+      currentParent = currentParent.parent;
+      ensurePropertyComplete(offset + length);
+    },
+    onArrayBegin: (offset, length) => {
+      currentParent = onValue({ type: "array", offset, length: -1, parent: currentParent, children: [] });
+    },
+    onArrayEnd: (offset, length) => {
+      currentParent.length = offset + length - currentParent.offset;
+      currentParent = currentParent.parent;
+      ensurePropertyComplete(offset + length);
+    },
+    onLiteralValue: (value, offset, length) => {
+      onValue({ type: getNodeType(value), offset, length, parent: currentParent, value });
+      ensurePropertyComplete(offset + length);
+    },
+    onSeparator: (sep, offset, length) => {
+      if (currentParent.type === "property") {
+        if (sep === ":") {
+          currentParent.colonOffset = offset;
+        } else if (sep === ",") {
+          ensurePropertyComplete(offset);
+        }
+      }
+    },
+    onError: (error, offset, length) => {
+      errors.push({ error, offset, length });
+    }
+  };
+  visit(text, visitor, options);
+  const result = currentParent.children[0];
+  if (result) {
+    delete result.parent;
+  }
+  return result;
+}
+function findNodeAtLocation(root, path) {
+  if (!root) {
+    return;
+  }
+  let node = root;
+  for (let segment of path) {
+    if (typeof segment === "string") {
+      if (node.type !== "object" || !Array.isArray(node.children)) {
+        return;
+      }
+      let found = false;
+      for (const propertyNode of node.children) {
+        if (Array.isArray(propertyNode.children) && propertyNode.children[0].value === segment && propertyNode.children.length === 2) {
+          node = propertyNode.children[1];
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return;
+      }
+    } else {
+      const index = segment;
+      if (node.type !== "array" || index < 0 || !Array.isArray(node.children) || index >= node.children.length) {
+        return;
+      }
+      node = node.children[index];
+    }
+  }
+  return node;
+}
+function getNodeValue(node) {
+  switch (node.type) {
+    case "array":
+      return node.children.map(getNodeValue);
+    case "object":
+      const obj = Object.create(null);
+      for (let prop of node.children) {
+        const valueNode = prop.children[1];
+        if (valueNode) {
+          obj[prop.children[0].value] = getNodeValue(valueNode);
+        }
+      }
+      return obj;
+    case "null":
+    case "string":
+    case "number":
+    case "boolean":
+      return node.value;
+    default:
+      return;
+  }
+}
+function visit(text, visitor, options = ParseOptions.DEFAULT) {
+  const _scanner = createScanner(text, false);
+  const _jsonPath = [];
+  let suppressedCallbacks = 0;
+  function toNoArgVisit(visitFunction) {
+    return visitFunction ? () => suppressedCallbacks === 0 && visitFunction(_scanner.getTokenOffset(), _scanner.getTokenLength(), _scanner.getTokenStartLine(), _scanner.getTokenStartCharacter()) : () => true;
+  }
+  function toOneArgVisit(visitFunction) {
+    return visitFunction ? (arg) => suppressedCallbacks === 0 && visitFunction(arg, _scanner.getTokenOffset(), _scanner.getTokenLength(), _scanner.getTokenStartLine(), _scanner.getTokenStartCharacter()) : () => true;
+  }
+  function toOneArgVisitWithPath(visitFunction) {
+    return visitFunction ? (arg) => suppressedCallbacks === 0 && visitFunction(arg, _scanner.getTokenOffset(), _scanner.getTokenLength(), _scanner.getTokenStartLine(), _scanner.getTokenStartCharacter(), () => _jsonPath.slice()) : () => true;
+  }
+  function toBeginVisit(visitFunction) {
+    return visitFunction ? () => {
+      if (suppressedCallbacks > 0) {
+        suppressedCallbacks++;
+      } else {
+        let cbReturn = visitFunction(_scanner.getTokenOffset(), _scanner.getTokenLength(), _scanner.getTokenStartLine(), _scanner.getTokenStartCharacter(), () => _jsonPath.slice());
+        if (cbReturn === false) {
+          suppressedCallbacks = 1;
+        }
+      }
+    } : () => true;
+  }
+  function toEndVisit(visitFunction) {
+    return visitFunction ? () => {
+      if (suppressedCallbacks > 0) {
+        suppressedCallbacks--;
+      }
+      if (suppressedCallbacks === 0) {
+        visitFunction(_scanner.getTokenOffset(), _scanner.getTokenLength(), _scanner.getTokenStartLine(), _scanner.getTokenStartCharacter());
+      }
+    } : () => true;
+  }
+  const onObjectBegin = toBeginVisit(visitor.onObjectBegin), onObjectProperty = toOneArgVisitWithPath(visitor.onObjectProperty), onObjectEnd = toEndVisit(visitor.onObjectEnd), onArrayBegin = toBeginVisit(visitor.onArrayBegin), onArrayEnd = toEndVisit(visitor.onArrayEnd), onLiteralValue = toOneArgVisitWithPath(visitor.onLiteralValue), onSeparator = toOneArgVisit(visitor.onSeparator), onComment = toNoArgVisit(visitor.onComment), onError = toOneArgVisit(visitor.onError);
+  const disallowComments = options && options.disallowComments;
+  const allowTrailingComma = options && options.allowTrailingComma;
+  function scanNext() {
+    while (true) {
+      const token = _scanner.scan();
+      switch (_scanner.getTokenError()) {
+        case 4:
+          handleError(14);
+          break;
+        case 5:
+          handleError(15);
+          break;
+        case 3:
+          handleError(13);
+          break;
+        case 1:
+          if (!disallowComments) {
+            handleError(11);
+          }
+          break;
+        case 2:
+          handleError(12);
+          break;
+        case 6:
+          handleError(16);
+          break;
+      }
+      switch (token) {
+        case 12:
+        case 13:
+          if (disallowComments) {
+            handleError(10);
+          } else {
+            onComment();
+          }
+          break;
+        case 16:
+          handleError(1);
+          break;
+        case 15:
+        case 14:
+          break;
+        default:
+          return token;
+      }
+    }
+  }
+  function handleError(error, skipUntilAfter = [], skipUntil = []) {
+    onError(error);
+    if (skipUntilAfter.length + skipUntil.length > 0) {
+      let token = _scanner.getToken();
+      while (token !== 17) {
+        if (skipUntilAfter.indexOf(token) !== -1) {
+          scanNext();
+          break;
+        } else if (skipUntil.indexOf(token) !== -1) {
+          break;
+        }
+        token = scanNext();
+      }
+    }
+  }
+  function parseString(isValue) {
+    const value = _scanner.getTokenValue();
+    if (isValue) {
+      onLiteralValue(value);
+    } else {
+      onObjectProperty(value);
+      _jsonPath.push(value);
+    }
+    scanNext();
+    return true;
+  }
+  function parseLiteral() {
+    switch (_scanner.getToken()) {
+      case 11:
+        const tokenValue = _scanner.getTokenValue();
+        let value = Number(tokenValue);
+        if (isNaN(value)) {
+          handleError(2);
+          value = 0;
+        }
+        onLiteralValue(value);
+        break;
+      case 7:
+        onLiteralValue(null);
+        break;
+      case 8:
+        onLiteralValue(true);
+        break;
+      case 9:
+        onLiteralValue(false);
+        break;
+      default:
+        return false;
+    }
+    scanNext();
+    return true;
+  }
+  function parseProperty() {
+    if (_scanner.getToken() !== 10) {
+      handleError(3, [], [2, 5]);
+      return false;
+    }
+    parseString(false);
+    if (_scanner.getToken() === 6) {
+      onSeparator(":");
+      scanNext();
+      if (!parseValue()) {
+        handleError(4, [], [2, 5]);
+      }
+    } else {
+      handleError(5, [], [2, 5]);
+    }
+    _jsonPath.pop();
+    return true;
+  }
+  function parseObject() {
+    onObjectBegin();
+    scanNext();
+    let needsComma = false;
+    while (_scanner.getToken() !== 2 && _scanner.getToken() !== 17) {
+      if (_scanner.getToken() === 5) {
+        if (!needsComma) {
+          handleError(4, [], []);
+        }
+        onSeparator(",");
+        scanNext();
+        if (_scanner.getToken() === 2 && allowTrailingComma) {
+          break;
+        }
+      } else if (needsComma) {
+        handleError(6, [], []);
+      }
+      if (!parseProperty()) {
+        handleError(4, [], [2, 5]);
+      }
+      needsComma = true;
+    }
+    onObjectEnd();
+    if (_scanner.getToken() !== 2) {
+      handleError(7, [2], []);
+    } else {
+      scanNext();
+    }
+    return true;
+  }
+  function parseArray() {
+    onArrayBegin();
+    scanNext();
+    let isFirstElement = true;
+    let needsComma = false;
+    while (_scanner.getToken() !== 4 && _scanner.getToken() !== 17) {
+      if (_scanner.getToken() === 5) {
+        if (!needsComma) {
+          handleError(4, [], []);
+        }
+        onSeparator(",");
+        scanNext();
+        if (_scanner.getToken() === 4 && allowTrailingComma) {
+          break;
+        }
+      } else if (needsComma) {
+        handleError(6, [], []);
+      }
+      if (isFirstElement) {
+        _jsonPath.push(0);
+        isFirstElement = false;
+      } else {
+        _jsonPath[_jsonPath.length - 1]++;
+      }
+      if (!parseValue()) {
+        handleError(4, [], [4, 5]);
+      }
+      needsComma = true;
+    }
+    onArrayEnd();
+    if (!isFirstElement) {
+      _jsonPath.pop();
+    }
+    if (_scanner.getToken() !== 4) {
+      handleError(8, [4], []);
+    } else {
+      scanNext();
+    }
+    return true;
+  }
+  function parseValue() {
+    switch (_scanner.getToken()) {
+      case 3:
+        return parseArray();
+      case 1:
+        return parseObject();
+      case 10:
+        return parseString(true);
+      default:
+        return parseLiteral();
+    }
+  }
+  scanNext();
+  if (_scanner.getToken() === 17) {
+    if (options.allowEmptyContent) {
+      return true;
+    }
+    handleError(4, [], []);
+    return false;
+  }
+  if (!parseValue()) {
+    handleError(4, [], []);
+    return false;
+  }
+  if (_scanner.getToken() !== 17) {
+    handleError(9, [], []);
+  }
+  return true;
+}
+function getNodeType(value) {
+  switch (typeof value) {
+    case "boolean":
+      return "boolean";
+    case "number":
+      return "number";
+    case "string":
+      return "string";
+    case "object": {
+      if (!value) {
+        return "null";
+      } else if (Array.isArray(value)) {
+        return "array";
+      }
+      return "object";
+    }
+    default:
+      return "null";
+  }
+}
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/impl/edit.js
+function setProperty(text, originalPath, value, options) {
+  const path = originalPath.slice();
+  const errors = [];
+  const root = parseTree(text, errors);
+  let parent = undefined;
+  let lastSegment = undefined;
+  while (path.length > 0) {
+    lastSegment = path.pop();
+    parent = findNodeAtLocation(root, path);
+    if (parent === undefined && value !== undefined) {
+      if (typeof lastSegment === "string") {
+        value = { [lastSegment]: value };
+      } else {
+        value = [value];
+      }
+    } else {
+      break;
+    }
+  }
+  if (!parent) {
+    if (value === undefined) {
+      throw new Error("Can not delete in empty document");
+    }
+    return withFormatting(text, { offset: root ? root.offset : 0, length: root ? root.length : 0, content: JSON.stringify(value) }, options);
+  } else if (parent.type === "object" && typeof lastSegment === "string" && Array.isArray(parent.children)) {
+    const existing = findNodeAtLocation(parent, [lastSegment]);
+    if (existing !== undefined) {
+      if (value === undefined) {
+        if (!existing.parent) {
+          throw new Error("Malformed AST");
+        }
+        const propertyIndex = parent.children.indexOf(existing.parent);
+        let removeBegin;
+        let removeEnd = existing.parent.offset + existing.parent.length;
+        if (propertyIndex > 0) {
+          let previous = parent.children[propertyIndex - 1];
+          removeBegin = previous.offset + previous.length;
+        } else {
+          removeBegin = parent.offset + 1;
+          if (parent.children.length > 1) {
+            let next = parent.children[1];
+            removeEnd = next.offset;
+          }
+        }
+        return withFormatting(text, { offset: removeBegin, length: removeEnd - removeBegin, content: "" }, options);
+      } else {
+        return withFormatting(text, { offset: existing.offset, length: existing.length, content: JSON.stringify(value) }, options);
+      }
+    } else {
+      if (value === undefined) {
+        return [];
+      }
+      const newProperty = `${JSON.stringify(lastSegment)}: ${JSON.stringify(value)}`;
+      const index = options.getInsertionIndex ? options.getInsertionIndex(parent.children.map((p) => p.children[0].value)) : parent.children.length;
+      let edit;
+      if (index > 0) {
+        let previous = parent.children[index - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      } else if (parent.children.length === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty };
+      } else {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty + "," };
+      }
+      return withFormatting(text, edit, options);
+    }
+  } else if (parent.type === "array" && typeof lastSegment === "number" && Array.isArray(parent.children)) {
+    const insertIndex = lastSegment;
+    if (insertIndex === -1) {
+      const newProperty = `${JSON.stringify(value)}`;
+      let edit;
+      if (parent.children.length === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: newProperty };
+      } else {
+        const previous = parent.children[parent.children.length - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      }
+      return withFormatting(text, edit, options);
+    } else if (value === undefined && parent.children.length >= 0) {
+      const removalIndex = lastSegment;
+      const toRemove = parent.children[removalIndex];
+      let edit;
+      if (parent.children.length === 1) {
+        edit = { offset: parent.offset + 1, length: parent.length - 2, content: "" };
+      } else if (parent.children.length - 1 === removalIndex) {
+        let previous = parent.children[removalIndex - 1];
+        let offset = previous.offset + previous.length;
+        let parentEndOffset = parent.offset + parent.length;
+        edit = { offset, length: parentEndOffset - 2 - offset, content: "" };
+      } else {
+        edit = { offset: toRemove.offset, length: parent.children[removalIndex + 1].offset - toRemove.offset, content: "" };
+      }
+      return withFormatting(text, edit, options);
+    } else if (value !== undefined) {
+      let edit;
+      const newProperty = `${JSON.stringify(value)}`;
+      if (!options.isArrayInsertion && parent.children.length > lastSegment) {
+        const toModify = parent.children[lastSegment];
+        edit = { offset: toModify.offset, length: toModify.length, content: newProperty };
+      } else if (parent.children.length === 0 || lastSegment === 0) {
+        edit = { offset: parent.offset + 1, length: 0, content: parent.children.length === 0 ? newProperty : newProperty + "," };
+      } else {
+        const index = lastSegment > parent.children.length ? parent.children.length : lastSegment;
+        const previous = parent.children[index - 1];
+        edit = { offset: previous.offset + previous.length, length: 0, content: "," + newProperty };
+      }
+      return withFormatting(text, edit, options);
+    } else {
+      throw new Error(`Can not ${value === undefined ? "remove" : options.isArrayInsertion ? "insert" : "modify"} Array index ${insertIndex} as length is not sufficient`);
+    }
+  } else {
+    throw new Error(`Can not add ${typeof lastSegment !== "number" ? "index" : "property"} to parent of type ${parent.type}`);
+  }
+}
+function withFormatting(text, edit, options) {
+  if (!options.formattingOptions) {
+    return [edit];
+  }
+  let newText = applyEdit(text, edit);
+  let begin = edit.offset;
+  let end = edit.offset + edit.content.length;
+  if (edit.length === 0 || edit.content.length === 0) {
+    while (begin > 0 && !isEOL(newText, begin - 1)) {
+      begin--;
+    }
+    while (end < newText.length && !isEOL(newText, end)) {
+      end++;
+    }
+  }
+  const edits = format(newText, { offset: begin, length: end - begin }, { ...options.formattingOptions, keepLines: false });
+  for (let i = edits.length - 1;i >= 0; i--) {
+    const edit = edits[i];
+    newText = applyEdit(newText, edit);
+    begin = Math.min(begin, edit.offset);
+    end = Math.max(end, edit.offset + edit.length);
+    end += edit.content.length - edit.length;
+  }
+  const editLength = text.length - (newText.length - end) - begin;
+  return [{ offset: begin, length: editLength, content: newText.substring(begin, end) }];
+}
+function applyEdit(text, edit) {
+  return text.substring(0, edit.offset) + edit.content + text.substring(edit.offset + edit.length);
+}
+
+// ../../node_modules/.bun/jsonc-parser@3.3.1/node_modules/jsonc-parser/lib/esm/main.js
+var createScanner2 = createScanner;
+var ScanError;
+(function(ScanError) {
+  ScanError[ScanError["None"] = 0] = "None";
+  ScanError[ScanError["UnexpectedEndOfComment"] = 1] = "UnexpectedEndOfComment";
+  ScanError[ScanError["UnexpectedEndOfString"] = 2] = "UnexpectedEndOfString";
+  ScanError[ScanError["UnexpectedEndOfNumber"] = 3] = "UnexpectedEndOfNumber";
+  ScanError[ScanError["InvalidUnicode"] = 4] = "InvalidUnicode";
+  ScanError[ScanError["InvalidEscapeCharacter"] = 5] = "InvalidEscapeCharacter";
+  ScanError[ScanError["InvalidCharacter"] = 6] = "InvalidCharacter";
+})(ScanError || (ScanError = {}));
+var SyntaxKind;
+(function(SyntaxKind) {
+  SyntaxKind[SyntaxKind["OpenBraceToken"] = 1] = "OpenBraceToken";
+  SyntaxKind[SyntaxKind["CloseBraceToken"] = 2] = "CloseBraceToken";
+  SyntaxKind[SyntaxKind["OpenBracketToken"] = 3] = "OpenBracketToken";
+  SyntaxKind[SyntaxKind["CloseBracketToken"] = 4] = "CloseBracketToken";
+  SyntaxKind[SyntaxKind["CommaToken"] = 5] = "CommaToken";
+  SyntaxKind[SyntaxKind["ColonToken"] = 6] = "ColonToken";
+  SyntaxKind[SyntaxKind["NullKeyword"] = 7] = "NullKeyword";
+  SyntaxKind[SyntaxKind["TrueKeyword"] = 8] = "TrueKeyword";
+  SyntaxKind[SyntaxKind["FalseKeyword"] = 9] = "FalseKeyword";
+  SyntaxKind[SyntaxKind["StringLiteral"] = 10] = "StringLiteral";
+  SyntaxKind[SyntaxKind["NumericLiteral"] = 11] = "NumericLiteral";
+  SyntaxKind[SyntaxKind["LineCommentTrivia"] = 12] = "LineCommentTrivia";
+  SyntaxKind[SyntaxKind["BlockCommentTrivia"] = 13] = "BlockCommentTrivia";
+  SyntaxKind[SyntaxKind["LineBreakTrivia"] = 14] = "LineBreakTrivia";
+  SyntaxKind[SyntaxKind["Trivia"] = 15] = "Trivia";
+  SyntaxKind[SyntaxKind["Unknown"] = 16] = "Unknown";
+  SyntaxKind[SyntaxKind["EOF"] = 17] = "EOF";
+})(SyntaxKind || (SyntaxKind = {}));
+var parse2 = parse;
+var parseTree2 = parseTree;
+var findNodeAtLocation2 = findNodeAtLocation;
+var getNodeValue2 = getNodeValue;
+var ParseErrorCode;
+(function(ParseErrorCode) {
+  ParseErrorCode[ParseErrorCode["InvalidSymbol"] = 1] = "InvalidSymbol";
+  ParseErrorCode[ParseErrorCode["InvalidNumberFormat"] = 2] = "InvalidNumberFormat";
+  ParseErrorCode[ParseErrorCode["PropertyNameExpected"] = 3] = "PropertyNameExpected";
+  ParseErrorCode[ParseErrorCode["ValueExpected"] = 4] = "ValueExpected";
+  ParseErrorCode[ParseErrorCode["ColonExpected"] = 5] = "ColonExpected";
+  ParseErrorCode[ParseErrorCode["CommaExpected"] = 6] = "CommaExpected";
+  ParseErrorCode[ParseErrorCode["CloseBraceExpected"] = 7] = "CloseBraceExpected";
+  ParseErrorCode[ParseErrorCode["CloseBracketExpected"] = 8] = "CloseBracketExpected";
+  ParseErrorCode[ParseErrorCode["EndOfFileExpected"] = 9] = "EndOfFileExpected";
+  ParseErrorCode[ParseErrorCode["InvalidCommentToken"] = 10] = "InvalidCommentToken";
+  ParseErrorCode[ParseErrorCode["UnexpectedEndOfComment"] = 11] = "UnexpectedEndOfComment";
+  ParseErrorCode[ParseErrorCode["UnexpectedEndOfString"] = 12] = "UnexpectedEndOfString";
+  ParseErrorCode[ParseErrorCode["UnexpectedEndOfNumber"] = 13] = "UnexpectedEndOfNumber";
+  ParseErrorCode[ParseErrorCode["InvalidUnicode"] = 14] = "InvalidUnicode";
+  ParseErrorCode[ParseErrorCode["InvalidEscapeCharacter"] = 15] = "InvalidEscapeCharacter";
+  ParseErrorCode[ParseErrorCode["InvalidCharacter"] = 16] = "InvalidCharacter";
+})(ParseErrorCode || (ParseErrorCode = {}));
+function printParseErrorCode(code) {
+  switch (code) {
+    case 1:
+      return "InvalidSymbol";
+    case 2:
+      return "InvalidNumberFormat";
+    case 3:
+      return "PropertyNameExpected";
+    case 4:
+      return "ValueExpected";
+    case 5:
+      return "ColonExpected";
+    case 6:
+      return "CommaExpected";
+    case 7:
+      return "CloseBraceExpected";
+    case 8:
+      return "CloseBracketExpected";
+    case 9:
+      return "EndOfFileExpected";
+    case 10:
+      return "InvalidCommentToken";
+    case 11:
+      return "UnexpectedEndOfComment";
+    case 12:
+      return "UnexpectedEndOfString";
+    case 13:
+      return "UnexpectedEndOfNumber";
+    case 14:
+      return "InvalidUnicode";
+    case 15:
+      return "InvalidEscapeCharacter";
+    case 16:
+      return "InvalidCharacter";
+  }
+  return "<unknown ParseErrorCode>";
+}
+function modify(text, path, value, options) {
+  return setProperty(text, path, value, options);
+}
+function applyEdits(text, edits) {
+  let sortedEdits = edits.slice(0).sort((a, b) => {
+    const diff = a.offset - b.offset;
+    if (diff === 0) {
+      return a.length - b.length;
+    }
+    return diff;
+  });
+  let lastModifiedOffset = text.length;
+  for (let i = sortedEdits.length - 1;i >= 0; i--) {
+    let e = sortedEdits[i];
+    if (e.offset + e.length <= lastModifiedOffset) {
+      text = applyEdit(text, e);
+    } else {
+      throw new Error("Overlapping edit");
+    }
+    lastModifiedOffset = e.offset;
+  }
+  return text;
+}
+
+// ../plugin/src/shared/jsonc-edit.ts
+var TOKEN_COMMA = 5;
+var TOKEN_EOF = 17;
+function parseDocument(text) {
+  const errors = [];
+  const root = parseTree2(text, errors, { allowTrailingComma: true });
+  if (!root || errors.length > 0) {
+    throw new Error("Cannot edit invalid JSONC");
+  }
+  return root;
+}
+function findNode(text, path) {
+  return findNodeAtLocation2(parseDocument(text), path);
+}
+function findComma(text, start, end) {
+  const scanner = createScanner2(text, false);
+  scanner.setPosition(start);
+  for (;; ) {
+    const kind = scanner.scan();
+    const offset = scanner.getTokenOffset();
+    if (kind === TOKEN_EOF || offset >= end)
+      return;
+    if (kind === TOKEN_COMMA) {
+      return {
+        offset,
+        length: scanner.getTokenLength(),
+        line: scanner.getTokenStartLine()
+      };
+    }
+  }
+}
+function setJsoncValue(text, path, value) {
+  const node = findNode(text, path);
+  if (node) {
+    if (Object.is(getNodeValue2(node), value))
+      return text;
+    const serialized = JSON.stringify(value);
+    return text.slice(0, node.offset) + serialized + text.slice(node.offset + node.length);
+  }
+  return applyEdits(text, modify(text, path, value, {}));
+}
+function removeObjectProperty(text, object, key) {
+  const properties = object.children ?? [];
+  const index = properties.findIndex((property) => {
+    const propertyKey = property.children?.[0];
+    return propertyKey !== undefined && getNodeValue2(propertyKey) === key;
+  });
+  if (index === -1)
+    return text;
+  const property = properties[index];
+  if (!property)
+    return text;
+  const closingBrace = object.offset + object.length - 1;
+  const next = properties[index + 1];
+  if (next) {
+    const followingComma = findComma(text, property.offset + property.length, next.offset);
+    if (!followingComma)
+      return text;
+    return text.slice(0, property.offset) + text.slice(followingComma.offset + followingComma.length);
+  }
+  const previous = properties[index - 1];
+  const trailingComma = findComma(text, property.offset + property.length, closingBrace);
+  if (!previous) {
+    const afterProperty = property.offset + property.length;
+    if (!trailingComma)
+      return text.slice(0, property.offset) + text.slice(afterProperty);
+    return text.slice(0, property.offset) + text.slice(afterProperty, trailingComma.offset) + text.slice(trailingComma.offset + trailingComma.length);
+  }
+  const precedingComma = findComma(text, previous.offset + previous.length, property.offset);
+  if (!precedingComma)
+    return text;
+  const afterProperty = property.offset + property.length;
+  const withoutProperty = text.slice(0, precedingComma.offset) + text.slice(precedingComma.offset + precedingComma.length, property.offset) + text.slice(afterProperty);
+  if (!trailingComma)
+    return withoutProperty;
+  const shiftedTrailingComma = trailingComma.offset - 1;
+  return withoutProperty.slice(0, shiftedTrailingComma) + withoutProperty.slice(shiftedTrailingComma + trailingComma.length);
+}
+function removeJsoncValue(text, path) {
+  const key = path.at(-1);
+  if (typeof key !== "string")
+    return text;
+  const parent = findNode(text, path.slice(0, -1));
+  if (parent?.type !== "object")
+    return text;
+  return removeObjectProperty(text, parent, key);
+}
+
+// ../plugin/src/config/migrate-config-location.ts
 var CONFIG_FILE_BASENAME = "magic-context";
 function homeDir() {
   if (process.platform === "win32") {
@@ -4477,6 +5953,55 @@ function sanitizeParsedJson(value, options = {}, path = []) {
     });
   }
   return sanitized;
+}
+function lineAndColumnAt(content, offset) {
+  const before = content.slice(0, Math.max(0, offset));
+  const lines = before.split(/\r?\n/);
+  return { line: lines.length, column: (lines.at(-1)?.length ?? 0) + 1 };
+}
+function parseIssue(content, error) {
+  const location = lineAndColumnAt(content, error.offset);
+  const code = printParseErrorCode(error.error);
+  const message = code.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  return {
+    ...location,
+    offset: error.offset,
+    length: error.length,
+    message
+  };
+}
+function normalizeJsoncParserObjects(value, options, path = []) {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => normalizeJsoncParserObjects(entry, options, [...path, String(index)]));
+  }
+  if (value === null || typeof value !== "object")
+    return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    options.onRejectedKey?.([...path, "__proto__"]);
+  }
+  const normalized = {};
+  for (const [key, entry] of Object.entries(value)) {
+    Object.defineProperty(normalized, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: normalizeJsoncParserObjects(entry, options, [...path, key])
+    });
+  }
+  return normalized;
+}
+function parseJsoncRecovering(content, options = {}) {
+  const errors = [];
+  const parsed = parse2(content, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+    allowEmptyContent: false
+  });
+  return {
+    value: sanitizeParsedJson(normalizeJsoncParserObjects(parsed, options), options),
+    issues: errors.map((error) => parseIssue(content, error))
+  };
 }
 function parseJsonc(content, options = {}) {
   const normalized = stripTrailingCommas(stripJsonComments(content));
@@ -5032,11 +6557,19 @@ Fix: install DSH ${DSH_COMPAT_EXPECTED_VERSION}, or pass ` + `--dsh-install <dir
 }
 
 // src/doctor/doctor.ts
-import { existsSync as existsSync8, readFileSync as readFileSync8, readdirSync as readdirSync3 } from "node:fs";
-import { join as join6 } from "node:path";
+import { existsSync as existsSync10, readFileSync as readFileSync8, readdirSync as readdirSync4 } from "node:fs";
+import { join as join7 } from "node:path";
 
 // ../plugin/src/config/index.ts
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { existsSync as existsSync6 } from "node:fs";
+
+// ../plugin/src/shared/config-diagnostics.ts
+var CONFIG_WARNING_CLASS = {
+  FILE_PARSE: "file-parse",
+  FILE_IO: "file-io",
+  INVALID_LEAF: "invalid-leaf"
+};
+var claimedFailures = new Set;
 
 // ../plugin/src/shared/data-path.ts
 import * as os from "node:os";
@@ -5064,15 +6597,43 @@ function getMagicContextLogPath(harness = getHarness()) {
 function getOpenCodeStorageDir() {
   return path.join(getDataDir(), "opencode", "storage");
 }
-function getMagicContextStorageDir() {
-  if (!process.env.XDG_DATA_HOME) {
-    const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
-    if (testDataDir) {
-      return path.join(testDataDir, "cortexkit", "magic-context");
+function getMagicContextStorageResolution() {
+  const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim();
+  if (testDataDir) {
+    const perTestDataHome = process.env.XDG_DATA_HOME?.trim();
+    if (perTestDataHome && path.resolve(perTestDataHome) !== path.resolve(testDataDir)) {
+      return {
+        path: path.join(perTestDataHome, "cortexkit", "magic-context"),
+        source: "test isolation"
+      };
     }
-    if (false) {}
+    return {
+      path: path.join(testDataDir, "cortexkit", "magic-context"),
+      source: "test isolation"
+    };
   }
-  return path.join(getDataDir(), "cortexkit", "magic-context");
+  if (false) {}
+  const explicitStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR?.trim();
+  if (explicitStorageDir) {
+    if (!path.isAbsolute(explicitStorageDir)) {
+      throw new Error("MAGIC_CONTEXT_STORAGE_DIR must be an absolute path");
+    }
+    return { path: explicitStorageDir, source: "environment override" };
+  }
+  const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+  if (xdgDataHome) {
+    return {
+      path: path.join(xdgDataHome, "cortexkit", "magic-context"),
+      source: "XDG_DATA_HOME"
+    };
+  }
+  return {
+    path: path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
+    source: "platform default"
+  };
+}
+function getMagicContextStorageDir() {
+  return getMagicContextStorageResolution().path;
 }
 function getLegacyOpenCodeMagicContextStorageDir() {
   return path.join(getOpenCodeStorageDir(), "plugin", "magic-context");
@@ -5081,20 +6642,280 @@ function getLegacyOpenCodeMagicContextStorageDir() {
 // ../plugin/src/shared/logger.ts
 import * as fs from "node:fs";
 import * as path2 from "node:path";
+
+// ../plugin/src/shared/redaction.ts
+import { homedir as homedir4, userInfo } from "node:os";
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+var SECRET_WORDS = [
+  "key",
+  "token",
+  "secret",
+  "password",
+  "auth",
+  "authorization",
+  "bearer",
+  "credential"
+];
+var SECRET_SEGMENT_PATTERN = new RegExp(`^(?:${SECRET_WORDS.map((w) => `${w}s?`).join("|")})$`, "i");
+var TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
+function redactionTypeForKey(key) {
+  const normalized = key.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "_");
+  const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
+  return suffix || "secret";
+}
+function isNonSecretScalarValue(value) {
+  const v = value.trim();
+  if (v === "true" || v === "false" || v === "null" || v === "undefined")
+    return true;
+  return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
+}
+var SECRET_QUALIFIERS = new Set([
+  "api",
+  "access",
+  "private",
+  "client",
+  "auth",
+  "authorization",
+  "secret",
+  "bearer",
+  "session",
+  "refresh",
+  "service",
+  "x",
+  "openai",
+  "anthropic",
+  "google",
+  "github",
+  "huggingface",
+  "aws",
+  "azure"
+]);
+function isSecretKey(key) {
+  const segments = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[._-]+/).filter(Boolean);
+  if (segments.length === 0)
+    return false;
+  if (segments.length === 1) {
+    const first = segments[0];
+    return Boolean(first && SECRET_SEGMENT_PATTERN.test(first));
+  }
+  for (let i = 0;i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg || !SECRET_SEGMENT_PATTERN.test(seg))
+      continue;
+    let trailingOk = true;
+    for (let j = i + 1;j < segments.length; j++) {
+      const tail = segments[j];
+      if (!tail)
+        continue;
+      if (TRAILING_DESCRIPTORS.has(tail))
+        continue;
+      if (SECRET_SEGMENT_PATTERN.test(tail))
+        continue;
+      trailingOk = false;
+      break;
+    }
+    if (!trailingOk)
+      continue;
+    for (let k = i - 1;k >= 0; k--) {
+      const lead = segments[k];
+      if (lead && SECRET_QUALIFIERS.has(lead))
+        return true;
+    }
+  }
+  return false;
+}
+function sanitizePathString(value) {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir4();
+  const username = userInfo().username;
+  let sanitized = value;
+  if (home) {
+    sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
+  }
+  sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
+  sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
+  sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+  if (username) {
+    sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
+  }
+  return sanitized;
+}
+var SECRET_TEXT_PATTERNS = [
+  {
+    pattern: /\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}/g,
+    replacement: "<ANTHROPIC_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}/g,
+    replacement: "<OPENAI_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+    replacement: "<GITHUB_PAT_REDACTED>"
+  },
+  {
+    pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}/g,
+    replacement: "<GITHUB_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\bhf_[A-Za-z0-9]{30,}/g,
+    replacement: "<HUGGINGFACE_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    replacement: "<AWS_ACCESS_KEY_ID_REDACTED>"
+  },
+  {
+    pattern: /\bxox[abprsuvc]-[A-Za-z0-9-]{10,}/g,
+    replacement: "<SLACK_TOKEN_REDACTED>"
+  },
+  {
+    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+    replacement: "<GOOGLE_API_KEY_REDACTED>"
+  },
+  {
+    pattern: /\b(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
+    replacement: (_full, prefix) => `${prefix}<REDACTED:bearer>`
+  },
+  {
+    pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+    replacement: "<JWT_REDACTED>"
+  },
+  {
+    pattern: /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
+    replacement: (full, quote, key, separator, valueQuote, value) => isNonSecretScalarValue(value) ? full : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`
+  },
+  {
+    pattern: /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
+    replacement: (full, key, value) => isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`
+  }
+];
+function redactSecretText(value) {
+  let redacted = value;
+  for (const { pattern, replacement } of SECRET_TEXT_PATTERNS) {
+    if (typeof replacement === "string") {
+      redacted = redacted.replace(pattern, replacement);
+    } else {
+      redacted = redacted.replace(pattern, replacement);
+    }
+  }
+  return redacted;
+}
+function sanitizeDiagnosticText(value) {
+  return redactSecretText(sanitizePathString(value));
+}
+function sanitizeConfigValue(value, keyPath = []) {
+  if (value === null || typeof value === "number" || typeof value === "boolean")
+    return value;
+  const key = keyPath.at(-1) ?? "";
+  if (key && isSecretKey(key)) {
+    return `<REDACTED:${redactionTypeForKey(key)}>`;
+  }
+  if (typeof value === "string")
+    return sanitizeDiagnosticText(value);
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => sanitizeConfigValue(entry, [...keyPath, String(index)]));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([entryKey, entry]) => [
+      entryKey,
+      sanitizeConfigValue(entry, [...keyPath, entryKey])
+    ]));
+  }
+  return value;
+}
+
+// ../plugin/src/shared/logger.ts
 var isTestEnv = false;
 var buffer = [];
 var flushTimer = null;
 var FLUSH_INTERVAL_MS = 500;
 var BUFFER_SIZE_LIMIT = 50;
-var lastEnsuredDir = null;
-function ensureDir(filePath) {
-  const dir = path2.dirname(filePath);
-  if (dir === lastEnsuredDir)
-    return;
+var MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
+var SIZE_CHECK_INTERVAL_FLUSHES = 64;
+var activeLogFile = null;
+var activeLogSize = null;
+var flushesSinceSizeCheck = 0;
+var swallowedWriteCount = 0;
+var lastErrorMessage = null;
+var lastErrorTime = null;
+function recordSwallowedWrite(error) {
   try {
-    fs.mkdirSync(dir, { recursive: true });
-    lastEnsuredDir = dir;
+    swallowedWriteCount++;
+    lastErrorMessage = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+    lastErrorTime = new Date().toISOString();
   } catch {}
+}
+function ensureDir(filePath) {
+  fs.mkdirSync(path2.dirname(filePath), { recursive: true });
+}
+function isMissingFile(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+function getCurrentLogSize(logFile) {
+  if (activeLogFile === logFile && activeLogSize !== null && flushesSinceSizeCheck < SIZE_CHECK_INTERVAL_FLUSHES) {
+    return activeLogSize;
+  }
+  try {
+    const stat = fs.statSync(logFile);
+    if (!stat.isFile()) {
+      throw new Error(`Magic Context log path is not a regular file: ${logFile}`);
+    }
+    fs.chmodSync(logFile, 384);
+    activeLogFile = logFile;
+    activeLogSize = stat.size;
+    flushesSinceSizeCheck = 0;
+    return stat.size;
+  } catch (error) {
+    if (!isMissingFile(error))
+      throw error;
+    activeLogFile = logFile;
+    activeLogSize = 0;
+    flushesSinceSizeCheck = 0;
+    return 0;
+  }
+}
+function capLogData(data) {
+  if (Buffer.byteLength(data) <= MAX_LOG_FILE_BYTES)
+    return data;
+  let bounded = Buffer.from(data).subarray(0, MAX_LOG_FILE_BYTES).toString("utf8");
+  while (Buffer.byteLength(bounded) > MAX_LOG_FILE_BYTES) {
+    bounded = bounded.slice(0, -1);
+  }
+  return bounded;
+}
+function writeBoundedPredecessor(logFile, predecessorPath, size) {
+  const predecessorFd = fs.openSync(predecessorPath, "w", 384);
+  try {
+    fs.fchmodSync(predecessorFd, 384);
+    const bytesToCopy = Math.min(size, MAX_LOG_FILE_BYTES);
+    const sourceFd = fs.openSync(logFile, "r");
+    try {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, bytesToCopy));
+      let remaining = bytesToCopy;
+      let position = Math.max(0, size - bytesToCopy);
+      while (remaining > 0) {
+        const bytesRead = fs.readSync(sourceFd, chunk, 0, Math.min(chunk.length, remaining), position);
+        if (bytesRead === 0)
+          break;
+        fs.writeSync(predecessorFd, chunk, 0, bytesRead);
+        remaining -= bytesRead;
+        position += bytesRead;
+      }
+    } finally {
+      fs.closeSync(sourceFd);
+    }
+  } finally {
+    fs.closeSync(predecessorFd);
+  }
+}
+function rotateLogFile(logFile, size) {
+  const predecessorPath = `${logFile}.1`;
+  writeBoundedPredecessor(logFile, predecessorPath, size);
+  fs.truncateSync(logFile, 0);
+  activeLogSize = 0;
+  flushesSinceSizeCheck = 0;
 }
 function flush() {
   if (flushTimer) {
@@ -5103,13 +6924,28 @@ function flush() {
   }
   if (buffer.length === 0)
     return;
-  const data = buffer.join("");
+  const bufferedData = buffer.join("");
   buffer = [];
   try {
+    const data = capLogData(bufferedData);
     const logFile = getMagicContextLogPath();
     ensureDir(logFile);
-    fs.appendFileSync(logFile, data);
-  } catch {}
+    let currentSize = getCurrentLogSize(logFile);
+    const dataSize = Buffer.byteLength(data);
+    if (currentSize > 0 && currentSize + dataSize > MAX_LOG_FILE_BYTES) {
+      rotateLogFile(logFile, currentSize);
+      currentSize = 0;
+    }
+    fs.appendFileSync(logFile, data, { encoding: "utf8", mode: 384 });
+    activeLogFile = logFile;
+    activeLogSize = currentSize + dataSize;
+    flushesSinceSizeCheck++;
+  } catch (error) {
+    activeLogFile = null;
+    activeLogSize = null;
+    flushesSinceSizeCheck = 0;
+    recordSwallowedWrite(error);
+  }
 }
 function scheduleFlush() {
   if (flushTimer)
@@ -5124,9 +6960,9 @@ function log(message, data) {
     return;
   try {
     const timestamp = new Date().toISOString();
-    const serialized = data === undefined ? "" : data instanceof Error ? ` ${data.message}${data.stack ? `
-${data.stack}` : ""}` : ` ${JSON.stringify(data)}`;
-    buffer.push(`[${timestamp}] ${message}${serialized}
+    const serialized = data === undefined ? "" : data instanceof Error ? ` ${sanitizeDiagnosticText(`${data.message}${data.stack ? `
+${data.stack}` : ""}`)}` : ` ${JSON.stringify(sanitizeConfigValue(data))}`;
+    buffer.push(`[${timestamp}] ${sanitizeDiagnosticText(message)}${serialized}
 `);
     if (buffer.length >= BUFFER_SIZE_LIMIT) {
       flush();
@@ -5143,6 +6979,45 @@ if (!isTestEnv) {
 var enforcePrivateStoragePermissions = true;
 function shouldEnforcePrivateStoragePermissions() {
   return enforcePrivateStoragePermissions;
+}
+
+// ../plugin/src/shared/window-geometry.ts
+var GRADES = new Set([
+  "provider_asserted_runtime",
+  "measured",
+  "provider_asserted_doc",
+  "catalog",
+  "unknown"
+]);
+var UNITS = new Set(["provider", "estimate"]);
+var BOUNDARIES = new Set(["Observed", "Asserted", "Corrected"]);
+var UNKNOWN_REASONS = new Set([
+  "placeholder_output_equals_context",
+  "placeholder_zero",
+  "never_measured",
+  "not_single_valued_at_key",
+  "retracted"
+]);
+var NUMERIC_FACT_KEYS = new Set([
+  "window.advertised",
+  "window.enforced",
+  "output.advertised",
+  "output.enforced",
+  "output.default"
+]);
+var configuredOverlayPath;
+var loadedOverlayPath;
+var loadedOverlay;
+var geometryClampLogSeen = new Set;
+function setWindowOverlayPath(path) {
+  if (configuredOverlayPath === path)
+    return;
+  reloadWindowOverlay(path);
+}
+function reloadWindowOverlay(path) {
+  configuredOverlayPath = path;
+  loadedOverlayPath = undefined;
+  loadedOverlay = undefined;
 }
 
 // ../plugin/src/shared/models-dev-cache.ts
@@ -5175,22 +7050,14 @@ function migrateLegacyEnabledForAgent(args) {
     args.patched.historian = agent;
     return;
   }
-  if (args.agentName === "dreamer") {
-    if (disable !== true && enabled === false) {
-      agent.disable = true;
-      args.warnings.push('Migrated "dreamer.enabled=false" → "dreamer.disable=true" in-memory (run doctor to persist). This now also disables manual /ctx-dream; for manual-only remove disable and set schedule="".');
-    }
-    args.patched.dreamer = agent;
-    return;
-  }
   if (disable !== true && enabled === false) {
     agent.disable = true;
-    args.warnings.push('Migrated "sidekick.enabled=false" → "sidekick.disable=true" in-memory (run doctor to persist).');
+    args.warnings.push('Migrated "dreamer.enabled=false" → "dreamer.disable=true" in-memory (run doctor to persist). This now also disables manual /ctx-dream; for manual-only remove disable and set schedule="".');
   }
-  args.patched.sidekick = agent;
+  args.patched.dreamer = agent;
 }
 function migrateLegacyAgentEnabledInMemory(rawConfig, warnings) {
-  const shouldPatch = ["dreamer", "sidekick", "historian"].some((key) => {
+  const shouldPatch = ["dreamer", "historian"].some((key) => {
     const agent = rawConfig[key];
     return typeof agent === "object" && agent !== null && !Array.isArray(agent) && "enabled" in agent;
   });
@@ -5198,7 +7065,6 @@ function migrateLegacyAgentEnabledInMemory(rawConfig, warnings) {
     return rawConfig;
   const patched = { ...rawConfig };
   migrateLegacyEnabledForAgent({ patched, agentName: "dreamer", warnings });
-  migrateLegacyEnabledForAgent({ patched, agentName: "sidekick", warnings });
   migrateLegacyEnabledForAgent({ patched, agentName: "historian", warnings });
   return patched;
 }
@@ -5512,7 +7378,7 @@ function migrateLegacyExperimental(rawConfig, warnings) {
 }
 
 // ../plugin/src/config/schema/magic-context.ts
-import { homedir as homedir4 } from "node:os";
+import { homedir as homedir5 } from "node:os";
 
 // ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -5681,7 +7547,7 @@ function shallowClone(o) {
   return o;
 }
 var propertyKeyTypes = /* @__PURE__ */ new Set(["string", "number", "symbol"]);
-function escapeRegex(str) {
+function escapeRegex2(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function clone(inst, def, params) {
@@ -6751,7 +8617,7 @@ var $ZodCheckUpperCase = /* @__PURE__ */ $constructor("$ZodCheckUpperCase", (ins
 });
 var $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst, def) => {
   $ZodCheck.init(inst, def);
-  const escapedRegex = escapeRegex(def.includes);
+  const escapedRegex = escapeRegex2(def.includes);
   const pattern = new RegExp(typeof def.position === "number" ? `^.{${def.position},}${escapedRegex}` : escapedRegex);
   def.pattern = pattern;
   inst._zod.check = (payload) => {
@@ -6770,7 +8636,7 @@ var $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst,
 });
 var $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (inst, def) => {
   $ZodCheck.init(inst, def);
-  const pattern = new RegExp(`^${escapeRegex(def.prefix)}.*`);
+  const pattern = new RegExp(`^${escapeRegex2(def.prefix)}.*`);
   def.pattern ?? (def.pattern = pattern);
   inst._zod.check = (payload) => {
     if (payload.value.startsWith(def.prefix))
@@ -6788,7 +8654,7 @@ var $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (i
 });
 var $ZodCheckEndsWith = /* @__PURE__ */ $constructor("$ZodCheckEndsWith", (inst, def) => {
   $ZodCheck.init(inst, def);
-  const pattern = new RegExp(`.*${escapeRegex(def.suffix)}$`);
+  const pattern = new RegExp(`.*${escapeRegex2(def.suffix)}$`);
   def.pattern ?? (def.pattern = pattern);
   inst._zod.check = (payload) => {
     if (payload.value.endsWith(def.suffix))
@@ -8098,7 +9964,7 @@ var $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
   inst._zod.values = valuesSet;
   defineLazyInternal(inst, "pattern", (zod) => {
     const patternValues = getEnumValues(zod.def.entries).filter((k) => propertyKeyTypes.has(typeof k));
-    return new RegExp(patternValues.length ? `^(${patternValues.map((o) => escapeRegex(o.toString())).join("|")})$` : "^[^\\s\\S]$");
+    return new RegExp(patternValues.length ? `^(${patternValues.map((o) => escapeRegex2(o.toString())).join("|")})$` : "^[^\\s\\S]$");
   });
   inst._zod.parse = (payload, _ctx) => {
     const input = payload.value;
@@ -8108,6 +9974,28 @@ var $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
     payload.issues.push({
       code: "invalid_value",
       values,
+      input,
+      inst
+    });
+    return payload;
+  };
+});
+var $ZodLiteral = /* @__PURE__ */ $constructor("$ZodLiteral", (inst, def) => {
+  $ZodType.init(inst, def);
+  const values = new Set(def.values);
+  inst._zod.values = values;
+  defineLazyInternal(inst, "pattern", (zod) => {
+    const vals = zod.def.values;
+    return new RegExp(vals.length ? `^(${vals.map((o) => typeof o === "string" ? escapeRegex2(o) : o ? escapeRegex2(o.toString()) : String(o)).join("|")})$` : "^[^\\s\\S]$");
+  });
+  inst._zod.parse = (payload, _ctx) => {
+    const input = payload.value;
+    if (values.has(input)) {
+      return payload;
+    }
+    payload.issues.push({
+      code: "invalid_value",
+      values: def.values,
       input,
       inst
     });
@@ -9971,6 +11859,45 @@ var enumProcessor = (schema, _ctx, json, _params) => {
     json.type = "string";
   json.enum = values;
 };
+var literalProcessor = (schema, ctx, json, params) => {
+  const def = schema._zod.def;
+  if (def.values.length === 0) {
+    json.not = {};
+    return;
+  }
+  const vals = [];
+  for (const val of def.values) {
+    if (val === undefined) {
+      if (handleUnrepresentable(schema, ctx, json, params, "Literal `undefined` cannot be represented in JSON Schema"))
+        return;
+    } else if (typeof val === "bigint") {
+      if (handleUnrepresentable(schema, ctx, json, params, "BigInt literals cannot be represented in JSON Schema"))
+        return;
+      vals.push(Number(val));
+    } else {
+      vals.push(val);
+    }
+  }
+  if (vals.length === 0) {} else if (vals.length === 1) {
+    const val = vals[0];
+    json.type = val === null ? "null" : typeof val;
+    if (ctx.target === "draft-04" || ctx.target === "openapi-3.0") {
+      json.enum = [val];
+    } else {
+      json.const = val;
+    }
+  } else {
+    if (vals.every((v) => typeof v === "number"))
+      json.type = "number";
+    if (vals.every((v) => typeof v === "string"))
+      json.type = "string";
+    if (vals.every((v) => typeof v === "boolean"))
+      json.type = "boolean";
+    if (vals.every((v) => v === null))
+      json.type = "null";
+    json.enum = vals;
+  }
+};
 var customProcessor = (schema, ctx, json, params) => {
   handleUnrepresentable(schema, ctx, json, params, "Custom types cannot be represented in JSON Schema");
 };
@@ -10308,7 +12235,7 @@ var ZodRealError = /* @__PURE__ */ $constructor("ZodError", initializer2, undefi
 });
 
 // ../../node_modules/.bun/zod@4.6.5/node_modules/zod/v4/classic/parse.js
-var parse2 = /* @__PURE__ */ _parse(ZodRealError);
+var parse4 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
 var safeParseAsync = /* @__PURE__ */ _safeParseAsync(ZodRealError);
@@ -10444,7 +12371,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
     own(this, "~standard", value);
   },
   parse: function _parse(data, params) {
-    return parse2(this, data, params, { callee: _parse });
+    return parse4(this, data, params, { callee: _parse });
   },
   parseAsync: async function _parseAsync(data, params) {
     return await parseAsync(this, data, params, { callee: _parseAsync });
@@ -11017,6 +12944,27 @@ function _enum(values, params) {
     ...normalizeParams(params)
   });
 }
+var ZodLiteral = /* @__PURE__ */ $constructor("ZodLiteral", (inst, def) => {
+  $ZodLiteral.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => literalProcessor(inst, ctx, json, params);
+  inst.values = new Set(def.values);
+  Object.defineProperty(inst, "value", {
+    get() {
+      if (def.values.length > 1) {
+        throw new Error("This schema contains multiple valid literal values. Use `.values` instead.");
+      }
+      return def.values[0];
+    }
+  });
+});
+function literal(value, params) {
+  return new ZodLiteral({
+    type: "literal",
+    values: Array.isArray(value) ? value : [value],
+    ...normalizeParams(params)
+  });
+}
 var ZodTransform = /* @__PURE__ */ $constructor("ZodTransform", (inst, def) => {
   _ensureDefaultMemoizer();
   $ZodTransform.init(inst, def);
@@ -11217,9 +13165,6 @@ function isValidLanguageCode(language) {
   return resolveLanguageName(language) !== "";
 }
 
-// ../plugin/src/features/magic-context/defaults.ts
-var DEFAULT_PROTECTED_TAGS = 20;
-
 // ../plugin/src/features/magic-context/dreamer/cron.ts
 var FIELDS = [
   { name: "minute", min: 0, max: 59 },
@@ -11365,10 +13310,12 @@ var AgentOverrideConfigSchema = object({
 // ../plugin/src/config/schema/magic-context.ts
 var DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
 var EXECUTE_THRESHOLD_CAP_MESSAGE = "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
-var DEFAULT_HISTORIAN_TIMEOUT_MS = 300000;
+var DEFAULT_HISTORIAN_TIMEOUT_MS = 600000;
 var DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
+var PROTECTED_TOKENS_MIN = 4000;
 var DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 var PiThinkingLevelSchema = _enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional();
+var OmpThinkingLevelSchema = _enum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "inherit", "auto"]).optional();
 var PiConfigSchema = object({
   subagent_extensions: array(string2().trim().min(1)).optional().describe("User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.")
 }).optional();
@@ -11389,16 +13336,156 @@ var PromptSurfaceConfigSchema = object({
     message: "tool description values must not be empty or whitespace-only"
   })).optional().describe("USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged.")
 }).describe("Prompt-surface preset routing. Project config may select default/models, while guidance_override_path and tool_descriptions are user-level only.");
+var PER_HARNESS_MIGRATION_INVENTORY = {
+  historian: {
+    retained: [
+      "temperature",
+      "top_p",
+      "prompt",
+      "tools",
+      "disable",
+      "description",
+      "mode",
+      "color",
+      "maxSteps",
+      "permission",
+      "maxTokens",
+      "two_pass",
+      "disallowed_tools"
+    ],
+    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"]
+  },
+  dreamer: {
+    retained: [
+      "temperature",
+      "top_p",
+      "prompt",
+      "tools",
+      "disable",
+      "description",
+      "mode",
+      "color",
+      "maxSteps",
+      "permission",
+      "maxTokens",
+      "inject_docs"
+    ],
+    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"]
+  },
+  task: {
+    retained: ["schedule", "promotion_threshold"],
+    migrated_execution: [
+      "model",
+      "fallback_models",
+      "variant",
+      "thinking_level",
+      "timeout_minutes"
+    ]
+  }
+};
+var PER_HARNESS_MODEL_KEYS = ["opencode", "pi", "omp"];
+var OcEntryObjectSchema = object({
+  model: string2().describe("OpenCode model ID (for example, provider/model)."),
+  variant: string2().optional().describe("OpenCode reasoning variant for this entry.")
+}).strict();
+var OcEntrySchema = union([string2(), OcEntryObjectSchema]);
+var PiEntryObjectSchema = object({
+  model: string2().describe("Pi model ID (for example, provider/model)."),
+  thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for this entry.")
+}).strict();
+var PiEntrySchema = union([string2(), PiEntryObjectSchema]);
+var OmpEntryObjectSchema = object({
+  model: string2().describe("OMP model ID (for example, provider/model)."),
+  thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for this entry.")
+}).strict();
+var OmpEntrySchema = union([string2(), OmpEntryObjectSchema]);
+var OpenCodeHarnessBlockSchema = object({
+  model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+  fallback_models: array(OcEntrySchema).optional().describe("Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array."),
+  variant: string2().optional().describe("OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.")
+}).strict().describe("Strict OpenCode model-resolution block. It accepts no Pi vocabulary.");
+var PiHarnessBlockSchema = object({
+  model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+  fallback_models: array(PiEntrySchema).optional().describe("Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array."),
+  thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.")
+}).strict().describe("Strict Pi model-resolution block. It accepts no OpenCode vocabulary.");
+var OmpHarnessBlockSchema = object({
+  model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+  fallback_models: array(OmpEntrySchema).optional().describe("Ordered fallback OMP entries."),
+  thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.")
+}).strict().describe("Strict OMP model-resolution block. It accepts no OpenCode vocabulary.");
+var OpenCodeTaskExecutionSchema = object({
+  model: OcEntrySchema.optional().describe("OpenCode model entry for this task."),
+  fallback_models: array(OcEntrySchema).optional().describe("Ordered OpenCode fallback entries for this task."),
+  variant: string2().optional().describe("OpenCode reasoning variant for this task's primary entry when it declares none. Fallback entries declare variants per-entry."),
+  timeout_minutes: number2().min(5).optional().describe("Minutes allowed for this task before it is aborted.")
+}).strict();
+var PiTaskExecutionSchema = object({
+  model: PiEntrySchema.optional().describe("Pi model entry for this task."),
+  fallback_models: array(PiEntrySchema).optional().describe("Ordered Pi fallback entries for this task."),
+  thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry."),
+  timeout_minutes: number2().min(5).optional().describe("Minutes allowed for this task before it is aborted.")
+}).strict();
+var OmpTaskExecutionSchema = object({
+  model: OmpEntrySchema.optional().describe("OMP model entry for this task."),
+  fallback_models: array(OmpEntrySchema).optional().describe("Ordered OMP fallback entries for this task."),
+  thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry."),
+  timeout_minutes: number2().min(5).optional().describe("Minutes allowed for this task before it is aborted.")
+}).strict();
+var DreamerOpenCodeHarnessBlockSchema = object({
+  model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+  fallback_models: array(OcEntrySchema).optional().describe("Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array."),
+  variant: string2().optional().describe("OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry."),
+  tasks: record(string2(), OpenCodeTaskExecutionSchema).optional().describe("OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.")
+}).strict().describe("Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary.");
+var DreamerPiHarnessBlockSchema = object({
+  model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+  fallback_models: array(PiEntrySchema).optional().describe("Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array."),
+  thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry."),
+  tasks: record(string2(), PiTaskExecutionSchema).optional().describe("Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.")
+}).strict().describe("Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary.");
+var DreamerOmpHarnessBlockSchema = object({
+  model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+  fallback_models: array(OmpEntrySchema).optional().describe("Ordered fallback OMP entries."),
+  thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry."),
+  tasks: record(string2(), OmpTaskExecutionSchema).optional().describe("OMP task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.")
+}).strict().describe("Strict OMP dreamer model-resolution block. It accepts no OpenCode vocabulary.");
+var ProfileOpenCodeModelBlockSchema = object({
+  model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+  fallback_models: array(OcEntrySchema).optional().describe("Ordered fallback OpenCode model entries."),
+  variant: string2().optional().describe("OpenCode reasoning variant for the primary model entry.")
+}).strict().describe("Strict profile-only OpenCode model-selection block.");
+var ProfilePiModelBlockSchema = object({
+  model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+  fallback_models: array(PiEntrySchema).optional().describe("Ordered fallback Pi model entries."),
+  thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for the primary model entry.")
+}).strict().describe("Strict profile-only Pi model-selection block.");
+var ProfileOmpModelBlockSchema = object({
+  model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+  fallback_models: array(OmpEntrySchema).optional().describe("Ordered fallback OMP model entries."),
+  thinking_level: OmpThinkingLevelSchema.describe("OMP thinking level for the primary model entry.")
+}).strict().describe("Strict profile-only OMP model-selection block.");
+var ProfileHistorianSchema = object({
+  opencode: ProfileOpenCodeModelBlockSchema.optional(),
+  pi: ProfilePiModelBlockSchema.optional(),
+  omp: ProfileOmpModelBlockSchema.optional()
+}).strict();
+var ProfileDreamerSchema = object({
+  opencode: ProfileOpenCodeModelBlockSchema.optional(),
+  pi: ProfilePiModelBlockSchema.optional(),
+  omp: ProfileOmpModelBlockSchema.optional()
+}).strict();
+var ConfigProfileSchema = object({
+  historian: ProfileHistorianSchema.optional(),
+  dreamer: ProfileDreamerSchema.optional()
+}).strict().describe("User-owned model-selection overlay. Only historian/dreamer harness model blocks are allowed.");
+var ConfigProfilesSchema = record(string2().trim().min(1, "Profile names must not be empty or whitespace-only."), ConfigProfileSchema);
 var CronScheduleSchema = string2().refine((s) => s.trim() === "" || isValidCron(s), {
   message: 'Invalid schedule: use a 5-field cron expression (e.g. "0 3 * * *" for 3am daily, "0 3 * * 0" for Sunday 3am, "0 */6 * * *" every 6h) or "" to disable.'
 }).describe('5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task.');
 var DreamTaskBaseConfigSchema = object({
-  schedule: CronScheduleSchema.default(""),
-  model: string2().optional().describe("Per-task model override (inherits dreamer.model)"),
-  fallback_models: union([string2(), array(string2())]).optional().describe("Per-task fallback chain (inherits dreamer.fallback_models)"),
-  thinking_level: PiThinkingLevelSchema.describe("Pi only: per-task thinking level"),
-  timeout_minutes: number2().min(5).default(20).describe("Minutes allowed for this task before it is aborted")
-});
+  schedule: CronScheduleSchema.default("")
+}).strict();
 var PromotionThresholdSchema = number2().min(2).max(20).optional().describe("review-user-memories: min candidate observations before promotion is considered (default: 3)");
 var PrimerPromotionThresholdSchema = number2().min(2).max(20).optional().describe("promote-primers: min recurring source days before promotion is considered (default: 2)");
 var DreamTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
@@ -11445,29 +13532,41 @@ var DreamTasksSchema = object({
   "review-user-memories": ReviewUserMemoriesTaskConfigSchema.default(() => ReviewUserMemoriesTaskConfigSchema.parse(defaultTaskConfig("review-user-memories"))),
   "promote-primers": PromotePrimersTaskConfigSchema.default(() => PromotePrimersTaskConfigSchema.parse(defaultTaskConfig("promote-primers"))),
   "refresh-primers": DreamTaskBaseConfigSchema.default(() => DreamTaskBaseConfigSchema.parse(defaultTaskConfig("refresh-primers")))
-}).describe("Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model.");
-var DreamerConfigSchema = AgentOverrideConfigSchema.merge(object({
+}).describe("Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks, dreamer.pi.tasks, or dreamer.omp.tasks.");
+var AgentMetadataSchema = AgentOverrideConfigSchema.pick({
+  temperature: true,
+  top_p: true,
+  prompt: true,
+  tools: true,
+  disable: true,
+  description: true,
+  mode: true,
+  color: true,
+  maxSteps: true,
+  permission: true,
+  maxTokens: true
+});
+var DreamerConfigSchema = AgentMetadataSchema.extend({
+  opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
+  pi: DreamerPiHarnessBlockSchema.optional(),
+  omp: DreamerOmpHarnessBlockSchema.optional(),
   tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
-  inject_docs: boolean2().default(true).describe("Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)"),
-  thinking_level: PiThinkingLevelSchema.describe("Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.")
-}));
-var SidekickConfigSchema = AgentOverrideConfigSchema.extend({
-  timeout_ms: number2().default(30000).describe("Timeout for sidekick calls in milliseconds"),
-  system_prompt: string2().optional().describe("Custom system prompt for sidekick"),
-  thinking_level: PiThinkingLevelSchema.describe("Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level.")
-}).optional();
-var HistorianConfigSchema = AgentOverrideConfigSchema.extend({
+  inject_docs: boolean2().default(true).describe("Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)")
+});
+var HistorianConfigSchema = AgentMetadataSchema.extend({
+  opencode: OpenCodeHarnessBlockSchema.optional(),
+  pi: PiHarnessBlockSchema.optional(),
+  omp: OmpHarnessBlockSchema.optional(),
   two_pass: boolean2().default(false).describe("Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)"),
-  thinking_level: PiThinkingLevelSchema.describe("Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max"),
   disallowed_tools: array(_enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"])).default([]).describe(`OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: [])`)
 }).optional();
 var EmbeddingFallbackProviderSchema = _enum(["local", "openai-compatible", "off"]);
 function expandConfigPath(value) {
   const trimmed = value.trim();
   if (trimmed === "~")
-    return homedir4();
+    return homedir5();
   if (trimmed.startsWith("~/"))
-    return `${homedir4()}/${trimmed.slice(2)}`;
+    return `${homedir5()}/${trimmed.slice(2)}`;
   return trimmed;
 }
 var BaseEmbeddingConfigSchema = object({
@@ -11478,8 +13577,11 @@ var BaseEmbeddingConfigSchema = object({
   api_key: string2().optional().describe("API key for remote embedding provider (optional)"),
   input_type: string2().optional().describe("Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset."),
   query_input_type: string2().optional().describe("Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type."),
+  query_instruction: union([string2(), literal(false)]).optional().describe("OpenAI-compatible query prefix override. A string is prepended verbatim to search queries; false disables the built-in model-family instruction. Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families have built-in recipes. Query-only changes do not re-embed stored content. User-level only; project values are ignored."),
+  document_prefix: string2().optional().describe("OpenAI-compatible stored-document prefix override, prepended verbatim. Defaults to the model-family recipe (empty for Qwen3/gte/e5 instruct; 'search_document: ' for Nomic). Changing it changes stored vectors and triggers re-embedding. User-level only; project values are ignored."),
   truncate: string2().optional().describe("Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' | 'START' | 'END'). Omitted from the request when unset."),
   max_input_tokens: number2().int().positive().optional().describe("Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted."),
+  local_runtime: _enum(["auto", "native", "wasm"]).default("auto").describe("Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon."),
   local_dtype: _enum([
     "auto",
     "fp32",
@@ -11528,6 +13630,8 @@ var EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) => {
       ...apiKey ? { api_key: apiKey } : {},
       ...inputType ? { input_type: inputType } : {},
       ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...data.query_instruction !== undefined ? { query_instruction: data.query_instruction } : {},
+      ...data.document_prefix !== undefined ? { document_prefix: data.document_prefix } : {},
       ...truncate ? { truncate } : {},
       ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}
     };
@@ -11536,6 +13640,7 @@ var EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) => {
     return {
       provider: "local",
       model: data.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+      local_runtime: data.local_runtime,
       ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {},
       ...data.local_dtype ? { local_dtype: data.local_dtype } : {}
     };
@@ -11552,6 +13657,8 @@ var EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) => {
       ...apiKey ? { api_key: apiKey } : {},
       ...inputType ? { input_type: inputType } : {},
       ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...data.query_instruction !== undefined ? { query_instruction: data.query_instruction } : {},
+      ...data.document_prefix !== undefined ? { document_prefix: data.document_prefix } : {},
       ...truncate ? { truncate } : {},
       ...data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}
     };
@@ -11567,18 +13674,23 @@ var MagicContextConfigSchema = object({
   }).default({ enabled: false }).describe("Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task."),
   transform_mode: _enum(["ts", "rust"]).default("ts").describe('Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.'),
   auto_update: boolean2().optional().describe("Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates."),
-  language: string2().trim().toLowerCase().refine((s) => isValidLanguageCode(s), 'language must be a 2-letter ISO 639-1 code (e.g. "tr", "es", "de")').optional().describe("Output language for Magic Context's generated content and guidance, as a " + '2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the ' + "historian, dreamer, sidekick, and the agent-guidance block instruct the model to " + "write its PROSE in this language while keeping all structural tokens (XML tags, " + "the five memory category names, code identifiers, file paths) in English. " + "USER-LEVEL ONLY (ignored in project config for security). Unset = today's " + "behavior (model mirrors the conversation; English scaffolding). Changing it " + "triggers one cache re-materialization; existing compartments/memories keep their " + "original language until naturally rewritten."),
-  historian: HistorianConfigSchema.describe("Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)"),
-  dreamer: DreamerConfigSchema.optional().describe("Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)"),
+  language: string2().trim().toLowerCase().refine((s) => isValidLanguageCode(s), 'language must be a 2-letter ISO 639-1 code (e.g. "tr", "es", "de")').optional().describe("Output language for Magic Context's generated content and guidance, as a " + '2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the ' + "historian, dreamer, and the agent-guidance block instruct the model to " + "write its PROSE in this language while keeping all structural tokens (XML tags, " + "the five memory category names, code identifiers, file paths) in English. " + "USER-LEVEL ONLY (ignored in project config for security). Unset = today's " + "behavior (model mirrors the conversation; English scaffolding). Changing it " + "triggers one cache re-materialization; existing compartments/memories keep their " + "original language until naturally rewritten."),
+  profile: string2().trim().min(1).optional().describe("Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration."),
+  profiles: ConfigProfilesSchema.optional().describe("User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles."),
+  historian: HistorianConfigSchema.describe("Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp."),
+  dreamer: DreamerConfigSchema.optional().describe("Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block."),
   smart_notes: object({
     retina_handoff: boolean2().default(false).describe("When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed.")
   }).default({ retina_handoff: false }).describe("Smart-note ownership transition controls."),
-  cache_ttl: union([string2(), object({ default: string2() }).catchall(string2())]).default("5m").describe('Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.'),
-  prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe("Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes)."),
+  cache_ttl: union([string2(), object({ default: string2() }).catchall(string2())]).default("5m").describe(`How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).`),
+  prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe("Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model."),
   output_reserve: union([
     number2().min(0),
     object({ default: number2().min(0) }).catchall(number2().min(0))
-  ]).optional().describe('User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.'),
+  ]).optional().describe('User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.'),
+  models: object({
+    window_overlay_path: string2().trim().min(1).optional()
+  }).optional().describe("User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json."),
   toast_duration_ms: number2().min(0).max(60000).default(5000).describe("TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000)"),
   execute_threshold_percentage: union([
     number2().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE),
@@ -11587,10 +13699,11 @@ var MagicContextConfigSchema = object({
   execute_threshold_tokens: object({
     default: number2().min(5000).max(2000000).optional()
   }).catchall(number2().min(5000).max(2000000)).optional().describe("Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000."),
-  protected_tags: number2().min(1).max(100).optional().describe("Number of recent tags to protect from dropping (min: 1, max: 100, default: 20)"),
+  protected_tokens: number2().int().min(PROTECTED_TOKENS_MIN).max(1e6).optional().describe("Positive integer token floor to protect from automatic reclaim (min: 4_000, max: 1_000_000). When omitted, the derived default is clamp(round(0.05 × usableSoft), min(16_000, round(0.08 × usableSoft)), 64_000)."),
+  protected_tags: unknown().optional().describe("Deprecated: number of recent tags to protect. Ignored for behaviour; use protected_tokens instead.").meta({ deprecated: true }),
   clear_reasoning_age: number2().min(10).default(50).describe("Clear reasoning/thinking blocks older than N tags (default: 50)"),
   history_budget_percentage: number2().min(0.05).max(0.5).default(DEFAULT_HISTORY_BUDGET_PERCENTAGE).describe("Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15)"),
-  historian_timeout_ms: number2().min(60000).default(DEFAULT_HISTORIAN_TIMEOUT_MS).describe("Timeout for each historian prompt call in milliseconds (default: 300000)"),
+  historian_timeout_ms: number2().min(60000).default(DEFAULT_HISTORIAN_TIMEOUT_MS).describe("Timeout for each historian prompt call in milliseconds (default: 600000)"),
   commit_cluster_trigger: object({
     enabled: boolean2().default(true).describe("Enable commit-cluster based historian triggering (default: true)"),
     min_clusters: number2().min(1).default(3).describe("Minimum commit clusters required to trigger historian (min: 1, default: 3)")
@@ -11611,7 +13724,8 @@ var MagicContextConfigSchema = object({
   }).default({ enforce_private_permissions: true }).describe("Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories."),
   embedding: EmbeddingConfigSchema.default({
     provider: "local",
-    model: DEFAULT_LOCAL_EMBEDDING_MODEL
+    model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+    local_runtime: "auto"
   }).describe("Embedding provider configuration"),
   subc: object({
     connection_file: string2().trim().min(1).transform(expandConfigPath).describe("Path to the owner-only subc connection file.")
@@ -11620,7 +13734,8 @@ var MagicContextConfigSchema = object({
     enabled: boolean2().default(false).describe("Developer-only Synapse shadow embedding lane switch.")
   }).default({ enabled: false }).describe("Developer-only Synapse shadow embedding lane."),
   temporal_awareness: boolean2().default(true).describe('Inject wall-clock gap markers (<!-- +Xm -->) between user messages where > 5 min elapsed since the previous message, and add compact date ranges to compartment headings. Gives the agent a sense of session pacing and "how long ago" across multi-day sessions. Graduated from experimental.temporal_awareness; default: true (set false to opt out).'),
-  keep_subagents: boolean2().default(false).describe("Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect."),
+  keep_subagents: boolean2().default(false).describe("Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect."),
+  debug_rpc: boolean2().default(false).describe("Developer-only: enable authenticated loopback RPCs for memory counters and heap snapshots. Disabled by default. USER-LEVEL ONLY and requires a restart."),
   fail_closed_blocking: boolean2().default(true).describe("When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart."),
   compaction: object({
     enabled: boolean2().default(true).describe("When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, /ctx-flush, and /ctx-session-upgrade refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.")
@@ -11630,7 +13745,7 @@ var MagicContextConfigSchema = object({
     overlay: boolean2().default(true).describe("Pi only: show the persistent todo overlay above the editor while tasks are active.")
   }).default({ enabled: true, overlay: true }).describe("Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart."),
   pi: PiConfigSchema.describe("Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load."),
-  smart_drops: boolean2().default(false).describe("Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart."),
+  smart_drops: boolean2().default(false).describe("Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart."),
   caveman_text_compression: object({
     enabled: boolean2().default(false).describe("Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%)."),
     min_chars: number2().min(100).max(1e4).default(500).describe("Text parts shorter than this (characters) stay untouched. Min 100, max 10000. Default: 500.")
@@ -11657,26 +13772,152 @@ var MagicContextConfigSchema = object({
     retrieval_count_promotion_threshold: 3,
     auto_search: { enabled: true, score_threshold: 0.6, min_prompt_chars: 20 },
     git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 }
-  }).describe("Cross-session memory configuration"),
-  sidekick: SidekickConfigSchema.describe("Optional sidekick agent configuration for session-start memory retrieval")
+  }).describe("Cross-session memory configuration")
 }).transform((data) => {
   return {
     ...data,
-    protected_tags: data.protected_tags ?? DEFAULT_PROTECTED_TAGS
+    protected_tags: data.protected_tags
   };
 });
 
+// ../plugin/src/config/profiles.ts
+function withoutProfileFields(raw) {
+  const copy = { ...raw };
+  delete copy.profile;
+  delete copy.profiles;
+  return copy;
+}
+function readProfileSelection(raw) {
+  if (!Object.hasOwn(raw, "profile"))
+    return { declared: false };
+  const value = raw.profile;
+  if (typeof value !== "string")
+    return { declared: true };
+  const name = value.trim();
+  return name.length > 0 ? { declared: true, name } : { declared: true };
+}
+function resolveConfigProfile(args) {
+  const warnings = [];
+  const userSelection = readProfileSelection(args.userRaw);
+  const projectSelection = readProfileSelection(args.projectRaw);
+  const selection = projectSelection.name ? { name: projectSelection.name, source: "project" } : userSelection.name ? { name: userSelection.name, source: "user" } : undefined;
+  if (projectSelection.declared && !projectSelection.name) {
+    warnings.push("Ignoring invalid profile selection from project config; expected a non-empty string.");
+  }
+  if (!projectSelection.declared && userSelection.declared && !userSelection.name) {
+    warnings.push("Ignoring invalid profile selection from user config; expected a non-empty string.");
+  }
+  let profiles = {};
+  if (Object.hasOwn(args.userRaw, "profiles")) {
+    const parsed = ConfigProfilesSchema.safeParse(args.userRaw.profiles);
+    if (parsed.success) {
+      profiles = parsed.data;
+    } else {
+      warnings.push("Ignoring profiles from user config: invalid profile configuration; profiles may contain only historian/dreamer harness model blocks.");
+    }
+  }
+  if (!selection) {
+    return {
+      userBase: withoutProfileFields(args.userRaw),
+      projectBase: withoutProfileFields(args.projectRaw),
+      overlay: {},
+      warnings
+    };
+  }
+  if (!Object.hasOwn(profiles, selection.name)) {
+    warnings.push(`Unknown profile "${selection.name}" selected by ${selection.source} config; using base config without a profile.`);
+    return {
+      userBase: withoutProfileFields(args.userRaw),
+      projectBase: withoutProfileFields(args.projectRaw),
+      overlay: {},
+      warnings
+    };
+  }
+  const overlay = profiles[selection.name];
+  return {
+    userBase: withoutProfileFields(args.userRaw),
+    projectBase: withoutProfileFields(args.projectRaw),
+    overlay,
+    activeProfile: selection.name,
+    warnings
+  };
+}
+
 // ../plugin/src/config/project-security.ts
-var HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"];
-var HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"];
+var HIDDEN_AGENT_KEYS = ["historian", "dreamer"];
+var HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
+var HISTORIAN_USER_ONLY_FIELDS = PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
 var PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"];
-var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"];
-var EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"];
+var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools"];
+var EMBEDDING_USER_ONLY_FIELDS = [
+  "endpoint",
+  "provider",
+  "fallback_provider",
+  "query_instruction",
+  "document_prefix"
+];
 var PERCENTAGE_THRESHOLD_REASON = "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 var TOKEN_THRESHOLD_REASON = "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
 var TOKEN_THRESHOLD_INTRODUCTION_REASON = "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
+var PROTECTED_TOKENS_REASON = "security: a repository may only raise protected_tokens above the resolved user-or-derived floor; it cannot lower protection.";
 function isPlainObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resolveProtectedTokensScalar(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 4000 && value <= 1e6) {
+    return value;
+  }
+  return;
+}
+var PROTECTED_TOKENS_TIER_OVERRIDES = Symbol.for("@cortexkit/magic-context/protected-tokens-tier-overrides");
+function attachProtectedTokensTierOverrides(config, args) {
+  const user = resolveProtectedTokensScalar(args.trustedUser);
+  const rawProject = resolveProtectedTokensScalar(args.project);
+  const project = rawProject !== undefined && (user === undefined || rawProject >= user) ? rawProject : undefined;
+  if (user === undefined && project === undefined)
+    return config;
+  Object.defineProperty(config, PROTECTED_TOKENS_TIER_OVERRIDES, {
+    value: {
+      ...user !== undefined ? { user } : {},
+      ...project !== undefined ? { project } : {}
+    },
+    configurable: false,
+    enumerable: false,
+    writable: false
+  });
+  return config;
+}
+function stripListedFields(target, fields, path, removed) {
+  for (const field of fields) {
+    if (field in target) {
+      delete target[field];
+      removed.push(path.length > 0 ? `${path}.${field}` : field);
+    }
+  }
+}
+function stripEscalationAtExecutableSite(block, path, removed) {
+  stripListedFields(block, AGENT_ESCALATION_FIELDS, path, removed);
+  if (isPlainObject2(block.model)) {
+    stripListedFields(block.model, AGENT_ESCALATION_FIELDS, `${path}.model`, removed);
+  }
+  if (Array.isArray(block.fallback_models)) {
+    for (let index = 0;index < block.fallback_models.length; index++) {
+      const entry = block.fallback_models[index];
+      if (isPlainObject2(entry)) {
+        stripListedFields(entry, AGENT_ESCALATION_FIELDS, `${path}.fallback_models.${index}`, removed);
+      }
+    }
+  }
+}
+function stripNestedMuralModels(node, path, removed) {
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "mural" && isPlainObject2(value) && "model" in value) {
+      delete value.model;
+      removed.push(`${path}.${key}.model`);
+    } else if (isPlainObject2(value)) {
+      stripNestedMuralModels(value, `${path}.${key}`, removed);
+    }
+  }
 }
 function isValidPercentageThreshold(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
@@ -11771,6 +14012,10 @@ function makeProjectThresholdWarning(field, reason) {
 }
 function stripUnsafeProjectConfigFields(projectRaw) {
   const warnings = [];
+  if ("profiles" in projectRaw) {
+    delete projectRaw.profiles;
+    warnings.push("Ignoring profiles from project config (security: profile definitions are user-level only; a repository may select a named user profile with profile).");
+  }
   if ("auto_update" in projectRaw) {
     delete projectRaw.auto_update;
     warnings.push("Ignoring auto_update from project config (security: this setting only honors user-level config).");
@@ -11778,6 +14023,10 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   if ("fail_closed_blocking" in projectRaw) {
     delete projectRaw.fail_closed_blocking;
     warnings.push("Ignoring fail_closed_blocking from project config (security: only user-level config may disable or force the loud inoperability gate).");
+  }
+  if ("debug_rpc" in projectRaw) {
+    delete projectRaw.debug_rpc;
+    warnings.push("Ignoring debug_rpc from project config (security: only user-level config may enable process heap diagnostics).");
   }
   if ("allow_home_project" in projectRaw) {
     delete projectRaw.allow_home_project;
@@ -11791,6 +14040,11 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   if ("output_reserve" in projectRaw) {
     delete projectRaw.output_reserve;
     warnings.push("Ignoring output_reserve from project config (security: output-token reservation only honors user-level config).");
+  }
+  const models = projectRaw.models;
+  if (isPlainObject2(models) && "window_overlay_path" in models) {
+    delete models.window_overlay_path;
+    warnings.push("Ignoring models.window_overlay_path from project config (security: only user-level config may select model geometry metadata).");
   }
   if ("language" in projectRaw) {
     delete projectRaw.language;
@@ -11832,14 +14086,46 @@ function stripUnsafeProjectConfigFields(projectRaw) {
   const embedding = projectRaw.embedding;
   if (isPlainObject2(embedding)) {
     const removed = [];
-    for (const field of EMBEDDING_DESTINATION_FIELDS) {
+    for (const field of EMBEDDING_USER_ONLY_FIELDS) {
       if (field in embedding) {
         delete embedding[field];
         removed.push(field);
       }
     }
     if (removed.length > 0) {
-      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where private text is embedded).");
+      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where or how private text is embedded).");
+    }
+  }
+  for (const agentKey of HIDDEN_AGENT_KEYS) {
+    const block = projectRaw[agentKey];
+    if (!isPlainObject2(block))
+      continue;
+    const removed = [];
+    stripEscalationAtExecutableSite(block, agentKey, removed);
+    for (const harness of HARNESS_KEYS) {
+      const harnessBlock = block[harness];
+      if (!isPlainObject2(harnessBlock))
+        continue;
+      stripEscalationAtExecutableSite(harnessBlock, `${agentKey}.${harness}`, removed);
+      const tasks = harnessBlock.tasks;
+      if (isPlainObject2(tasks)) {
+        for (const [taskName, taskBlock] of Object.entries(tasks)) {
+          if (isPlainObject2(taskBlock)) {
+            stripEscalationAtExecutableSite(taskBlock, `${agentKey}.${harness}.tasks.${taskName}`, removed);
+          }
+        }
+      }
+    }
+    const schedulingTasks = block.tasks;
+    if (isPlainObject2(schedulingTasks)) {
+      for (const [taskName, taskBlock] of Object.entries(schedulingTasks)) {
+        if (isPlainObject2(taskBlock)) {
+          stripListedFields(taskBlock, AGENT_ESCALATION_FIELDS, `${agentKey}.tasks.${taskName}`, removed);
+        }
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring ${removed.join(", ")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
     }
   }
   const historian = projectRaw.historian;
@@ -11851,8 +14137,19 @@ function stripUnsafeProjectConfigFields(projectRaw) {
         removed.push(field);
       }
     }
+    for (const harness of HARNESS_KEYS) {
+      const harnessBlock = historian[harness];
+      if (!isPlainObject2(harnessBlock))
+        continue;
+      for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+        if (field in harnessBlock) {
+          delete harnessBlock[field];
+          removed.push(`${harness}.${field}`);
+        }
+      }
+    }
     if (removed.length > 0) {
-      warnings.push(`Ignoring historian.${removed.join("/")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
+      warnings.push(`Ignoring ${removed.map((path) => `historian.${path}`).join(", ")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
     }
   }
   const mural = projectRaw.mural;
@@ -11866,20 +14163,15 @@ function stripUnsafeProjectConfigFields(projectRaw) {
     delete legacyMural.model;
     warnings.push("Ignoring experimental.mural.model from project config (security: the mural cue-compressor model is a user-level setting; use user-level mural.model).");
   }
+  const nestedMuralRemoved = [];
   for (const agentKey of HIDDEN_AGENT_KEYS) {
     const block = projectRaw[agentKey];
     if (!isPlainObject2(block))
       continue;
-    const removed = [];
-    for (const field of AGENT_ESCALATION_FIELDS) {
-      if (field in block) {
-        delete block[field];
-        removed.push(field);
-      }
-    }
-    if (removed.length > 0) {
-      warnings.push(`Ignoring ${agentKey}.${removed.join("/")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
-    }
+    stripNestedMuralModels(block, agentKey, nestedMuralRemoved);
+  }
+  if (nestedMuralRemoved.length > 0) {
+    warnings.push(`Ignoring ${nestedMuralRemoved.join(", ")} from project config (security: the mural cue-compressor model is a user-level setting; a repository cannot choose where project memory is sent).`);
   }
   return warnings;
 }
@@ -11976,6 +14268,30 @@ function constrainProjectThresholdOverrides(args) {
       setMergedTokenThreshold(args.mergedRaw, constrained);
     }
   }
+  if ("protected_tokens" in args.projectRaw) {
+    const rawProject = args.projectRaw.protected_tokens;
+    const projectVal = resolveProtectedTokensScalar(rawProject);
+    const trustedUserVal = resolveProtectedTokensScalar(args.trustedBaseConfig.protected_tokens);
+    if (projectVal !== undefined) {
+      if (trustedUserVal !== undefined) {
+        if (projectVal >= trustedUserVal) {
+          args.mergedRaw.protected_tokens = projectVal;
+        } else {
+          args.mergedRaw.protected_tokens = trustedUserVal;
+          warnings.push(makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON));
+        }
+      } else {
+        args.mergedRaw.protected_tokens = projectVal;
+      }
+    } else {
+      if (trustedUserVal !== undefined) {
+        args.mergedRaw.protected_tokens = trustedUserVal;
+      } else {
+        delete args.mergedRaw.protected_tokens;
+      }
+      warnings.push(makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON));
+    }
+  }
   return warnings;
 }
 function normalizeEndpoint(value) {
@@ -12045,6 +14361,390 @@ function pruneNestedConfigLeaf(block, relativePath) {
   return { block: result, removed: relativePath.map(String).join(".") };
 }
 
+// ../plugin/src/config/raw-loader.ts
+import {
+  closeSync as closeSync2,
+  existsSync as existsSync4,
+  linkSync,
+  openSync as openSync2,
+  readFileSync as readFileSync4,
+  renameSync as renameSync2,
+  statSync as statSync2,
+  unlinkSync,
+  writeFileSync as writeFileSync2
+} from "node:fs";
+import { basename as basename2, dirname as dirname4, join as join4 } from "node:path";
+var MODEL_FIELDS = ["model", "fallback_models"];
+var QUALIFIER_FIELDS = ["variant", "thinking_level"];
+var TASK_MODEL_FIELDS = [...MODEL_FIELDS, ...QUALIFIER_FIELDS, "timeout_minutes"];
+var PRE_PER_HARNESS_BACKUP_SUFFIX = ".pre-per-harness.bak";
+var temporaryFileSequence = 0;
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function asDocument(text) {
+  try {
+    const document = parseJsonc(text.startsWith("\uFEFF") ? text.slice(1) : text);
+    return isRecord2(document) ? document : null;
+  } catch {
+    return null;
+  }
+}
+function getAtPath(document, path) {
+  let current = document;
+  for (const part of path) {
+    if (!isRecord2(current) || !Object.hasOwn(current, part))
+      return;
+    current = current[part];
+  }
+  return current;
+}
+function stableJson(value) {
+  if (Array.isArray(value))
+    return `[${value.map(stableJson).join(",")}]`;
+  if (!isRecord2(value))
+    return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+}
+function valuesMatch(left, right) {
+  return stableJson(left) === stableJson(right);
+}
+function valueForDiagnostic(value) {
+  return stableJson(value);
+}
+function migrateEntryForHarness(value, harness) {
+  if (Array.isArray(value))
+    return value.map((entry) => migrateEntryForHarness(entry, harness));
+  if (!isRecord2(value) || !Object.hasOwn(value, "model"))
+    return value;
+  const entry = { model: value.model };
+  if (harness === "opencode" && Object.hasOwn(value, "variant")) {
+    entry.variant = value.variant;
+  }
+  if (harness === "pi" && Object.hasOwn(value, "thinking_level")) {
+    entry.thinking_level = value.thinking_level;
+  }
+  return entry;
+}
+function migrateFallbackForHarness(value, harness) {
+  if (typeof value === "string")
+    return [value];
+  return migrateEntryForHarness(value, harness);
+}
+function canCreateAtPath(document, path) {
+  let current = document;
+  for (const part of path) {
+    if (current === undefined)
+      return true;
+    if (!isRecord2(current))
+      return false;
+    current = current[part];
+  }
+  return current === undefined || isRecord2(current);
+}
+function flatFieldPath(parts) {
+  return parts.join(".");
+}
+function updateDocumentForFlatFields(text) {
+  const hasBom = text.startsWith("\uFEFF");
+  const editableText = hasBom ? text.slice(1) : text;
+  const document = asDocument(text);
+  if (!document) {
+    return { text, hasFlatKeys: false, diagnostics: [], flatPaths: [] };
+  }
+  let nextText = editableText;
+  let hasFlatKeys = false;
+  const diagnostics = [];
+  const flatPaths = [];
+  const sourcePathsToRemove = [];
+  const addDestination = (sourcePath, destinationPath, destinationValue) => {
+    const sourceLabel = flatFieldPath(sourcePath);
+    const destinationLabel = flatFieldPath(destinationPath);
+    if (!canCreateAtPath(document, destinationPath.slice(0, -1))) {
+      diagnostics.push({
+        path: sourceLabel,
+        message: `Flat config field "${sourceLabel}" (${valueForDiagnostic(destinationValue)}) conflicts with non-object destination "${destinationLabel}" (${valueForDiagnostic(getAtPath(document, destinationPath.slice(0, -1)))}); kept the destination and ignored the flat field.`
+      });
+      return;
+    }
+    const existing = getAtPath(document, destinationPath);
+    if (existing !== undefined) {
+      if (!valuesMatch(existing, destinationValue)) {
+        diagnostics.push({
+          path: sourceLabel,
+          message: `Flat config field "${sourceLabel}" (${valueForDiagnostic(destinationValue)}) conflicts with "${destinationLabel}" (${valueForDiagnostic(existing)}); kept "${destinationLabel}" and ignored the flat field.`
+        });
+      }
+      return;
+    }
+    nextText = setJsoncValue(nextText, destinationPath, destinationValue);
+  };
+  const migrateAgentFields = (agentName) => {
+    const agent = document[agentName];
+    if (!isRecord2(agent))
+      return;
+    for (const field of MODEL_FIELDS) {
+      if (!Object.hasOwn(agent, field))
+        continue;
+      const sourcePath = [agentName, field];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      const migrateValue = field === "fallback_models" ? migrateFallbackForHarness : migrateEntryForHarness;
+      addDestination(sourcePath, [agentName, "opencode", field], migrateValue(agent[field], "opencode"));
+      addDestination(sourcePath, [agentName, "pi", field], migrateValue(agent[field], "pi"));
+    }
+    if (Object.hasOwn(agent, "variant")) {
+      const sourcePath = [agentName, "variant"];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      addDestination(sourcePath, [agentName, "opencode", "variant"], agent.variant);
+    }
+    if (Object.hasOwn(agent, "thinking_level")) {
+      const sourcePath = [agentName, "thinking_level"];
+      hasFlatKeys = true;
+      flatPaths.push(flatFieldPath(sourcePath));
+      sourcePathsToRemove.push(sourcePath);
+      addDestination(sourcePath, [agentName, "pi", "thinking_level"], agent.thinking_level);
+    }
+  };
+  migrateAgentFields("historian");
+  migrateAgentFields("dreamer");
+  const dreamer = document.dreamer;
+  const tasks = isRecord2(dreamer) ? dreamer.tasks : undefined;
+  if (isRecord2(tasks)) {
+    for (const taskName of Object.keys(tasks).sort()) {
+      const task = tasks[taskName];
+      if (!isRecord2(task))
+        continue;
+      for (const field of TASK_MODEL_FIELDS) {
+        if (!Object.hasOwn(task, field))
+          continue;
+        const sourcePath = ["dreamer", "tasks", taskName, field];
+        hasFlatKeys = true;
+        flatPaths.push(flatFieldPath(sourcePath));
+        sourcePathsToRemove.push(sourcePath);
+        if (field === "model" || field === "fallback_models") {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], field === "fallback_models" ? migrateFallbackForHarness(task[field], "opencode") : migrateEntryForHarness(task[field], "opencode"));
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], field === "fallback_models" ? migrateFallbackForHarness(task[field], "pi") : migrateEntryForHarness(task[field], "pi"));
+        } else if (field === "variant") {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], task[field]);
+        } else if (field === "thinking_level") {
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], task[field]);
+        } else {
+          addDestination(sourcePath, ["dreamer", "opencode", "tasks", taskName, field], task[field]);
+          addDestination(sourcePath, ["dreamer", "pi", "tasks", taskName, field], task[field]);
+        }
+      }
+    }
+  }
+  for (const sourcePath of sourcePathsToRemove) {
+    nextText = removeJsoncValue(nextText, sourcePath);
+  }
+  return {
+    text: hasBom ? `\uFEFF${nextText}` : nextText,
+    hasFlatKeys,
+    diagnostics,
+    flatPaths
+  };
+}
+function hasFlatKeys(input) {
+  const text = typeof input === "string" ? input : input.toString("utf-8");
+  return updateDocumentForFlatFields(text).hasFlatKeys;
+}
+function migrateFlatDetailed(input) {
+  const bytes = typeof input === "string" ? Buffer.from(input, "utf-8") : input;
+  const result = updateDocumentForFlatFields(bytes.toString("utf-8"));
+  return {
+    bytes: Buffer.from(result.text, "utf-8"),
+    hasFlatKeys: result.hasFlatKeys,
+    diagnostics: result.diagnostics
+  };
+}
+function writeExclusiveBackup(backupPath, bytes, mode) {
+  const temporaryPath = writeTemporaryCandidate(backupPath, bytes, mode);
+  try {
+    try {
+      linkSync(temporaryPath, backupPath);
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        throw error;
+    }
+    const existingBytes = readFileSync4(backupPath);
+    if (existingBytes.equals(bytes))
+      return;
+    if (bytes.subarray(0, existingBytes.length).equals(existingBytes)) {
+      renameSync2(temporaryPath, backupPath);
+      return;
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
+  }
+}
+function writeTemporaryCandidate(configPath, bytes, mode) {
+  const directory = dirname4(configPath);
+  const stem = basename2(configPath);
+  for (let attempt = 0;attempt < 32; attempt++) {
+    temporaryFileSequence += 1;
+    const path = join4(directory, `.${stem}.per-harness-${process.pid}-${temporaryFileSequence}.tmp`);
+    let descriptor;
+    try {
+      descriptor = openSync2(path, "wx", mode);
+      writeFileSync2(descriptor, bytes);
+      closeSync2(descriptor);
+      return path;
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try {
+          closeSync2(descriptor);
+        } catch {}
+      }
+      try {
+        unlinkSync(path);
+      } catch {}
+      if (error.code !== "EEXIST")
+        throw error;
+    }
+  }
+  throw new Error(`Could not allocate a temporary config file beside ${configPath}`);
+}
+function migrationWarning(diagnostic) {
+  return diagnostic.message;
+}
+function loadRawConfigFile(options) {
+  if (!existsSync4(options.configPath))
+    return null;
+  let observedBytes;
+  try {
+    observedBytes = readFileSync4(options.configPath);
+  } catch (error) {
+    throw new Error(`failed to read config: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const initialMigration = migrateFlatDetailed(observedBytes);
+  if (!initialMigration.hasFlatKeys) {
+    return {
+      configPath: options.configPath,
+      bytes: observedBytes,
+      text: observedBytes.toString("utf-8"),
+      warnings: [],
+      migrated: false
+    };
+  }
+  if (options.tier === "project") {
+    return {
+      configPath: options.configPath,
+      bytes: initialMigration.bytes,
+      text: initialMigration.bytes.toString("utf-8"),
+      warnings: [
+        "Adapted flat model config in memory; use historian.opencode/historian.pi and dreamer.opencode/dreamer.pi instead. Project config files are never rewritten.",
+        ...initialMigration.diagnostics.map(migrationWarning)
+      ],
+      migrated: false
+    };
+  }
+  const backupPath = `${options.configPath}${PRE_PER_HARNESS_BACKUP_SUFFIX}`;
+  for (;; ) {
+    const migration = migrateFlatDetailed(observedBytes);
+    if (!migration.hasFlatKeys) {
+      return {
+        configPath: options.configPath,
+        bytes: observedBytes,
+        text: observedBytes.toString("utf-8"),
+        warnings: [],
+        migrated: false
+      };
+    }
+    let temporaryPath;
+    try {
+      const mode = statSync2(options.configPath).mode & 511;
+      writeExclusiveBackup(backupPath, observedBytes, mode);
+      temporaryPath = writeTemporaryCandidate(options.configPath, migration.bytes, mode);
+      options.afterTemporaryWrite?.();
+      const currentBytes = readFileSync4(options.configPath);
+      if (!hasFlatKeys(currentBytes)) {
+        unlinkSync(temporaryPath);
+        return {
+          configPath: options.configPath,
+          bytes: currentBytes,
+          text: currentBytes.toString("utf-8"),
+          warnings: [],
+          migrated: false
+        };
+      }
+      if (!currentBytes.equals(observedBytes)) {
+        unlinkSync(temporaryPath);
+        observedBytes = currentBytes;
+        continue;
+      }
+      renameSync2(temporaryPath, options.configPath);
+      return {
+        configPath: options.configPath,
+        bytes: migration.bytes,
+        text: migration.bytes.toString("utf-8"),
+        warnings: [
+          "Migrated flat historian/dreamer model config to per-harness blocks.",
+          ...migration.diagnostics.map(migrationWarning)
+        ],
+        migrated: true
+      };
+    } catch (error) {
+      if (temporaryPath) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {}
+      }
+      return {
+        configPath: options.configPath,
+        bytes: observedBytes,
+        text: observedBytes.toString("utf-8"),
+        warnings: [
+          `Could not migrate flat model config: ${error instanceof Error ? error.message : String(error)}. Flat fields were not applied.`,
+          ...migration.diagnostics.map(migrationWarning)
+        ],
+        migrated: false
+      };
+    }
+  }
+}
+
+// ../plugin/src/config/removed-agent-config.ts
+var REMOVED_AGENT_CONFIG_KEY = "sidekick";
+var REMOVED_AGENT_CONFIG_WARNING = `The "${REMOVED_AGENT_CONFIG_KEY}" configuration was removed and is ignored.`;
+function isPlainObject4(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function stripRemovedAgentConfig(rawConfig, warnings) {
+  let removed = false;
+  const patched = { ...rawConfig };
+  if (Object.hasOwn(patched, REMOVED_AGENT_CONFIG_KEY)) {
+    delete patched[REMOVED_AGENT_CONFIG_KEY];
+    removed = true;
+  }
+  if (isPlainObject4(patched.profiles)) {
+    const profiles = { ...patched.profiles };
+    let profilesChanged = false;
+    for (const [name, value] of Object.entries(profiles)) {
+      if (!isPlainObject4(value) || !Object.hasOwn(value, REMOVED_AGENT_CONFIG_KEY))
+        continue;
+      const profile = { ...value };
+      delete profile[REMOVED_AGENT_CONFIG_KEY];
+      profiles[name] = profile;
+      profilesChanged = true;
+      removed = true;
+    }
+    if (profilesChanged)
+      patched.profiles = profiles;
+  }
+  if (removed && !warnings.includes(REMOVED_AGENT_CONFIG_WARNING)) {
+    warnings.push(REMOVED_AGENT_CONFIG_WARNING);
+  }
+  return removed ? patched : rawConfig;
+}
+
 // ../plugin/src/config/transform-mode.ts
 var RUST_COMPACTION_OFF_WARNING = "compaction-off mode does not support rust transform mode; using the TypeScript transform.";
 var RUST_REQUIRES_USER_SUBC_WARNING = "rust mode requires user-level subc configuration; running ts.";
@@ -12065,18 +14765,18 @@ function resolveTransformMode(args) {
 }
 
 // ../plugin/src/config/variable.ts
-import { existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
-import { homedir as homedir5 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute2, resolve } from "node:path";
+import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { homedir as homedir6 } from "node:os";
+import { dirname as dirname5, isAbsolute as isAbsolute3, resolve as resolve2 } from "node:path";
 var ENV_PATTERN = /\{env:([^}]+)\}/g;
 var FILE_PATTERN = /\{file:([^}]+)\}/g;
 function sensitiveFilePathReason(resolvedPath) {
-  const home = homedir5();
+  const home = homedir6();
   const sensitiveDirs = [
-    { dir: resolve(home, ".ssh"), label: "SSH keys" },
-    { dir: resolve(home, ".aws"), label: "AWS credentials" },
-    { dir: resolve(home, ".gnupg"), label: "GnuPG keyring" },
-    { dir: resolve(home, ".config", "gh"), label: "GitHub CLI auth" }
+    { dir: resolve2(home, ".ssh"), label: "SSH keys" },
+    { dir: resolve2(home, ".aws"), label: "AWS credentials" },
+    { dir: resolve2(home, ".gnupg"), label: "GnuPG keyring" },
+    { dir: resolve2(home, ".config", "gh"), label: "GitHub CLI auth" }
   ];
   for (const { dir, label } of sensitiveDirs) {
     if (resolvedPath === dir || resolvedPath.startsWith(`${dir}/`)) {
@@ -12116,7 +14816,7 @@ function substituteConfigVariables(input) {
   if (fileMatches.length === 0) {
     return { text, warnings };
   }
-  const configDir = input.configPath ? dirname4(input.configPath) : process.cwd();
+  const configDir = input.configPath ? dirname5(input.configPath) : process.cwd();
   let output = "";
   let cursor = 0;
   for (const match of fileMatches) {
@@ -12134,21 +14834,21 @@ function substituteConfigVariables(input) {
     }
     let filePath = rawPath.trim();
     if (filePath.startsWith("~/")) {
-      filePath = resolve(homedir5(), filePath.slice(2));
-    } else if (!isAbsolute2(filePath)) {
-      filePath = resolve(configDir, filePath);
+      filePath = resolve2(homedir6(), filePath.slice(2));
+    } else if (!isAbsolute3(filePath)) {
+      filePath = resolve2(configDir, filePath);
     }
     const sensitiveReason = sensitiveFilePathReason(filePath);
     if (sensitiveReason) {
       warnings.push(`${token} resolves to a sensitive path (${sensitiveReason}: ${filePath}); ` + "inlining its contents into config — make sure this is intentional.");
     }
-    if (!existsSync4(filePath)) {
+    if (!existsSync5(filePath)) {
       warnings.push(`File not found for ${token} (resolved to ${filePath}); using empty string`);
       continue;
     }
     let contents;
     try {
-      contents = readFileSync4(filePath, "utf-8").trim();
+      contents = readFileSync5(filePath, "utf-8").trim();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       warnings.push(`Failed to read file for ${token} (${filePath}): ${message}; using empty string`);
@@ -12168,20 +14868,28 @@ function getProjectConfigBasePath(directory) {
   return cortexKitProjectConfigBasePath(directory);
 }
 function resolveLegacyReadFallback(sources) {
-  return { source: sources.find((s) => existsSync5(s.path)) ?? null };
+  return { source: sources.find((s) => existsSync6(s.path)) ?? null };
 }
 function loadConfigFileDetailed(configPath, source) {
-  if (!existsSync5(configPath)) {
+  if (!existsSync6(configPath)) {
     return null;
   }
   let rawText;
+  let rawWarnings;
   try {
-    rawText = readFileSync5(configPath, "utf-8");
+    const raw = loadRawConfigFile({ configPath, tier: source });
+    if (!raw)
+      return null;
+    rawText = raw.text;
+    rawWarnings = raw.warnings;
   } catch (error) {
+    const message = `failed to read config: ${error instanceof Error ? error.message : String(error)}`;
     return {
       config: {},
-      warnings: [
-        `${configPath}: failed to read config: ${error instanceof Error ? error.message : String(error)}`
+      warnings: [`${configPath}: ${message}`],
+      parseFailures: [],
+      warningDetails: [
+        { warningClass: CONFIG_WARNING_CLASS.FILE_IO, source, path: configPath, message }
       ],
       outcome: "project-file-io-error",
       source
@@ -12194,22 +14902,56 @@ function loadConfigFileDetailed(configPath, source) {
       isProjectConfig: source === "project"
     });
     const rejectedKeyPaths = [];
-    const config = parseJsonc(substituted.text, {
+    const parsed = parseJsoncRecovering(substituted.text, {
       onRejectedKey: (path) => rejectedKeyPaths.push(path.join("."))
     });
+    const config = parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value) ? parsed.value : {};
     const unsafeKeyWarnings = rejectedKeyPaths.map((path) => `Ignored unsafe config key "${path}" (security: prototype-pollution keys are not allowed).`);
+    const firstIssue = parsed.issues[0];
+    const recovered = firstIssue !== undefined && Object.keys(config).length > 0;
+    const parseFailures = firstIssue ? [
+      {
+        warningClass: CONFIG_WARNING_CLASS.FILE_PARSE,
+        source,
+        path: configPath,
+        line: firstIssue.line,
+        column: firstIssue.column,
+        message: firstIssue.message,
+        recovered,
+        warning: `${configPath}:${firstIssue.line}:${firstIssue.column}: ${firstIssue.message}; ${recovered ? "recovered values were applied, but the file must be fixed." : "using defaults for this file."}`
+      }
+    ] : [];
     return {
       config,
-      warnings: [...substituted.warnings, ...unsafeKeyWarnings].map((warning) => `${configPath}: ${warning}`),
-      outcome: rejectedKeyPaths.length > 0 ? "schema-recovery" : substituted.warnings.length > 0 ? "substitution-failure" : "ok",
+      warnings: [
+        ...parseFailures.map((failure) => failure.warning),
+        ...rawWarnings.map((warning) => `${configPath}: ${warning}`),
+        ...substituted.warnings.map((warning) => `${configPath}: ${warning}`),
+        ...unsafeKeyWarnings.map((warning) => `${configPath}: ${warning}`)
+      ],
+      parseFailures,
+      warningDetails: parseFailures,
+      outcome: parseFailures.length > 0 ? "project-file-parse-error" : rejectedKeyPaths.length > 0 ? "schema-recovery" : substituted.warnings.length > 0 ? "substitution-failure" : "ok",
       source
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const warning = `${configPath}:1:1: ${message}; using defaults for this file.`;
+    const failure = {
+      warningClass: CONFIG_WARNING_CLASS.FILE_PARSE,
+      source,
+      path: configPath,
+      line: 1,
+      column: 1,
+      message,
+      recovered: false,
+      warning
+    };
     return {
       config: {},
-      warnings: [
-        `${configPath}: failed to load config: ${error instanceof Error ? error.message : String(error)}`
-      ],
+      warnings: [warning],
+      parseFailures: [failure],
+      warningDetails: [failure],
       outcome: "project-file-parse-error",
       source
     };
@@ -12266,9 +15008,24 @@ function redactConfigValue(value) {
   }
   return typeof value;
 }
+var warnedProtectedTagsDeprecation = false;
+function formatProtectedTokensBelowMinWarning(value) {
+  return `protected_tokens is a token floor (minimum ${PROTECTED_TOKENS_MIN}, default derived from the context window); ${value} looks like the old protected_tags count. Remove the key to use the default, or set a token count such as 16000.`;
+}
+function warnProtectedTagsDeprecationOnce() {
+  if (!warnedProtectedTagsDeprecation) {
+    warnedProtectedTagsDeprecation = true;
+    console.warn("[magic-context] protected_tags is deprecated and ignored; use protected_tokens instead.");
+  }
+}
 function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
   const preMigrationWarnings = [];
-  const migratedExperimental = migrateLegacyExperimental(rawConfig, preMigrationWarnings);
+  const configWithoutRemovedAgent = stripRemovedAgentConfig(rawConfig, preMigrationWarnings);
+  if (Object.hasOwn(rawConfig, "protected_tags")) {
+    warnProtectedTagsDeprecationOnce();
+    preMigrationWarnings.push("protected_tags is deprecated and ignored; use protected_tokens instead.");
+  }
+  const migratedExperimental = migrateLegacyExperimental(configWithoutRemovedAgent, preMigrationWarnings);
   const migratedDreamer = migrateDreamerV2(migratedExperimental, preMigrationWarnings);
   const migrated = migrateLegacyAgentEnabledInMemory(migratedDreamer, preMigrationWarnings);
   const parsed = MagicContextConfigSchema.safeParse(migrated);
@@ -12294,7 +15051,13 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
       const key = String(topKey);
       errorPaths.add(key);
       const paths = issuePathsByKey.get(key) ?? [];
-      paths.push([...issue.path]);
+      if (issue.code === "unrecognized_keys") {
+        for (const unrecognizedKey of issue.keys) {
+          paths.push([...issue.path, unrecognizedKey]);
+        }
+      } else {
+        paths.push([...issue.path]);
+      }
       issuePathsByKey.set(key, paths);
       const msg = issue.message;
       if (msg && !GENERIC_ZOD_PREFIXES.some((p) => msg.startsWith(p))) {
@@ -12307,12 +15070,7 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
   const patched = { ...rawConfig };
   for (const key of errorPaths) {
     recoveredTopLevelKeys.push(key);
-    const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
-    if (isAgentConfig) {
-      delete patched[key];
-      warnings.push(`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`);
-      continue;
-    }
+    const isAgentConfig = key === "historian" || key === "dreamer";
     const issuePaths = issuePathsByKey.get(key) ?? [];
     const rawValue = rawConfig[key];
     const allNested = issuePaths.length > 0 && issuePaths.every((p) => p.length >= 2) && typeof rawValue === "object" && rawValue !== null && !Array.isArray(rawValue);
@@ -12329,14 +15087,26 @@ function parsePluginConfig(rawConfig, recoveredTopLevelKeys = []) {
           prunedLeaves.push(result.removed);
         }
       }
-      patched[key] = prunedBlock;
-      const reason = customMessagesByKey.get(key);
-      warnings.push(`"${key}": invalid nested field(s) ${prunedLeaves.map((l) => `"${l}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`);
+      if (prunedLeaves.length === issuePaths.length) {
+        patched[key] = prunedBlock;
+        const reason = customMessagesByKey.get(key);
+        warnings.push(`"${key}": invalid nested field(s) ${prunedLeaves.map((leaf) => `"${key}.${leaf}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`);
+        continue;
+      }
+    }
+    if (isAgentConfig) {
+      delete patched[key];
+      warnings.push(`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`);
       continue;
     }
     delete patched[key];
     const defaultVal = defaults[key];
     const reason = customMessagesByKey.get(key);
+    const invalidRawValue = rawConfig[key];
+    if (key === "protected_tokens" && typeof invalidRawValue === "number" && invalidRawValue < PROTECTED_TOKENS_MIN) {
+      warnings.push(formatProtectedTokensBelowMinWarning(invalidRawValue));
+      continue;
+    }
     warnings.push(`"${key}": invalid value (${redactConfigValue(rawConfig[key])}), using default ${JSON.stringify(defaultVal)}.${reason ? ` ${reason}` : ""}`);
   }
   const retryMigrated = migrateLegacyAgentEnabledInMemory(migrateDreamerV2(migrateLegacyExperimental(patched, preMigrationWarnings), preMigrationWarnings), preMigrationWarnings);
@@ -12412,13 +15182,13 @@ function loadPluginConfigDetailed(directory) {
   const harnessLegacy = resolveLegacyConfigSourcesForHarness(directory, "opencode");
   const userLegacyFallback = userDetected.format === "none" ? resolveLegacyReadFallback(harnessLegacy.user) : { source: null };
   const projectLegacyFallback = projectDetected.format === "none" ? resolveLegacyReadFallback(harnessLegacy.project) : { source: null };
-  const legacyUserUnmigrated = userDetected.format === "none" && !userLegacyFallback.source && legacySources.user.some((source) => existsSync5(source.path));
-  const legacyProjectUnmigrated = projectDetected.format === "none" && !projectLegacyFallback.source && legacySources.project.some((source) => existsSync5(source.path));
+  const legacyUserUnmigrated = userDetected.format === "none" && !userLegacyFallback.source && legacySources.user.some((source) => existsSync6(source.path));
+  const legacyProjectUnmigrated = projectDetected.format === "none" && !projectLegacyFallback.source && legacySources.project.some((source) => existsSync6(source.path));
   const userLoaded = userDetected.format !== "none" ? loadConfigFileDetailed(userDetected.path, "user") : userLegacyFallback.source ? loadConfigFileDetailed(userLegacyFallback.source.path, "user") : null;
   const projectLoaded = projectDetected.format !== "none" ? loadConfigFileDetailed(projectDetected.path, "project") : projectLegacyFallback.source ? loadConfigFileDetailed(projectLegacyFallback.source.path, "project") : null;
   const allWarnings = [];
-  let mergedRaw = {};
-  const trustedBaseConfig = parsePluginConfig(userLoaded?.config ?? {});
+  const removedConfigWarnings = [];
+  const userRaw = stripRemovedAgentConfig(userLoaded?.config ?? {}, removedConfigWarnings);
   if (userLegacyFallback.source) {
     allWarnings.push(`[user config] reading legacy config from ${userLegacyFallback.source.path} until migration completes; run \`npx @cortexkit/magic-context doctor\` to consolidate into the shared CortexKit location.`);
   } else if (legacyUserUnmigrated) {
@@ -12431,29 +15201,49 @@ function loadPluginConfigDetailed(directory) {
   }
   if (userLoaded) {
     allWarnings.push(...userLoaded.warnings.map((w) => `[user config] ${w}`));
-    mergedRaw = deepMergeRawConfig(mergedRaw, userLoaded.config);
   }
+  let projectRaw = {};
   if (projectLoaded) {
     allWarnings.push(...projectLoaded.warnings.map((w) => `[project config] ${w}`));
-    const projectRaw = { ...projectLoaded.config };
+    projectRaw = stripRemovedAgentConfig(projectLoaded.config, removedConfigWarnings);
     for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
       allWarnings.push(`[project config] ${warning}`);
     }
-    mergedRaw = deepMergeRawConfig(mergedRaw, projectRaw);
-    for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, userLoaded?.config)) {
+  }
+  allWarnings.push(...removedConfigWarnings.map((warning) => `[config] ${warning}`));
+  const profileResolution = resolveConfigProfile({
+    userRaw,
+    projectRaw
+  });
+  allWarnings.push(...profileResolution.warnings.map((warning) => `[config] ${warning}`));
+  const trustedProfiledRaw = deepMergeRawConfig(profileResolution.userBase, profileResolution.overlay);
+  let mergedRaw = trustedProfiledRaw;
+  const trustedBaseConfig = parsePluginConfig(trustedProfiledRaw);
+  if (projectLoaded) {
+    mergedRaw = deepMergeRawConfig(mergedRaw, profileResolution.projectBase);
+    for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, profileResolution.userBase)) {
       allWarnings.push(`[project config] ${warning}`);
     }
     for (const warning of constrainProjectThresholdOverrides({
       mergedRaw,
-      projectRaw,
+      projectRaw: profileResolution.projectBase,
       trustedBaseConfig
     })) {
       allWarnings.push(`[project config] ${warning}`);
     }
   }
   const recoveredTopLevelKeys = [];
+  const cacheTtlConfigured = Object.hasOwn(mergedRaw, "cache_ttl");
   const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+  attachProtectedTokensTierOverrides(config, {
+    trustedUser: trustedBaseConfig.protected_tokens,
+    project: projectLoaded ? profileResolution.projectBase.protected_tokens : undefined
+  });
+  if (profileResolution.activeProfile)
+    config.profile = profileResolution.activeProfile;
   setOutputReserveConfig(config.output_reserve);
+  setWindowOverlayPath(config.models?.window_overlay_path);
+  const leafValidationWarnings = [...config.configWarnings ?? []];
   if (config.configWarnings?.length) {
     allWarnings.push(...config.configWarnings.map((w) => {
       if (userLoaded && projectLoaded)
@@ -12465,7 +15255,7 @@ function loadPluginConfigDetailed(directory) {
   }
   const resolvedTransformMode = resolveTransformMode({
     configured: config.transform_mode,
-    userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
+    userTierHasSubc: hasUserTierSubcConfig(userRaw),
     compactionEnabled: isCompactionEnabled(config)
   });
   config.transform_mode = resolvedTransformMode.mode;
@@ -12479,6 +15269,21 @@ function loadPluginConfigDetailed(directory) {
     ...bindSubstitutionFailures(userLoaded),
     ...bindSubstitutionFailures(projectLoaded)
   ];
+  const configParseFailures = [
+    ...userLoaded?.parseFailures ?? [],
+    ...projectLoaded?.parseFailures ?? []
+  ];
+  const warningDetails = [
+    ...userLoaded?.warningDetails ?? [],
+    ...projectLoaded?.warningDetails ?? [],
+    ...leafValidationWarnings.map((message) => ({
+      warningClass: CONFIG_WARNING_CLASS.INVALID_LEAF,
+      message
+    }))
+  ];
+  config.configParseFailures = configParseFailures;
+  config.configWarningDetails = warningDetails;
+  config.cacheTtlConfigured = cacheTtlConfigured;
   const sources = {
     userConfig: userLoaded?.outcome ?? (legacyUserUnmigrated ? "legacy-config-unmigrated" : "ok"),
     projectConfig: projectLoaded?.outcome ?? (legacyProjectUnmigrated ? "legacy-config-unmigrated" : "ok")
@@ -12489,23 +15294,26 @@ function loadPluginConfigDetailed(directory) {
     loadOutcome: combinedOutcome({ sources, substitutionFailures, recoveredTopLevelKeys }),
     sources,
     substitutionFailures,
-    recoveredTopLevelKeys
+    recoveredTopLevelKeys,
+    configParseFailures,
+    warningDetails,
+    cacheTtlConfigured
   };
 }
 
 // ../plugin/src/features/magic-context/storage-db.ts
 import {
-  chmodSync,
+  chmodSync as chmodSync2,
   copyFileSync,
   cpSync,
-  existsSync as existsSync7,
+  existsSync as existsSync9,
   mkdirSync as mkdirSync3,
-  readdirSync as readdirSync2,
+  readdirSync as readdirSync3,
   readFileSync as readFileSync7,
-  statSync,
-  unlinkSync
+  statSync as statSync4,
+  unlinkSync as unlinkSync2
 } from "node:fs";
-import { basename as basename2, dirname as dirname5, join as join5 } from "node:path";
+import { basename as basename3, dirname as dirname6, join as join6, resolve as resolve3 } from "node:path";
 
 // ../plugin/src/plugin/boot-quiet.ts
 var bootQuietUntilMs = 0;
@@ -12526,22 +15334,47 @@ function getErrorMessage(error) {
 // ../plugin/src/shared/rpc-utils.ts
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync6 } from "node:fs";
+
+// ../plugin/src/shared/pi-executable.ts
+var PI_IMAGE_NAMES = new Set(["pi", "pi.cmd", "omp", "oh-my-pi"]);
+function piHarnessKindFromExecutable(value) {
+  const executable = (value ?? "").trim().replace(/^['"]|['"]$/g, "").replaceAll("\\", "/").split("/").at(-1)?.toLowerCase().replace(/\.(?:exe|cmd)$/, "");
+  if (!executable || !PI_IMAGE_NAMES.has(executable))
+    return;
+  return executable === "pi" ? "pi" : "omp";
+}
+
+// ../plugin/src/shared/rpc-utils.ts
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0)
-    return false;
+    return "dead";
+  if (rpcIdentityPlatform === "win32")
+    return readWindowsProcess(pid).state;
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === "EPERM";
+    rpcIdentityProcessKill(pid, 0);
+    return "alive";
+  } catch (error) {
+    return error.code === "ESRCH" ? "dead" : "inconclusive";
   }
 }
 var RPC_IDENTITY_SKEW_TOLERANCE_MS = 120000;
 var LINUX_CLOCK_TICKS_PER_SECOND = 100;
 var PS_PROBE_TIMEOUT_MS = 1000;
+var WINDOWS_CIM_PROBE_TIMEOUT_MS = 5000;
+var MAX_ANCESTOR_WALK_DEPTH = 16;
 var OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
+var TASKLIST_NO_TASKS_PATTERN = /^INFO:\s+No tasks are running which match the specified criteria\.?$/im;
+var WINDOWS_CIM_COMMAND = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress";
+var PI_HARNESS_ARC_MARKERS = [
+  "pi-coding-agent",
+  "oh-my-pi",
+  "@oh-my-pi",
+  "cljs/dist",
+  "dist/bundle/cli"
+];
 var rpcIdentityReadFileSync = readFileSync6;
 var rpcIdentityExecFileSync = execFileSync;
+var rpcIdentityProcessKill = process.kill;
 var rpcProcessListExecFileSync = execFileSync;
 var rpcIdentityPlatform = process.platform;
 var rpcIdentityNowMs = () => Date.now();
@@ -12571,13 +15404,103 @@ function readPsProcessStartTime(pid) {
   try {
     const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
-      timeout: PS_PROBE_TIMEOUT_MS
+      timeout: PS_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"]
     });
     const processStartTime = Date.parse(String(output).trim());
     return Number.isFinite(processStartTime) ? processStartTime : null;
   } catch {
     return null;
   }
+}
+function readProcessStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return null;
+  return rpcIdentityPlatform === "linux" ? readLinuxProcessStartTime(pid) : rpcIdentityPlatform === "win32" ? readWindowsProcessStartTime(pid) : readPsProcessStartTime(pid);
+}
+function readProcessProbeEvidence(pid) {
+  return {
+    startTime: readProcessStartTime(pid),
+    commandLine: readProcessCommand(pid)
+  };
+}
+var windowsProcessFactsCache = null;
+function rememberWindowsProcessFacts(facts) {
+  windowsProcessFactsCache = new Map(facts.map((fact) => [fact.pid, fact]));
+}
+function parseCsvLine(line) {
+  const fields = [];
+  let field = "";
+  let quoted = false;
+  for (let index = 0;index < line.length; index += 1) {
+    const character = line[index];
+    if (character === '"') {
+      if (quoted && line[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (character === "," && !quoted) {
+      fields.push(field);
+      field = "";
+    } else {
+      field += character;
+    }
+  }
+  if (quoted)
+    return null;
+  fields.push(field);
+  return fields;
+}
+function parseTasklistOutput(output) {
+  const entries = [];
+  let sawHeader = false;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line)
+      continue;
+    if (TASKLIST_NO_TASKS_PATTERN.test(line))
+      return [];
+    const fields = parseCsvLine(line);
+    if (!fields)
+      continue;
+    if (fields[1]?.trim().toLowerCase() === "pid") {
+      sawHeader = true;
+      continue;
+    }
+    const pid = Number(fields[1]);
+    if (!Number.isInteger(pid) || pid <= 0 || !fields[0])
+      continue;
+    entries.push({ pid, command: fields[0] });
+  }
+  return entries.length > 0 || sawHeader ? entries : null;
+}
+function readWindowsProcess(pid) {
+  try {
+    const output = rpcIdentityExecFileSync("tasklist", ["/FO", "CSV", "/FI", `PID eq ${pid}`], {
+      encoding: "utf8",
+      timeout: PS_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const entries = parseTasklistOutput(String(output));
+    if (entries === null)
+      return { state: "inconclusive" };
+    const process2 = entries.find((entry) => entry.pid === pid);
+    return process2 ? { state: "alive", command: process2.command } : { state: "dead" };
+  } catch {
+    return { state: "inconclusive" };
+  }
+}
+function readWindowsProcessStartTime(pid) {
+  const cached = windowsProcessFactsCache?.get(pid);
+  if (cached)
+    return cached.startTime;
+  const snapshot = tryReadWindowsCimSnapshot(rpcIdentityExecFileSync);
+  if (!snapshot)
+    return null;
+  rememberWindowsProcessFacts(snapshot.facts);
+  return windowsProcessFactsCache?.get(pid)?.startTime ?? null;
 }
 function readLinuxProcessCommand(pid) {
   try {
@@ -12590,63 +15513,341 @@ function readPsProcessCommand(pid) {
   try {
     const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "command="], {
       encoding: "utf8",
-      timeout: PS_PROBE_TIMEOUT_MS
+      timeout: PS_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"]
     });
     return String(output);
   } catch {
     return null;
   }
 }
+function readProcessCommand(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return null;
+  if (rpcIdentityPlatform === "linux")
+    return readLinuxProcessCommand(pid);
+  if (rpcIdentityPlatform === "win32") {
+    const cached = windowsProcessFactsCache?.get(pid);
+    if (cached?.commandLine)
+      return cached.commandLine;
+    return readWindowsProcess(pid).command ?? null;
+  }
+  return readPsProcessCommand(pid);
+}
+function executableName(token) {
+  return (token ?? "").replace(/^['"]|['"]$/g, "").split("/").at(-1) ?? "";
+}
+function commandTokens(command) {
+  return command.toLowerCase().replaceAll("\\", "/").replaceAll("\x00", " ").split(/\s+/).map((token) => token.replace(/^['"]|['"]$/g, "")).filter(Boolean);
+}
+function commandHasOpenCodeExecutable(tokens) {
+  return tokens.findIndex((token) => {
+    const executable = executableName(token).replace(/\.(?:exe|cmd)$/, "");
+    return executable === "opencode" || executable.endsWith("/opencode");
+  });
+}
+function commandHasPiExecutable(tokens) {
+  for (let index = 0;index < tokens.length; index += 1) {
+    const executable = executableName(tokens[index]).replace(/\.(?:exe|cmd)$/, "");
+    if (piHarnessKindFromExecutable(executable) !== undefined)
+      return true;
+    if (["node", "bun", "deno"].includes(executable)) {
+      const script = executableName(tokens[index + 1]).replace(/\.(?:exe|cmd)$/, "");
+      if (["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) || tokens[index + 1]?.includes("pi-coding-agent")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function classifyProcessKind(command) {
+  if (!command)
+    return "process";
+  const tokens = commandTokens(command);
+  const openCodeIndex = commandHasOpenCodeExecutable(tokens);
+  if (openCodeIndex >= 0) {
+    const args = tokens.slice(openCodeIndex + 1);
+    if (args.some((token) => token === "serve" || token === "--serve" || token.startsWith("--serve="))) {
+      return "OpenCode server";
+    }
+    return "OpenCode instance (TUI/CLI)";
+  }
+  return commandHasPiExecutable(tokens) ? "Pi" : "process";
+}
 function commandLooksLikeOpenCode(command) {
   const normalized = command.toLowerCase();
   return OPEN_CODE_COMMAND_MARKERS.some((marker) => normalized.includes(marker));
 }
-function isPidIdentityPlausible(record) {
+function isPidIdentityPlausible(record, evidence) {
   if (!Number.isInteger(record.pid) || record.pid <= 0)
-    return false;
+    return "implausible";
   if (Number.isFinite(record.started_at) && record.started_at > 0) {
-    const processStartTime = rpcIdentityPlatform === "linux" ? readLinuxProcessStartTime(record.pid) : readPsProcessStartTime(record.pid);
+    const processStartTime = evidence ? evidence.startTime : readProcessStartTime(record.pid);
     if (processStartTime === null)
-      return true;
-    return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS;
+      return "inconclusive";
+    return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS ? "plausible" : "implausible";
   }
-  const command = rpcIdentityPlatform === "linux" ? readLinuxProcessCommand(record.pid) : readPsProcessCommand(record.pid);
+  const command = evidence ? evidence.commandLine : rpcIdentityPlatform === "linux" ? readLinuxProcessCommand(record.pid) : rpcIdentityPlatform === "win32" ? readWindowsProcess(record.pid).command ?? null : readPsProcessCommand(record.pid);
   if (command === null)
-    return true;
-  return commandLooksLikeOpenCode(command);
+    return "inconclusive";
+  return commandLooksLikeOpenCode(command) ? "plausible" : "implausible";
 }
-function commandLooksLikePi(command) {
-  const normalized = command.trim().toLowerCase().replaceAll("\\", "/");
-  const tokens = normalized.split(/\s+/).filter(Boolean);
-  const executableName = (token) => (token ?? "").split("/").at(-1) ?? "";
-  const first = executableName(tokens[0]).replace(/\.exe$/, "");
-  if (["pi", "pi.cmd", "omp", "oh-my-pi"].includes(first))
+function commandLooksLikePiImage(command) {
+  const tokens = commandTokens(command);
+  const first = executableName(tokens[0]).replace(/\.(?:exe|cmd)$/, "");
+  return PI_IMAGE_NAMES.has(first);
+}
+function commandHasPiHarnessArc(command) {
+  const normalized = command.trim().toLowerCase().replaceAll("\\", "/").replaceAll("\x00", " ");
+  if (!normalized)
+    return false;
+  const tokens = commandTokens(command);
+  if (tokens.length === 0)
+    return false;
+  const hasArc = PI_HARNESS_ARC_MARKERS.some((marker) => normalized.includes(marker));
+  const first = executableName(tokens[0]).replace(/\.(?:exe|cmd)$/, "");
+  if (hasArc && ["pi", "omp", "oh-my-pi", "node", "bun", "deno", "cmd"].includes(first)) {
     return true;
+  }
+  if (hasArc && PI_HARNESS_ARC_MARKERS.some((marker) => tokens[0].includes(marker))) {
+    return true;
+  }
   if (["node", "bun", "deno"].includes(first)) {
-    const script = executableName(tokens[1]);
-    return ["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) || normalized.includes("pi-coding-agent");
+    const script = executableName(tokens[1]).replace(/\.(?:exe|cmd)$/, "");
+    if (["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script))
+      return true;
+    if (hasArc)
+      return true;
   }
   return false;
+}
+function execProcessList(exec, file, args, timeout = PS_PROBE_TIMEOUT_MS) {
+  return String(exec(file, [...args], {
+    encoding: "utf8",
+    timeout,
+    stdio: ["ignore", "pipe", "pipe"]
+  }));
+}
+function parseWindowsCreationDate(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1000000000000 ? value : value * 1000;
+  }
+  if (typeof value !== "string")
+    return null;
+  const trimmed = value.trim();
+  if (!trimmed)
+    return null;
+  const wmi = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/.exec(trimmed);
+  if (wmi) {
+    const utcMs = Date.UTC(Number(wmi[1]), Number(wmi[2]) - 1, Number(wmi[3]), Number(wmi[4]), Number(wmi[5]), Number(wmi[6]), Number(wmi[7]) / 1000);
+    if (!Number.isFinite(utcMs))
+      return null;
+    const offsetMinutes = Number(wmi[9]);
+    const sign = wmi[8] === "+" ? 1 : -1;
+    return utcMs - sign * offsetMinutes * 60000;
+  }
+  const dotNet = /^\/Date\((-?\d+)\)\/$/.exec(trimmed);
+  if (dotNet) {
+    const milliseconds = Number(dotNet[1]);
+    return Number.isFinite(milliseconds) ? milliseconds : null;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function parseWindowsCimOutput(output) {
+  const trimmed = output.trim();
+  if (!trimmed)
+    return null;
+  const bracket = trimmed.indexOf("[");
+  const brace = trimmed.indexOf("{");
+  const start = Math.min(bracket === -1 ? Number.POSITIVE_INFINITY : bracket, brace === -1 ? Number.POSITIVE_INFINITY : brace);
+  if (!Number.isFinite(start))
+    return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed.slice(start));
+  } catch {
+    return null;
+  }
+  if (parsed == null)
+    return null;
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const facts = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object")
+      continue;
+    const record = row;
+    const pid = Number(record.ProcessId);
+    if (!Number.isInteger(pid) || pid <= 0)
+      continue;
+    const parentRaw = record.ParentProcessId;
+    const parentPid = parentRaw == null || parentRaw === "" ? Number.NaN : Number(parentRaw);
+    const commandLine = typeof record.CommandLine === "string" ? record.CommandLine : null;
+    facts.push({
+      pid,
+      parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null,
+      commandLine,
+      imageName: commandLine ? executableName(commandTokens(commandLine)[0]) : null,
+      startTime: parseWindowsCreationDate(record.CreationDate)
+    });
+  }
+  return facts.length > 0 ? facts : null;
+}
+function snapshotFromFacts(facts, source) {
+  const parentByPid = new Map;
+  for (const fact of facts) {
+    if (fact.parentPid != null)
+      parentByPid.set(fact.pid, fact.parentPid);
+  }
+  return { facts, parentByPid, source };
+}
+function tryReadWindowsCimSnapshot(exec) {
+  try {
+    const output = execProcessList(exec, "powershell", ["-NoProfile", "-Command", WINDOWS_CIM_COMMAND], WINDOWS_CIM_PROBE_TIMEOUT_MS);
+    const facts = parseWindowsCimOutput(output);
+    return facts ? snapshotFromFacts(facts, "cim") : null;
+  } catch {
+    return null;
+  }
+}
+function tryReadWindowsTasklistSnapshot() {
+  try {
+    const output = execProcessList(rpcProcessListExecFileSync, "tasklist", ["/FO", "CSV"]);
+    const entries = parseTasklistOutput(output);
+    if (entries === null)
+      return null;
+    const facts = entries.map((entry) => ({
+      pid: entry.pid,
+      parentPid: null,
+      commandLine: null,
+      imageName: entry.command,
+      startTime: null
+    }));
+    return snapshotFromFacts(facts, "tasklist");
+  } catch {
+    return null;
+  }
+}
+function readPosixProcessSnapshot() {
+  const output = execProcessList(rpcProcessListExecFileSync, "ps", ["-axo", "pid=,command="]);
+  const facts = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!match)
+      continue;
+    const pid = Number(match[1]);
+    if (!Number.isInteger(pid) || pid <= 0)
+      continue;
+    facts.push({
+      pid,
+      parentPid: null,
+      commandLine: match[2],
+      imageName: executableName(commandTokens(match[2])[0]),
+      startTime: null
+    });
+  }
+  return snapshotFromFacts(facts, "ps");
+}
+function readPosixParentPid(pid) {
+  try {
+    const output = execProcessList(rpcProcessListExecFileSync, "ps", [
+      "-o",
+      "ppid=",
+      "-p",
+      String(pid)
+    ]);
+    const match = /^\s*(\d+)\s*$/.exec(output);
+    if (!match)
+      return null;
+    const ppid = Number(match[1]);
+    return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+function collectAncestorPids(selfPid, parentByPid) {
+  const ancestors = new Set;
+  let current = selfPid;
+  for (let depth = 0;depth < MAX_ANCESTOR_WALK_DEPTH; depth += 1) {
+    let ppid = null;
+    if (parentByPid.has(current)) {
+      ppid = parentByPid.get(current) ?? null;
+    } else if (rpcIdentityPlatform !== "win32") {
+      ppid = readPosixParentPid(current);
+      if (ppid == null && current === process.pid && process.ppid > 0) {
+        ppid = process.ppid;
+      }
+    } else if (current === process.pid && process.ppid > 0) {
+      ppid = process.ppid;
+    } else {
+      break;
+    }
+    if (ppid == null || ppid <= 0 || ppid === current || ancestors.has(ppid))
+      break;
+    ancestors.add(ppid);
+    current = ppid;
+  }
+  return ancestors;
+}
+function classifyLivePiSnapshot(snapshot) {
+  const ancestors = collectAncestorPids(process.pid, snapshot.parentByPid);
+  const processIds = new Set;
+  const inconclusivePids = new Set;
+  const skippedAncestorPids = [];
+  for (const fact of snapshot.facts) {
+    if (fact.pid === process.pid)
+      continue;
+    const command = fact.commandLine ?? fact.imageName ?? "";
+    const looksLikeHarness = commandHasPiHarnessArc(command) || commandLooksLikePiImage(command);
+    if (!looksLikeHarness)
+      continue;
+    if (ancestors.has(fact.pid)) {
+      skippedAncestorPids.push(fact.pid);
+      log(`[magic-context] Pi process scan: skipping ancestor PID ${fact.pid} (session launcher shim)`);
+      continue;
+    }
+    if (commandHasPiHarnessArc(command)) {
+      processIds.add(fact.pid);
+      continue;
+    }
+    inconclusivePids.add(fact.pid);
+    log(`[magic-context] Pi process scan: PID ${fact.pid} command line is ambiguous (image-name or missing Pi/OMP arc); treating as inconclusive`);
+  }
+  skippedAncestorPids.sort((left, right) => left - right);
+  const verified = [...processIds].sort((left, right) => left - right);
+  const inconclusive = [...inconclusivePids].sort((left, right) => left - right);
+  if (verified.length === 0 && inconclusive.length > 0) {
+    return {
+      state: "inconclusive",
+      processIds: [],
+      inconclusivePids: inconclusive,
+      ...skippedAncestorPids.length > 0 ? { skippedAncestorPids } : {}
+    };
+  }
+  return {
+    state: "known",
+    processIds: verified,
+    ...inconclusive.length > 0 ? { inconclusivePids: inconclusive } : {},
+    ...skippedAncestorPids.length > 0 ? { skippedAncestorPids } : {}
+  };
 }
 function inspectLivePiProcesses() {
   if (false) {}
   try {
-    const output = String(rpcProcessListExecFileSync("ps", ["-axo", "pid=,command="], {
-      encoding: "utf8",
-      timeout: PS_PROBE_TIMEOUT_MS
-    }));
-    const pids = new Set;
-    for (const line of output.split(/\r?\n/)) {
-      const match = /^\s*(\d+)\s+(.+)$/.exec(line);
-      if (!match)
-        continue;
-      const pid = Number(match[1]);
-      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid)
-        continue;
-      if (commandLooksLikePi(match[2]))
-        pids.add(pid);
+    if (rpcIdentityPlatform === "win32") {
+      const cim = tryReadWindowsCimSnapshot(rpcProcessListExecFileSync);
+      const snapshot = cim ?? tryReadWindowsTasklistSnapshot();
+      if (!snapshot) {
+        return {
+          state: "unreadable",
+          processIds: [],
+          error: "process list unavailable"
+        };
+      }
+      rememberWindowsProcessFacts(snapshot.facts);
+      return classifyLivePiSnapshot(snapshot);
     }
-    return { state: "known", processIds: [...pids].sort((left, right) => left - right) };
+    return classifyLivePiSnapshot(readPosixProcessSnapshot());
   } catch (error) {
     return {
       state: "unreadable",
@@ -12654,9 +15855,6 @@ function inspectLivePiProcesses() {
       error: error instanceof Error ? error.message : String(error)
     };
   }
-}
-function discoverLivePiProcessIds() {
-  return inspectLivePiProcesses().processIds;
 }
 function parseRpcPortFile(content, fallbackPid = 0) {
   const trimmed = content.trim();
@@ -12674,6 +15872,8 @@ function parseRpcPortFile(content, fallbackPid = 0) {
         port,
         pid,
         started_at: Number.isFinite(startedAt) ? startedAt : 0,
+        kind: typeof parsed.kind === "string" ? parsed.kind : undefined,
+        harness: typeof parsed.harness === "string" ? parsed.harness : undefined,
         token: typeof parsed.token === "string" ? parsed.token : undefined,
         instance_id: typeof parsed.instance_id === "string" ? parsed.instance_id : undefined
       };
@@ -12691,6 +15891,10 @@ function isValidPort(port) {
 }
 
 // ../plugin/src/shared/sqlite.ts
+var reportSlowPrivilegedWrite;
+function registerSlowWriteReporter(reporter) {
+  reportSlowPrivilegedWrite = reporter;
+}
 function detectSqliteRuntime() {
   const hasBunVersion = typeof process !== "undefined" && typeof process.versions?.bun === "string";
   const hasBunGlobal = typeof globalThis !== "undefined" && typeof globalThis.Bun !== "undefined";
@@ -12739,6 +15943,38 @@ var detectedRuntime = detectSqliteRuntime();
 var isBun = detectedRuntime === "Bun";
 var sqliteModule = await loadSqliteModule(detectedRuntime);
 var DatabaseImpl = isBun ? sqliteModule.Database : buildNodeSqliteDatabaseClass(sqliteModule.DatabaseSync);
+var trackedSqliteConnections = new Map;
+var nextSqliteConnectionSequence = 1;
+function trackSqliteConnection(db, filename, options) {
+  const originalClose = db.close.bind(db);
+  const sequence = nextSqliteConnectionSequence++;
+  const metadata = {
+    sequence,
+    filename: typeof filename === "string" ? filename : Buffer.isBuffer(filename) ? "<buffer>" : ":memory:",
+    readonly: Boolean(options) && typeof options === "object" && (options.readonly === true || options.readOnly === true)
+  };
+  Object.defineProperty(db, "close", {
+    configurable: true,
+    value: (...args) => {
+      try {
+        return originalClose(...args);
+      } finally {
+        trackedSqliteConnections.delete(sequence);
+      }
+    }
+  });
+  trackedSqliteConnections.set(sequence, {
+    ...metadata,
+    reference: new WeakRef(db)
+  });
+  return db;
+}
+var TrackedDatabase = new Proxy(DatabaseImpl, {
+  construct(target, args) {
+    const db = Reflect.construct(target, args, target);
+    return trackSqliteConnection(db, args[0], args[1]);
+  }
+});
 function buildNodeSqliteDatabaseClass(DatabaseSync) {
   const SAVEPOINT = "mc_tx_sp";
 
@@ -12798,7 +16034,7 @@ function buildNodeSqliteDatabaseClass(DatabaseSync) {
   }
   return NodeSqliteDatabase;
 }
-var Database = DatabaseImpl;
+var Database = TrackedDatabase;
 var privilegeDepth = new WeakMap;
 function isInTransaction(db) {
   const candidate = db;
@@ -12808,6 +16044,7 @@ function withPrivilegedWriter(db, operation) {
   const previousDepth = privilegeDepth.get(db) ?? 0;
   const nested = isInTransaction(db);
   const savepoint = "mc_privilege_scope";
+  const transactionStartedAt = nested ? undefined : performance.now();
   if (nested) {
     db.exec(`SAVEPOINT ${savepoint}`);
   } else {
@@ -12824,6 +16061,9 @@ function withPrivilegedWriter(db, operation) {
       db.exec(`RELEASE ${savepoint}`);
     } else {
       db.exec("COMMIT");
+      if (transactionStartedAt !== undefined) {
+        reportSlowPrivilegedWrite?.("privileged_writer", transactionStartedAt);
+      }
     }
     if (previousDepth > 0)
       privilegeDepth.set(db, previousDepth);
@@ -12857,8 +16097,20 @@ function closeQuietly(db) {
   } catch {}
 }
 
+// ../plugin/src/shared/write-transaction-timing.ts
+var SLOW_WRITE_TRANSACTION_THRESHOLD_MS = 1000;
+function logSlowWriteTransaction(site, startedAt, thresholdMs = SLOW_WRITE_TRANSACTION_THRESHOLD_MS, completedAtMs = performance.now()) {
+  try {
+    const durationMs = completedAtMs - startedAt;
+    if (durationMs < thresholdMs)
+      return;
+    log(`[magic-context] slow write transaction: site=${site} held=${durationMs.toFixed(1)}ms`);
+  } catch {}
+}
+
 // ../plugin/src/features/magic-context/context-authority.ts
 import { createHash, randomUUID } from "node:crypto";
+var observedAuthorityRoutingByProject = new Map;
 var moduleNoteEvaluationBridges = new Map;
 function getContextStoreUuid(db) {
   const row = db.prepare("SELECT value FROM context_store_meta WHERE key = 'store_uuid'").get();
@@ -12878,6 +16130,116 @@ function ensureContextStoreUuid(db) {
 }
 var MAX_AUTHORITY_SEED_FRAME_BYTES = 900 * 1024;
 var mirrorFlights = new WeakMap;
+
+// ../plugin/src/features/magic-context/fail-closed-block.ts
+function attachFailClosedBlockingProcessEvidence(process2, evidence) {
+  Object.defineProperties(process2, {
+    startTime: { configurable: true, value: evidence.startTime },
+    commandLine: { configurable: true, value: evidence.commandLine }
+  });
+  return process2;
+}
+var OPENCODE_INTERNAL_AGENT_NAMES = new Set(["title", "summary", "compaction"]);
+
+// ../plugin/src/features/magic-context/message-fts-rowid-map.ts
+import { createHash as createHash2 } from "node:crypto";
+var MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE = 500;
+var BACKFILL_STATE_ID = 1;
+var EMPTY_INDEX_CONTENT_HASH = createHash2("sha256").update("").digest("hex");
+var upsertMapStatements = new WeakMap;
+var rangeReadyStatements = new WeakMap;
+var activeBackfills = new WeakMap;
+function getUpsertMapStatement(db) {
+  let statement = upsertMapStatements.get(db);
+  if (!statement) {
+    statement = db.prepare(`INSERT INTO message_fts_rowid_map (session_id, message_ordinal, fts_rowid)
+             VALUES (?, ?, ?)
+             ON CONFLICT(session_id, message_ordinal) DO UPDATE SET
+                 fts_rowid = excluded.fts_rowid`);
+    upsertMapStatements.set(db, statement);
+  }
+  return statement;
+}
+function getBackfillState(db) {
+  const row = db.prepare(`SELECT watermark_rowid AS watermarkRowid, completed
+             FROM message_fts_rowid_map_backfill_state
+             WHERE id = ?`).get(BACKFILL_STATE_ID);
+  return {
+    processed: 0,
+    watermarkRowid: typeof row?.watermarkRowid === "number" && Number.isSafeInteger(row.watermarkRowid) ? row.watermarkRowid : 0,
+    completed: row?.completed === 1
+  };
+}
+function recordMessageFtsRowid(db, sessionId, messageOrdinal, ftsRowid) {
+  const numericRowid = Number(ftsRowid);
+  if (!Number.isSafeInteger(numericRowid) || numericRowid <= 0) {
+    throw new Error(`invalid message FTS rowid: ${String(ftsRowid)}`);
+  }
+  getUpsertMapStatement(db).run(sessionId, messageOrdinal, numericRowid);
+}
+function backfillMessageFtsRowidMapBatch(db, batchSize = MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE) {
+  const boundedBatchSize = Math.max(1, Math.floor(batchSize));
+  let progress = {
+    processed: 0,
+    watermarkRowid: 0,
+    completed: false
+  };
+  const transactionStartedAt = performance.now();
+  db.transaction(() => {
+    const state = getBackfillState(db);
+    if (state.completed) {
+      progress = state;
+      return;
+    }
+    const rows = db.prepare(`SELECT rowid AS ftsRowid,
+                        session_id AS sessionId,
+                        message_ordinal AS messageOrdinal
+                 FROM message_history_fts
+                 WHERE rowid > ?
+                 ORDER BY rowid ASC
+                 LIMIT ?`).all(state.watermarkRowid, boundedBatchSize);
+    let watermarkRowid = state.watermarkRowid;
+    for (const row of rows) {
+      const ftsRowid = Number(row.ftsRowid);
+      const messageOrdinal = Number(row.messageOrdinal);
+      if (Number.isSafeInteger(ftsRowid) && ftsRowid > watermarkRowid) {
+        watermarkRowid = ftsRowid;
+      }
+      if (typeof row.sessionId === "string" && Number.isSafeInteger(messageOrdinal) && messageOrdinal >= 0 && Number.isSafeInteger(ftsRowid) && ftsRowid > 0) {
+        recordMessageFtsRowid(db, row.sessionId, messageOrdinal, ftsRowid);
+      }
+    }
+    const completed = rows.length < boundedBatchSize;
+    db.prepare(`UPDATE message_fts_rowid_map_backfill_state
+             SET watermark_rowid = ?, completed = ?, updated_at = ?
+             WHERE id = ?`).run(watermarkRowid, completed ? 1 : 0, Date.now(), BACKFILL_STATE_ID);
+    progress = {
+      processed: rows.length,
+      watermarkRowid,
+      completed
+    };
+  })();
+  logSlowWriteTransaction("message_fts_rowid_backfill", transactionStartedAt);
+  return progress;
+}
+async function runMessageFtsRowidMapBackfill(db) {
+  for (;; ) {
+    const progress = backfillMessageFtsRowidMapBatch(db);
+    if (progress.completed)
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+function startMessageFtsRowidMapBackfill(db) {
+  const active = activeBackfills.get(db);
+  if (active)
+    return active;
+  const run = runMessageFtsRowidMapBackfill(db).finally(() => {
+    activeBackfills.delete(db);
+  });
+  activeBackfills.set(db, run);
+  return run;
+}
 
 // ../plugin/src/hooks/magic-context/compartment-parser.ts
 function makeTierOpenRegex(n) {
@@ -12959,6 +16321,9 @@ function healAllNullColumns(db) {
     ["stripped_placeholder_ids", ""],
     ["stale_reduce_stripped_ids", ""],
     ["processed_image_stripped_ids", ""],
+    ["merged_reasoning_stripped_ids", ""],
+    ["thinking_binding_recovery_target", ""],
+    ["trailing_blank_decisions", ""],
     ["memory_block_cache", ""],
     ["memory_block_ids", ""],
     ["compaction_marker_state", ""],
@@ -13044,6 +16409,7 @@ var CATEGORY_DEFAULT_TTL = {
 // ../plugin/src/features/magic-context/memory/project-identity.ts
 var TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 var identityCache = new Map;
+var linkedGitWorktreeCache = new Map;
 var lastKnownGitIdentityCache = new Map;
 var directoryFallbackCache = new Map;
 var transientFailureCooldown = new Map;
@@ -13051,6 +16417,7 @@ var dubiousOwnershipFallbackDirectories = new Set;
 var dubiousOwnershipLoggedDirectories = new Set;
 var dubiousOwnershipWarnedDirectories = new Set;
 var transientGitIdentityReuseLoggedDirectories = new Set;
+var sessionIdentityCache = new Map;
 // ../plugin/src/features/magic-context/workspaces.ts
 var VALID_SHARE_CATEGORIES = new Set(V2_MEMORY_CATEGORIES);
 function uniqueSorted(values) {
@@ -13077,10 +16444,12 @@ function bumpEpochsForWorkspaceMemberSet(db, identities, now = Date.now()) {
     run();
     return;
   }
+  const transactionStartedAt = performance.now();
   db.exec("BEGIN IMMEDIATE");
   try {
     run();
     db.exec("COMMIT");
+    logSlowWriteTransaction("workspace_epoch_bump", transactionStartedAt);
   } catch (error) {
     try {
       db.exec("ROLLBACK");
@@ -13109,6 +16478,114 @@ function isSqliteLockError(error) {
 }
 function tableExists(db, name) {
   return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name));
+}
+function tableHasHarnessColumn(db, name) {
+  if (!tableExists(db, name))
+    return false;
+  return db.prepare(`PRAGMA table_info(${name})`).all().some((column) => column.name === "harness");
+}
+var V85_OPENCODE2_RELABEL_TABLES = [
+  "tags",
+  "pending_ops",
+  "source_contents",
+  "compartments",
+  "compartment_chunk_embeddings",
+  "session_projects",
+  "compartment_events",
+  "compression_depth",
+  "session_facts",
+  "primer_candidates",
+  "notes",
+  "message_history_index",
+  "message_history_source",
+  "pending_session_cleanup",
+  "message_history_orphan_sweep",
+  "session_meta",
+  "subagent_invocations",
+  "historian_runs",
+  "transform_decisions",
+  "recomp_compartments",
+  "recomp_facts"
+];
+var V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"];
+function deleteLosingOpenCode2Twin(db, table, joinColumns, newerPredicate) {
+  if (!tableHasHarnessColumn(db, table))
+    return;
+  const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
+  const o2On = naturalJoin ? `${naturalJoin} AND oc.harness = 'opencode'` : `oc.harness = 'opencode'`;
+  const ocOn = naturalJoin ? `${naturalJoin} AND o2.harness = 'opencode2'` : `o2.harness = 'opencode2'`;
+  db.exec(`
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT o2.rowid
+            FROM ${table} AS o2
+            JOIN ${table} AS oc
+              ON ${o2On}
+            WHERE o2.harness = 'opencode2'
+              AND NOT (${newerPredicate})
+        );
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT oc.rowid
+            FROM ${table} AS oc
+            JOIN ${table} AS o2
+              ON ${ocOn}
+            WHERE oc.harness = 'opencode'
+              AND (${newerPredicate})
+        );
+    `);
+}
+function relabelOpenCode2HarnessRows(db) {
+  deleteLosingOpenCode2Twin(db, "session_projects", ["session_id"], "o2.updated_at > oc.updated_at");
+  deleteLosingOpenCode2Twin(db, "primer_candidates", ["project_path", "session_id", "source_start_message_id", "source_end_message_id"], "o2.created_at > oc.created_at");
+  deleteLosingOpenCode2Twin(db, "transform_decisions", ["session_id", "message_id"], "o2.ts_ms > oc.ts_ms");
+  deleteLosingOpenCode2Twin(db, "message_history_orphan_sweep", [], "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)");
+  if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
+    db.exec(`
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode2'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
+              )
+              AND NOT (
+                  (status = 'completed'
+                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                        != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                      AND COALESCE(started_at, -1) > COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
+                          -1
+                      )
+                  )
+              );
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
+              )
+              AND (
+                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
+                    AND status != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
+                      AND COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
+                          -1
+                      ) > COALESCE(started_at, -1)
+                  )
+              );
+        `);
+  }
+  const tables = new Set([
+    ...V85_OPENCODE2_RELABEL_TABLES,
+    ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES
+  ]);
+  for (const table of tables) {
+    if (!tableHasHarnessColumn(db, table))
+      continue;
+    db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
+  }
 }
 function healMismatchedTierClose(db, table, hasLegacy) {
   if (!tableExists(db, table))
@@ -13318,6 +16795,7 @@ var MIGRATIONS = [
                     status TEXT NOT NULL DEFAULT 'active',
                     promoted_at INTEGER NOT NULL,
                     source_candidate_ids TEXT DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -13545,7 +17023,7 @@ var MIGRATIONS = [
   },
   {
     version: 15,
-    description: "Add deferred_execute_state column for boundary execution drain",
+    description: "Add the now-retired deferred_execute_state column",
     up: (db) => {
       const cols = db.prepare("PRAGMA table_info(session_meta)").all();
       if (!cols.some((c) => c.name === "deferred_execute_state")) {
@@ -14344,6 +17822,7 @@ var MIGRATIONS = [
                     last_observed_at INTEGER,
                     answer_refreshed_at INTEGER,
                     source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -15280,114 +18759,6 @@ var MIGRATIONS = [
   }
 ];
 var LATEST_MIGRATION_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
-function tableHasHarnessColumn(db, name) {
-  if (!tableExists(db, name))
-    return false;
-  return db.prepare(`PRAGMA table_info(${name})`).all().some((column) => column.name === "harness");
-}
-var V85_OPENCODE2_RELABEL_TABLES = [
-  "tags",
-  "pending_ops",
-  "source_contents",
-  "compartments",
-  "compartment_chunk_embeddings",
-  "session_projects",
-  "compartment_events",
-  "compression_depth",
-  "session_facts",
-  "primer_candidates",
-  "notes",
-  "message_history_index",
-  "message_history_source",
-  "pending_session_cleanup",
-  "message_history_orphan_sweep",
-  "session_meta",
-  "subagent_invocations",
-  "historian_runs",
-  "transform_decisions",
-  "recomp_compartments",
-  "recomp_facts"
-];
-var V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"];
-function deleteLosingOpenCode2Twin(db, table, joinColumns, newerPredicate) {
-  if (!tableHasHarnessColumn(db, table))
-    return;
-  const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
-  const o2On = naturalJoin ? `${naturalJoin} AND oc.harness = 'opencode'` : `oc.harness = 'opencode'`;
-  const ocOn = naturalJoin ? `${naturalJoin} AND o2.harness = 'opencode2'` : `o2.harness = 'opencode2'`;
-  db.exec(`
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT o2.rowid
-            FROM ${table} AS o2
-            JOIN ${table} AS oc
-              ON ${o2On}
-            WHERE o2.harness = 'opencode2'
-              AND NOT (${newerPredicate})
-        );
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT oc.rowid
-            FROM ${table} AS oc
-            JOIN ${table} AS o2
-              ON ${ocOn}
-            WHERE oc.harness = 'opencode'
-              AND (${newerPredicate})
-        );
-    `);
-}
-function relabelOpenCode2HarnessRows(db) {
-  deleteLosingOpenCode2Twin(db, "session_projects", ["session_id"], "o2.updated_at > oc.updated_at");
-  deleteLosingOpenCode2Twin(db, "primer_candidates", ["project_path", "session_id", "source_start_message_id", "source_end_message_id"], "o2.created_at > oc.created_at");
-  deleteLosingOpenCode2Twin(db, "transform_decisions", ["session_id", "message_id"], "o2.ts_ms > oc.ts_ms");
-  deleteLosingOpenCode2Twin(db, "message_history_orphan_sweep", [], "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)");
-  if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
-    db.exec(`
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode2'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
-              )
-              AND NOT (
-                  (status = 'completed'
-                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                        != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                      AND COALESCE(started_at, -1) > COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
-                          -1
-                      )
-                  )
-              );
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
-              )
-              AND (
-                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
-                    AND status != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
-                      AND COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
-                          -1
-                      ) > COALESCE(started_at, -1)
-                  )
-              );
-        `);
-  }
-  const tables = new Set([
-    ...V85_OPENCODE2_RELABEL_TABLES,
-    ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES
-  ]);
-  for (const table of tables) {
-    if (!tableHasHarnessColumn(db, table))
-      continue;
-    db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
-  }
-}
 function ensureMigrationsTable(db) {
   db.exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -15428,11 +18799,19 @@ function runMigrations(db) {
   let touchedLegacyAuthorityBatch = false;
   while (true) {
     let migration;
+    const migrationState = {};
     let currentVersion = 0;
     try {
+      currentVersion = getCurrentVersion(db);
+      const pendingMigration = MIGRATIONS.find((candidate) => candidate.version > currentVersion && !isMigrationApplied(db, candidate.version));
+      if (!pendingMigration)
+        break;
+      migration = undefined;
+      const transactionStartedAt = performance.now();
       const applied = db.transaction(() => {
         currentVersion = getCurrentVersion(db);
         migration = MIGRATIONS.find((candidate) => candidate.version > currentVersion && !isMigrationApplied(db, candidate.version));
+        migrationState.value = migration;
         if (!migration)
           return false;
         if (!loggedPlan) {
@@ -15444,6 +18823,8 @@ function runMigrations(db) {
         db.prepare("INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)").run(migration.version, migration.description, Date.now());
         return true;
       }).immediate();
+      logSlowWriteTransaction("migration-runner", transactionStartedAt);
+      migration = migrationState.value;
       if (!applied || !migration)
         break;
       if (migration.version <= 61)
@@ -15468,7 +18849,9 @@ function runMigrations(db) {
   }
   if (touchedLegacyAuthorityBatch) {
     try {
+      const transactionStartedAt = performance.now();
       db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+      logSlowWriteTransaction("migration-runner", transactionStartedAt);
     } catch (error) {
       throw new Error(`Migration authority-trigger postcondition failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`);
     }
@@ -15534,12 +18917,144 @@ function loadToolDefinitionMeasurements(db) {
 }
 
 // ../plugin/src/features/magic-context/tool-owner-backfill.ts
-import { existsSync as existsSync6 } from "node:fs";
-import { join as join4 } from "node:path";
+import { existsSync as existsSync8 } from "node:fs";
+
+// ../plugin/src/shared/opencode-db-path.ts
+import { existsSync as existsSync7, readdirSync as readdirSync2, statSync as statSync3 } from "node:fs";
+import { homedir as homedir7 } from "node:os";
+import { isAbsolute as isAbsolute4, join as join5 } from "node:path";
+var cachedResolution = null;
+var claimedDiagnostics = new Set;
+function openCodeDataDir(env = process.env, dataHome) {
+  return join5(dataHome ?? env.XDG_DATA_HOME ?? join5(homedir7(), ".local", "share"), "opencode");
+}
+function environmentKey(dataDir, hostGeneration, channel, env) {
+  return [
+    hostGeneration,
+    dataDir,
+    env.OPENCODE_DB ?? "",
+    env.OPENCODE_DISABLE_CHANNEL_DB ?? "",
+    channel ?? env.OPENCODE_CHANNEL ?? ""
+  ].join("\x00");
+}
+function channelPath(dataDir, channel) {
+  return ["latest", "beta", "prod"].includes(channel) ? join5(dataDir, "opencode.db") : join5(dataDir, `opencode-${channel}.db`);
+}
+function discoveredCandidateNames(dataDir) {
+  const names = ["opencode.db", "opencode-local.db", "opencode-dev.db"];
+  try {
+    const discovered = readdirSync2(dataDir, { withFileTypes: true }).filter((entry) => /^opencode-.+\.db$/.test(entry.name) && !names.includes(entry.name)).map((entry) => entry.name).sort();
+    names.push(...discovered);
+  } catch {}
+  return names;
+}
+function discoverOpenCodeDb(dataDir) {
+  const candidates = discoveredCandidateNames(dataDir).map((name, order) => {
+    const path = join5(dataDir, name);
+    try {
+      const metadata = statSync3(path);
+      return metadata.isFile() ? { path, order, mtimeMs: metadata.mtimeMs } : null;
+    } catch {
+      return null;
+    }
+  });
+  const existing = candidates.filter((candidate) => candidate !== null).sort((left, right) => right.mtimeMs - left.mtimeMs || left.order - right.order)[0];
+  if (!existing) {
+    return { path: join5(dataDir, "opencode.db"), source: "default", channel: null };
+  }
+  const name = existing.path.slice(dataDir.length + 1);
+  const channel = name === "opencode.db" ? null : name.slice("opencode-".length, -".db".length) || null;
+  return { path: existing.path, source: "discovered", channel };
+}
+function resolveV1Fresh(dataDir, env = process.env) {
+  const explicit = env.OPENCODE_DB;
+  if (explicit !== undefined && explicit.length > 0) {
+    if (explicit === ":memory:") {
+      return { path: explicit, source: "OPENCODE_DB", channel: null };
+    }
+    return {
+      path: isAbsolute4(explicit) ? explicit : join5(dataDir, explicit),
+      source: "OPENCODE_DB",
+      channel: null
+    };
+  }
+  const disableChannelDb = env.OPENCODE_DISABLE_CHANNEL_DB;
+  if (disableChannelDb === "1" || disableChannelDb === "true") {
+    return { path: join5(dataDir, "opencode.db"), source: "default", channel: null };
+  }
+  const channel = env.OPENCODE_CHANNEL;
+  if (channel !== undefined && channel.length > 0) {
+    return { path: channelPath(dataDir, channel), source: "channel", channel };
+  }
+  return discoverOpenCodeDb(dataDir);
+}
+function sourceOpenCodeDatabaseFilename(hostGeneration, channel, env = process.env) {
+  if (hostGeneration === "v1") {
+    const explicit = env.OPENCODE_DB;
+    if (explicit !== undefined && explicit.length > 0)
+      return explicit;
+    if (env.OPENCODE_DISABLE_CHANNEL_DB === "1" || env.OPENCODE_DISABLE_CHANNEL_DB === "true") {
+      return "opencode.db";
+    }
+    return ["latest", "beta", "prod"].includes(channel) ? "opencode.db" : `opencode-${channel}.db`;
+  }
+  return env.OPENCODE_DB ?? (["latest", "dev", "beta", "next", "prod"].includes(channel) || env.OPENCODE_DISABLE_CHANNEL_DB === "1" || env.OPENCODE_DISABLE_CHANNEL_DB === "true" ? "opencode.db" : `opencode-${channel.replace(/[^a-zA-Z0-9._-]/g, "")}.db`);
+}
+function resolveV2Fresh(dataDir, channel, env) {
+  const filename = sourceOpenCodeDatabaseFilename("v2", channel, env);
+  const explicit = env.OPENCODE_DB !== undefined;
+  return {
+    path: filename === ":memory:" ? filename : join5(dataDir, filename),
+    source: explicit ? "OPENCODE_DB" : env.OPENCODE_CHANNEL ? "channel" : "default",
+    channel: explicit ? null : channel
+  };
+}
+function resolveOpenCodeDbPath(hostGeneration = "v1", options = {}) {
+  const env = options.env ?? process.env;
+  const dataDir = openCodeDataDir(env, options.dataHome);
+  const channel = options.channel ?? env.OPENCODE_CHANNEL;
+  const key = environmentKey(dataDir, hostGeneration, channel, env);
+  if (cachedResolution?.key === key && (!cachedResolution.existed || existsSync7(cachedResolution.resolution.path))) {
+    if (cachedResolution.existed)
+      return cachedResolution.resolution;
+  }
+  const resolution = hostGeneration === "v2" ? resolveV2Fresh(dataDir, channel ?? "latest", env) : resolveV1Fresh(dataDir, env);
+  cachedResolution = {
+    key,
+    resolution,
+    existed: resolution.path !== ":memory:" && existsSync7(resolution.path)
+  };
+  return resolution;
+}
+function schemaTableNames(db, schema = "main") {
+  const rows = db.prepare(`SELECT name FROM ${schema}.sqlite_master WHERE type = 'table' AND name IN ('message', 'part', 'session', 'project', 'session_message')`).all();
+  return new Set(rows.flatMap((row) => typeof row.name === "string" ? [row.name] : []));
+}
+function detectOpenCodeStoreGeneration(db, schema = "main") {
+  const tables = schemaTableNames(db, schema);
+  const hasV1Messages = tables.has("message") && tables.has("part");
+  if (hasV1Messages)
+    return "v1";
+  if (tables.has("session_message"))
+    return "v2";
+  if (tables.has("session") || tables.has("project"))
+    return "v1";
+  return "unknown";
+}
+function assertOpenCodeStoreGeneration(db, expected, path, schema = "main") {
+  const actual = detectOpenCodeStoreGeneration(db, schema);
+  if (actual === expected)
+    return;
+  if (actual === "unknown")
+    return;
+  throw new Error(`OpenCode store generation mismatch at ${path}: expected ${expected}, found ${actual}; refusing generation-specific database access`);
+}
+
+// ../plugin/src/features/magic-context/tool-owner-backfill.ts
 var LEASE_DURATION_MS = 5 * 60 * 1000;
 var LEASE_RENEWAL_MS = 60 * 1000;
 function resolveOpencodeDbPath() {
-  return join4(getDataDir(), "opencode", "opencode.db");
+  return resolveOpenCodeDbPath().path;
 }
 function ensureBackfillStateTable(db) {
   db.exec(`
@@ -15574,7 +19089,7 @@ function runToolOwnerBackfill(db) {
     return result;
   }
   const opencodeDbPath = resolveOpencodeDbPath();
-  if (!existsSync6(opencodeDbPath)) {
+  if (!existsSync8(opencodeDbPath)) {
     log(`[backfill] OpenCode DB not found at ${opencodeDbPath} — marking all unbackfilled sessions as skipped. Lazy adoption (defense-in-depth) handles legacy rows at runtime.`);
     markAllUnbackfilledSessionsSkipped(db);
     result.sessionsSkippedNoOcDb = countSessionsByStatus(db, "skipped");
@@ -15584,6 +19099,7 @@ function runToolOwnerBackfill(db) {
   const escapedDbPath = opencodeDbPath.replaceAll("'", "''");
   db.exec(`ATTACH '${escapedDbPath}' AS oc_backfill`);
   try {
+    assertOpenCodeStoreGeneration(db, "v1", opencodeDbPath, "oc_backfill");
     backfillToolOwnersInChunks(db, result);
   } finally {
     try {
@@ -15788,6 +19304,7 @@ function backfillToolOwnersInChunks(db, result) {
 }
 
 // ../plugin/src/features/magic-context/storage-db.ts
+registerSlowWriteReporter(logSlowWriteTransaction);
 var databases = new Map;
 var pendingAsyncOpens = new Map;
 var persistenceByDatabase = new WeakMap;
@@ -15802,8 +19319,9 @@ function getMigrationOnOpenRefusal() {
   return lastMigrationOnOpenRefusal;
 }
 var LATEST_SUPPORTED_VERSION = 85;
+var BOOT_SQLITE_BUSY_TIMEOUT_MS = 5000;
 var PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
-var defaultStoragePermissionFs = { chmodSync, mkdirSync: mkdirSync3 };
+var defaultStoragePermissionFs = { chmodSync: chmodSync2, mkdirSync: mkdirSync3 };
 var storagePermissionFs = defaultStoragePermissionFs;
 function ensureSecureStorageDir(dir) {
   if (!shouldEnforcePrivateStoragePermissions()) {
@@ -15824,7 +19342,7 @@ function restrictDatabaseFilePermissions(dbPath) {
     return;
   for (const suffix of ["", "-wal", "-shm"]) {
     const file = `${dbPath}${suffix}`;
-    if (!existsSync7(file))
+    if (!existsSync9(file))
       continue;
     try {
       storagePermissionFs.chmodSync(file, 384);
@@ -15833,19 +19351,30 @@ function restrictDatabaseFilePermissions(dbPath) {
     }
   }
 }
+function resolveBootBusyTimeoutMs(value) {
+  if (value === undefined)
+    return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+  if (!Number.isFinite(value))
+    return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+  return Math.max(0, Math.min(BOOT_SQLITE_BUSY_TIMEOUT_MS, Math.floor(value)));
+}
+function installBootBusyTimeout(db, dbPath, timeoutMs, report = log) {
+  db.exec(`PRAGMA busy_timeout=${timeoutMs}`);
+  report(`[magic-context] SQLite boot busy timeout: backend=${detectSqliteRuntime()} timeout=${timeoutMs}ms path=${dbPath}`);
+}
 function resolveDatabasePath(dbPathOverride) {
   if (dbPathOverride) {
-    return { dbDir: dirname5(dbPathOverride), dbPath: dbPathOverride };
+    return { dbDir: dirname6(dbPathOverride), dbPath: dbPathOverride };
   }
   const dbDir = getMagicContextStorageDir();
-  return { dbDir, dbPath: join5(dbDir, "context.db") };
+  return { dbDir, dbPath: join6(dbDir, "context.db") };
 }
 function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
-  if (existsSync7(targetDbPath))
+  if (existsSync9(targetDbPath))
     return;
   const legacyDir = getLegacyOpenCodeMagicContextStorageDir();
-  const legacyDbPath = join5(legacyDir, "context.db");
-  if (!existsSync7(legacyDbPath))
+  const legacyDbPath = join6(legacyDir, "context.db");
+  if (!existsSync9(legacyDbPath))
     return;
   log(`[magic-context] migrating legacy plugin storage: ${legacyDir} -> ${targetDbDir} (legacy left in place as backup)`);
   ensureSecureStorageDir(targetDbDir);
@@ -15861,8 +19390,8 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
   }
   for (const suffix of ["", "-wal", "-shm"]) {
     const src = `${legacyDbPath}${suffix}`;
-    const dst = join5(targetDbDir, `context.db${suffix}`);
-    if (existsSync7(src)) {
+    const dst = join6(targetDbDir, `context.db${suffix}`);
+    if (existsSync9(src)) {
       try {
         copyFileSync(src, dst);
       } catch (error) {
@@ -15870,9 +19399,9 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
       }
     }
   }
-  const legacyModelsDir = join5(legacyDir, "models");
-  const targetModelsDir = join5(targetDbDir, "models");
-  if (existsSync7(legacyModelsDir) && !existsSync7(targetModelsDir)) {
+  const legacyModelsDir = join6(legacyDir, "models");
+  const targetModelsDir = join6(targetDbDir, "models");
+  if (existsSync9(legacyModelsDir) && !existsSync9(targetModelsDir)) {
     try {
       cpSync(legacyModelsDir, targetModelsDir, { recursive: true });
     } catch (error) {
@@ -15925,10 +19454,10 @@ function unreadableDiscovery(path, arm) {
 }
 var RPC_DISCOVERY_PARSE_GRACE_MS = 10 * 60 * 1000;
 var defaultRpcDiscoveryFs = {
-  readdirSync: (path, options) => options?.withFileTypes ? readdirSync2(path, { withFileTypes: true }) : readdirSync2(path),
+  readdirSync: (path, options) => options?.withFileTypes ? readdirSync3(path, { withFileTypes: true }) : readdirSync3(path),
   readFileSync: (path, encoding) => String(readFileSync7(path, encoding)),
-  statSync: (path) => ({ mtimeMs: statSync(path).mtimeMs }),
-  unlinkSync: (path) => unlinkSync(path)
+  statSync: (path) => ({ mtimeMs: statSync4(path).mtimeMs }),
+  unlinkSync: (path) => unlinkSync2(path)
 };
 var rpcDiscoveryFs = defaultRpcDiscoveryFs;
 function invalidDiscoveryReason(raw) {
@@ -15944,6 +19473,28 @@ function invalidDiscoveryReason(raw) {
     } catch {}
   }
   return "parse-invalid";
+}
+function classifyDiscoveryRecordKind(record) {
+  for (const value of [record.kind, record.harness]) {
+    const normalized = value?.trim().toLowerCase();
+    if (!normalized)
+      continue;
+    if (normalized === "process")
+      return "process";
+    if (normalized === "opencode server" || normalized === "server") {
+      return "OpenCode server";
+    }
+    if (normalized === "opencode instance" || normalized === "opencode instance (tui/cli)" || normalized === "opencode" || normalized === "tui" || normalized === "cli") {
+      return "OpenCode instance (TUI/CLI)";
+    }
+    if (normalized === "pi" || normalized === "pi harness" || normalized === "omp" || normalized === "oh-my-pi") {
+      return "Pi";
+    }
+  }
+  return null;
+}
+function classifyRpcProcess(record, commandLine) {
+  return classifyDiscoveryRecordKind(record) ?? classifyProcessKind(commandLine === undefined ? readProcessProbeEvidence(record.pid).commandLine : commandLine);
 }
 function classifyJunkDiscovery(portFile, raw, staleFiles) {
   let mtimeMs;
@@ -15964,7 +19515,7 @@ function classifyJunkDiscovery(portFile, raw, staleFiles) {
   return null;
 }
 function inspectRpcServerDiscovery(storageDir) {
-  const rpcRoot = join5(storageDir, "rpc");
+  const rpcRoot = join6(storageDir, "rpc");
   let projectEntries;
   try {
     projectEntries = rpcDiscoveryFs.readdirSync(rpcRoot, { withFileTypes: true });
@@ -15978,7 +19529,7 @@ function inspectRpcServerDiscovery(storageDir) {
   for (const projectEntry of projectEntries) {
     if (!projectEntry.isDirectory())
       continue;
-    const projectDir = join5(rpcRoot, projectEntry.name);
+    const projectDir = join6(rpcRoot, projectEntry.name);
     let entries;
     try {
       entries = rpcDiscoveryFs.readdirSync(projectDir);
@@ -15989,7 +19540,7 @@ function inspectRpcServerDiscovery(storageDir) {
     }
     for (const entry of entries) {
       if (entry === "port" || entry.startsWith("port-") && entry.endsWith(".json")) {
-        portFiles.push(join5(projectDir, entry));
+        portFiles.push(join6(projectDir, entry));
       }
     }
   }
@@ -15997,7 +19548,9 @@ function inspectRpcServerDiscovery(storageDir) {
     return { state: "absent", serverPids: [], staleFiles: [] };
   }
   const pids = new Set;
+  const processByPid = new Map;
   const staleFiles = [];
+  const inconclusivePids = new Set;
   for (const portFile of portFiles) {
     let raw;
     try {
@@ -16007,7 +19560,7 @@ function inspectRpcServerDiscovery(storageDir) {
         continue;
       return unreadableDiscovery(portFile, "io");
     }
-    const filename = basename2(portFile);
+    const filename = basename3(portFile);
     const pidFromName = /^port-(\d+)/.exec(filename)?.[1];
     const fallbackPid = pidFromName ? Number(pidFromName) : 0;
     const record = parseRpcPortFile(raw, fallbackPid);
@@ -16017,10 +19570,28 @@ function inspectRpcServerDiscovery(storageDir) {
         return junk;
       continue;
     }
-    if (isPidAlive(record.pid) && isPidIdentityPlausible(record))
-      pids.add(record.pid);
-    else
+    const liveness = isPidAlive(record.pid);
+    if (liveness === "dead") {
       staleFiles.push(portFile);
+      continue;
+    }
+    const evidence = readProcessProbeEvidence(record.pid);
+    const identity = isPidIdentityPlausible(record, evidence);
+    if (identity === "plausible") {
+      pids.add(record.pid);
+      const detected = attachFailClosedBlockingProcessEvidence({
+        kind: classifyRpcProcess(record, evidence.commandLine),
+        pid: record.pid
+      }, evidence);
+      const previous = processByPid.get(record.pid);
+      if (!previous || previous.kind === "process" && detected.kind !== "process") {
+        processByPid.set(record.pid, detected);
+      }
+    } else if (identity === "implausible") {
+      staleFiles.push(portFile);
+    } else {
+      inconclusivePids.add(record.pid);
+    }
   }
   for (const staleFile of staleFiles) {
     try {
@@ -16031,9 +19602,62 @@ function inspectRpcServerDiscovery(storageDir) {
   }
   const serverPids = [...pids].sort((a, b) => a - b);
   if (serverPids.length > 0) {
-    return { state: "live", serverPids, staleFiles };
+    return {
+      state: "live",
+      serverPids,
+      serverProcesses: serverPids.map((pid) => processByPid.get(pid) ?? { kind: "process", pid }),
+      staleFiles
+    };
+  }
+  const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
+  if (uncertainPids.length > 0) {
+    return {
+      state: "inconclusive",
+      serverPids: [],
+      staleFiles,
+      inconclusivePids: uncertainPids
+    };
   }
   return { state: "stale", serverPids: [], staleFiles };
+}
+function createPiBlockingProcess(pid) {
+  return attachFailClosedBlockingProcessEvidence({ kind: "Pi", pid }, readProcessProbeEvidence(pid));
+}
+function formatInconclusiveOpenCodeMigrationWarning(dbPath, pids) {
+  return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
+}
+function formatInconclusivePiMigrationWarning(dbPath, pids) {
+  return `[magic-context] storage warning: continuing migration for ${dbPath}; Pi/OMP PID ${pids.join(", ")} was not confirmed as a live harness because the process image or command line was ambiguous. No live Pi harness was confirmed.`;
+}
+function logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery) {
+  const uncertainPids = discovery.inconclusivePids ?? [];
+  if (uncertainPids.length > 0) {
+    log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
+  }
+  if (piDiscovery.state === "unreadable") {
+    log(`[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`);
+  } else if ((piDiscovery.inconclusivePids?.length ?? 0) > 0) {
+    log(formatInconclusivePiMigrationWarning(dbPath, piDiscovery.inconclusivePids ?? []));
+  }
+}
+function isDefaultSharedDatabasePath(dbPath) {
+  if (!process.env.XDG_DATA_HOME && (process.env.MAGIC_CONTEXT_TEST_DATA_DIR || false)) {
+    return false;
+  }
+  return resolve3(dbPath) === resolve3(join6(getMagicContextStorageDir(), "context.db"));
+}
+function migrationBlockingPiPids(dbPath, discovery, discoveredPiPids) {
+  if (isDefaultSharedDatabasePath(dbPath))
+    return [...discoveredPiPids];
+  const sameDataDirPids = new Set(discovery.serverPids);
+  return discoveredPiPids.filter((pid) => sameDataDirPids.has(pid));
+}
+function formatLiveProcessMigrationRefusal(dbPath, persistedVersion, latestSupportedVersion, serverPids, piPids) {
+  const blockers = [
+    ...serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
+    ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`)
+  ];
+  return `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`;
 }
 function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) {
   const persistedVersion = getPersistedSchemaVersion(db);
@@ -16042,9 +19666,13 @@ function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) 
     return true;
   }
   const discovery = inspectRpcServerDiscovery(dbDir);
-  const piPids = discoverLivePiProcessIds();
-  if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
+  const piDiscovery = inspectLivePiProcesses();
+  const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
+  const serverProcesses = discovery.serverProcesses ?? (discovery.state === "live" ? discovery.serverPids.map((pid) => ({ kind: "process", pid })) : []);
+  const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
+  if ((discovery.state === "absent" || discovery.state === "stale" || discovery.state === "inconclusive") && piPids.length === 0) {
     lastMigrationOnOpenRefusal = null;
+    logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery);
     return true;
   }
   const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort((left, right) => left - right);
@@ -16052,6 +19680,7 @@ function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) 
     persistedVersion,
     supportedVersion: latestSupportedVersion,
     serverPids: blockingPids,
+    blockingProcesses,
     ...discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {},
     ...discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}
   };
@@ -16061,11 +19690,7 @@ function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) 
     const recovery = arm === "io" ? `If no OpenCode server is running, it is safe to delete ${unreadableFile} and retry.` : `Retry after the file is older than the ten-minute grace window, or stop OpenCode before deleting it.`;
     log(`[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`);
   } else {
-    const blockers = [
-      ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
-      ...piPids.map((pid) => `Pi harness PID ${pid}`)
-    ];
-    log(`[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`);
+    log(formatLiveProcessMigrationRefusal(dbPath, persistedVersion, latestSupportedVersion, discovery.serverPids, piPids));
   }
   return false;
 }
@@ -16085,17 +19710,20 @@ function finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion) 
   }
   healWedgedChannel2Claims(db);
   if (!explicitDbPath) {
-    const runBackfill = () => {
+    const runBackfills = () => {
       try {
         runToolOwnerBackfill(db);
       } catch (error) {
         log(`[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`);
       }
+      startMessageFtsRowidMapBackfill(db).catch((error) => {
+        log(`[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`);
+      });
     };
     if (bootQuietRemainingMs() > 0)
-      scheduleAfterBootQuiet(runBackfill);
+      scheduleAfterBootQuiet(runBackfills);
     else
-      runBackfill();
+      runBackfills();
   }
   setDatabase(db);
   loadToolDefinitionMeasurements(db);
@@ -16109,8 +19737,8 @@ function finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion) 
   }
   return db;
 }
-function initializeDatabase(db) {
-  db.exec("PRAGMA busy_timeout=5000");
+function initializeDatabase(db, busyTimeoutMs = BOOT_SQLITE_BUSY_TIMEOUT_MS) {
+  db.exec(`PRAGMA busy_timeout=${resolveBootBusyTimeoutMs(busyTimeoutMs)}`);
   db.exec("PRAGMA foreign_keys=ON");
   db.exec("PRAGMA journal_mode=WAL");
   applySqliteTuningPragmas(db);
@@ -16144,7 +19772,7 @@ function initializeDatabase(db) {
       tag_id INTEGER,
       session_id TEXT,
       content TEXT,
-      created_at INTEGER,
+      created_at INTEGER, -- epoch ms; Date.now() on source writes, preserved on session clones
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, tag_id)
     );
@@ -16168,7 +19796,7 @@ function initializeDatabase(db) {
       p1_embedding BLOB,
       p1_embedding_model_id TEXT,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -16187,7 +19815,7 @@ function initializeDatabase(db) {
       model_id TEXT NOT NULL,
       dims INTEGER NOT NULL,
       vector BLOB NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(compartment_id, model_id, window_index)
     );
     CREATE INDEX IF NOT EXISTS idx_cce_session ON compartment_chunk_embeddings(session_id);
@@ -16210,7 +19838,7 @@ function initializeDatabase(db) {
       kind TEXT NOT NULL,
       at_compartment INTEGER,
       fields_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
     CREATE INDEX IF NOT EXISTS idx_compartment_events_session
@@ -16239,7 +19867,7 @@ function initializeDatabase(db) {
       session_id TEXT NOT NULL,
       category TEXT NOT NULL,
       content TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -16258,7 +19886,7 @@ function initializeDatabase(db) {
       source_message_time INTEGER NOT NULL,
       question_embedding BLOB,
       question_embedding_model_id TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(project_path, harness, session_id, source_start_message_id, source_end_message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_primer_candidates_project_time
@@ -16280,7 +19908,8 @@ function initializeDatabase(db) {
       last_observed_at INTEGER,
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL,
+      source_candidate_provenance TEXT,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_primers_project_status_observed
@@ -16393,7 +20022,7 @@ function initializeDatabase(db) {
       job_id TEXT,
       cursor TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL DEFAULT 0,
       UNIQUE(session_id, request_key)
     );
@@ -16434,7 +20063,7 @@ function initializeDatabase(db) {
       shadow_epoch INTEGER NOT NULL DEFAULT 0,
       corpus_hash TEXT NOT NULL DEFAULT '',
       coverage_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       UNIQUE(dedup_key, cohort_key)
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
@@ -16446,8 +20075,10 @@ function initializeDatabase(db) {
       -- verified_at=0 means "mapped (files known) but not yet content-verified".
       -- map-memories sets mapped_at + verified_at=0; verify sets verified_at=now.
       verified_at  INTEGER NOT NULL,
-      mapped_at    INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (memory_id, file_path)
+       mapped_at    INTEGER NOT NULL DEFAULT 0,
+       -- Distinguishes mapper-authored independence from a host rejection fallback.
+       mapping_origin TEXT NOT NULL DEFAULT 'mapper',
+       PRIMARY KEY (memory_id, file_path)
     );
     CREATE INDEX IF NOT EXISTS idx_memory_verifications_memory ON memory_verifications(memory_id);
 
@@ -16632,6 +20263,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       tokenize='porter unicode61'
     );
 
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+      session_id TEXT NOT NULL,
+      message_ordinal INTEGER NOT NULL,
+      fts_rowid INTEGER NOT NULL,
+      PRIMARY KEY(session_id, message_ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      watermark_rowid INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+      (id, watermark_rowid, completed, updated_at)
+    VALUES (1, 0, 0, 0);
+
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
@@ -16639,8 +20287,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
-    CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
-      ON message_history_index(harness, session_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS message_history_source (
       session_id TEXT NOT NULL,
@@ -16743,10 +20389,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       pending_pi_compaction_marker_state TEXT,
       new_work_tokens INTEGER NOT NULL DEFAULT 0,
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
-      -- deferred_execute_state: intentionally NULLABLE without a default.
-      -- Absence is SQL NULL; presence is a JSON blob written via
-      -- setDeferredExecutePendingIfAbsent. Excluded from the
-      -- healAllNullColumns fallback list.
+      -- Retired columns remain in place so existing databases keep the same schema:
+      -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
       cached_m0_project_memory_epoch INTEGER,
@@ -16761,6 +20405,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
+      protected_tokens_effective INTEGER,
+      protected_tokens_pre_snapshot TEXT,
       protected_tail_policy_version INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_window_started_at INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_tokens INTEGER NOT NULL DEFAULT 0,
@@ -16777,8 +20423,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
-      cached_m0_project_identity TEXT,
-      cached_m0_last_baseline_end_message_id TEXT,
+       cached_m0_project_identity TEXT,
+       cached_m0_last_baseline_end_message_id TEXT,
+       thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
     );
@@ -16839,7 +20486,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance_avg REAL,
       discarded_last INTEGER NOT NULL DEFAULT 0,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL -- epoch ms (Date.now())
     );
     CREATE INDEX IF NOT EXISTS idx_historian_runs_session
       ON historian_runs(session_id, created_at DESC);
@@ -16854,6 +20501,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       decision           TEXT    NOT NULL,
       materialized       INTEGER NOT NULL DEFAULT 0,
       materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
       emergency          INTEGER NOT NULL DEFAULT 0,
       dropped_tokens     INTEGER NOT NULL DEFAULT 0,
       dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -16886,7 +20539,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance INTEGER NOT NULL DEFAULT 50,
       episode_type TEXT,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -16897,7 +20550,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       category TEXT NOT NULL,
       content TEXT NOT NULL,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
 
@@ -16915,6 +20568,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "primer_candidates", "question_embedding", "BLOB");
   ensureColumn(db, "primer_candidates", "question_embedding_model_id", "TEXT");
   ensureColumn(db, "primers", "question_embedding_model_id", "TEXT");
+  ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
+  const hasUserMemoriesTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_memories'").get();
+  if (hasUserMemoriesTable) {
+    ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
+  }
   db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_primer_candidates_occurrence
         ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
@@ -16988,6 +20646,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "session_meta", "stripped_placeholder_ids", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
+  ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+  ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
+  ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
   ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
   ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
   ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
@@ -17069,6 +20730,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
   ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+  ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
   ensureColumn(db, "session_meta", "protected_tail_policy_version", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "session_meta", "protected_tail_drain_window_started_at", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "session_meta", "protected_tail_drain_tokens", "INTEGER NOT NULL DEFAULT 0");
@@ -17184,6 +20847,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         decision           TEXT    NOT NULL,
         materialized       INTEGER NOT NULL DEFAULT 0,
         materialize_reason TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
         emergency          INTEGER NOT NULL DEFAULT 0,
         dropped_tokens     INTEGER NOT NULL DEFAULT 0,
         dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -17193,6 +20862,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
         ON transform_decisions(session_id, harness);
     `);
+  ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+  ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+  ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+  ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
   ensureColumn(db, "tags", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "message_history_index", "dirty_floor_ordinal", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "pending_ops", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
@@ -17204,13 +20877,17 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "recomp_compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "recomp_facts", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "message_history_index", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+  db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+        ON message_history_index(harness, session_id, updated_at);
+    `);
   ensureColumn(db, "workspaces", "share_categories", `TEXT NOT NULL DEFAULT '["CONSTRAINTS"]'`);
 }
-var CHANNEL2_CLAIM_TTL_MS = 120000;
+var CHANNEL2_CLAIM_TTL_MS = 10 * 60000;
 function healWedgedChannel2Claims(db) {
   try {
     const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
-    db.prepare("UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
   } catch {}
 }
 async function openDatabaseAsync(dbPathOrOptions) {
@@ -17218,45 +20895,78 @@ async function openDatabaseAsync(dbPathOrOptions) {
   const explicitDbPath = options?.dbPath !== undefined;
   const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
   const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+  const busyTimeoutMs = resolveBootBusyTimeoutMs(options?.busyTimeoutMs);
   lastSchemaFenceRejection = null;
   lastMigrationOnOpenRefusal = null;
   const existing = databases.get(dbPath);
   if (existing) {
-    if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion))
-      return null;
-    if (!persistenceByDatabase.has(existing))
-      persistenceByDatabase.set(existing, true);
-    healWedgedChannel2Claims(existing);
-    return existing;
+    const startedAt = performance.now();
+    const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
+    if (accepted) {
+      if (!persistenceByDatabase.has(existing))
+        persistenceByDatabase.set(existing, true);
+      healWedgedChannel2Claims(existing);
+    }
+    options?.onBootTimings?.({
+      openMs: performance.now() - startedAt,
+      guardMs: 0,
+      migrateMs: 0
+    });
+    return accepted ? existing : null;
   }
   const pending = pendingAsyncOpens.get(dbPath);
   if (pending)
     return pending;
   const opening = (async () => {
     let db;
+    const openStartedAt = performance.now();
+    let openMs = 0;
+    let guardMs = 0;
+    let migrateMs = 0;
+    let guardStartedAt = null;
+    let migrateStartedAt = null;
     try {
       if (!explicitDbPath)
         migrateLegacyStorageIfNeeded(dbPath, dbDir);
       ensureSecureStorageDir(dbDir);
       db = new Database(dbPath);
+      installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
+      openMs = performance.now() - openStartedAt;
+      guardStartedAt = performance.now();
       if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+        guardMs = performance.now() - guardStartedAt;
         closeQuietly(db);
         return null;
       }
       if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+        guardMs = performance.now() - guardStartedAt;
         closeQuietly(db);
         return null;
       }
-      initializeDatabase(db);
+      guardMs = performance.now() - guardStartedAt;
+      migrateStartedAt = performance.now();
+      initializeDatabase(db, busyTimeoutMs);
       await runMigrationsWithRetry(db);
       ensureContextStoreUuid(db);
-      return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+      const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+      migrateMs = performance.now() - migrateStartedAt;
+      return opened;
     } catch (error) {
       if (db)
         closeQuietly(db);
       const detail = getErrorMessage(error);
       log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
       throw new Error(`[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`);
+    } finally {
+      if (openMs === 0)
+        openMs = performance.now() - openStartedAt;
+      if (guardStartedAt !== null && guardMs === 0) {
+        guardMs = performance.now() - guardStartedAt;
+      }
+      if (migrateStartedAt !== null && migrateMs === 0) {
+        migrateMs = performance.now() - migrateStartedAt;
+      }
+      options?.onBootTimings?.({ openMs, guardMs, migrateMs });
     }
   })();
   pendingAsyncOpens.set(dbPath, opening);
@@ -17295,28 +21005,28 @@ async function classifyDatabaseOpen(dbPath) {
   }
 }
 function scanLivenessMarkers(storageDir) {
-  const rpcRoot = join6(storageDir, "rpc");
-  if (!existsSync8(rpcRoot))
+  const rpcRoot = join7(storageDir, "rpc");
+  if (!existsSync10(rpcRoot))
     return { markers: [], liveCount: 0 };
   const markers = [];
   let projectDirs = [];
   try {
-    projectDirs = readdirSync3(rpcRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    projectDirs = readdirSync4(rpcRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
   } catch {
     return { markers: [], liveCount: 0 };
   }
   for (const projectDir of projectDirs) {
-    const dirPath = join6(rpcRoot, projectDir);
+    const dirPath = join7(rpcRoot, projectDir);
     let files = [];
     try {
-      files = readdirSync3(dirPath);
+      files = readdirSync4(dirPath);
     } catch {
       continue;
     }
     for (const file of files) {
       if (!file.startsWith("port-") || !file.endsWith(".json"))
         continue;
-      const path = join6(dirPath, file);
+      const path = join7(dirPath, file);
       try {
         const record = JSON.parse(readFileSync8(path, "utf8"));
         markers.push({
@@ -17343,8 +21053,8 @@ function pidAlive(pid) {
   }
 }
 function profileBundleFacts(dshHome, profileName) {
-  const packageJsonPath = join6(dshHome, "profiles", profileName, "package.json");
-  const packageJsonExists = existsSync8(packageJsonPath);
+  const packageJsonPath = join7(dshHome, "profiles", profileName, "package.json");
+  const packageJsonExists = existsSync10(packageJsonPath);
   let bundles = [];
   if (packageJsonExists) {
     const parsed = readJsoncFile(packageJsonPath);
@@ -17353,7 +21063,7 @@ function profileBundleFacts(dshHome, profileName) {
       bundles = raw.map(String);
   }
   const bundleInstalled = bundles.includes(MAGIC_CONTEXT_PACKAGE);
-  const nodeModulesPackageExists = existsSync8(join6(dshHome, "profiles", profileName, "node_modules", MAGIC_CONTEXT_PACKAGE));
+  const nodeModulesPackageExists = existsSync10(join7(dshHome, "profiles", profileName, "node_modules", MAGIC_CONTEXT_PACKAGE));
   return {
     name: profileName,
     packageJsonPath,
@@ -17364,11 +21074,11 @@ function profileBundleFacts(dshHome, profileName) {
   };
 }
 function listProfiles(dshHome) {
-  const profilesRoot = join6(dshHome, "profiles");
-  if (!existsSync8(profilesRoot))
+  const profilesRoot = join7(dshHome, "profiles");
+  if (!existsSync10(profilesRoot))
     return [];
   try {
-    return readdirSync3(profilesRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name !== "node_modules").map((entry) => entry.name);
+    return readdirSync4(profilesRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name !== "node_modules").map((entry) => entry.name);
   } catch {
     return [];
   }
@@ -17394,7 +21104,7 @@ async function runDshDoctor(argv, options = {}) {
       fix: `Install DSH ${DSH_COMPAT_EXPECTED_VERSION} or pass --dsh-install <dir>.`
     });
   } else {
-    const manifestPath = join6(located.dshInstallDir, "package.json");
+    const manifestPath = join7(located.dshInstallDir, "package.json");
     let installedVersion;
     try {
       const parsed = JSON.parse(readFileSync8(manifestPath, "utf8"));
@@ -17435,7 +21145,7 @@ async function runDshDoctor(argv, options = {}) {
       id: "bundle-install",
       title: "Bundle install state",
       status: "warn",
-      detail: `no profiles found under ${join6(dshHome, "profiles")}.`,
+      detail: `no profiles found under ${join7(dshHome, "profiles")}.`,
       fix: `Create a profile first (e.g. dsh --profile web), then add ${MAGIC_CONTEXT_PACKAGE}.`
     });
   } else {
@@ -17553,8 +21263,8 @@ async function runDshDoctor(argv, options = {}) {
     });
   }
   const storageDir = options.storageDirOverride ?? getMagicContextStorageDir();
-  const dbPath = options.dbPathOverride ?? join6(storageDir, "context.db");
-  if (!existsSync8(dbPath)) {
+  const dbPath = options.dbPathOverride ?? join7(storageDir, "context.db");
+  if (!existsSync10(dbPath)) {
     checks.push({
       id: "shared-db",
       title: "Shared DB",
@@ -17610,14 +21320,14 @@ async function runDshDoctor(argv, options = {}) {
       id: "liveness-markers",
       title: "Liveness markers",
       status: "ok",
-      detail: markerScan.markers.length === 0 ? `${join6(storageDir, "rpc")}: no DSH liveness markers.` : `${markerScan.markers.length} marker(s) found, all from dead processes (stale, harmless).`
+      detail: markerScan.markers.length === 0 ? `${join7(storageDir, "rpc")}: no DSH liveness markers.` : `${markerScan.markers.length} marker(s) found, all from dead processes (stale, harmless).`
     });
   } else {
     checks.push({
       id: "liveness-markers",
       title: "Liveness markers",
       status: "warn",
-      detail: `${markerScan.liveCount} live DSH liveness marker(s) under ${join6(storageDir, "rpc")} — ` + `a running harness process may hold the migration guard.`,
+      detail: `${markerScan.liveCount} live DSH liveness marker(s) under ${join7(storageDir, "rpc")} — ` + `a running harness process may hold the migration guard.`,
       fix: "If no harness is actually running, remove the stale port-*.json marker files."
     });
   }
@@ -17632,12 +21342,12 @@ async function runDshDoctor(argv, options = {}) {
     "project-file-parse-error": "fail",
     "project-file-io-error": "fail"
   };
-  const configStatus = !existsSync8(configPath) ? "warn" : statusForOutcome[outcome] ?? "warn";
+  const configStatus = !existsSync10(configPath) ? "warn" : statusForOutcome[outcome] ?? "warn";
   checks.push({
     id: "config-load",
     title: "Config loading",
     status: configStatus,
-    detail: `${existsSync8(configPath) ? configPath : "no user config (defaults apply)"} ` + `→ loadOutcome=${outcome} (user: ${loaded.sources.userConfig}, project: ${loaded.sources.projectConfig})` + (loaded.config.configWarnings?.length ? `; warnings: ${loaded.config.configWarnings.join(" | ")}` : ""),
+    detail: `${existsSync10(configPath) ? configPath : "no user config (defaults apply)"} ` + `→ loadOutcome=${outcome} (user: ${loaded.sources.userConfig}, project: ${loaded.sources.projectConfig})` + (loaded.config.configWarnings?.length ? `; warnings: ${loaded.config.configWarnings.join(" | ")}` : ""),
     fix: configStatus === "ok" ? undefined : configStatus === "fail" ? "Fix the config file parse error, then re-run doctor." : "Review the config warnings; run `dsh-magic-context setup` to bootstrap a user config."
   });
   return {

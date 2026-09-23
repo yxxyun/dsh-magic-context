@@ -1,9 +1,8 @@
-import"./agent-nb38pbc0.js";
 import {
   resolveCortexKitUserConfigPath,
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion
-} from "./agent-z992kvg4.js";
+} from "./agent-5gth7qh5.js";
 
 // src/host/remote.ts
 import { existsSync, readFileSync } from "node:fs";
