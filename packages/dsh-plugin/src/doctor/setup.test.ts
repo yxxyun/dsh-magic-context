@@ -1,15 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { dump as yamlDump } from "js-yaml";
 import { entryListSchema } from "@deepseek-ai/cordis-plugin-include";
@@ -17,20 +8,36 @@ import { parseJsonc } from "@magic-context/core/shared/jsonc-parser";
 import {
   runDshSetup,
   parseEntryListYaml,
+  readPresetDeclaration,
   RECOMMENDED_CONFIG_KEYS,
 } from "./setup";
 import {
-  MAGIC_CONTEXT_PACKAGE,
-  magicEntryPath,
-  magicStandardAgentCordisPath,
-  magicStandardDir,
-  magicStandardPresetYamlPath,
-} from "./env";
+  MAGIC_AGENT_ROW_ID,
+  MAGIC_COMPACTION_ROW_ID,
+  STOCK_PRESET_CONFIG_ID,
+  STOCK_PRESET_ROW_ID,
+} from "../compat/dsh-0.1/preset";
+import { DSH_COMPAT_EXPECTED_VERSION, legacyMagicStandardDir, magicEntryPath } from "./env";
 
-/** Minimal stand-in for the stock standard preset layout (same as preset.test). */
-function stockLayout(): Record<string, unknown>[] {
-  return [
-    { id: "persona", name: "@deepseek-ai/dsh-persona", config: { text: "x" } },
+/**
+ * Stand-in for the shipped standard preset plugin list. It must carry every
+ * row id that this bundle's own override restates, because setup cross-checks
+ * the two lists — a trimmed stub would report the bundle as inventing rows.
+ */
+function stockPlugins(overrides: (rows: Record<string, unknown>[]) => Record<string, unknown>[] = (rows) => rows): Record<string, unknown>[] {
+  return overrides([
+    { id: "persona", name: "@deepseek-ai/dsh-persona", config: { prefix: "p", suffix: "s" } },
+    { id: "agent-instructions", name: "@deepseek-ai/dsh-agent-instructions" },
+    { id: "tool-bash", name: "@deepseek-ai/dsh-tool-bash" },
+    { id: "tool-pwsh", name: "@deepseek-ai/dsh-tool-pwsh" },
+    { id: "tool-fs", name: "@deepseek-ai/dsh-tool-fs" },
+    { id: "tool-fs-search", name: "@deepseek-ai/dsh-tool-fs-search" },
+    { id: "tool-jobs", name: "@deepseek-ai/dsh-tool-jobs" },
+    { id: "skill-filesystem", name: "@deepseek-ai/dsh-skill-filesystem" },
+    { id: "tool-skill", name: "@deepseek-ai/dsh-tool-skill" },
+    { id: "command-goal", name: "@deepseek-ai/dsh-command-goal" },
+    { id: "tool-goal", name: "@deepseek-ai/dsh-tool-goal" },
+    { id: "planning", name: "cordis:group", group: true, config: [{ id: "plan-mode", name: "@deepseek-ai/dsh-plan-mode" }] },
     {
       id: "compaction",
       name: "cordis:group",
@@ -42,20 +49,57 @@ function stockLayout(): Record<string, unknown>[] {
         { id: "tool-result-pruner", name: "@deepseek-ai/dsh-compaction-tool-result-pruner" },
       ],
     },
+    { id: "delegation", name: "cordis:group", group: true, config: [
+      { id: "tool-subagent-control", name: "@deepseek-ai/dsh-tool-subagent-control" },
+      { id: "tool-subagent", name: "@deepseek-ai/dsh-tool-subagent" },
+      { id: "tool-subagent-fork", name: "@deepseek-ai/dsh-tool-subagent-fork" },
+      { id: "workflow-ptc", name: "@deepseek-ai/dsh-workflow-ptc" },
+      { id: "tool-workflow", name: "@deepseek-ai/dsh-tool-workflow" },
+    ]},
     { id: "tool-ask-user", name: "@deepseek-ai/dsh-tool-ask-user" },
-  ];
+    { id: "tool-todo", name: "@deepseek-ai/dsh-tool-todo" },
+    { id: "tool-web", name: "@deepseek-ai/dsh-tool-web" },
+    { id: "present", name: "@deepseek-ai/dsh-present" },
+    { id: "tool-plugin-manager", name: "@deepseek-ai/dsh-tool-plugin-manager" },
+  ]);
 }
 
-function writeStockPreset(installDir: string, overrides: (rows: Record<string, unknown>[]) => Record<string, unknown>[] = (rows) => rows): string {
-  // A dsh install root is identified by its package.json identity.
+/**
+ * Write a fake DSH install whose `@deepseek-ai/dsh-web-app` bundle carries the
+ * shipped `presets/standard.patch.yml` declaration — the 0.1.7 layout.
+ */
+function writeStockInstall(
+  installDir: string,
+  overrides: (rows: Record<string, unknown>[]) => Record<string, unknown>[] = (rows) => rows,
+  version = DSH_COMPAT_EXPECTED_VERSION,
+): string {
   mkdirSync(installDir, { recursive: true });
   writeFileSync(
     join(installDir, "package.json"),
-    JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.0-rc.6" }),
+    JSON.stringify({ name: "@deepseek-ai/dsh", version }),
   );
-  const file = join(installDir, "config", "agent-presets", "standard", "agent.cordis.yml");
+  const file = join(
+    installDir,
+    "node_modules",
+    "@deepseek-ai",
+    "dsh-web-app",
+    "presets",
+    "standard.patch.yml",
+  );
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, yamlDump(overrides(stockLayout()), { schema: entryListSchema }));
+  writeFileSync(
+    file,
+    yamlDump(
+      [
+        {
+          id: STOCK_PRESET_ROW_ID,
+          name: "@deepseek-ai/dsh-agent-preset",
+          config: { id: STOCK_PRESET_CONFIG_ID, order: 1, plugins: stockPlugins(overrides) },
+        },
+      ],
+      { schema: entryListSchema },
+    ),
+  );
   return file;
 }
 
@@ -82,17 +126,17 @@ async function cleanup(root: string): Promise<void> {
       rmSync(root, { recursive: true, force: true });
       return;
     } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 }
 
-describe("dsh-magic-context setup (Phase 2 slice C)", () => {
-  it("generates the thin preset structure and the user config", async () => {
+describe("dsh-magic-context setup (0.1.7 inline-preset form)", () => {
+  it("verifies the shipped layout and this bundle's own override, then seeds the config", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
-      const stock = writeStockPreset(env.installDir);
+      const stock = writeStockInstall(env.installDir);
       const report = await runDshSetup([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
@@ -100,81 +144,42 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
       expect(report.exitCode).toBe(0);
       expect(report.steps.every((step) => step.status !== "fail")).toBe(true);
 
-      // agent.cordis.yml = the single include row over the stock file.
-      const agentCordisPath = magicStandardAgentCordisPath(env.dshHome);
-      expect(report.generatedFiles).toContain(agentCordisPath);
-      const entries = parseEntryListYaml(readFileSync(agentCordisPath, "utf8"));
-      expect(entries).toHaveLength(1);
-      const include = entries[0];
-      expect(include.id).toBe("magic-include-standard");
-      // The include row names THIS package's no-write entry (absolute file
-      // path): the raw include would truncate the shipped stock composition
-      // via the loader's write-back on the first agent teardown.
-      expect(include.name).toBe(pathToFileURL(magicEntryPath("preset-include")).href);
-      const config = include.config as { path: string; patches: unknown[] };
-      // The include path is emitted as a file:// URL (Windows drive paths
-      // would parse as a URL scheme).
-      expect(config.path).toBe(pathToFileURL(stock).href);
-      // compaction-basic disable + compaction insert + magicRows insert.
-      expect(config.patches).toHaveLength(3);
-      const magicRows = (config.patches[2] as { insert: Record<string, unknown>[] }).insert;
-      // Nested-include rows resolve from the stock directory's module walk,
-      // so Magic rows are emitted as absolute entry file paths.
-      expect(
-        magicRows.some(
-          (row) =>
-            row.id === "magic-agent" &&
-            typeof row.name === "string" &&
-            row.name.includes("entries") &&
-            row.name.endsWith("agent.js"),
-        ),
-      ).toBe(true);
-      const compactionRows = (
-        config.patches[1] as { insert: Record<string, unknown>[] }
-      ).insert;
-      expect(
-        compactionRows.some(
-          (row) =>
-            row.id === "magic-compaction" &&
-            typeof row.name === "string" &&
-            row.name.includes("entries") &&
-            row.name.endsWith("compaction.js"),
-        ),
-      ).toBe(true);
+      const scan = report.steps.find((step) => step.title.includes("contract scan"));
+      expect(scan?.status).toBe("ok");
+      expect(scan?.detail).toContain(stock);
 
-      // preset.yml metadata.
-      const presetYamlPath = magicStandardPresetYamlPath(env.dshHome);
-      expect(report.generatedFiles).toContain(presetYamlPath);
-      const presetYaml = readFileSync(presetYamlPath, "utf8");
-      expect(presetYaml).toContain("name: Magic Context standard");
-      expect(presetYaml).toContain("order: 10");
+      // The bundle's own override is checked against the shipped list.
+      const override = report.steps.find((step) => step.title.includes("Bundle preset override"));
+      expect(override?.status).toBe("ok");
+      expect(override?.detail).toContain(MAGIC_AGENT_ROW_ID);
+      expect(override?.detail).toContain(MAGIC_COMPACTION_ROW_ID);
 
-      // 0600 permissions (mode bits are meaningless on Windows).
-      if (process.platform !== "win32") {
-        expect(statSync(agentCordisPath).mode & 0o777).toBe(0o600);
-        expect(statSync(presetYamlPath).mode & 0o777).toBe(0o600);
-      }
+      // Setup no longer GENERATES a preset: nothing preset-shaped is written.
+      const legacy = legacyMagicStandardDir(env.dshHome);
+      expect(existsSync(legacy)).toBe(false);
+      expect(report.generatedFiles.some((file) => file.includes(".agent-presets"))).toBe(false);
 
-      // User config created with defaults.
+      // The user config is the only artifact it creates.
       const configPath = join(env.configHome, "cortexkit", "magic-context.jsonc");
       expect(report.generatedFiles).toContain(configPath);
       expect(existsSync(configPath)).toBe(true);
       const parsed = parseJsonc<{ enabled?: boolean }>(readFileSync(configPath, "utf8"));
       expect(parsed.enabled).toBe(true);
 
-      // Next steps mention the profile install command.
-      expect(report.nextSteps.some((line) => line.includes("dsh plugin"))).toBe(true);
+      // Next steps point at the profile bundle list, not a `dsh plugin` call.
+      expect(report.nextSteps.some((line) => line.includes("dsh.profile.bundles"))).toBe(true);
+      expect(report.nextSteps.some((line) => line.includes(STOCK_PRESET_CONFIG_ID))).toBe(true);
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
     }
   });
 
-  it("fails closed on a stock layout mismatch and writes nothing", async () => {
+  it("fails closed on a shipped layout mismatch and writes nothing", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
-      writeStockPreset(env.installDir, (rows) =>
+      writeStockInstall(env.installDir, (rows) =>
         rows.map((row) =>
           row.id === "compaction"
             ? {
@@ -194,11 +199,35 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
       });
       expect(report.exitCode).toBe(1);
       expect(report.generatedFiles).toEqual([]);
-      const scanStep = report.steps.find((step) => step.title.includes("contract scan"));
-      expect(scanStep?.status).toBe("fail");
-      // Fail closed: neither the preset nor the user config is written.
-      expect(existsSync(magicStandardDir(env.dshHome))).toBe(false);
+      const scan = report.steps.find((step) => step.title.includes("contract scan"));
+      expect(scan?.status).toBe("fail");
+      // Fail closed: the user config is not created either.
       expect(existsSync(join(env.configHome, "cortexkit", "magic-context.jsonc"))).toBe(false);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+
+  it("removes a stale pre-0.1.7 preset directory", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      writeStockInstall(env.installDir);
+      const legacy = legacyMagicStandardDir(env.dshHome);
+      mkdirSync(legacy, { recursive: true });
+      writeFileSync(join(legacy, "agent.cordis.yml"), "[]\n", "utf8");
+      writeFileSync(join(legacy, "preset.yml"), "name: Magic Context standard\norder: 10\n", "utf8");
+
+      const report = await runDshSetup([], {
+        dshHome: env.dshHome,
+        dshInstallDir: env.installDir,
+      });
+      expect(report.exitCode).toBe(0);
+      expect(existsSync(legacy)).toBe(false);
+      const step = report.steps.find((s) => s.title.includes("Legacy preset directory"));
+      expect(step?.status).toBe("ok");
+      expect(step?.detail).toContain("removed stale");
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
@@ -209,7 +238,7 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
-      writeStockPreset(env.installDir);
+      writeStockInstall(env.installDir);
       const configPath = join(env.configHome, "cortexkit", "magic-context.jsonc");
       mkdirSync(dirname(configPath), { recursive: true });
       writeFileSync(configPath, '{\n  "enabled": false,\n  "custom": 1\n}\n', "utf8");
@@ -237,14 +266,13 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
-      writeStockPreset(env.installDir);
+      writeStockInstall(env.installDir);
       const report = await runDshSetup(["--dry-run"], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
       });
       expect(report.exitCode).toBe(0);
       expect(report.generatedFiles).toEqual([]);
-      expect(existsSync(magicStandardAgentCordisPath(env.dshHome))).toBe(false);
       expect(existsSync(join(env.configHome, "cortexkit", "magic-context.jsonc"))).toBe(false);
     } finally {
       delete process.env.XDG_CONFIG_HOME;
@@ -268,5 +296,72 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
     } finally {
       await cleanup(env.root);
     }
+  });
+
+  it("warns (not fails) on a DSH release line it was not written for", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      writeStockInstall(env.installDir, (rows) => rows, "0.2.0");
+      const report = await runDshSetup([], {
+        dshHome: env.dshHome,
+        dshInstallDir: env.installDir,
+      });
+      const versionStep = report.steps.find((step) => step.title === "DSH version");
+      expect(versionStep?.status).toBe("warn");
+      expect(versionStep?.detail).toContain(DSH_COMPAT_EXPECTED_VERSION);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+});
+
+describe("readPresetDeclaration", () => {
+  it("reads an inline declaration and checks the preset identity", () => {
+    const patch = [
+      {
+        id: STOCK_PRESET_ROW_ID,
+        name: "@deepseek-ai/dsh-agent-preset",
+        config: { id: STOCK_PRESET_CONFIG_ID, plugins: [{ id: "persona" }] },
+      },
+    ];
+    const declared = readPresetDeclaration(patch, STOCK_PRESET_ROW_ID);
+    expect(typeof declared).not.toBe("string");
+    expect((declared as { plugins: unknown[] }).plugins).toHaveLength(1);
+  });
+
+  it("returns a reason string for every malformed shape", () => {
+    expect(readPresetDeclaration([], STOCK_PRESET_ROW_ID)).toContain("declares no row");
+    expect(
+      readPresetDeclaration([{ id: STOCK_PRESET_ROW_ID }], STOCK_PRESET_ROW_ID),
+    ).toContain("carries no config");
+    expect(
+      readPresetDeclaration(
+        [{ id: STOCK_PRESET_ROW_ID, config: { id: "other", plugins: [] } }],
+        STOCK_PRESET_ROW_ID,
+      ),
+    ).toContain('expected "standard"');
+    expect(
+      readPresetDeclaration(
+        [{ id: STOCK_PRESET_ROW_ID, config: { id: STOCK_PRESET_CONFIG_ID } }],
+        STOCK_PRESET_ROW_ID,
+      ),
+    ).toContain("no config.plugins list");
+  });
+});
+
+describe("shipped patch is the real one", () => {
+  it("this bundle's cordis.patch.yml parses and declares the override", async () => {
+    const own = parseEntryListYaml(
+      readFileSync(new URL("../../cordis.patch.yml", import.meta.url), "utf8"),
+    );
+    const declared = readPresetDeclaration(own, STOCK_PRESET_ROW_ID);
+    expect(typeof declared).not.toBe("string");
+    // The row must NOT carry `insert`: that would duplicate, not override.
+    const row = own.find((entry) => entry.id === STOCK_PRESET_ROW_ID);
+    expect(row?.insert).toBeUndefined();
+    // And the agent entry it names must exist on disk.
+    expect(magicEntryPath("agent").endsWith("agent.js")).toBe(true);
   });
 });

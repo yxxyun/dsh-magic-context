@@ -1,15 +1,12 @@
+import"./agent-nb38pbc0.js";
 import {
-  resolveCortexKitUserConfigPath
-} from "./agent-b2xpbemd.js";
-import {
+  resolveCortexKitUserConfigPath,
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion
-} from "./agent-21g2xwj5.js";
-import"./agent-amr6x35h.js";
-import"./agent-wckvcay0.js";
+} from "./agent-8w60yqpt.js";
 
 // src/host/remote.ts
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join as join2 } from "node:path";
 import { Service } from "@deepseek-ai/cordis";
@@ -20,7 +17,7 @@ var MAGIC_CONTEXT_REMOTE_NAMESPACE = "magicContext";
 // src/doctor/env.ts
 import { dirname, join } from "node:path";
 var MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
-var STOCK_PRESET_REL = join("config", "agent-presets", "standard", "agent.cordis.yml");
+var STOCK_PRESET_REL = join("presets", "standard.patch.yml");
 
 // src/host/remote.ts
 var MAGIC_STATUS_METHOD = "status";
@@ -30,6 +27,17 @@ function dshHome() {
   if (explicit !== undefined && explicit.trim() !== "")
     return explicit;
   return join2(homedir(), ".dsh");
+}
+function readPresetDeclarationState() {
+  const rowId = "preset-standard";
+  try {
+    const url = new URL("../../cordis.patch.yml", import.meta.url);
+    const text = readFileSync(url, "utf8");
+    const declared = new RegExp(`^\\s*-?\\s*id:\\s*['"]?${rowId}['"]?\\s*$`, "m").test(text);
+    return { rowId, declared };
+  } catch (error) {
+    return { rowId, declared: false, detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 class MagicContextRemoteService extends Service {
@@ -63,13 +71,13 @@ class MagicContextRemoteService extends Service {
     })();
     const home = dshHome();
     const configPath = resolveCortexKitUserConfigPath();
-    const presetDir = join2(home, ".agent-presets", "magic-standard");
+    const preset = readPresetDeclarationState();
     return {
       package: MAGIC_CONTEXT_PACKAGE,
       harness: "dsh",
       storage,
       config: { path: configPath, exists: existsSync(configPath) },
-      preset: { dir: presetDir, exists: existsSync(join2(presetDir, "agent.cordis.yml")) },
+      preset,
       ...args.sessionId === undefined ? {} : { sessionId: args.sessionId }
     };
   }
@@ -209,8 +217,8 @@ function apply(ctx) {
 }
 var remote_default = { name, inject, apply };
 export {
-  name,
-  inject,
+  apply,
   remote_default as default,
-  apply
+  inject,
+  name
 };

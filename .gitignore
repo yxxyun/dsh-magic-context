@@ -29,6 +29,12 @@ Thumbs.db
 # Spike generated artifacts
 spikes/.generated/
 
+# Deploy staging — a generated copy of packages/dsh-plugin's publishable payload
+# (dist + src + cordis.patch.yml + NOTICE + package.json), produced by the deploy
+# step and installed into ~/.dsh/profiles/<profile>/node_modules/dsh-magic-context.
+# Never hand-edit it; regenerate from packages/dsh-plugin instead.
+stage/
+
 # E2E scratch runtime (volatile per-run artifacts; the scratch-home tree itself
 # and the probe/overlay sources are committed as reproducible harness state)
 e2e/.restore-tmp/

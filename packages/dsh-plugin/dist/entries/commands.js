@@ -1,10 +1,10 @@
+import"./agent-v534j6cb.js";
+import"./agent-8w60yqpt.js";
+import"./agent-nb38pbc0.js";
 import {
   registerCtxCommands
-} from "./agent-yw41x53x.js";
-import"./agent-9809ars1.js";
-import"./agent-21g2xwj5.js";
-import"./agent-amr6x35h.js";
-import"./agent-wckvcay0.js";
+} from "./agent-a4fynjzt.js";
+import"./agent-56hph06t.js";
 
 // src/entries/commands.ts
 var name = "magic-context-commands";
@@ -13,7 +13,7 @@ function apply(ctx, config = {}) {
 }
 var commands_default = { name, apply };
 export {
-  name,
+  apply,
   commands_default as default,
-  apply
+  name
 };

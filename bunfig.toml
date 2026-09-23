@@ -1,0 +1,7 @@
+# Bun workspace config for the self-maintained dsh-magic-context fork.
+#
+# Alias mechanism note: `@magic-context/core/*` is NOT a published package
+# (npm 404). It is the upstream @cortexkit Magic Context feature tree, vendored
+# at v0.36.1 under packages/plugin/src. Resolution is provided by the shim
+# package at packages/magic-context-core (see its package.json "exports"), which
+# the workspace links into node_modules as `@magic-context/core`.

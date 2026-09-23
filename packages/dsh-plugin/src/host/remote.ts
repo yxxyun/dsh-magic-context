@@ -13,7 +13,7 @@
  * `{service, serviceKey, namespace}` shape) and the descriptor uses src-json
  * codecs, so no decorators or generated artifacts are involved.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
@@ -61,7 +61,19 @@ export interface MagicStatus {
     readonly detail?: string;
   };
   readonly config: { readonly path: string; readonly exists: boolean };
-  readonly preset: { readonly dir: string; readonly exists: boolean };
+  /**
+   * Preset state. Since DSH 0.1.7 a preset is an inline
+   * `@deepseek-ai/dsh-agent-preset` declaration carried by a bundle patch, so
+   * there is no file to point at: `declared` reports whether this bundle's own
+   * patch carries the override row that the shipped `standard` preset is
+   * composed from.
+   */
+  readonly preset: {
+    readonly rowId: string;
+    readonly declared: boolean;
+    /** Set when the bundle's patch could not be read. */
+    readonly detail?: string;
+  };
   readonly sessionId?: string | null;
 }
 
@@ -69,6 +81,24 @@ function dshHome(): string {
   const explicit = process.env.DSH_HOME;
   if (explicit !== undefined && explicit.trim() !== "") return explicit;
   return join(homedir(), ".dsh");
+}
+
+/**
+ * Read this bundle's own preset override out of its shipped patch. Cheap and
+ * synchronous: the file ships beside the running module.
+ */
+function readPresetDeclarationState(): MagicStatus["preset"] {
+  const rowId = "preset-standard";
+  try {
+    const url = new URL("../../cordis.patch.yml", import.meta.url);
+    const text = readFileSync(url, "utf8");
+    // The override is a top-level mapping with this id and no `insert`; a
+    // targeted scan avoids pulling a YAML parser into the host-plane bundle.
+    const declared = new RegExp(`^\\s*-?\\s*id:\\s*['"]?${rowId}['"]?\\s*$`, "m").test(text);
+    return { rowId, declared };
+  } catch (error) {
+    return { rowId, declared: false, detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /** Cordis Service backing the `magicContext` Remote namespace. */
@@ -112,13 +142,13 @@ export class MagicContextRemoteService extends Service {
     })();
     const home = dshHome();
     const configPath = resolveCortexKitUserConfigPath();
-    const presetDir = join(home, ".agent-presets", "magic-standard");
+    const preset = readPresetDeclarationState();
     return {
       package: MAGIC_CONTEXT_PACKAGE,
       harness: "dsh",
       storage,
       config: { path: configPath, exists: existsSync(configPath) },
-      preset: { dir: presetDir, exists: existsSync(join(presetDir, "agent.cordis.yml")) },
+      preset,
       ...(args.sessionId === undefined ? {} : { sessionId: args.sessionId }),
     };
   }

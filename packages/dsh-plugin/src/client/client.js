@@ -37,7 +37,11 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		var react = require("react");
 		var jsxRuntime = require("react/jsx-runtime");
-		var clientRuntime = require("@deepseek-ai/dsh-client-runtime/client");
+		// DSH 0.1.7 dropped `@deepseek-ai/dsh-client-runtime`; its
+		// createSnapshotStore now lives in `@deepseek-ai/dsh-client-store`,
+		// with the same signature and the same {getSnapshot, subscribe, update,
+		// set} result shape.
+		var clientRuntime = require("@deepseek-ai/dsh-client-store");
 		var primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 
 		/* ------------------------------------------------ styles */

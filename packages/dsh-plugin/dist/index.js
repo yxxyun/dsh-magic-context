@@ -299,9 +299,9 @@ function migrateConfigFile(opts) {
     }));
     if (existsSync(opts.targetPath)) {
       const targetContent = readFileSync(opts.targetPath, "utf-8");
-      const differing2 = sources.filter((source) => !fileSemanticsMatch(source.content, targetContent));
-      if (differing2.length > 0) {
-        const message = visibleConfigMigrationWarning(opts.scope, opts.targetPath, differing2.map((source) => source.path), "the CortexKit target already exists with different settings");
+      const differing = sources.filter((source) => !fileSemanticsMatch(source.content, targetContent));
+      if (differing.length > 0) {
+        const message = visibleConfigMigrationWarning(opts.scope, opts.targetPath, differing.map((source) => source.path), "the CortexKit target already exists with different settings");
         warnings.push(message);
         opts.logger?.warn?.(message);
         return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
@@ -447,18 +447,15 @@ var buffer = [];
 var flushTimer = null;
 var FLUSH_INTERVAL_MS = 500;
 var BUFFER_SIZE_LIMIT = 50;
-var swallowedWriteCount = 0;
-var lastErrorMessage = null;
-var lastErrorTime = null;
-function recordSwallowedWrite(error) {
-  try {
-    swallowedWriteCount++;
-    lastErrorMessage = error instanceof Error ? error.message : String(error);
-    lastErrorTime = new Date().toISOString();
-  } catch {}
-}
+var lastEnsuredDir = null;
 function ensureDir(filePath) {
-  fs.mkdirSync(path2.dirname(filePath), { recursive: true });
+  const dir = path2.dirname(filePath);
+  if (dir === lastEnsuredDir)
+    return;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    lastEnsuredDir = dir;
+  } catch {}
 }
 function flush() {
   if (flushTimer) {
@@ -473,9 +470,7 @@ function flush() {
     const logFile = getMagicContextLogPath();
     ensureDir(logFile);
     fs.appendFileSync(logFile, data);
-  } catch (error) {
-    recordSwallowedWrite(error);
-  }
+  } catch {}
 }
 function scheduleFlush() {
   if (flushTimer)
@@ -510,12 +505,12 @@ import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2 } from "node:fs";
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0)
-    return "dead";
+    return false;
   try {
-    rpcIdentityProcessKill(pid, 0);
-    return "alive";
-  } catch (error) {
-    return error.code === "ESRCH" ? "dead" : "inconclusive";
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
   }
 }
 var RPC_IDENTITY_SKEW_TOLERANCE_MS = 120000;
@@ -524,7 +519,6 @@ var PS_PROBE_TIMEOUT_MS = 1000;
 var OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 var rpcIdentityReadFileSync = readFileSync2;
 var rpcIdentityExecFileSync = execFileSync;
-var rpcIdentityProcessKill = process.kill;
 var rpcProcessListExecFileSync = execFileSync;
 var rpcIdentityPlatform = process.platform;
 var rpcIdentityNowMs = () => Date.now();
@@ -586,17 +580,17 @@ function commandLooksLikeOpenCode(command) {
 }
 function isPidIdentityPlausible(record) {
   if (!Number.isInteger(record.pid) || record.pid <= 0)
-    return "implausible";
+    return false;
   if (Number.isFinite(record.started_at) && record.started_at > 0) {
     const processStartTime = rpcIdentityPlatform === "linux" ? readLinuxProcessStartTime(record.pid) : readPsProcessStartTime(record.pid);
     if (processStartTime === null)
-      return "inconclusive";
-    return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS ? "plausible" : "implausible";
+      return true;
+    return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS;
   }
   const command = rpcIdentityPlatform === "linux" ? readLinuxProcessCommand(record.pid) : readPsProcessCommand(record.pid);
   if (command === null)
-    return "inconclusive";
-  return commandLooksLikeOpenCode(command) ? "plausible" : "implausible";
+    return true;
+  return commandLooksLikeOpenCode(command);
 }
 function commandLooksLikePi(command) {
   const normalized = command.trim().toLowerCase().replaceAll("\\", "/");
@@ -638,6 +632,9 @@ function inspectLivePiProcesses() {
     };
   }
 }
+function discoverLivePiProcessIds() {
+  return inspectLivePiProcesses().processIds;
+}
 function parseRpcPortFile(content, fallbackPid = 0) {
   const trimmed = content.trim();
   if (!trimmed)
@@ -645,13 +642,13 @@ function parseRpcPortFile(content, fallbackPid = 0) {
   if (trimmed.startsWith("{")) {
     try {
       const parsed = JSON.parse(trimmed);
-      const port2 = Number(parsed.port);
+      const port = Number(parsed.port);
       const pid = Number(parsed.pid);
       const startedAt = Number(parsed.started_at);
-      if (!isValidPort(port2) || !Number.isInteger(pid) || pid <= 0)
+      if (!isValidPort(port) || !Number.isInteger(pid) || pid <= 0)
         return null;
       return {
-        port: port2,
+        port,
         pid,
         started_at: Number.isFinite(startedAt) ? startedAt : 0,
         token: typeof parsed.token === "string" ? parsed.token : undefined,
@@ -1030,7 +1027,6 @@ var CATEGORY_DEFAULT_TTL = {
 // ../plugin/src/features/magic-context/memory/project-identity.ts
 var TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 var identityCache = new Map;
-var linkedGitWorktreeCache = new Map;
 var lastKnownGitIdentityCache = new Map;
 var directoryFallbackCache = new Map;
 var transientFailureCooldown = new Map;
@@ -1305,7 +1301,6 @@ var MIGRATIONS = [
                     status TEXT NOT NULL DEFAULT 'active',
                     promoted_at INTEGER NOT NULL,
                     source_candidate_ids TEXT DEFAULT '[]',
-                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -2332,7 +2327,6 @@ var MIGRATIONS = [
                     last_observed_at INTEGER,
                     answer_refreshed_at INTEGER,
                     source_candidate_ids TEXT NOT NULL DEFAULT '[]',
-                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -3154,9 +3148,229 @@ var MIGRATIONS = [
         ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
       }
     }
+  },
+  {
+    version: 78,
+    description: "add migration_pending journal for crash-safe cross-harness session migration",
+    up(db) {
+      db.exec(`
+                CREATE TABLE IF NOT EXISTS migration_pending (
+                    migration_key TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    target_harness TEXT NOT NULL,
+                    pi_session_id TEXT NOT NULL,
+                    final_path TEXT NOT NULL,
+                    stage_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    phase TEXT NOT NULL CHECK (phase IN ('staged', 'db_committed')),
+                    created_at INTEGER NOT NULL
+                );
+            `);
+    }
+  },
+  {
+    version: 79,
+    description: "record m[0] system-hash and model-key comparison telemetry",
+    up(db) {
+      if (!tableExists(db, "transform_decisions"))
+        return;
+      ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+      ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+      ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+      ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
+    }
+  },
+  {
+    version: 80,
+    description: "record observed m[0] tool-set hash comparisons",
+    up(db) {
+      if (!tableExists(db, "transform_decisions"))
+        return;
+      ensureColumn(db, "transform_decisions", "m0_tool_set_hash_prev", "TEXT");
+      ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
+    }
+  },
+  {
+    version: 81,
+    description: "persist last-known-good transform snapshots across restarts",
+    up(db) {
+      db.exec(`
+                CREATE TABLE IF NOT EXISTS lkg_slots (
+                    session_id TEXT PRIMARY KEY,
+                    json_prefix TEXT NOT NULL,
+                    input_id_seq TEXT NOT NULL,
+                    input_content_digests TEXT NOT NULL,
+                    input_content_signatures TEXT,
+                    last_input_message_id TEXT NOT NULL,
+                    model_key TEXT,
+                    provider_key TEXT,
+                    captured_at INTEGER NOT NULL,
+                    row_version INTEGER,
+                    capture_sequence INTEGER
+                );
+            `);
+    }
+  },
+  {
+    version: 82,
+    description: "record the origin of memory file-independent mappings",
+    up(db) {
+      if (!tableExists(db, "memory_verifications"))
+        return;
+      ensureColumn(db, "memory_verifications", "mapping_origin", "TEXT NOT NULL DEFAULT 'mapper'");
+    }
+  },
+  {
+    version: 83,
+    description: "add indexed rowid access for message FTS content",
+    up(db) {
+      db.exec(`
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+                    session_id TEXT NOT NULL,
+                    message_ordinal INTEGER NOT NULL,
+                    fts_rowid INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, message_ordinal)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    watermark_rowid INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+                    (id, watermark_rowid, completed, updated_at)
+                VALUES (1, 0, 0, 0);
+            `);
+    }
+  },
+  {
+    version: 84,
+    description: "persist protected-token floor state per session",
+    up(db) {
+      if (!tableExists(db, "session_meta"))
+        return;
+      ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+      ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
+    }
+  },
+  {
+    version: 85,
+    description: "relabel OpenCode 1.x mis-tagged opencode2 session rows",
+    up(db) {
+      relabelOpenCode2HarnessRows(db);
+    }
   }
 ];
 var LATEST_MIGRATION_VERSION = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
+function tableHasHarnessColumn(db, name) {
+  if (!tableExists(db, name))
+    return false;
+  return db.prepare(`PRAGMA table_info(${name})`).all().some((column) => column.name === "harness");
+}
+var V85_OPENCODE2_RELABEL_TABLES = [
+  "tags",
+  "pending_ops",
+  "source_contents",
+  "compartments",
+  "compartment_chunk_embeddings",
+  "session_projects",
+  "compartment_events",
+  "compression_depth",
+  "session_facts",
+  "primer_candidates",
+  "notes",
+  "message_history_index",
+  "message_history_source",
+  "pending_session_cleanup",
+  "message_history_orphan_sweep",
+  "session_meta",
+  "subagent_invocations",
+  "historian_runs",
+  "transform_decisions",
+  "recomp_compartments",
+  "recomp_facts"
+];
+var V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"];
+function deleteLosingOpenCode2Twin(db, table, joinColumns, newerPredicate) {
+  if (!tableHasHarnessColumn(db, table))
+    return;
+  const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
+  const o2On = naturalJoin ? `${naturalJoin} AND oc.harness = 'opencode'` : `oc.harness = 'opencode'`;
+  const ocOn = naturalJoin ? `${naturalJoin} AND o2.harness = 'opencode2'` : `o2.harness = 'opencode2'`;
+  db.exec(`
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT o2.rowid
+            FROM ${table} AS o2
+            JOIN ${table} AS oc
+              ON ${o2On}
+            WHERE o2.harness = 'opencode2'
+              AND NOT (${newerPredicate})
+        );
+        DELETE FROM ${table}
+        WHERE rowid IN (
+            SELECT oc.rowid
+            FROM ${table} AS oc
+            JOIN ${table} AS o2
+              ON ${ocOn}
+            WHERE oc.harness = 'opencode'
+              AND (${newerPredicate})
+        );
+    `);
+}
+function relabelOpenCode2HarnessRows(db) {
+  deleteLosingOpenCode2Twin(db, "session_projects", ["session_id"], "o2.updated_at > oc.updated_at");
+  deleteLosingOpenCode2Twin(db, "primer_candidates", ["project_path", "session_id", "source_start_message_id", "source_end_message_id"], "o2.created_at > oc.created_at");
+  deleteLosingOpenCode2Twin(db, "transform_decisions", ["session_id", "message_id"], "o2.ts_ms > oc.ts_ms");
+  deleteLosingOpenCode2Twin(db, "message_history_orphan_sweep", [], "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)");
+  if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
+    db.exec(`
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode2'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
+              )
+              AND NOT (
+                  (status = 'completed'
+                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                        != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
+                      AND COALESCE(started_at, -1) > COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
+                          -1
+                      )
+                  )
+              );
+            DELETE FROM session_project_backfill_state
+            WHERE harness = 'opencode'
+              AND EXISTS (
+                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
+              )
+              AND (
+                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
+                    AND status != 'completed')
+                  OR (
+                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
+                      AND COALESCE(
+                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
+                          -1
+                      ) > COALESCE(started_at, -1)
+                  )
+              );
+        `);
+  }
+  const tables = new Set([
+    ...V85_OPENCODE2_RELABEL_TABLES,
+    ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES
+  ]);
+  for (const table of tables) {
+    if (!tableHasHarnessColumn(db, table))
+      continue;
+    db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
+  }
+}
 function ensureMigrationsTable(db) {
   db.exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3570,7 +3784,7 @@ function getSchemaFenceRejection() {
 function getMigrationOnOpenRefusal() {
   return lastMigrationOnOpenRefusal;
 }
-var LATEST_SUPPORTED_VERSION = 77;
+var LATEST_SUPPORTED_VERSION = 85;
 var PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
 var defaultStoragePermissionFs = { chmodSync, mkdirSync: mkdirSync3 };
 var storagePermissionFs = defaultStoragePermissionFs;
@@ -3683,21 +3897,21 @@ function enforceSchemaFence(db, dbPath, latestSupportedVersion) {
   log(`[magic-context] storage fatal: refusing to open ${dbPath}; upstream migration lane v${persistedVersion} is newer than this binary supports (max v${latestSupportedVersion}). A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart.`);
   return false;
 }
-function unreadableDiscovery(path3, arm) {
+function unreadableDiscovery(path, arm) {
   return {
     state: "unreadable",
     serverPids: [],
     staleFiles: [],
-    unreadableFile: path3,
+    unreadableFile: path,
     unreadableArm: arm
   };
 }
 var RPC_DISCOVERY_PARSE_GRACE_MS = 10 * 60 * 1000;
 var defaultRpcDiscoveryFs = {
-  readdirSync: (path3, options) => options?.withFileTypes ? readdirSync(path3, { withFileTypes: true }) : readdirSync(path3),
-  readFileSync: (path3, encoding) => String(readFileSync3(path3, encoding)),
-  statSync: (path3) => ({ mtimeMs: statSync2(path3).mtimeMs }),
-  unlinkSync: (path3) => unlinkSync2(path3)
+  readdirSync: (path, options) => options?.withFileTypes ? readdirSync(path, { withFileTypes: true }) : readdirSync(path),
+  readFileSync: (path, encoding) => String(readFileSync3(path, encoding)),
+  statSync: (path) => ({ mtimeMs: statSync2(path).mtimeMs }),
+  unlinkSync: (path) => unlinkSync2(path)
 };
 var rpcDiscoveryFs = defaultRpcDiscoveryFs;
 function invalidDiscoveryReason(raw) {
@@ -3767,7 +3981,6 @@ function inspectRpcServerDiscovery(storageDir) {
   }
   const pids = new Set;
   const staleFiles = [];
-  const inconclusivePids = new Set;
   for (const portFile of portFiles) {
     let raw;
     try {
@@ -3787,15 +4000,10 @@ function inspectRpcServerDiscovery(storageDir) {
         return junk;
       continue;
     }
-    const liveness = isPidAlive(record.pid);
-    const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
-    if (liveness === "alive" && identity === "plausible") {
+    if (isPidAlive(record.pid) && isPidIdentityPlausible(record))
       pids.add(record.pid);
-    } else if (liveness === "dead" || identity === "implausible") {
+    else
       staleFiles.push(portFile);
-    } else {
-      inconclusivePids.add(record.pid);
-    }
   }
   for (const staleFile of staleFiles) {
     try {
@@ -3808,28 +4016,7 @@ function inspectRpcServerDiscovery(storageDir) {
   if (serverPids.length > 0) {
     return { state: "live", serverPids, staleFiles };
   }
-  const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
-  if (uncertainPids.length > 0) {
-    return {
-      state: "inconclusive",
-      serverPids: [],
-      staleFiles,
-      inconclusivePids: uncertainPids
-    };
-  }
   return { state: "stale", serverPids: [], staleFiles };
-}
-function formatInconclusiveOpenCodeMigrationWarning(dbPath, pids) {
-  return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
-}
-function logInconclusiveMigrationProbes(dbPath, discovery, piProbeState) {
-  const uncertainPids = discovery.inconclusivePids ?? [];
-  if (uncertainPids.length > 0) {
-    log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
-  }
-  if (piProbeState === "unreadable") {
-    log(`[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`);
-  }
 }
 function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) {
   const persistedVersion = getPersistedSchemaVersion(db);
@@ -3838,11 +4025,9 @@ function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) 
     return true;
   }
   const discovery = inspectRpcServerDiscovery(dbDir);
-  const piDiscovery = inspectLivePiProcesses();
-  const piPids = piDiscovery.processIds;
-  if ((discovery.state === "absent" || discovery.state === "stale" || discovery.state === "inconclusive") && piPids.length === 0) {
+  const piPids = discoverLivePiProcessIds();
+  if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
     lastMigrationOnOpenRefusal = null;
-    logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery.state);
     return true;
   }
   const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort((left, right) => left - right);
@@ -3860,10 +4045,10 @@ function enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion) 
     log(`[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`);
   } else {
     const blockers = [
-      ...discovery.serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
-      ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`)
+      ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
+      ...piPids.map((pid) => `Pi harness PID ${pid}`)
     ];
-    log(`[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`);
+    log(`[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`);
   }
   return false;
 }
@@ -4081,7 +4266,6 @@ function initializeDatabase(db) {
       last_observed_at INTEGER,
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
-      source_candidate_provenance TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -4717,11 +4901,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "primer_candidates", "question_embedding", "BLOB");
   ensureColumn(db, "primer_candidates", "question_embedding_model_id", "TEXT");
   ensureColumn(db, "primers", "question_embedding_model_id", "TEXT");
-  ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
-  const hasUserMemoriesTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_memories'").get();
-  if (hasUserMemoriesTable) {
-    ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
-  }
   db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_primer_candidates_occurrence
         ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
@@ -5136,7 +5315,7 @@ function writeDshLivenessMarker(opts) {
     started_at: opts.startedAt ?? Date.now(),
     ...opts.instanceId === undefined ? {} : { instance_id: `dsh:${opts.instanceId}` }
   };
-  const path3 = markerPath({
+  const path = markerPath({
     storageDir: opts.storageDir,
     projectPath: opts.projectPath,
     pid
@@ -5144,12 +5323,12 @@ function writeDshLivenessMarker(opts) {
   mkdirSync4(join5(opts.storageDir, "rpc", projectHash(opts.projectPath)), {
     recursive: true
   });
-  writeFileSync2(path3, JSON.stringify(record), { encoding: "utf8", mode: 384 });
-  return path3;
+  writeFileSync2(path, JSON.stringify(record), { encoding: "utf8", mode: 384 });
+  return path;
 }
-function removeDshLivenessMarker(path3) {
+function removeDshLivenessMarker(path) {
   try {
-    rmSync2(path3, { force: true });
+    rmSync2(path, { force: true });
   } catch {}
 }
 
@@ -5204,14 +5383,14 @@ function initializeDshAdapterTables(db) {
 
 // src/host/bootstrap.ts
 async function bootstrapDshStorage(opts) {
-  const log2 = opts.log ?? (() => {});
+  const log = opts.log ?? (() => {});
   setDshHarness();
   const migrationLogger = {
-    warn: (message) => log2(`[magic-context] config migration: ${message}`)
+    warn: (message) => log(`[magic-context] config migration: ${message}`)
   };
   const migrationWarnings = migrateMagicContextConfigLocations(opts.directory, migrationLogger);
   for (const warning of migrationWarnings) {
-    log2(`[magic-context] config migration warning: ${warning}`);
+    log(`[magic-context] config migration warning: ${warning}`);
   }
   setSqlitePragmaConfig({ cacheSizeMb: 64, mmapSizeMb: 0 });
   const storageDir = opts.storageDirOverride ?? getMagicContextStorageDir();
@@ -5241,7 +5420,7 @@ async function bootstrapDshStorage(opts) {
       port: opts.port,
       instanceId: process.pid.toString(16)
     });
-    log2(`[magic-context] dsh liveness marker: ${markerPathOut}`);
+    log(`[magic-context] dsh liveness marker: ${markerPathOut}`);
     return { kind: "ok", db, storageDir, livenessPath: markerPathOut };
   } catch (error) {
     removeDshLivenessMarker(ownLivenessPath);
@@ -5294,7 +5473,7 @@ function hash8(input) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 export {
-  name,
+  apply,
   defaultHomeHash,
-  apply
+  name
 };

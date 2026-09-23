@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@magic-context/core/*": ["packages/plugin/src/*"],
+      "@cortexkit/retina-local-fs/*": [
+        "packages/retina-local-fs/dist/types/*",
+        "packages/retina-local-fs/src/*"
+      ],
+      "@cortexkit/opencode-magic-context": ["packages/plugin/src/index.ts"],
+      "dsh-magic-context-adapter": ["packages/adapter-api/src/index.ts"],
+      "dsh-magic-context-adapter/*": ["packages/adapter-api/src/*"]
+    }
+  }
+}

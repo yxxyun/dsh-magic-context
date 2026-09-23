@@ -6,10 +6,11 @@
  * parsing). Path semantics follow dsh-reference:
  *
  *   - DSH home: `$DSH_HOME` (empty = unset) → `~/.dsh`            (H.3, I.1)
- *   - system standard preset: `<dsh install>/config/agent-presets/standard/
- *     agent.cordis.yml`; the install is found with the profile/install double
- *     anchor from A.1 (install first, then profile dirs), falling back to the
- *     `dsh` executable on PATH.
+ *   - the DSH install root: the profile's installed `@deepseek-ai/dsh`, or a
+ *     `dsh` on PATH. NOTE: there is no on-disk stock preset any more — from
+ *     0.1.7 an agent preset is a declaration row carried by a bundle patch
+ *     (`@deepseek-ai/dsh-web-app/presets/<id>.patch.yml`), so this module
+ *     locates the INSTALL and reads the preset patch out of it.
  *   - user config: `~/.config/cortexkit/magic-context.jsonc`       (§2.1)
  *   - storage dir: `~/.local/share/cortexkit/magic-context/`       (§2.1)
  */
@@ -31,19 +32,32 @@ import { randomBytes } from "node:crypto";
 /** npm package identity of this adapter (checked against profile bundles). */
 export const MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 
-/** The exact DSH release this adapter's compat layer (compat/dsh-0.1) pins. */
-export const DSH_COMPAT_EXPECTED_VERSION = "0.1.0-rc.6";
+/**
+ * The DSH release line this adapter's compat layer (compat/dsh-0.1) targets.
+ * Matched by prefix, not equality: the desktop app ships alpha/beta builds
+ * (`0.1.7-alpha.2`) whose patch suffix changes without any compat impact.
+ */
+export const DSH_COMPAT_EXPECTED_VERSION = "0.1.7";
 
 /** Installed-package identity of the DSH runtime. */
 export const DSH_PACKAGE = "@deepseek-ai/dsh";
 
-/** System preset directory inside a dsh install. */
-export const STOCK_PRESET_REL = join(
-  "config",
-  "agent-presets",
-  "standard",
-  "agent.cordis.yml",
-);
+/** Package identity of the bundle that ships the stock agent presets. */
+export const DSH_WEB_APP_PACKAGE = "@deepseek-ai/dsh-web-app";
+
+/**
+ * Preset patch path inside `@deepseek-ai/dsh-web-app`, relative to its root.
+ * The `standard` preset (the one this bundle overrides) lives here.
+ */
+export const STOCK_PRESET_REL = join("presets", "standard.patch.yml");
+
+/**
+ * Whether an installed DSH version is one this adapter supports. Compares the
+ * release line (`major.minor.patch`), ignoring any `-alpha.N` / `-rc.N` suffix.
+ */
+export function isSupportedDshVersion(version: string): boolean {
+  return version.split("-")[0] === DSH_COMPAT_EXPECTED_VERSION;
+}
 
 /**
  * Resolve the DSH home directory. Priority: `$DSH_HOME` (empty string counts
@@ -58,7 +72,7 @@ export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
 export interface DshInstallLocateResult {
   /** Package root of the resolved `@deepseek-ai/dsh` install (if found). */
   readonly dshInstallDir?: string;
-  /** Absolute path of the system standard `agent.cordis.yml` (if found). */
+  /** Absolute path of the shipped standard preset patch (if found). */
   readonly stockPresetPath?: string;
   /** Every candidate probed, for the fail diagnosis. */
   readonly tried: readonly string[];
@@ -68,13 +82,13 @@ export interface DshInstallLocateOptions {
   readonly dshHome: string;
   /** Explicit install dir override (tests / `--dsh-install`). */
   readonly dshInstallDir?: string;
-  /** Explicit stock preset override (tests / `--stock-preset`). */
+  /** Explicit stock preset patch override (tests / `--stock-preset`). */
   readonly stockPresetPath?: string;
   readonly env?: NodeJS.ProcessEnv;
 }
 
 /**
- * Locate the DSH install and the system standard preset.
+ * Locate the DSH install and the shipped standard preset patch.
  *
  * Anchors (dsh-reference §A.1 "模块解析双锚点"): the install is resolved from
  * the dsh install first, then from profile directories. Concrete candidate
@@ -85,6 +99,10 @@ export interface DshInstallLocateOptions {
  *      (healProfilesModuleFallback);
  *   3. every `$DSH_HOME/profiles/<name>/node_modules/…` (profile anchor);
  *   4. the `dsh` executable on PATH, walked up to its package root.
+ *
+ * A candidate counts only when it is the DSH package root AND carries the
+ * shipped preset patch — an install missing it cannot be composed against, and
+ * reporting it as located would move the failure somewhere less legible.
  */
 export function locateDshInstall(
   opts: DshInstallLocateOptions,
@@ -119,12 +137,35 @@ export function locateDshInstall(
 
   for (const candidate of installCandidates) {
     tried.push(candidate);
-    const stock = join(candidate, STOCK_PRESET_REL);
-    if (isDshInstallRoot(candidate) && existsSync(stock)) {
+    if (!isDshInstallRoot(candidate)) continue;
+    // The preset patch lives in the dsh-web-app bundle, which may be nested
+    // inside the install's own node_modules or hoisted beside the install.
+    const stock = findStockPresetPatch(candidate);
+    if (stock !== undefined) {
       return { dshInstallDir: candidate, stockPresetPath: stock, tried };
     }
   }
   return { tried };
+}
+
+/**
+ * Find the shipped `standard` preset patch relative to a DSH install root.
+ * Probes the install's own `node_modules` first (the layout a profile install
+ * produces), then walks up a few levels for a hoisted layout (bun/pnpm hoist
+ * the workspace into a shared `node_modules`).
+ */
+export function findStockPresetPatch(dshInstallDir: string): string | undefined {
+  const rel = join(DSH_WEB_APP_PACKAGE, STOCK_PRESET_REL);
+  const candidates = [
+    join(dshInstallDir, "node_modules", rel),
+    join(dshInstallDir, "..", rel),
+    join(dshInstallDir, "..", "..", rel),
+    join(dshInstallDir, "..", "..", "..", rel),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 /** Whether a directory is the `@deepseek-ai/dsh` package root. */
@@ -176,22 +217,21 @@ function resolvePackageRoot(binPath: string): string | undefined {
 
 // ── Magic Context paths ─────────────────────────────────────────────────────
 
-/** `$DSH_HOME/.agent-presets` — user preset root (dsh-reference §A.6). */
-export function agentPresetsRoot(dshHome: string): string {
+/**
+ * `$DSH_HOME/.agent-presets` — the LEGACY file-backed preset root.
+ *
+ * Nothing in DSH reads this directory any more (0.1.7 moved presets to inline
+ * `@deepseek-ai/dsh-agent-preset` declaration rows). It survives here only so
+ * `setup` can detect and report a leftover directory from an older install
+ * instead of silently leaving a preset that no longer loads.
+ */
+export function legacyAgentPresetsRoot(dshHome: string): string {
   return join(dshHome, ".agent-presets");
 }
 
-/** `$DSH_HOME/.agent-presets/magic-standard` — this adapter's thin preset. */
-export function magicStandardDir(dshHome: string): string {
-  return join(agentPresetsRoot(dshHome), "magic-standard");
-}
-
-export function magicStandardAgentCordisPath(dshHome: string): string {
-  return join(magicStandardDir(dshHome), "agent.cordis.yml");
-}
-
-export function magicStandardPresetYamlPath(dshHome: string): string {
-  return join(magicStandardDir(dshHome), "preset.yml");
+/** `$DSH_HOME/.agent-presets/magic-standard` — this adapter's legacy preset. */
+export function legacyMagicStandardDir(dshHome: string): string {
+  return join(legacyAgentPresetsRoot(dshHome), "magic-standard");
 }
 
 // ── file helpers ────────────────────────────────────────────────────────────
@@ -271,7 +311,7 @@ export function stringFlag(
 
 /** Absolute path of one bundled entry file (`dist/entries/<name>.js`) of THIS package. */
 export function magicEntryPath(
-  entry: "agent" | "compaction" | "commands" | "tools" | "remote" | "preset-include",
+  entry: "agent" | "compaction" | "commands" | "tools" | "remote",
 ): string {
   let dir = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 12 && dir !== dirname(dir); depth += 1) {

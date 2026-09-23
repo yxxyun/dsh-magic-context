@@ -1,5 +1,3 @@
-import"./agent-wckvcay0.js";
-
 // src/compat/dsh-0.1/compaction.ts
 import {
   BasicCompactionEngine
@@ -35,6 +33,6 @@ function readHostSummarizeHook(ctx) {
 // src/entries/compaction.ts
 var compaction_default = MagicCompactionEngine;
 export {
-  compaction_default as default,
-  MagicCompactionEngine
+  MagicCompactionEngine,
+  compaction_default as default
 };

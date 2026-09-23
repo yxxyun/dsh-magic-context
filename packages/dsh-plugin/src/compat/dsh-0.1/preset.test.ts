@@ -1,16 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { join } from "node:path";
 import {
+  MAGIC_AGENT_ROW_ID,
+  MAGIC_COMPACTION_ROW_ID,
+  STOCK_COMPACTION_BASIC_ROW,
+  STOCK_PRESET_CONFIG_ID,
+  STOCK_PRESET_ROW_ID,
   applyMagicPatches,
-  buildThinPresetEntries,
+  buildPresetPatchEntries,
+  buildPresetPlugins,
+  findPresetRow,
   scanStockPresetLayout,
 } from "./preset";
 
-/** Minimal stand-in for the stock standard preset's compaction group. */
-function stockLayout(overrides: Record<string, unknown> = {}): Record<string, unknown>[] {
+/** Minimal stand-in for the shipped standard preset's plugin list. */
+function stockPlugins(extra: Record<string, unknown>[] = []): Record<string, unknown>[] {
   return [
     { id: "persona", name: "@deepseek-ai/dsh-persona", config: { text: "x" } },
     {
@@ -25,20 +29,29 @@ function stockLayout(overrides: Record<string, unknown> = {}): Record<string, un
       ],
     },
     { id: "tool-ask-user", name: "@deepseek-ai/dsh-tool-ask-user" },
-    ...(overrides.extra ?? []),
+    ...extra,
   ];
 }
 
-describe("magic-standard thin preset (guarded patch)", () => {
-  it("disables compaction-basic and inserts the Magic engine into the group", () => {
-    const patched = applyMagicPatches(stockLayout(), {
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
-    });
-    const group = patched.find((row) => row.id === "compaction");
+/** The shipped preset patch layer: one insert carrying the declaration row. */
+function stockPatchLayer(): Record<string, unknown>[] {
+  return [
+    {
+      id: STOCK_PRESET_ROW_ID,
+      name: "@deepseek-ai/dsh-agent-preset",
+      config: { id: STOCK_PRESET_CONFIG_ID, order: 1, plugins: stockPlugins() },
+    },
+  ];
+}
+
+describe("magic standard preset override", () => {
+  it("disables compaction-basic and folds the Magic engine into the group", () => {
+    const plugins = buildPresetPlugins({ stockPlugins: stockPlugins() });
+    const group = findPresetRow(plugins, "compaction");
     const children = group?.config as Record<string, unknown>[];
-    const basic = children.find((row) => row.id === "compaction-basic");
+    const basic = children.find((row) => row.id === STOCK_COMPACTION_BASIC_ROW.id);
     expect(basic?.disabled).toBe(true);
-    const engine = children.find((row) => row.id === "magic-compaction");
+    const engine = children.find((row) => row.id === MAGIC_COMPACTION_ROW_ID);
     expect(engine?.name).toBe("dsh-magic-context/compaction");
     expect((engine?.config as { auto?: boolean })?.auto).toBe(true);
     // Stock siblings untouched.
@@ -46,29 +59,85 @@ describe("magic-standard thin preset (guarded patch)", () => {
     expect(children.some((row) => row.id === "tool-result-pruner" && !row.disabled)).toBe(true);
   });
 
-  it("exactly one compaction provider remains", () => {
-    const patched = applyMagicPatches(stockLayout(), {
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
+  it("appends the Magic agent row last, outside the compaction group", () => {
+    const plugins = buildPresetPlugins({ stockPlugins: stockPlugins() });
+    expect(plugins[plugins.length - 1].id).toBe(MAGIC_AGENT_ROW_ID);
+    expect(plugins[plugins.length - 1].name).toBe("dsh-magic-context/agent");
+    // The engine must live INSIDE the group so it shares the compaction realm.
+    const group = findPresetRow(plugins, "compaction");
+    expect((group?.config as Record<string, unknown>[]).some((row) => row.id === MAGIC_AGENT_ROW_ID)).toBe(
+      false,
+    );
+  });
+
+  it("preserves the stock list verbatim and in order", () => {
+    const stock = stockPlugins();
+    const plugins = buildPresetPlugins({ stockPlugins: stock });
+    // Everything except the Magic agent row is the stock list, same ids/order.
+    expect(plugins.slice(0, stock.length).map((row) => row.id)).toEqual(stock.map((row) => row.id));
+    // The input is not mutated (the patch layer is shared state).
+    expect((stock[1].config as Record<string, unknown>[]).some((row) => row.id === MAGIC_COMPACTION_ROW_ID)).toBe(
+      false,
+    );
+    expect((stock[1].config as Record<string, unknown>[])[0].disabled).toBeUndefined();
+  });
+
+  it("names absolute magics entry paths as file:// URLs", () => {
+    const absoluteAgent = process.platform === "win32"
+      ? "D:\\pkg\\dist\\entries\\agent.js"
+      : "/pkg/dist/entries/agent.js";
+    const plugins = buildPresetPlugins({
+      stockPlugins: stockPlugins(),
+      magicAgentEntry: absoluteAgent,
+      magicEngineEntry: process.platform === "win32"
+        ? "D:\\pkg\\dist\\entries\\compaction.js"
+        : "/pkg/dist/entries/compaction.js",
     });
-    const group = patched.find((row) => row.id === "compaction");
+    const agent = plugins[plugins.length - 1];
+    expect(agent.name).toBe(pathToFileURL(absoluteAgent).href);
+    const group = findPresetRow(plugins, "compaction");
+    const engine = (group?.config as Record<string, unknown>[]).find(
+      (row) => row.id === MAGIC_COMPACTION_ROW_ID,
+    );
+    expect(String(engine?.name).startsWith("file://")).toBe(true);
+  });
+
+  it("buildPresetPatchEntries emits an override row (id, no insert)", () => {
+    const rows = buildPresetPatchEntries({ stockPlugins: stockPlugins() });
+    expect(rows.length).toBe(1);
+    const row = rows[0];
+    expect(row.id).toBe(STOCK_PRESET_ROW_ID);
+    expect(row.name).toBe("@deepseek-ai/dsh-agent-preset");
+    // An override must NOT carry `insert` — that would duplicate the row.
+    expect(row.insert).toBeUndefined();
+    const config = row.config as { id: string; order: number; plugins: Record<string, unknown>[] };
+    expect(config.id).toBe(STOCK_PRESET_CONFIG_ID);
+    expect(config.order).toBe(1);
+    expect(config.plugins.length).toBeGreaterThan(0);
+  });
+
+  it("applyMagicPatches leaves exactly one enabled compaction provider", () => {
+    const patched = applyMagicPatches(stockPatchLayer(), { stockPlugins: stockPlugins() });
+    const row = patched.find((entry) => entry.id === STOCK_PRESET_ROW_ID);
+    const plugins = (row?.config as { plugins: Record<string, unknown>[] }).plugins;
+    const group = findPresetRow(plugins, "compaction");
     const providers = (group?.config as Record<string, unknown>[])
-      .filter((row) => !row.disabled)
-      .filter((row) => String(row.id).includes("compaction"));
-    expect(providers.map((row) => row.id)).toEqual(["magic-compaction"]);
+      .filter((child) => !child.disabled)
+      .filter((child) => String(child.id).includes("compaction"));
+    expect(providers.map((child) => child.id)).toEqual([MAGIC_COMPACTION_ROW_ID]);
   });
 
   it("contract scan rejects unknown layouts (fail closed)", () => {
-    expect(scanStockPresetLayout(stockLayout())).toBeUndefined();
+    expect(scanStockPresetLayout(stockPlugins())).toBeUndefined();
     expect(scanStockPresetLayout([])).toBe("compaction group row missing");
+
     // Rewrite the NESTED compaction-basic row inside the group's config.
-    const renamedBasic = stockLayout().map((row) =>
+    const renamedBasic = stockPlugins().map((row) =>
       row.id === "compaction"
         ? {
             ...row,
             config: (row.config as Record<string, unknown>[]).map((child) =>
-              child.id === "compaction-basic"
-                ? { ...child, name: "some-other-package" }
-                : child,
+              child.id === "compaction-basic" ? { ...child, name: "some-other-package" } : child,
             ),
           }
         : row,
@@ -76,100 +145,43 @@ describe("magic-standard thin preset (guarded patch)", () => {
     expect(scanStockPresetLayout(renamedBasic)).toBe("compaction-basic name mismatch");
     expect(
       scanStockPresetLayout(
-        stockLayout().map((row) =>
-          row.id === "compaction"
-            ? { ...row, isolate: { compaction: true } }
-            : row,
+        stockPlugins().map((row) =>
+          row.id === "compaction" ? { ...row, isolate: { compaction: true } } : row,
         ),
       ),
     ).toBe("compaction group isolate realms mismatch");
   });
 
-  it("buildThinPresetEntries emits the include row with guarded patches", () => {
-    const thin = buildThinPresetEntries({
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
-      magicRows: [{ id: "magic-agent", name: "dsh-magic-context/agent" }],
-    });
-    expect(thin.length).toBe(1);
-    const include = thin[0];
-    expect(include.id).toBe("magic-include-standard");
-    // Without an explicit entry the row falls back to the raw include — only
-    // for offline config tooling; setup/doctor always pass the no-write entry.
-    expect(include.name).toBe("@deepseek-ai/cordis-plugin-include");
-    const config = include.config as { path: string; patches: unknown[] };
-    // Windows drive paths would parse as a URL scheme; the emitted include
-    // path is the universal file:// URL form.
-    expect(config.path).toBe("file:///stock/standard/agent.cordis.yml");
-    expect(config.patches).toHaveLength(3);
-  });
-
-  it("include row names this package's no-write entry when includeEntry is set", () => {
-    const thin = buildThinPresetEntries({
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
-      includeEntry: "D:/pkg/dist/entries/preset-include.js",
-      magicRows: [{ id: "magic-agent", name: "dsh-magic-context/agent" }],
-    });
-    const include = thin[0];
-    // The shipped stock file must be mounted through a write()-no-op tree:
-    // the raw include inherits the loader's write-back, which truncates the
-    // shipped composition to `[]` on the first agent teardown.
-    // pathToFileURL 语义：POSIX 上 "D:/..." 是相对路径（相对 cwd 解析）；
-    // Windows 上是驱动器绝对路径。两侧都断言实现与 pathToFileURL 一致。
-    expect(include.name).toBe(pathToFileURL("D:/pkg/dist/entries/preset-include.js").href);
-    const config = include.config as { path: string; patches: unknown[] };
-    expect(config.path).toBe("file:///stock/standard/agent.cordis.yml");
-    expect(config.patches).toHaveLength(3);
-  });
-
-  it("emits absolute magic-row names as file:// URLs", () => {
-    const thin = buildThinPresetEntries({
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
-      includeEntry: "D:/pkg/dist/entries/preset-include.js",
-      magicRows: [
-        {
-          id: "magic-agent",
-          name: "D:\\pkg\\dist\\entries\\agent.js",
-        },
-      ],
-    });
-    const config = thin[0].config as { patches: { insert: Record<string, unknown>[] }[] };
-    const magicAgent = (config.patches[2] as { insert: Record<string, unknown>[] }).insert[0];
-    // 绝对路径才转 file:// URL；夹具按平台取绝对路径（Windows 驱动器盘符 /
-    // POSIX 根路径），期望与 pathToFileURL 一致。
-    const absoluteEntry = process.platform === "win32"
-      ? "D:\\pkg\\dist\\entries\\agent.js"
-      : "/pkg/dist/entries/agent.js";
-    const magicRows = [
-      { id: "magic-agent", name: absoluteEntry },
-    ];
-    const thin2 = buildThinPresetEntries({
-      stockPresetPath: "/stock/standard/agent.cordis.yml",
-      includeEntry: "D:/pkg/dist/entries/preset-include.js",
-      magicRows,
-    });
-    const config2 = thin2[0].config as { patches: { insert: Record<string, unknown>[] }[] };
-    const agent2 = (config2.patches[2] as { insert: Record<string, unknown>[] }).insert[0];
-    expect(agent2.name).toBe(
-      pathToFileURL(process.platform === "win32" ? "D:/pkg/dist/entries/agent.js" : "/pkg/dist/entries/agent.js").href,
+  it("contract scan refuses a list that already carries the Magic rows", () => {
+    // An override must not double-insert; a re-patched list is a layout error.
+    const already = stockPlugins().map((row) =>
+      row.id === "compaction"
+        ? {
+            ...row,
+            config: [
+              ...(row.config as Record<string, unknown>[]),
+              { id: MAGIC_COMPACTION_ROW_ID, name: "dsh-magic-context/compaction" },
+            ],
+          }
+        : row,
     );
-    // 原夹具（Windows 专属路径）在 POSIX 上按相对路径原样透传。
-    expect(magicAgent.name).toBe(
-      process.platform === "win32" ? "file:///D:/pkg/dist/entries/agent.js" : "D:\\pkg\\dist\\entries\\agent.js",
+    expect(scanStockPresetLayout(already)).toBe(`row id "${MAGIC_COMPACTION_ROW_ID}" already present`);
+    expect(scanStockPresetLayout(stockPlugins([{ id: MAGIC_AGENT_ROW_ID, name: "x" }]))).toBe(
+      `row id "${MAGIC_AGENT_ROW_ID}" already present`,
     );
   });
 
-  it("thin preset round-trips through the loader YAML dialect", async () => {
-    const yaml = await import("js-yaml");
-    const { entryListSchema } = await import("@deepseek-ai/cordis-plugin-include");
-    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-preset-"));
-    try {
-      const file = join(dir, "agent.cordis.yml");
-      const thin = buildThinPresetEntries({ stockPresetPath: "/stock/x.yml" });
-      writeFileSync(file, yaml.dump(thin, { schema: entryListSchema }));
-      const reloaded = yaml.load(readFileSync(file, "utf8"), { schema: entryListSchema });
-      expect(reloaded).toEqual(thin);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it("applyMagicPatches throws when the shipped override row is missing", () => {
+    expect(() => applyMagicPatches([], { stockPlugins: stockPlugins() })).toThrow(
+      /missing from the patch layer/,
+    );
+  });
+
+  it("findPresetRow descends into nested group rows", () => {
+    const plugins = stockPlugins();
+    expect(findPresetRow(plugins, "compaction-basic")?.name).toBe(
+      "@deepseek-ai/dsh-compaction-basic",
+    );
+    expect(findPresetRow(plugins, "nope")).toBeUndefined();
   });
 });

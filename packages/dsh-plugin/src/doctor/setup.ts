@@ -1,21 +1,29 @@
 /**
- * doctor/setup — `dsh-magic-context setup` (Phase 2 slice C).
+ * doctor/setup — `dsh-magic-context setup` (Phase 2 slice C; 0.1.7 form).
  *
  * The DSH adapter's own setup tool (a package bin, NOT a dsh CLI command):
- *   1. locate the DSH install and the system standard preset
+ *   1. locate the DSH install and the shipped `standard` preset patch
  *      (profile/install double anchor, dsh-reference §A.1);
- *   2. contract-scan the stock layout (scanStockPresetLayout) — a mismatch
+ *   2. parse that patch and contract-scan the restated layout — a mismatch
  *      FAILS CLOSED and nothing is written;
- *   3. generate the `magic-standard` thin preset
- *      (`$DSH_HOME/.agent-presets/magic-standard/`: preset.yml metadata +
- *      agent.cordis.yml = buildThinPresetEntries output), atomic writes with
- *      0600 permissions;
+ *   3. detect a LEGACY `$DSH_HOME/.agent-presets/magic-standard/` directory
+ *      from a pre-0.1.7 install and report it as stale (nothing reads it any
+ *      more, so leaving it invites the belief that a preset is active);
  *   4. bootstrap/validate `~/.config/cortexkit/magic-context.jsonc` — never
  *      overwrites an existing file, only hints about missing keys;
- *   5. print next steps (profile install + preset usage).
+ *   5. print next steps (bundle install).
+ *
+ * NOTE ON HISTORY. This tool used to GENERATE the preset: it wrote
+ * `$DSH_HOME/.agent-presets/magic-standard/{preset.yml,agent.cordis.yml}` — a
+ * thin include over the stock preset file. DSH 0.1.7 removed file-backed
+ * presets entirely; a preset is now an `@deepseek-ai/dsh-agent-preset`
+ * declaration row carried by a bundle patch, and this bundle ships that row in
+ * its own `cordis.patch.yml`. There is nothing left to write, so setup
+ * verifies instead of generating, and the check is deliberately the same
+ * contract scan the generator used to run.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { load as yamlLoad, dump as yamlDump } from "js-yaml";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { load as yamlLoad } from "js-yaml";
 import { entryListSchema } from "@deepseek-ai/cordis-plugin-include";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
 import {
@@ -23,32 +31,44 @@ import {
   readJsoncFile,
 } from "@magic-context/core/shared/jsonc-parser";
 import {
-  buildThinPresetEntries,
-  scanStockPresetLayout,
+  MAGIC_AGENT_ROW_ID,
+  MAGIC_COMPACTION_ROW_ID,
+  STOCK_COMPACTION_BASIC_ROW,
+  STOCK_COMPACTION_GROUP,
+  STOCK_PRESET_CONFIG_ID,
+  STOCK_PRESET_ROW_ID,
+  findPresetRow,
 } from "../compat/dsh-0.1/preset";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   MAGIC_CONTEXT_PACKAGE,
   errorMessage,
+  isSupportedDshVersion,
+  legacyMagicStandardDir,
   locateDshInstall,
   magicEntryPath,
-  magicStandardAgentCordisPath,
-  magicStandardDir,
-  magicStandardPresetYamlPath,
   parseFlags,
   resolveDshHome,
   stringFlag,
-  writeFileAtomic,
 } from "./env";
+import { writeFileAtomic } from "./env";
 
-/** Thin preset identity (dsh-reference §A.6 custom preset metadata). */
-export const MAGIC_STANDARD_PRESET = {
-  id: "magic-standard",
+/**
+ * The identity of the preset this bundle declares.
+ *
+ * It is the SHIPPED `standard` preset, overridden in place, not a separate
+ * `magic-standard` roster entry: sessions already select `standard`, so
+ * overriding it means Magic applies without the user re-selecting a preset in
+ * every session. The cost is that this bundle must track DSH's shipped plugin
+ * list across upgrades — `scanStockPresetLayout` fails closed when it drifts.
+ */
+export const MAGIC_PRESET = {
+  rowId: STOCK_PRESET_ROW_ID,
+  configId: STOCK_PRESET_CONFIG_ID,
   name: "Magic Context standard",
   description:
-    "Stock `standard` preset with the Magic Context compaction engine enabled " +
-    "(compaction-basic disabled) and the Magic agent rows mounted.",
-  order: 10,
+    "The shipped `standard` preset with the Magic Context compaction engine " +
+    "enabled (compaction-basic disabled) and the Magic agent rows mounted.",
 } as const;
 
 /** Recommended top-level keys checked when a user config already exists. */
@@ -82,7 +102,7 @@ export interface DshSetupOptions {
   readonly dshHome?: string;
   /** DSH install override (tests / `--dsh-install`). */
   readonly dshInstallDir?: string;
-  /** Stock preset override (tests / `--stock-preset`). */
+  /** Stock preset patch override (tests / `--stock-preset`). */
   readonly stockPresetPath?: string;
   /** Validate + report but write nothing. */
   readonly dryRun?: boolean;
@@ -115,14 +135,34 @@ function presentTopLevelKeys(configPath: string): Set<string> {
   return new Set(Object.keys(parsed));
 }
 
-/** Parse a stock/standard `agent.cordis.yml` entry list (loader YAML dialect). */
+/**
+ * Parse a bundle patch layer (loader YAML dialect). The `!!js` scalars in the
+ * shipped patch are loader expressions, which the plain YAML schema cannot
+ * evaluate; they are preserved as strings and never executed here.
+ */
 export function parseEntryListYaml(text: string): Record<string, unknown>[] {
   return yamlLoad(text, { schema: entryListSchema }) as Record<string, unknown>[];
 }
 
-/** Render an entry list back to the loader YAML dialect. */
-export function dumpEntryListYaml(entries: Record<string, unknown>[]): string {
-  return yamlDump(entries, { schema: entryListSchema });
+/**
+ * Extract the preset declaration a patch layer carries for `rowId`, or a
+ * reason string when the layer does not declare it.
+ */
+export function readPresetDeclaration(
+  patch: readonly Record<string, unknown>[],
+  rowId: string,
+): { plugins?: readonly Record<string, unknown>[] } | string {
+  const row = patch.find((entry) => entry.id === rowId);
+  if (row === undefined) return `patch layer declares no row "${rowId}"`;
+  const config = row.config as
+    | { id?: unknown; plugins?: readonly Record<string, unknown>[] }
+    | undefined;
+  if (config === undefined) return `row "${rowId}" carries no config`;
+  if (config.id !== STOCK_PRESET_CONFIG_ID) {
+    return `row "${rowId}" declares config.id "${String(config.id)}", expected "${STOCK_PRESET_CONFIG_ID}"`;
+  }
+  if (!Array.isArray(config.plugins)) return `row "${rowId}" carries no config.plugins list`;
+  return { plugins: config.plugins };
 }
 
 export async function runDshSetup(
@@ -144,14 +184,14 @@ export async function runDshSetup(
   // 1. DSH home.
   steps.push({ status: "ok", title: "DSH home", detail: dshHome });
 
-  // 2. DSH install + system standard preset.
+  // 2. DSH install + shipped standard preset patch.
   const located = locateDshInstall({ dshHome, dshInstallDir, stockPresetPath, env });
   if (located.stockPresetPath === undefined) {
     steps.push({
       status: "fail",
-      title: "DSH install / system standard preset",
+      title: "DSH install / shipped standard preset",
       detail:
-        `Could not locate the system standard preset ` +
+        `Could not locate the shipped standard preset patch ` +
         `(${DSH_COMPAT_EXPECTED_VERSION} expected). Probed:\n` +
         located.tried.map((candidate) => `  - ${candidate}`).join("\n") +
         `\nFix: install DSH ${DSH_COMPAT_EXPECTED_VERSION}, or pass ` +
@@ -161,35 +201,98 @@ export async function runDshSetup(
   } else {
     steps.push({
       status: "ok",
-      title: "DSH install / system standard preset",
+      title: "DSH install / shipped standard preset",
       detail: located.stockPresetPath,
     });
+    if (located.dshInstallDir !== undefined) {
+      try {
+        const manifest = JSON.parse(
+          readFileSync(`${located.dshInstallDir}/package.json`, "utf8"),
+        ) as { version?: string };
+        const version = manifest.version ?? "";
+        if (!isSupportedDshVersion(version)) {
+          steps.push({
+            status: "warn",
+            title: "DSH version",
+            detail:
+              `found ${version}; this adapter targets ${DSH_COMPAT_EXPECTED_VERSION}.x. ` +
+              `The preset layout may have changed — re-check after upgrading.`,
+          });
+        } else {
+          steps.push({ status: "ok", title: "DSH version", detail: version });
+        }
+      } catch (error) {
+        steps.push({
+          status: "warn",
+          title: "DSH version",
+          detail: `could not read the install manifest: ${errorMessage(error)}`,
+        });
+      }
+    }
   }
 
-  // 3. Contract scan (fail closed — nothing is written on a mismatch).
-  let stockEntries: Record<string, unknown>[] | undefined;
+  // 3. Contract scan of the shipped patch (fail closed).
+  let stockPlugins: readonly Record<string, unknown>[] | undefined;
   if (!failed && located.stockPresetPath !== undefined) {
     try {
-      stockEntries = parseEntryListYaml(
-        readFileSync(located.stockPresetPath, "utf8"),
-      );
-      const layoutIssue = scanStockPresetLayout(stockEntries);
-      if (layoutIssue !== undefined) {
+      const patch = parseEntryListYaml(readFileSync(located.stockPresetPath, "utf8"));
+      const declared = readPresetDeclaration(patch, STOCK_PRESET_ROW_ID);
+      if (typeof declared === "string") {
         steps.push({
           status: "fail",
           title: "Stock preset contract scan",
           detail:
-            `${located.stockPresetPath}: ${layoutIssue}. The guarded patch cannot ` +
-            `be applied — refusing to generate magic-standard (fail closed). ` +
+            `${located.stockPresetPath}: ${declared}. This adapter overrides that ` +
+            `row, so it cannot proceed (fail closed). ` +
             `Fix: check that the DSH install matches ${DSH_COMPAT_EXPECTED_VERSION}.`,
         });
         failed = true;
-      } else {
+      } else if (declared.plugins === undefined) {
         steps.push({
-          status: "ok",
+          status: "fail",
           title: "Stock preset contract scan",
-          detail: `${located.stockPresetPath}: compaction group + compaction-basic match the expected layout.`,
+          detail: `${located.stockPresetPath}: no plugin list.`,
         });
+        failed = true;
+      } else {
+        stockPlugins = declared.plugins;
+        const group = stockPlugins.find((row) => row.id === STOCK_COMPACTION_GROUP.id);
+        const basic = group === undefined
+          ? undefined
+          : findPresetRow(stockPlugins, STOCK_COMPACTION_BASIC_ROW.id);
+        if (group === undefined || basic === undefined) {
+          steps.push({
+            status: "fail",
+            title: "Stock preset contract scan",
+            detail:
+              `${located.stockPresetPath}: the compaction group or its ` +
+              `compaction-basic row is missing. The Magic engine is inserted into ` +
+              `that group and replaces that row; without them the override cannot ` +
+              `be written (fail closed).`,
+          });
+          failed = true;
+        } else if (basic.name !== STOCK_COMPACTION_BASIC_ROW.name) {
+          // The row id must still name the stock package: the override disables
+          // this row and Magic's engine takes over its responsibility, so a
+          // repointed row would silently disable something we do not replace.
+          steps.push({
+            status: "fail",
+            title: "Stock preset contract scan",
+            detail:
+              `${located.stockPresetPath}: compaction-basic is bound to ` +
+              `"${String(basic.name)}", expected "${STOCK_COMPACTION_BASIC_ROW.name}" ` +
+              `(fail closed — the override would disable an unknown plugin).`,
+          });
+          failed = true;
+        } else {
+          steps.push({
+            status: "ok",
+            title: "Stock preset contract scan",
+            detail:
+              `${located.stockPresetPath}: ${String(stockPlugins.length)} plugin rows; ` +
+              `compaction group + compaction-basic match the expected layout.`,
+          });
+        }
       }
     } catch (error) {
       steps.push({
@@ -201,68 +304,104 @@ export async function runDshSetup(
     }
   }
 
-  // 4. Generate the thin preset (atomic, 0600).
-  if (!failed && stockEntries !== undefined && located.stockPresetPath !== undefined) {
+  // 4. Verify this bundle's own preset override against the shipped list.
+  if (!failed && stockPlugins !== undefined) {
     try {
-      const presetDir = magicStandardDir(dshHome);
-      const presetYamlPath = magicStandardPresetYamlPath(dshHome);
-      const agentCordisPath = magicStandardAgentCordisPath(dshHome);
-      const thinEntries = buildThinPresetEntries({
-        stockPresetPath: located.stockPresetPath,
-        magicEngineEntry: magicEntryPath("compaction"),
-        includeEntry: magicEntryPath("preset-include"),
-        magicRows: [
-          { id: "magic-agent", name: magicEntryPath("agent") },
-        ],
-      });
-      const presetYaml = yamlDump({
-        name: MAGIC_STANDARD_PRESET.name,
-        description: MAGIC_STANDARD_PRESET.description,
-        order: MAGIC_STANDARD_PRESET.order,
-      });
-      const agentCordis = dumpEntryListYaml(thinEntries);
-
-      if (dryRun) {
+      const ownPatchPath = new URL("../../cordis.patch.yml", import.meta.url);
+      const ownPatch = parseEntryListYaml(readFileSync(ownPatchPath, "utf8"));
+      const own = readPresetDeclaration(ownPatch, STOCK_PRESET_ROW_ID);
+      if (typeof own === "string") {
         steps.push({
-          status: "ok",
-          title: "Generate magic-standard preset (dry run)",
-          detail:
-            `${presetDir} would be written with agent.cordis.yml (include row ` +
-            `over the stock file + guarded patches).`,
+          status: "fail",
+          title: "Bundle preset override",
+          detail: `${ownPatchPath.pathname}: ${own}`,
         });
+        failed = true;
       } else {
-        const unchangedPreset = existsSync(presetYamlPath) &&
-          readFileSync(presetYamlPath, "utf8") === presetYaml;
-        const unchangedAgent = existsSync(agentCordisPath) &&
-          readFileSync(agentCordisPath, "utf8") === agentCordis;
-        if (unchangedPreset && unchangedAgent) {
+        const plugins = own.plugins ?? [];
+        const problems: string[] = [];
+        const stockIds = new Set(stockPlugins.map((row) => row.id));
+        for (const row of plugins) {
+          if (row.id === MAGIC_AGENT_ROW_ID || row.id === MAGIC_COMPACTION_ROW_ID) continue;
+          if (!stockIds.has(row.id)) {
+            problems.push(`row "${String(row.id)}" is not in the shipped preset`);
+          }
+        }
+        const missing = [...stockIds].filter(
+          (id) => id !== undefined && !plugins.some((row) => row.id === id),
+        );
+        if (missing.length > 0) {
+          problems.push(`shipped rows dropped by the override: ${missing.join(", ")}`);
+        }
+        const engine = findPresetRow(plugins, MAGIC_COMPACTION_ROW_ID);
+        const agent = findPresetRow(plugins, MAGIC_AGENT_ROW_ID);
+        if (engine === undefined) problems.push(`missing "${MAGIC_COMPACTION_ROW_ID}" row`);
+        if (agent === undefined) problems.push(`missing "${MAGIC_AGENT_ROW_ID}" row`);
+        const basicRow = findPresetRow(plugins, STOCK_COMPACTION_BASIC_ROW.id);
+        if (basicRow !== undefined && basicRow.disabled !== true) {
+          problems.push("compaction-basic is not disabled (would double-compress)");
+        }
+        if (problems.length > 0) {
           steps.push({
-            status: "ok",
-            title: "Generate magic-standard preset",
-            detail: `${presetDir} already up to date (unchanged).`,
+            status: "fail",
+            title: "Bundle preset override",
+            detail: problems.join("; "),
           });
+          failed = true;
         } else {
-          writeFileAtomic(presetYamlPath, presetYaml);
-          writeFileAtomic(agentCordisPath, agentCordis);
-          generatedFiles.push(presetYamlPath, agentCordisPath);
           steps.push({
             status: "ok",
-            title: "Generate magic-standard preset",
-            detail: `wrote ${presetDir} (preset.yml + agent.cordis.yml, 0600).`,
+            title: "Bundle preset override",
+            detail:
+              `restates all ${String(stockIds.size)} shipped rows plus ` +
+              `${MAGIC_COMPACTION_ROW_ID} and ${MAGIC_AGENT_ROW_ID}.`,
           });
         }
       }
     } catch (error) {
       steps.push({
         status: "fail",
-        title: "Generate magic-standard preset",
+        title: "Bundle preset override",
         detail: errorMessage(error),
       });
       failed = true;
     }
   }
 
-  // 5. Bootstrap / validate the user config (never overwrite an existing file).
+  // 5. Legacy preset directory from a pre-0.1.7 install.
+  const legacyDir = legacyMagicStandardDir(dshHome);
+  if (existsSync(legacyDir)) {
+    if (dryRun) {
+      steps.push({
+        status: "warn",
+        title: "Legacy preset directory",
+        detail: `${legacyDir} exists but nothing reads it any more; would be removed.`,
+      });
+    } else {
+      try {
+        rmSync(legacyDir, { recursive: true, force: true });
+        steps.push({
+          status: "ok",
+          title: "Legacy preset directory",
+          detail: `removed stale ${legacyDir} (presets are inline declarations since 0.1.7).`,
+        });
+      } catch (error) {
+        steps.push({
+          status: "warn",
+          title: "Legacy preset directory",
+          detail: `${legacyDir} is stale but could not be removed: ${errorMessage(error)}`,
+        });
+      }
+    }
+  } else {
+    steps.push({
+      status: "ok",
+      title: "Legacy preset directory",
+      detail: `none at ${legacyDir} (expected).`,
+    });
+  }
+
+  // 6. Bootstrap / validate the user config (never overwrite an existing file).
   const configPath = resolveCortexKitUserConfigPath();
   if (existsSync(configPath)) {
     let missing: string[] = [];
@@ -328,24 +467,20 @@ export async function runDshSetup(
     }
   }
 
-  // 6. Next steps.
+  // 7. Next steps.
   const nextSteps: string[] = [];
   if (failed) {
     nextSteps.push("Fix the failing steps above, then re-run `dsh-magic-context setup`.");
   } else {
-    if (profile !== undefined) {
-      nextSteps.push(
-        `Install the bundle into the profile: dsh plugin --profile ${profile} add ${MAGIC_CONTEXT_PACKAGE}`,
-      );
-    } else {
-      nextSteps.push(
-        `Install the bundle into a profile: dsh plugin --profile <name> add ${MAGIC_CONTEXT_PACKAGE} ` +
-        `(or add it to the profile's dsh.profile.bundles manually).`,
-      );
-    }
+    const where = profile === undefined ? "<name>" : profile;
     nextSteps.push(
-      "Select the `magic-standard` preset for new sessions (Settings → Agent preset), " +
-      `or set it as the default in settings.yaml (agent-presets.default). Preset location: ${magicStandardDir(dshHome)}`,
+      `Install the bundle into the profile: add "${MAGIC_CONTEXT_PACKAGE}" to ` +
+      `dsh.profile.bundles in $DSH_HOME/profiles/${where}/package.json and run ` +
+      `pnpm install there (the desktop profile has no working \`dsh plugin\` path).`,
+    );
+    nextSteps.push(
+      `The bundle override applies to the "${STOCK_PRESET_CONFIG_ID}" preset, so ` +
+      `sessions already using it pick Magic up on their next start.`,
     );
     nextSteps.push("Verify with: dsh-magic-context doctor");
   }
@@ -356,4 +491,9 @@ export async function runDshSetup(
     generatedFiles,
     nextSteps,
   };
+}
+
+/** Exposed for doctor: the agent-plane entry path this preset must mount. */
+export function magicAgentEntryPath(): string {
+  return magicEntryPath("agent");
 }
