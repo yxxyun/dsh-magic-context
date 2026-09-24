@@ -2,8 +2,12 @@
 // reachable file must resolve, and no emitted chunk may be unreachable.
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, dirname, resolve, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const DIST = process.argv[2] ?? "dist";
+// Default to the plugin's build output, resolved from THIS script so the command
+// works from anywhere in the repo (a bare "dist" silently meant <cwd>/dist).
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const DIST = process.argv[2] ?? join(REPO_ROOT, "packages", "dsh-plugin", "dist");
 const ENTRY_POINTS = ["agent", "compaction", "commands", "tools", "remote"];
 
 function walk(dir, out = []) {

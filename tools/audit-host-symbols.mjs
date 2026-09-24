@@ -37,7 +37,9 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ASAR = process.env.DSH_ASAR?.trim() || "D:/DeepSeekHarness/resources/app.asar";
-const DIST = process.argv[2];
+// Default to the plugin's build output, resolved from THIS script so the command
+// works from anywhere in the repo.
+const DIST = process.argv[2] ?? join(HERE, "..", "packages", "dsh-plugin", "dist");
 const TMP = join(process.env.TEMP ?? "/tmp", "dsh-runtime-audit");
 
 // The asar reader is a workspace tool, not a repo one, so look in both places.
