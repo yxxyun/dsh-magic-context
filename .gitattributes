@@ -1,0 +1,11 @@
+# Line endings: normalize to LF in the index AND in the working tree.
+#
+# This repository used to carry MIXED blob endings (packages/dsh-plugin/src/agent
+# /knowledge-gate.ts was stored CRLF while nearly everything else was LF) with
+# core.autocrlf=true, so a tool that wrote the "wrong" ending re-wrote the whole
+# file and a 50-line change showed up as 500+ lines of churn. Declaring the
+# convention here makes staging tool-independent and keeps diffs reviewable.
+#
+# `text=auto` still lets Git detect and skip binaries, so no per-type rules are
+# needed. After changing this file, run `git add --renormalize .` once.
+* text=auto eol=lf
