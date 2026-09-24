@@ -23,7 +23,7 @@
 | m0/m1 知识注入 | 两条独立合成消息（缓存分裂契约）；m1 占位恒发；首轮调用即注入 | ✅ |
 | auto-search | 模糊回忆提示（门内 fire-and-forget，CAS 防双发） | ✅ |
 | Dreamer 全部任务 | 12 任务（core scheduler/lease/gate/telemetry 复用）；**需要工具的 9 个走 `ctx.subagents` 工具 worker**，按 agent 的权威工具表映射（DSH 无 `aft_*`，`bash` 映射到平台 shell） | ✅ |
-| Sidekick /ctx-aug | 单轮直连 LLM + 记忆检索注入 | ✅ |
+| ~~Sidekick /ctx-aug~~ | **上游 0.42.6 已移除**：核心把 `sidekick` 列为退休配置键（`removed-agent-config.ts` → `REMOVED_AGENT_CONFIG_KEY`），加载器对 jsonc 里的 `sidekick` 段**警告并忽略**，端口不再注册 `/ctx-aug` | ⛔ 下线 |
 | Mural | 视觉门 + attachments.saveImage → m0 图像块 | ✅ |
 | feedback | DSH 桥接（messageFeedback → dsh_feedback_signals） | ✅ |
 | ctx_reduce nudge | Channel-1/2 双通道（共享决策 + 注入交付） | ✅ |
@@ -51,8 +51,9 @@
 - **`§N§` 是每会话独立编号**：DSH 的 resume/seed 会 fork 出 seeded 子会话
   （`header.parentSession`），子会话从 §1 重新编号 → **跨 fork 引用旧 §N§ 会失效**。
   上游编号语义的后果，非缺陷。
-- **Sidekick**：Pi 用子代理（含工具）；DSH 单轮直连 + 记忆检索注入
-  （需工具路径由 worker 承担——maxDepth 0 + 工具 allowlist + 委托策略钉死）。
+- **Sidekick 已下线**：上游 0.42.6 把 `sidekick` 列为退休配置键（`removed-agent-config.ts`），
+  加载器对 `magic-context.jsonc` 里的 `sidekick` 段警告并忽略，端口也不再注册 `/ctx-aug`。
+  用户配置里的该段是死键，可删。
 - **dreamer-docs 的工具集**：核心配置授予 `read/grep/glob/bash/write/edit/aft_*`；
   DSH 侧**去掉 shell**，只给 `read/grep/glob/write/edit`——定时器驱动的 worker 可以
   改它该维护的文档，但不应能跑任意命令。`maintain-docs` 默认未排期。

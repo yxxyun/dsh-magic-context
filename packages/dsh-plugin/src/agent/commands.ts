@@ -51,7 +51,6 @@ import {
   type CommandDefinition,
   type CommandResult,
 } from "../compat/dsh-0.1/commands";
-import { MAGIC_SOURCE_KIND, magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
 import {
   cwdOf,
   resolveCanonicalKey,
@@ -65,9 +64,6 @@ export type { CommandDefinition };
 /** Compaction-off guard text (Pi `COMPACTION_OFF_COMMAND_UNAVAILABLE` parity). */
 const COMPACTION_OFF_UNAVAILABLE =
   "Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).";
-
-/** Magic-owned message source marker for /ctx-aug follow-ups. */
-const MAGIC_SOURCE = { kind: MAGIC_SOURCE_KIND } as const;
 
 /** Seams wired by later slices (historian/dreamer/subagent). */
 export interface CtxCommandSeams {

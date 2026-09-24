@@ -1,7 +1,7 @@
 {
   "name": "dsh-magic-context-workspace",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "packageManager": "bun@1.4.2",
   "engines": {
@@ -10,7 +10,7 @@
   "workspaces": [
     "packages/*"
   ],
-  "description": "Self-maintained fork of dsh-magic-context: Magic Context (memory + context management) for DeepSeek Harness. Vendors the upstream @cortexkit Magic Context core at v0.36.1 under packages/plugin and maps it to the @magic-context/core/* specifier the adapter was written against.",
+  "description": "Self-maintained fork of dsh-magic-context: Magic Context (memory + context management) for DeepSeek Harness. Vendors the upstream @cortexkit Magic Context core at v0.42.6 under packages/plugin and maps it to the @magic-context/core/* specifier the adapter was written against.",
   "scripts": {
     "build": "bun run --cwd packages/dsh-plugin build",
     "typecheck": "bun run --cwd packages/dsh-plugin typecheck"

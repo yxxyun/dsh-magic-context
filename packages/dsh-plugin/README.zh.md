@@ -14,7 +14,7 @@ historian/dreamer 调度、压缩策略与 Typert Remote 面。
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dependencies": { "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.3&path:/packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```
@@ -47,8 +47,9 @@ SQLite（`~/.local/share/cortexkit/magic-context/context.db`）。
 
 ## 兼容
 
-- DSH `0.1.0-rc.6` exact-rc（升级前先跑契约门）
-- Magic Context 0.36.1 共享 schema 基线
+- DSH `0.1.7-rc.1`（兼容契约接受任意 `0.1.7-alpha.N` / `-rc.N`；升级前先跑契约门：
+  `bun run typecheck && bun test`）
+- Magic Context 上游 **0.42.6**（共享 schema 围栏 `v85`）
 
 ## 许可证
 

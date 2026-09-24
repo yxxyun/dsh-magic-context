@@ -15,7 +15,7 @@ In your DSH profile's `package.json`:
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dependencies": { "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.3&path:/packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```
@@ -54,8 +54,9 @@ longer need the preset.
 
 ## Compatibility
 
-- DSH `0.1.0-rc.6` exact-rc (run the contract gate before upgrading)
-- Magic Context 0.36.1 shared schema baseline
+- DSH `0.1.7-rc.1` (the compat contract accepts any `0.1.7-alpha.N` / `-rc.N`;
+  run the contract gate before upgrading: `bun run typecheck && bun test`)
+- Magic Context upstream **0.42.6** (shared schema fence `v85`)
 
 ## License
 
