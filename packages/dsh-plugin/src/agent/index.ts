@@ -377,6 +377,10 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     host,
     config: config.context,
     directory,
+    // The per-session self-check asserts our tools are actually in the catalog
+    // this host exposes (tools.view/get) — the exact check that would have
+    // caught the ctx_* disappearance instead of a silent "ready".
+    readTools: () => ctx.get("tools"),
     historian: {
       config: config.historian,
       readPressure: readContextPressure(ctx),

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { apply, bridgeMagicConfig, createEnsureProjectRegistered } from "./index";
+import { cleanupTestDir } from "../test-utils";
 
 function withProjectConfig(
   configText: string | null,
@@ -32,6 +33,8 @@ function withProjectConfig(
   } finally {
     if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = previousXdg;
+    // No SQLite handle is opened here, so a bare remove is safe (the retrying
+    // helper exists for temp dirs that held a database).
     rmSync(root, { recursive: true, force: true });
   }
 }

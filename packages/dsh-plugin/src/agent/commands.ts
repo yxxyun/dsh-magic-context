@@ -43,6 +43,7 @@ import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-s
 import { formatEmbedStatusText } from "@magic-context/core/hooks/magic-context/format-embed-status";
 import { describeError } from "@magic-context/core/shared/error-message";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { runSelfCheck } from "./self-check";
 import { getEmbeddingCoverageStatus } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import {
   errorResult,
@@ -605,6 +606,49 @@ export function registerCtxSessionUpgradeCommand(
   });
 }
 
+/* ───────────────────────────── /ctx-selfcheck ──────────────────────────── */
+
+/**
+ * On-demand form of the per-session self-check — the acceptance instrument that
+ * runs IN the host (the bun suite cannot see the host's tool catalog). Asserts
+ * the log accessor, the tool catalog this agent sees, and tag production.
+ */
+export function registerCtxSelfCheckCommand(ctx: Context, opts: CtxCommandsOptions): () => void {
+  return registerCommand(ctx, {
+    name: "ctx-selfcheck",
+    description: "Verify the Magic Context plane in this live session (log accessor, tool catalog, tagging)",
+    handler: async (invocation) => {
+      const agent = invocation.agent;
+      try {
+        const sessionId = resolveCanonicalKey(ctx, opts, agent);
+        if (!sessionId) return errorResult("No canonical session id is available for this agent.");
+        const db = await resolveDb(ctx, opts);
+        const surface = (agent as { session?: { surface?: { nodes?: readonly unknown[] } } } | undefined)
+          ?.session?.surface;
+        const report = runSelfCheck({
+          readTools: () => ctx.get("tools"),
+          agent,
+          db,
+          canonicalSessionId: sessionId,
+          surfaceNodes: surface?.nodes?.length ?? 0,
+        });
+        const ok = report.failures.length === 0;
+        const body = [
+          `## Magic Context self-check — ${ok ? "ok" : "FAILED"}`,
+          "",
+          `session: ${sessionId}`,
+          "",
+          ...report.lines.map((line) => `- ${line}`),
+          ...(ok ? [] : ["", "### Failures", ...report.failures.map((line) => `- ${line}`)]),
+        ].join("\n");
+        return ok ? successResult(body) : errorResult(body);
+      } catch (error) {
+        return errorResult(`## Self-check — Failed\n\n${describeError(error).brief}`);
+      }
+    },
+  });
+}
+
 /* ─────────────────────────────── registration ──────────────────────────── */
 
 /**
@@ -614,6 +658,7 @@ export function registerCtxSessionUpgradeCommand(
 export function registerCtxCommands(ctx: Context, opts: CtxCommandsOptions = {}): () => void {
   const disposers = [
     registerCtxStatusCommand(ctx, opts),
+    registerCtxSelfCheckCommand(ctx, opts),
     registerCtxFlushCommand(ctx, opts),
     registerCtxDreamCommand(ctx, opts),
     registerCtxEmbedCommand(ctx, opts),

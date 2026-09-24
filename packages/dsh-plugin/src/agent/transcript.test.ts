@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import { cleanupTestDir } from "../test-utils";
 import { MAGIC_SOURCE_KIND } from "../compat/dsh-0.1/session";
 import {
   createAssistantMessage,
@@ -92,7 +93,7 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
   }
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      await cleanupTestDir(dir);
       return;
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -382,7 +383,7 @@ describe("temporal gap markers (Magic temporal-awareness parity)", () => {
       expect(temporal[0]!.replacement).toMatch(/<!-- \+6m -->/);
       db.close();
     } finally {
-      await rmSync(dir, { recursive: true, force: true });
+      await cleanupTestDir(dir);
     }
   });
 
@@ -404,7 +405,7 @@ describe("temporal gap markers (Magic temporal-awareness parity)", () => {
       expect(temporal.length).toBe(0);
       db.close();
     } finally {
-      await rmSync(dir, { recursive: true, force: true });
+      await cleanupTestDir(dir);
     }
   });
 });

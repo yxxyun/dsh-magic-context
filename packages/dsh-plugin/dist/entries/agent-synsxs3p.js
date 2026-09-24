@@ -2762,6 +2762,105 @@ function formatEmbedStatusText(coverage, drain) {
 `);
 }
 
+// src/agent/self-check.ts
+var MAGIC_TOOL_NAMES = [
+  "ctx_search",
+  "ctx_memory",
+  "ctx_note",
+  "ctx_expand",
+  "ctx_reduce",
+  "todowrite"
+];
+function asRecord(value) {
+  return value !== null && typeof value === "object" ? value : undefined;
+}
+function logAccessorOf(session) {
+  const record = asRecord(session);
+  if (record === undefined)
+    return { accessor: "none", count: 0 };
+  if (typeof record.snapshotEvents === "function") {
+    try {
+      const value = record.snapshotEvents();
+      return { accessor: "snapshotEvents", count: Array.isArray(value) ? value.length : 0 };
+    } catch {
+      return { accessor: "none", count: 0 };
+    }
+  }
+  if (Array.isArray(record.events))
+    return { accessor: "events", count: record.events.length };
+  return { accessor: "none", count: 0 };
+}
+function toolVisibility(tools, agent) {
+  const runtime = asRecord(tools);
+  const scopes = [["agent", agent]];
+  const agentCtx = asRecord(agent)?.ctx;
+  if (agentCtx !== undefined)
+    scopes.push(["agent.ctx", agentCtx]);
+  let verifiable = false;
+  for (const [label, scope] of scopes) {
+    for (const fn of ["view", "get"]) {
+      if (typeof runtime?.[fn] !== "function")
+        continue;
+      try {
+        if (fn === "view") {
+          const visible = runtime.view(scope)?.visible;
+          if (visible instanceof Map) {
+            verifiable = true;
+            return {
+              missing: MAGIC_TOOL_NAMES.filter((name) => !visible.has(name)),
+              verifiable,
+              scope: label
+            };
+          }
+        } else {
+          const absent = MAGIC_TOOL_NAMES.filter((name) => runtime.get(name, scope) === undefined);
+          verifiable = true;
+          return { missing: absent, verifiable, scope: label };
+        }
+      } catch {}
+    }
+  }
+  return { missing: [], verifiable, scope: "unavailable" };
+}
+function runSelfCheck(input) {
+  const lines = [];
+  const failures = [];
+  const { accessor, count } = logAccessorOf(asRecord(input.agent)?.session);
+  lines.push(`log accessor: ${accessor} (${count} event(s), surfaceNodes=${input.surfaceNodes})`);
+  if (accessor === "none") {
+    failures.push("the session exposes neither snapshotEvents() nor an events array — the context plane cannot read history");
+  } else if (count === 0 && input.surfaceNodes > 0) {
+    failures.push(`the log reads as empty (${accessor}) while the surface has ${input.surfaceNodes} node(s)`);
+  }
+  const visibility = toolVisibility(input.readTools?.(), input.agent);
+  if (!visibility.verifiable) {
+    lines.push(`tool visibility: NOT VERIFIABLE (no tools.view/get on this host)`);
+  } else {
+    lines.push(`tool visibility: ${MAGIC_TOOL_NAMES.length - visibility.missing.length}/${MAGIC_TOOL_NAMES.length} visible via ${visibility.scope}`);
+    if (visibility.missing.length > 0) {
+      failures.push(`tools absent from the catalog this agent sees: ${visibility.missing.join(", ")}`);
+    }
+  }
+  try {
+    const tags = getTagsBySession(input.db, input.canonicalSessionId).length;
+    lines.push(`tags for this session: ${tags}`);
+    if (tags === 0 && input.surfaceNodes > 0) {
+      failures.push("no tags exist for a session that has surface content — tagging is producing nothing");
+    }
+  } catch (error) {
+    failures.push(`tag lookup failed: ${String(error)}`);
+  }
+  return { lines, failures };
+}
+function formatSelfCheck(report, sessionId) {
+  const head = `[magic-context] self-check ${report.failures.length === 0 ? "ok" : "FAILED"} for ${sessionId}`;
+  const body = report.lines.map((line) => `
+  - ${line}`).join("");
+  const problems = report.failures.map((line) => `
+  !! ${line}`).join("");
+  return `${head}${body}${problems}`;
+}
+
 // src/compat/dsh-0.1/commands.ts
 function registerCommand(ctx, definition) {
   const commands = ctx.get("commands");
@@ -3214,9 +3313,48 @@ ${describeError(error).brief}`);
     }
   });
 }
+function registerCtxSelfCheckCommand(ctx, opts) {
+  return registerCommand(ctx, {
+    name: "ctx-selfcheck",
+    description: "Verify the Magic Context plane in this live session (log accessor, tool catalog, tagging)",
+    handler: async (invocation) => {
+      const agent = invocation.agent;
+      try {
+        const sessionId = resolveCanonicalKey(ctx, opts, agent);
+        if (!sessionId)
+          return errorResult("No canonical session id is available for this agent.");
+        const db = await resolveDb(ctx, opts);
+        const surface = agent?.session?.surface;
+        const report = runSelfCheck({
+          readTools: () => ctx.get("tools"),
+          agent,
+          db,
+          canonicalSessionId: sessionId,
+          surfaceNodes: surface?.nodes?.length ?? 0
+        });
+        const ok = report.failures.length === 0;
+        const body = [
+          `## Magic Context self-check — ${ok ? "ok" : "FAILED"}`,
+          "",
+          `session: ${sessionId}`,
+          "",
+          ...report.lines.map((line) => `- ${line}`),
+          ...ok ? [] : ["", "### Failures", ...report.failures.map((line) => `- ${line}`)]
+        ].join(`
+`);
+        return ok ? successResult(body) : errorResult(body);
+      } catch (error) {
+        return errorResult(`## Self-check — Failed
+
+${describeError(error).brief}`);
+      }
+    }
+  });
+}
 function registerCtxCommands(ctx, opts = {}) {
   const disposers = [
     registerCtxStatusCommand(ctx, opts),
+    registerCtxSelfCheckCommand(ctx, opts),
     registerCtxFlushCommand(ctx, opts),
     registerCtxDreamCommand(ctx, opts),
     registerCtxEmbedCommand(ctx, opts),
@@ -3233,4 +3371,4 @@ function registerCtxCommands(ctx, opts = {}) {
   };
 }
 
-export { CONFIG_WARNING_CLASS, resolveCacheTtl, deriveTriggerBudget, deriveHistorianChunkTokens, resolveHistorianContextLimit, describeBoundaryDiagnostics, selectPerRunCap, resolveOpenCodeProtectedTailBoundary, resolveWrapupProtectedTailBoundary, hasRunnableCompartmentWindow, validateBoundarySnapshot, recordHighPressureNoEligibleHead, createDefaultBoundarySnapshotForTests, getProactiveCompartmentTriggerPercentage, renderUserFacingFailure, userFacingFailureCode, renderCapabilityRefusal, renderDreamFailure, dreamFailureCode, parseCacheTtl, SMART_NOTE_CHECK_FLOOR_MS, SMART_NOTE_CHECK_CEILING_MS, SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS, SmartNoteNetworkError, SmartNoteSecurityError, isSmartNoteNetworkError, isTerminalSmartNoteNetworkError, parseSmartNoteManifest, commitSmartNoteState, getDueCompiledSmartNoteChecks, getSmartNotesNeedingCompilation, getStaleCompiledSmartNotes, storeCompiledSmartNoteCheck, markCompiledCheckFalse, markCompiledCheckLogicFailure, markCompiledCheckNetworkFailure, markSmartNoteLivenessChecked, markSmartNoteCheckStatus, markSmartNoteCompilationFailure, getTaskScheduleState, writeTaskScheduleState, isRetrospectiveWindowProcessed, recordRetrospectiveWindowProcessed, curateCategoryForMemoryCategory, beginCurateCategoryRun, curateTaskStateAfterSuccess, CANONICAL_DREAM_TASKS, DREAM_TASK_CAPABILITIES, processedDreamTaskItems, leaseKeyFor, getDreamTaskBacklog, DREAMING_LEASE_KEY, getLeaseHolder, peekLeaseHolderAndExpiry, leaseOwnershipMatches, acquireLeaseWithAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat, runDueTasksForProject, parseRecompArgs, registerCtxCommands };
+export { CONFIG_WARNING_CLASS, resolveCacheTtl, deriveTriggerBudget, deriveHistorianChunkTokens, resolveHistorianContextLimit, describeBoundaryDiagnostics, selectPerRunCap, resolveOpenCodeProtectedTailBoundary, resolveWrapupProtectedTailBoundary, hasRunnableCompartmentWindow, validateBoundarySnapshot, recordHighPressureNoEligibleHead, createDefaultBoundarySnapshotForTests, getProactiveCompartmentTriggerPercentage, renderUserFacingFailure, userFacingFailureCode, renderCapabilityRefusal, renderDreamFailure, dreamFailureCode, parseCacheTtl, SMART_NOTE_CHECK_FLOOR_MS, SMART_NOTE_CHECK_CEILING_MS, SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS, SmartNoteNetworkError, SmartNoteSecurityError, isSmartNoteNetworkError, isTerminalSmartNoteNetworkError, parseSmartNoteManifest, commitSmartNoteState, getDueCompiledSmartNoteChecks, getSmartNotesNeedingCompilation, getStaleCompiledSmartNotes, storeCompiledSmartNoteCheck, markCompiledCheckFalse, markCompiledCheckLogicFailure, markCompiledCheckNetworkFailure, markSmartNoteLivenessChecked, markSmartNoteCheckStatus, markSmartNoteCompilationFailure, getTaskScheduleState, writeTaskScheduleState, isRetrospectiveWindowProcessed, recordRetrospectiveWindowProcessed, curateCategoryForMemoryCategory, beginCurateCategoryRun, curateTaskStateAfterSuccess, CANONICAL_DREAM_TASKS, DREAM_TASK_CAPABILITIES, processedDreamTaskItems, leaseKeyFor, getDreamTaskBacklog, DREAMING_LEASE_KEY, getLeaseHolder, peekLeaseHolderAndExpiry, leaseOwnershipMatches, acquireLeaseWithAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat, runDueTasksForProject, runSelfCheck, formatSelfCheck, parseRecompArgs, registerCtxCommands };

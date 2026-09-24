@@ -21,6 +21,7 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import { createTestDb, createTestStorageDir } from "../test-utils";
 import { registerCtxTools, type CtxToolsOptions } from "./tools";
+import { cleanupTestDir } from "../test-utils";
 
 const HOME_HASH = "a1b2c3d4";
 const PROJECT = "git:/tmp/dsh-proj";
@@ -31,7 +32,7 @@ const CANONICAL = canonicalSessionKey(HOME_HASH, SESSION_ID);
 async function removeTestDir(dir: string): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      await cleanupTestDir(dir);
       return;
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 60));

@@ -284,9 +284,11 @@ import {
   runLeaseGuardedWrite,
   startLeaseHeartbeat,
   runDueTasksForProject,
+  runSelfCheck,
+  formatSelfCheck,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-cy44qmr2.js";
+} from "./agent-synsxs3p.js";
 import {
   getHarness,
   getDataDir,
@@ -5749,6 +5751,7 @@ function createContextPlaneState() {
   return {
     coordinator: createCoordinatorState(),
     reconciled: new Set,
+    selfChecked: new Set,
     tablesInitialized: false
   };
 }
@@ -5892,6 +5895,40 @@ function previewTagPayloadMessages(db, sessionId, messages, log) {
     messages.push(...out);
   } catch {}
 }
+async function runPlaneSelfCheck(deps, db, canonicalSessionId, agent) {
+  try {
+    const report = runSelfCheck({
+      readTools: deps.readTools,
+      agent,
+      db,
+      canonicalSessionId,
+      surfaceNodes: agent.session?.surface?.nodes?.length ?? 0
+    });
+    const line = formatSelfCheck(report, canonicalSessionId);
+    if (report.failures.length === 0)
+      deps.log?.(line);
+    else
+      log(line);
+    if (report.failures.length === 0)
+      return;
+    const marker = "mc-selfcheck";
+    const alreadyInjected = sessionEvents2(agent.session).some((event) => {
+      const source = event?.data?.source;
+      return source?.messageId === marker;
+    });
+    if (alreadyInjected)
+      return;
+    const { magicUserMessage } = await import("./session-68ck7efb.js");
+    const message = magicUserMessage(`Magic Context self-check found a problem in this session:
+` + report.failures.map((failure) => `- ${failure}`).join(`
+`) + `
+
+The memory/search plane may be degraded. Run /ctx-selfcheck for the full report.`, { kind: MAGIC_SOURCE_KIND2, messageId: marker }, []);
+    agent.inject?.(message);
+  } catch (error) {
+    log(`[magic-context] self-check threw (fail-open): ${String(error)}`);
+  }
+}
 var DEFAULT_USABLE_SOFT = 128000;
 function resolveProtectionFloor(db, sessionId, deps, agent) {
   try {
@@ -5903,7 +5940,7 @@ function resolveProtectionFloor(db, sessionId, deps, agent) {
       isCacheBustingPass: true
     });
     if (resolution.snapshotChanged) {
-      log(`[magic-context] protected token floor snapshot: floor=${resolution.floor}` + ` provenance=${resolution.provenance} usableSoft=${usableSoft}`);
+      log(`[magic-context] protected token floor snapshot: floor=${resolution.floor} provenance=${resolution.provenance} usableSoft=${usableSoft}`);
     }
     return resolution.floor;
   } catch (error) {
@@ -5929,6 +5966,10 @@ async function runContextPlaneStep(state, deps, payload, next) {
       state.reconciled.add(canonicalSessionId);
       reconcileSessionOutbox(db, canonicalSessionId, sessionLogView(db, canonicalSessionId, agent, canonicalSessionId));
     }
+    if (!state.selfChecked.has(canonicalSessionId)) {
+      state.selfChecked.add(canonicalSessionId);
+      await runPlaneSelfCheck(deps, db, canonicalSessionId, agent);
+    }
     const protectionFloor = resolveProtectionFloor(db, canonicalSessionId, deps, agent);
     if (deps.config?.enabled !== false) {
       previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
@@ -5949,7 +5990,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       const sessionEventCount = sessionEvents2(agent.session).length;
       const surfaceNodeCount = agent.session.surface?.nodes?.length ?? 0;
       if (view.messages.length === 0 && surfaceNodeCount > 0) {
-        log(`[magic-context] empty transcript despite ${sessionEventCount} session events` + ` (surfaceNodes=${surfaceNodeCount}) — tagging is producing nothing.`);
+        log(`[magic-context] empty transcript despite ${sessionEventCount} session events (surfaceNodes=${surfaceNodeCount}) — tagging is producing nothing.`);
       }
       if (plan !== null) {
         const hostView = {
@@ -18735,6 +18776,7 @@ function apply(ctx, config = {}) {
     host,
     config: config.context,
     directory,
+    readTools: () => ctx.get("tools"),
     historian: {
       config: config.historian,
       readPressure: readContextPressure(ctx),

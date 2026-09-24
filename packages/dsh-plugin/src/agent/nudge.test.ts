@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { createTestDb, createTestStorageDir } from "../test-utils";
 import { maybeNudgeChannels, scanSessionMetrics } from "./nudge";
 import { updateTagTokenCount } from "@magic-context/core/features/magic-context/storage-tags";
+import { cleanupTestDir } from "../test-utils";
 
 describe("nudge (ctx_reduce Channel-1 parity)", () => {
   async function openDb() {
@@ -41,7 +42,7 @@ describe("nudge (ctx_reduce Channel-1 parity)", () => {
       expect(row).toBeNull();
     } finally {
       db.close();
-      await import("node:fs").then((f) => f.rmSync(dir, { recursive: true, force: true }));
+      await cleanupTestDir(dir);
     }
   });
 
@@ -69,7 +70,7 @@ describe("nudge (ctx_reduce Channel-1 parity)", () => {
       expect(injected.length).toBe(0);
     } finally {
       db.close();
-      await import("node:fs").then((f) => f.rmSync(dir, { recursive: true, force: true }));
+      await cleanupTestDir(dir);
     }
   });
 });

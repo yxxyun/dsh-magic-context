@@ -19,6 +19,7 @@ import {
   getObservedEpochFloor,
   resolveEpochFloorForPass,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { formatSelfCheck, runSelfCheck } from "./self-check";
 import {
   registerPreStepGate,
   type PreStepDecision,
@@ -112,6 +113,8 @@ export interface ContextPlaneDeps {
   };
   /** Workspace directory for the historian fire (project memory scope). */
   readonly directory?: string;
+  /** Host tool runtime (the self-check asserts our tools are in its catalog). */
+  readonly readTools?: () => unknown;
   readonly log?: (message: string) => void;
 }
 
@@ -120,6 +123,8 @@ export interface ContextPlaneState {
   readonly coordinator: CoordinatorState;
   /** sessionId → reconciliation already run this process. */
   readonly reconciled: Set<string>;
+  /** sessionId → self-check already reported this process. */
+  readonly selfChecked: Set<string>;
   /** Adapter tables already ensured for this process (idempotent init). */
   tablesInitialized: boolean;
 }
@@ -128,6 +133,7 @@ export function createContextPlaneState(): ContextPlaneState {
   return {
     coordinator: createCoordinatorState(),
     reconciled: new Set(),
+    selfChecked: new Set(),
     tablesInitialized: false,
   };
 }
@@ -357,6 +363,52 @@ function previewTagPayloadMessages(
 }
 
 /**
+ * Run the per-session self-check once and report it. Success is one structured
+ * log line; a failure ALSO reaches the conversation as a one-time note, because
+ * a silent plane is how every failure in this port started ("agent plane ready"
+ * printed while the tools were absent from the catalog).
+ */
+async function runPlaneSelfCheck(
+  deps: ContextPlaneDeps,
+  db: Database,
+  canonicalSessionId: string,
+  agent: Agent,
+): Promise<void> {
+  try {
+    const report = runSelfCheck({
+      readTools: deps.readTools,
+      agent,
+      db,
+      canonicalSessionId,
+      surfaceNodes:
+        (agent.session as { surface?: { nodes?: readonly unknown[] } })?.surface?.nodes?.length ?? 0,
+    });
+    const line = formatSelfCheck(report, canonicalSessionId);
+    if (report.failures.length === 0) deps.log?.(line);
+    else coreLog(line);
+    if (report.failures.length === 0) return;
+
+    const marker = "mc-selfcheck";
+    const alreadyInjected = sessionEvents(agent.session).some((event) => {
+      const source = (event as { data?: { source?: { messageId?: unknown } } })?.data?.source;
+      return source?.messageId === marker;
+    });
+    if (alreadyInjected) return;
+    const { magicUserMessage } = await import("../compat/dsh-0.1/session");
+    const message = magicUserMessage(
+      "Magic Context self-check found a problem in this session:\n" +
+        report.failures.map((failure) => `- ${failure}`).join("\n") +
+        "\n\nThe memory/search plane may be degraded. Run /ctx-selfcheck for the full report.",
+      { kind: MAGIC_SOURCE_KIND, messageId: marker } as never,
+      [],
+    );
+    (agent as unknown as { inject?: (m: unknown) => void }).inject?.(message);
+  } catch (error) {
+    coreLog(`[magic-context] self-check threw (fail-open): ${String(error)}`);
+  }
+}
+
+/**
  * Resolve the epoch protection floor (upstream `protected_tokens` lifecycle) and
  * persist it, so the protection window is token-derived instead of empty.
  *
@@ -441,6 +493,13 @@ export async function runContextPlaneStep(
     if (!state.reconciled.has(canonicalSessionId)) {
       state.reconciled.add(canonicalSessionId);
       reconcileSessionOutbox(db, canonicalSessionId, sessionLogView(db, canonicalSessionId, agent, canonicalSessionId));
+    }
+
+    // Per-session self-check, once: state what was OBSERVED instead of trusting a
+    // "ready" banner. Runs here because a check needs a session to check.
+    if (!state.selfChecked.has(canonicalSessionId)) {
+      state.selfChecked.add(canonicalSessionId);
+      await runPlaneSelfCheck(deps, db, canonicalSessionId, agent);
     }
 
     // Protection floor for this pass: resolved and snapshotted once, then shared

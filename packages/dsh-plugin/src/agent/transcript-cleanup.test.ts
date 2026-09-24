@@ -7,6 +7,7 @@ import { createAssistantMessage, createUserMessage } from "../compat/dsh-0.1/ses
 import { createTestDb } from "../test-utils";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage";
 import { deriveMutationPlan, readDshTranscript } from "./transcript";
+import { cleanupTestDir } from "../test-utils";
 
 function buildSession() {
   const session = Session.create(SessionId("sess-cleanup"));
@@ -37,7 +38,7 @@ describe("heuristic cleanup integration (Pi/OpenCode parity)", () => {
       expect(getTagsBySession(db, view.sessionId).length).toBeGreaterThan(0);
       db.close();
     } finally {
-      await rmSync(dir, { recursive: true, force: true });
+      await cleanupTestDir(dir);
     }
   });
 });

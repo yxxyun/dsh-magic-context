@@ -12,7 +12,6 @@
  * later-slice seams).
  */
 import { describe, expect, it } from "bun:test";
-import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
@@ -27,22 +26,16 @@ import {
   type CtxCommandsOptions,
 } from "./commands";
 import type { CommandResult } from "../compat/dsh-0.1/commands";
+import { cleanupTestDir } from "../test-utils";
 
 const HOME_HASH = "a1b2c3d4";
 const PROJECT = "git:/tmp/dsh-proj";
 const SESSION_ID = "session-1";
 const CANONICAL = canonicalSessionKey(HOME_HASH, SESSION_ID);
 
-/** Windows may hold SQLite WAL handles briefly after close; best-effort retry. */
+/** Shared retrying cleanup (Windows holds SQLite WAL handles past close). */
 async function removeTestDir(dir: string): Promise<void> {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 60));
-    }
-  }
+  await cleanupTestDir(dir);
 }
 
 interface FakeCommandRecord {
@@ -103,7 +96,7 @@ function findCommand(registered: FakeCommandRecord[], name: string): FakeCommand
 }
 
 describe("registerCtxCommands (DSH /ctx-* commands)", () => {
-  it("registers all seven commands and unregisters via the disposer", async () => {
+  it("registers all eight commands and unregisters via the disposer", async () => {
     const { db, dir } = await openDb();
     try {
       const { ctx, registered } = makeFakeCtx();
@@ -114,6 +107,7 @@ describe("registerCtxCommands (DSH /ctx-* commands)", () => {
         "ctx-embed",
         "ctx-flush",
         "ctx-recomp",
+        "ctx-selfcheck",
         "ctx-session-upgrade",
         "ctx-status",
         "ctx-wrapup",
