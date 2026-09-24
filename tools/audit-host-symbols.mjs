@@ -40,12 +40,20 @@ const ASAR = process.env.DSH_ASAR?.trim() || "D:/DeepSeekHarness/resources/app.a
 const DIST = process.argv[2];
 const TMP = join(process.env.TEMP ?? "/tmp", "dsh-runtime-audit");
 
-// The asar reader is a workspace tool, not a repo one, so look in both places
-// (and honour an explicit override) instead of assuming a single layout.
+// The asar reader is a workspace tool, not a repo one, so look in both places.
+// An EXPLICIT override is honoured strictly: if you name a helper, a missing one
+// is an error rather than a reason to quietly use a different reader.
+const ASAR2_ENV = process.env.DSH_ASAR2?.trim();
+if (ASAR2_ENV !== undefined && ASAR2_ENV.length > 0 && !existsSync(ASAR2_ENV)) {
+  console.error(`error: DSH_ASAR2 points at ${ASAR2_ENV}, which does not exist`);
+  process.exit(2);
+}
 const ASAR2 =
-  [process.env.DSH_ASAR2?.trim(), join(HERE, "asar2.mjs"), join(HERE, "..", "..", "tools", "asar2.mjs")]
-    .filter((candidate) => typeof candidate === "string" && candidate.length > 0)
-    .find((candidate) => existsSync(candidate));
+  ASAR2_ENV !== undefined && ASAR2_ENV.length > 0
+    ? ASAR2_ENV
+    : [join(HERE, "asar2.mjs"), join(HERE, "..", "..", "tools", "asar2.mjs")].find((candidate) =>
+        existsSync(candidate),
+      );
 
 if (!DIST || !existsSync(DIST)) {
   console.error("usage: bun tools/audit-host-symbols.mjs <dist-dir>");
