@@ -38,11 +38,13 @@ function importsOf(file) {
 
 const reachable = new Set();
 const unresolved = [];
-const expectedOptional = [];
-// Lazy runtime variants the node build does not ship: the chunk resolves them
-// with `new URL("./x.js", import.meta.url)` inside an async fallback that only
-// runs on the web/wasm path. Pre-existing, not a packaging defect.
-const OPTIONAL_VARIANTS = [/^\.\/transformers-(web|node-wasm)\.js$/];
+const missingRequired = [];
+// The lazy local-embedding variants. These ARE shipped — the build vendors them
+// from upstream into dist/entries — so a missing one is a defect, not an
+// expected absence: it silently degrades /ctx-embed and the whole vector lane to
+// "no embedding provider". (This check previously waved them through, which is
+// exactly how that gap stayed invisible.)
+const REQUIRED_VARIANTS = [/^\.\/transformers-(web|node-wasm)\.js$/];
 const queue = [...roots];
 while (queue.length > 0) {
   const file = queue.pop();
@@ -53,7 +55,7 @@ while (queue.length > 0) {
     const target = resolve(dirname(file), spec);
     if (!existsSync(target)) {
       const line = `${relative(DIST, file).split(sep).join("/")} -> ${spec}`;
-      if (OPTIONAL_VARIANTS.some((pattern) => pattern.test(spec))) expectedOptional.push(line);
+      if (REQUIRED_VARIANTS.some((pattern) => pattern.test(spec))) missingRequired.push(line);
       else unresolved.push(line);
       continue;
     }
@@ -70,6 +72,6 @@ console.log(`UNREACHABLE (dead)  : ${orphans.length}`);
 for (const o of orphans) console.log(`   ${relative(DIST, o).split(sep).join("/")}`);
 console.log(`UNRESOLVED imports  : ${unresolved.length}`);
 for (const u of unresolved) console.log(`   ${u}`);
-console.log(`optional variants not shipped (expected): ${expectedOptional.length}`);
-for (const e of expectedOptional) console.log(`   ${e}`);
-console.log(`\nverdict: ${unresolved.length === 0 && orphans.length === 0 ? "CLEAN — closed graph, no dead files" : "NEEDS ATTENTION"}`);
+console.log(`MISSING REQUIRED variants: ${missingRequired.length}`);
+for (const m of missingRequired) console.log(`   ${m}`);
+console.log(`\nverdict: ${unresolved.length === 0 && missingRequired.length === 0 && orphans.length === 0 ? "CLEAN — closed graph, no dead files, embedding variants present" : "NEEDS ATTENTION"}`);

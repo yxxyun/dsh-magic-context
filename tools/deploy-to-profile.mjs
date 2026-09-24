@@ -127,8 +127,11 @@ function copyTree(src, dest) {
 
 /**
  * Build the manifest that ships in the profile: everything the loader needs,
- * minus the workspace-only `dependencies` and the build-only `devDependencies`
- * and `scripts`.
+ * minus the workspace-only dependencies (which pnpm cannot resolve outside this
+ * workspace) and the build-only `devDependencies` and `scripts`.
+ *
+ * Real dependencies ARE kept: `onnxruntime-web` has to be installed in the
+ * profile for the lazy local-embedding siblings to resolve it at run time.
  */
 function publishableManifest(srcManifest) {
   const keep = [
@@ -137,7 +140,10 @@ function publishableManifest(srcManifest) {
   ];
   const out = {};
   for (const key of keep) if (srcManifest[key] !== undefined) out[key] = srcManifest[key];
-  out.dependencies = {};
+  const dependencies = Object.entries(srcManifest.dependencies ?? {})
+    .filter(([, version]) => !String(version).startsWith("workspace:"))
+    .sort(([a], [b]) => a.localeCompare(b));
+  out.dependencies = Object.fromEntries(dependencies);
   return out;
 }
 

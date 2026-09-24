@@ -22,18 +22,20 @@
   "files": [
     "dist",
     "src",
+    "vendor",
     "cordis.patch.yml",
     "NOTICE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/dsh-llm --external @deepseek-ai/cordis && bun build src/doctor/cli.ts --outdir dist --target node --format esm --external @deepseek-ai/cordis && bun build src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts --outdir dist/entries --target node --format esm --splitting --external @deepseek-ai/cordis --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-llm --external @deepseek-ai/dsh-tools --external @deepseek-ai/dsh-subagent --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/cordis-plugin-include && tsc --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/dsh-llm --external @deepseek-ai/cordis && bun build src/doctor/cli.ts --outdir dist --target node --format esm --external @deepseek-ai/cordis && bun build src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts --outdir dist/entries --target node --format esm --splitting --external @deepseek-ai/cordis --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-llm --external @deepseek-ai/dsh-tools --external @deepseek-ai/dsh-subagent --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/cordis-plugin-include && cp vendor/transformers/transformers-web.js vendor/transformers/transformers-node-wasm.js dist/entries/ && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@magic-context/core": "workspace:*",
-    "dsh-magic-context-adapter": "workspace:*"
+    "dsh-magic-context-adapter": "workspace:*",
+    "onnxruntime-web": "1.31.0-dev.20260914-8d85527a0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
