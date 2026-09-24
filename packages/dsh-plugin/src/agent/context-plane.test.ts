@@ -74,7 +74,7 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
           ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
           canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
         },
-        config: { protectedTags: 0 },
+        config: { protectedTokens: 0 },
         log: () => {},
       };
 
@@ -121,7 +121,7 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
           ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
           canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
         },
-        config: { protectedTags: 0 },
+        config: { protectedTokens: 0 },
         log: () => {},
       };
 
@@ -327,7 +327,7 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
           ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
           canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
         },
-        config: { protectedTags: 0 },
+        config: { protectedTokens: 0 },
         log: () => {},
       });
 
@@ -372,6 +372,74 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
       db.close();
     } finally {
       spy.mockRestore();
+      await cleanupDir(dir);
+    }
+  });
+
+  // The protection window used to be EMPTY unless the user configured
+  // protected_tokens: the port passed the raw config value straight to
+  // getProtectionWindowForSession, so an unset key meant a floor of 0 and
+  // nothing was protected (ctx_reduce could drop the newest tool output). The
+  // epoch-floor lifecycle now derives and SNAPSHOTS a floor, which every reader
+  // that passes no explicit value (ctx_reduce, status, RPC) then sees.
+  it("snapshots a derived protection floor when the user configured none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = buildSession();
+      const deps: ContextPlaneDeps = {
+        host: {
+          ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
+          canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
+        },
+        config: { enabled: true },
+        historian: { readPressure: () => ({ contextWindow: 128_000 }) },
+        log: () => {},
+      };
+      await runContextPlaneStep(
+        createContextPlaneState(),
+        deps,
+        { agent: { id: session.id, session } as never },
+        async () => ({ reject: false, messages: [] }),
+      );
+      const row = db
+        .prepare("SELECT protected_tokens_effective FROM session_meta WHERE session_id = ?")
+        .get("dsh:a1b2c3d4:sess-plane") as { protected_tokens_effective: number | null } | null;
+      // deriveDefaultProtectedTokens(128_000) = 10_240 — upstream's familiar
+      // figure for a 128k soft window.
+      expect(row?.protected_tokens_effective).toBe(10_240);
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
+
+  it("lets an explicit protected_tokens override win over the derived floor", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-plane-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = buildSession();
+      const deps: ContextPlaneDeps = {
+        host: {
+          ready: Promise.resolve({ kind: "ok", db, storageDir: dir, livenessPath: "" }),
+          canonicalKey: (id: string) => `dsh:a1b2c3d4:${id}`,
+        },
+        config: { enabled: true, protectedTokens: 24_000 },
+        historian: { readPressure: () => ({ contextWindow: 128_000 }) },
+        log: () => {},
+      };
+      await runContextPlaneStep(
+        createContextPlaneState(),
+        deps,
+        { agent: { id: session.id, session } as never },
+        async () => ({ reject: false, messages: [] }),
+      );
+      const row = db
+        .prepare("SELECT protected_tokens_effective FROM session_meta WHERE session_id = ?")
+        .get("dsh:a1b2c3d4:sess-plane") as { protected_tokens_effective: number | null } | null;
+      expect(row?.protected_tokens_effective).toBe(24_000);
+      db.close();
+    } finally {
       await cleanupDir(dir);
     }
   });

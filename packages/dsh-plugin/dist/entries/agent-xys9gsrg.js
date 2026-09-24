@@ -7340,6 +7340,12 @@ var MagicContextConfigSchema = object({
     protected_tags: data.protected_tags
   };
 });
+function deriveDefaultProtectedTokens(usableSoft) {
+  const clampedUsable = Math.max(0, usableSoft);
+  const lowerBound = Math.min(16000, Math.round(0.08 * clampedUsable));
+  const target = Math.round(0.05 * clampedUsable);
+  return Math.min(64000, Math.max(lowerBound, target));
+}
 
 // ../plugin/src/features/magic-context/compartment-chunk-embedding.ts
 import { createHash as createHash2 } from "node:crypto";
@@ -20513,6 +20519,123 @@ function clearPendingCompactionMarkerStateIf(db, sessionId, expected) {
 }
 var preSnapshotSessions = new Map;
 var warnedProtectedTokenTierOverrides = new WeakSet;
+function isPreSnapshotMemo(value) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  const memo = value;
+  return (memo.configuredOverride === undefined || typeof memo.configuredOverride === "number" && Number.isFinite(memo.configuredOverride)) && typeof memo.usableSoft === "number" && Number.isFinite(memo.usableSoft) && typeof memo.floor === "number" && Number.isFinite(memo.floor) && memo.floor >= 0 && (memo.provenance === "override" || memo.provenance === "derived");
+}
+function readPreSnapshotMemo(db, sessionId) {
+  const row = db.prepare("SELECT protected_tokens_pre_snapshot FROM session_meta WHERE session_id = ?").get(sessionId);
+  const raw = row?.protected_tokens_pre_snapshot;
+  if (!raw)
+    return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (isPreSnapshotMemo(parsed))
+      return parsed;
+  } catch {}
+  db.prepare(`UPDATE session_meta SET protected_tokens_pre_snapshot = NULL
+         WHERE session_id = ? AND protected_tokens_pre_snapshot = ?`).run(sessionId, raw);
+  return null;
+}
+function writePreSnapshotMemo(db, sessionId, memo) {
+  ensureSessionMetaRow(db, sessionId);
+  db.prepare(`UPDATE session_meta SET protected_tokens_pre_snapshot = ?
+         WHERE session_id = ? AND protected_tokens_pre_snapshot IS NULL`).run(JSON.stringify(memo), sessionId);
+  return readPreSnapshotMemo(db, sessionId) ?? memo;
+}
+function clearPreSnapshotMemo(db, sessionId) {
+  db.prepare("UPDATE session_meta SET protected_tokens_pre_snapshot = NULL WHERE session_id = ?").run(sessionId);
+  preSnapshotSessions.delete(sessionId);
+}
+function preSnapshotResult(memo, inputs) {
+  const overrideMoved = memo.configuredOverride !== inputs.configuredOverride;
+  const geometryMoved = memo.usableSoft !== inputs.usableSoft;
+  return {
+    floor: memo.floor,
+    isSnapshotPersisted: false,
+    provenance: memo.provenance,
+    snapshotChanged: false,
+    preSnapshotInputChanged: overrideMoved || geometryMoved,
+    preSnapshotBustReason: overrideMoved ? "config-re-read" : geometryMoved ? "live-geometry" : undefined
+  };
+}
+function persistEpochFloorSnapshot(db, sessionId, floor) {
+  ensureSessionMetaRow(db, sessionId);
+  const rounded = Math.max(0, Math.round(floor));
+  db.prepare(`UPDATE session_meta
+         SET protected_tokens_effective = ?, protected_tokens_pre_snapshot = NULL
+         WHERE session_id = ?`).run(rounded, sessionId);
+  preSnapshotSessions.delete(sessionId);
+}
+function getPersistedEpochFloor(db, sessionId) {
+  return readEpochFloorSnapshot(db, sessionId);
+}
+function getObservedEpochFloor(db, sessionId) {
+  const persisted = getPersistedEpochFloor(db, sessionId);
+  if (persisted !== null)
+    return persisted;
+  const memo = preSnapshotSessions.get(sessionId) ?? readPreSnapshotMemo(db, sessionId);
+  return memo?.floor ?? null;
+}
+function resolveEpochFloorForPass(db, sessionId, inputs) {
+  const derived = deriveDefaultProtectedTokens(inputs.usableSoft);
+  let configuredOverride = inputs.configuredOverride;
+  const tierOverrides = inputs.tierOverrides;
+  if (tierOverrides) {
+    const userOrDerived = tierOverrides.user ?? derived;
+    configuredOverride = tierOverrides.user;
+    if (tierOverrides.project !== undefined) {
+      if (tierOverrides.project >= userOrDerived) {
+        configuredOverride = tierOverrides.project;
+      } else if (inputs.onRejectedProjectOverride && !warnedProtectedTokenTierOverrides.has(tierOverrides)) {
+        warnedProtectedTokenTierOverrides.add(tierOverrides);
+        inputs.onRejectedProjectOverride(`Ignoring project protected_tokens=${tierOverrides.project}; it cannot lower resolved user/default floor ${userOrDerived}.`);
+      }
+    }
+  }
+  const resolvedInputs = { ...inputs, configuredOverride };
+  const persisted = getPersistedEpochFloor(db, sessionId);
+  if (!inputs.isCacheBustingPass && persisted !== null) {
+    return {
+      floor: persisted,
+      isSnapshotPersisted: true,
+      provenance: "persisted",
+      snapshotChanged: false
+    };
+  }
+  const hasValidOverride = typeof configuredOverride === "number" && Number.isInteger(configuredOverride) && configuredOverride >= 4000 && configuredOverride <= 1e6;
+  const floor = hasValidOverride && typeof configuredOverride === "number" ? configuredOverride : derived;
+  const provenance = hasValidOverride ? "override" : "derived";
+  if (inputs.isCacheBustingPass) {
+    const snapshotChanged = persisted !== floor;
+    if (snapshotChanged)
+      persistEpochFloorSnapshot(db, sessionId, floor);
+    else
+      clearPreSnapshotMemo(db, sessionId);
+    return {
+      floor,
+      isSnapshotPersisted: true,
+      provenance,
+      snapshotChanged
+    };
+  }
+  const existing = preSnapshotSessions.get(sessionId) ?? readPreSnapshotMemo(db, sessionId);
+  if (existing !== null && existing !== undefined) {
+    preSnapshotSessions.set(sessionId, existing);
+    return preSnapshotResult(existing, resolvedInputs);
+  }
+  const memo = {
+    configuredOverride,
+    usableSoft: inputs.usableSoft,
+    floor,
+    provenance
+  };
+  const firstObservedMemo = writePreSnapshotMemo(db, sessionId, memo);
+  preSnapshotSessions.set(sessionId, firstObservedMemo);
+  return preSnapshotResult(firstObservedMemo, resolvedInputs);
+}
 // ../plugin/src/features/magic-context/storage-meta-session.ts
 import { Buffer as Buffer3 } from "node:buffer";
 
@@ -28775,4 +28898,4 @@ function registerCtxTools(ctx, opts = {}) {
   };
 }
 
-export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, stripJsonComments, isPrototypePollutionKey, parseJsoncRecovering, parseJsonc, detectConfigFile, modelRefLookupOrder, setWindowOverlayPath, formatWindowDerivationLine, setOutputReserveConfig, getSdkContextLimit, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigValue, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, PROTECTED_TOKENS_MIN, DEFAULT_LOCAL_EMBEDDING_MODEL, PER_HARNESS_MIGRATION_INVENTORY, PER_HARNESS_MODEL_KEYS, ConfigProfilesSchema, DreamerConfigSchema, MagicContextConfigSchema, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, releaseCompartmentLeaseBestEffort, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, isNoContentCompartment, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateProject, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, SubcClient, connectionFileExists, SYNAPSE_DEFAULT_MODEL, toSynapseLaneDescriptor, formatSynapseLaneDescriptor, SynapseEmbeddingProvider, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, describeShadowBackfillWriteRefusal, markProjectLoadUntrusted, contentSha256, registerProjectEmbedding, registerProjectShadowEmbedding, enqueueShadowEmbeddingItems, registerProjectInObservationMode, unregisterProjectShadowEmbedding, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isRecord, buildSyntheticTodoPart, CHANNEL1_FLOOR_TOKENS, decideChannel1, evaluateChannel2, buildChannel2Reminder, buildChannel1Reminder, getActiveTagTokenAggregate, getOldestActiveUnprotectedToolTags, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, getMessageTimesFromOpenCodeDb, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForCompletedToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, hasRawMessageProvider, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, getMessageIndexReconciliationStartOrdinal, isMessageIndexReconciledThrough, indexMessagesAfterOrdinal, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, getProtectionWindowForSession, describeProtectedTailDrainBudgetSkip, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, getLastNudgeUndropped, setLastNudgeUndropped, getChannel1NudgeState, setChannel1NudgeState, getChannel2NudgeState, setChannel2NudgeState, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, BoundedSessionMap, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, onNoteTrigger, peekNoteNudgeText, markNoteNudgeDelivered, cavemanCompress, unifiedSearch, parseProviderModel, modelBodyField, toModelEntry, getPromptFailureDetail, promptSyncWithModelSuggestionRetry, promptSyncWithValidatedOutputRetry, normalizeSDKResponse, createTagger, convertDshEventsToRawMessages, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity, registerCtxTools };
+export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, stripJsonComments, isPrototypePollutionKey, parseJsoncRecovering, parseJsonc, detectConfigFile, modelRefLookupOrder, setWindowOverlayPath, formatWindowDerivationLine, setOutputReserveConfig, getSdkContextLimit, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigValue, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, PROTECTED_TOKENS_MIN, DEFAULT_LOCAL_EMBEDDING_MODEL, PER_HARNESS_MIGRATION_INVENTORY, PER_HARNESS_MODEL_KEYS, ConfigProfilesSchema, DreamerConfigSchema, MagicContextConfigSchema, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, releaseCompartmentLeaseBestEffort, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, isNoContentCompartment, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateProject, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, SubcClient, connectionFileExists, SYNAPSE_DEFAULT_MODEL, toSynapseLaneDescriptor, formatSynapseLaneDescriptor, SynapseEmbeddingProvider, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, describeShadowBackfillWriteRefusal, markProjectLoadUntrusted, contentSha256, registerProjectEmbedding, registerProjectShadowEmbedding, enqueueShadowEmbeddingItems, registerProjectInObservationMode, unregisterProjectShadowEmbedding, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isRecord, buildSyntheticTodoPart, CHANNEL1_FLOOR_TOKENS, decideChannel1, evaluateChannel2, buildChannel2Reminder, buildChannel1Reminder, getActiveTagTokenAggregate, getOldestActiveUnprotectedToolTags, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, getMessageTimesFromOpenCodeDb, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForCompletedToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, hasRawMessageProvider, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, getMessageIndexReconciliationStartOrdinal, isMessageIndexReconciledThrough, indexMessagesAfterOrdinal, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, getProtectionWindowForSession, describeProtectedTailDrainBudgetSkip, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, getLastNudgeUndropped, setLastNudgeUndropped, getChannel1NudgeState, setChannel1NudgeState, getChannel2NudgeState, setChannel2NudgeState, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getObservedEpochFloor, resolveEpochFloorForPass, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, BoundedSessionMap, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, onNoteTrigger, peekNoteNudgeText, markNoteNudgeDelivered, cavemanCompress, unifiedSearch, parseProviderModel, modelBodyField, toModelEntry, getPromptFailureDetail, promptSyncWithModelSuggestionRetry, promptSyncWithValidatedOutputRetry, normalizeSDKResponse, createTagger, convertDshEventsToRawMessages, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity, registerCtxTools };

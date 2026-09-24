@@ -136,6 +136,7 @@ import {
   indexMessagesAfterOrdinal,
   queueM0Mutation,
   queueMemoryMutation,
+  getProtectionWindowForSession,
   describeProtectedTailDrainBudgetSkip,
   recordProtectedTailPublicationFloor,
   getWrapupInProgressState,
@@ -164,6 +165,8 @@ import {
   getPendingCompactionMarkerState,
   setPendingCompactionMarkerState,
   clearPendingCompactionMarkerStateIf,
+  getObservedEpochFloor,
+  resolveEpochFloorForPass,
   getOrCreateSessionMeta,
   updateSessionMeta,
   getPendingSmartNotes,
@@ -219,7 +222,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-3gz09g3a.js";
+} from "./agent-xys9gsrg.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -282,7 +285,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-d6qad5e1.js";
+} from "./agent-m64sabbz.js";
 import {
   getHarness,
   getDataDir,
@@ -4607,16 +4610,6 @@ function scanSessionMetrics(agent) {
   }
   return { lastInputTokens, contextWindow };
 }
-function protectedWindow(tags, newestCount) {
-  if (newestCount <= 0)
-    return { numbers: new Set, cutoff: null };
-  const newest = tags.filter((t) => t.type === "tool" && t.status === "active").sort((a, b) => b.tagNumber - a.tagNumber).slice(0, newestCount);
-  const oldestProtected = newest[newest.length - 1];
-  return {
-    numbers: new Set(newest.map((t) => t.tagNumber)),
-    cutoff: oldestProtected === undefined ? null : oldestProtected.tagNumber
-  };
-}
 function reclaimableOutputCount(tags, protectedNumbers) {
   return tags.filter((t) => t.type === "tool" && t.status === "active" && !protectedNumbers.has(t.tagNumber)).length;
 }
@@ -4642,14 +4635,13 @@ function injectNudge(agent, sessionId, kind, text) {
 function maybeNudgeChannels(db, sessionId, agent, opts = {}) {
   try {
     const threshold = Math.max(0, opts.threshold ?? 65);
-    const protectedTags = Math.max(0, opts.protectedTags ?? 20);
     const { lastInputTokens, contextWindow: scanWindow } = scanSessionMetrics(agent);
     const contextWindow = opts.contextWindow ?? scanWindow ?? 1e6;
     if (typeof contextWindow !== "number" || contextWindow <= 0)
       return;
+    const protection = getProtectionWindowForSession(db, sessionId, opts.protectedTokens);
     const tags = getTagsBySession(db, sessionId);
-    const window = protectedWindow(tags, protectedTags);
-    const agg = getActiveTagTokenAggregate(db, sessionId, window.cutoff);
+    const agg = getActiveTagTokenAggregate(db, sessionId, protection.cutoff);
     const reclaimable = agg.toolOutput ?? 0;
     const baselineU = reclaimable;
     const baselineT = Math.max(baselineU, agg.conversation + agg.toolCall + reclaimable);
@@ -4674,8 +4666,8 @@ function maybeNudgeChannels(db, sessionId, agent, opts = {}) {
         postReduceGracePreLevel: decision.clearPostReduceGrace ? undefined : nudgeState.postReduceGracePreLevel
       });
       if (decision.fire) {
-        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
-        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, reclaimableOutputCount(tags, window.numbers), hint, decision.sticky);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, protection.protectedTagNumbers, 4);
+        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, reclaimableOutputCount(tags, protection.protectedTagNumbers), hint, decision.sticky);
         injectNudge(agent, sessionId, "channel1", reminder);
         opts.log?.(`[magic-context] channel1 nudge fired: level=${decision.level} reclaimable~${Math.round(reclaimable / 1000)}k`);
       }
@@ -4691,8 +4683,8 @@ function maybeNudgeChannels(db, sessionId, agent, opts = {}) {
     if (evaluation.shouldTrigger) {
       const state = getChannel2NudgeState(db, sessionId);
       if (state === "") {
-        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
-        const reminder = buildChannel2Reminder(evaluation.reclaimableTokens, reclaimableOutputCount(tags, window.numbers), hint);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, protection.protectedTagNumbers, 4);
+        const reminder = buildChannel2Reminder(evaluation.reclaimableTokens, reclaimableOutputCount(tags, protection.protectedTagNumbers), hint);
         setChannel2NudgeState(db, sessionId, "delivered");
         injectNudge(agent, sessionId, "channel2", reminder);
         opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(evaluation.reclaimableTokens / 1000)}k`);
@@ -5895,6 +5887,25 @@ function previewTagPayloadMessages(db, sessionId, messages, log) {
     messages.push(...out);
   } catch {}
 }
+var DEFAULT_USABLE_SOFT = 128000;
+function resolveProtectionFloor(db, sessionId, deps, agent) {
+  try {
+    const observed = deps.historian?.readPressure?.(agent)?.contextWindow;
+    const usableSoft = typeof observed === "number" && observed > 0 ? observed : DEFAULT_USABLE_SOFT;
+    const resolution = resolveEpochFloorForPass(db, sessionId, {
+      configuredOverride: deps.config?.protectedTokens,
+      usableSoft,
+      isCacheBustingPass: true
+    });
+    if (resolution.snapshotChanged) {
+      log(`[magic-context] protected token floor snapshot: floor=${resolution.floor}` + ` provenance=${resolution.provenance} usableSoft=${usableSoft}`);
+    }
+    return resolution.floor;
+  } catch (error) {
+    deps.log?.(`[magic-context] protected token floor resolution failed (fail-open): ${String(error)}`);
+    return deps.config?.protectedTokens ?? getObservedEpochFloor(db, sessionId) ?? undefined;
+  }
+}
 async function runContextPlaneStep(state, deps, payload, next) {
   const agent = payload.agent;
   try {
@@ -5913,6 +5924,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       state.reconciled.add(canonicalSessionId);
       reconcileSessionOutbox(db, canonicalSessionId, sessionLogView(db, canonicalSessionId, agent, canonicalSessionId));
     }
+    const protectionFloor = resolveProtectionFloor(db, canonicalSessionId, deps, agent);
     if (deps.config?.enabled !== false) {
       previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
@@ -5925,7 +5937,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       });
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTokens: deps.config?.protectedTokens,
+        protectedTokens: protectionFloor,
         heuristicCleanup: deps.heuristicCleanup,
         skipPrefixInjection: true
       });
@@ -5945,7 +5957,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
     }
     maybeNudgeChannels(db, canonicalSessionId, agent, {
       threshold: deps.historian?.config?.executeThresholdPercentage ?? 65,
-      protectedTags: deps.config?.protectedTags ?? 20,
+      protectedTokens: protectionFloor,
       log: deps.log
     });
     try {
@@ -18468,7 +18480,6 @@ function bridgeMagicConfig(config, directory) {
     context: {
       ...config.context,
       protectedTokens: config.context?.protectedTokens ?? cfg.protected_tokens,
-      protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
       heuristicCleanup: config.context?.heuristicCleanup ?? (() => {
         const caveman = cfg.caveman_text_compression;
         if (typeof caveman !== "object" || caveman === null)

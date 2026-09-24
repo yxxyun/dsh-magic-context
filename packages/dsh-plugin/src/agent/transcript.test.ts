@@ -181,7 +181,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const session = buildSession();
       const view = viewOf(session);
 
-      const first = deriveMutationPlan(view, { db, protectedTags: 0 });
+      const first = deriveMutationPlan(view, { db, protectedTokens: 0 });
       expect(first).not.toBeNull();
       expect(first!.ops.length).toBeGreaterThan(0);
       expect(first!.ops.every((op) => op.kind === "tags")).toBe(true);
@@ -194,7 +194,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       // same plan (replay invariant); surface-side idempotency is enforced by
       // the coordinator's outbox CAS (opId already applied → no-op), and by
       // the surface reflecting applied prefixes on later passes.
-      const second = deriveMutationPlan(view, { db, protectedTags: 0 });
+      const second = deriveMutationPlan(view, { db, protectedTokens: 0 });
       expect(second).not.toBeNull();
       expect(second!.ops).toEqual(first!.ops);
       db.close();
@@ -210,13 +210,13 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const session = buildSession();
       const view = viewOf(session);
       // First pass assigns tags.
-      deriveMutationPlan(view, { db, protectedTags: 0 });
+      deriveMutationPlan(view, { db, protectedTokens: 0 });
       const tags = getTagsBySession(db, view.sessionId);
       expect(tags.length).toBeGreaterThan(0);
       const textTag = tags.find((t) => t.type === "message")!;
       queuePendingOp(db, view.sessionId, textTag.tagNumber, "drop", Date.now());
 
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      const plan = deriveMutationPlan(view, { db, protectedTokens: 0 });
       expect(plan).not.toBeNull();
       const dropOp = plan!.ops.find((op) => op.kind === "drops");
       expect(dropOp).toBeDefined();
@@ -234,8 +234,8 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const db = await createTestDb(join(dir, "context.db"));
       const session = buildSession();
       const view = viewOf(session);
-      const a = deriveMutationPlan(view, { db, protectedTags: 0 })!;
-      const b = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const a = deriveMutationPlan(view, { db, protectedTokens: 0 })!;
+      const b = deriveMutationPlan(view, { db, protectedTokens: 0 })!;
       expect(a.ops).toEqual(b.ops);
       db.close();
     } finally {
@@ -251,7 +251,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const eventsBefore = JSON.stringify(session.snapshotEvents());
       const nodesBefore = [...session.surface.nodes];
       const view = viewOf(session);
-      deriveMutationPlan(view, { db, protectedTags: 0 });
+      deriveMutationPlan(view, { db, protectedTokens: 0 });
       expect(JSON.stringify(session.snapshotEvents())).toBe(eventsBefore);
       expect([...session.surface.nodes]).toEqual(nodesBefore);
       db.close();
@@ -266,7 +266,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const db = await createTestDb(join(dir, "context.db"));
       const session = Session.create(SessionId("sess-empty"));
       const view = viewOf(session);
-      expect(deriveMutationPlan(view, { db, protectedTags: 0 })).toBeNull();
+      expect(deriveMutationPlan(view, { db, protectedTokens: 0 })).toBeNull();
       db.close();
     } finally {
       await cleanupDir(dir);
@@ -279,7 +279,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const db = await createTestDb(join(dir, "context.db"));
       const session = buildSession();
       const view = viewOf(session);
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      const plan = deriveMutationPlan(view, { db, protectedTokens: 0 });
       // The folding of tool results is tag-driven; with tags applied the
       // fold message is dirty and the plan carries a replace op for the
       // tool/result span. (If the shared tagger does not dirty it, the
@@ -342,7 +342,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       // tagger would inject a §N§ prefix → a surface replace each round →
       // the visible catalog digest disappears → dsh-tool-skill re-injects
       // the reminder on every pre-step).
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      const plan = deriveMutationPlan(view, { db, protectedTokens: 0 });
       expect(plan).toBeNull();
       db.close();
     } finally {
@@ -375,7 +375,7 @@ describe("temporal gap markers (Magic temporal-awareness parity)", () => {
         session: { events, surface: { nodes: [1, 2, 3], replaceGeneration: 0 }, header: { cwd: "/tmp" } },
         canonicalSessionId: "dsh:a1b2c3d4:sess-temporal",
       });
-      const plan = deriveMutationPlan(view, { db, protectedTags: 20 });
+      const plan = deriveMutationPlan(view, { db, protectedTokens: 20 });
       expect(plan).not.toBeNull();
       const temporal = plan!.ops.filter((op) => op.kind === "temporal");
       expect(temporal.length).toBe(1);
@@ -399,7 +399,7 @@ describe("temporal gap markers (Magic temporal-awareness parity)", () => {
         session: { events, surface: { nodes: [1, 2], replaceGeneration: 0 }, header: { cwd: "/tmp" } },
         canonicalSessionId: "dsh:a1b2c3d4:sess-temporal2",
       });
-      const plan = deriveMutationPlan(view, { db, protectedTags: 20 });
+      const plan = deriveMutationPlan(view, { db, protectedTokens: 20 });
       const temporal = (plan?.ops ?? []).filter((op) => op.kind === "temporal");
       expect(temporal.length).toBe(0);
       db.close();

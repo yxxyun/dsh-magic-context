@@ -15,9 +15,11 @@
  * baseline plus per-turn deltas, and replaced `shouldTriggerChannel2` with
  * `evaluateChannel2`. The DSH port has no tail-hygiene pass of its own, so it
  * projects its tag aggregate onto that form: U = reclaimable tool output,
- * T = the whole live tail, deltas 0. Protected tags moved from a newest-N count
- * to an exact membership set (+ tag-number cutoff); the port converts its
- * configured count into that representation in `protectedWindow`.
+ * T = the whole live tail, deltas 0. Protected tags are a TOKEN floor, resolved
+ * through the core's `getProtectionWindowForSession` — the same call the plan
+ * path and ctx_reduce use. The port used to convert a configured newest-N count
+ * here instead; upstream retired that count ("deprecated and ignored"), so the
+ * two paths could disagree about what was protected.
  */
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import {
@@ -31,6 +33,7 @@ import {
   getActiveTagTokenAggregate,
   getOldestActiveUnprotectedToolTags,
 } from "@magic-context/core/features/magic-context/storage-tags";
+import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage";
 import {
   getChannel1NudgeState,
@@ -75,28 +78,6 @@ export function scanSessionMetrics(agent: Agent): {
   return { lastInputTokens, contextWindow };
 }
 
-/**
- * Convert the legacy newest-N protected-tag count into the v0.42.6
- * token-window representation: an exact membership set plus a tag-number
- * cutoff. Tags with `tag_number < cutoff` are reclaimable; a null cutoff means
- * no threshold is applied (nothing is protected).
- */
-function protectedWindow(
-  tags: readonly TagEntry[],
-  newestCount: number,
-): { numbers: ReadonlySet<number>; cutoff: number | null } {
-  if (newestCount <= 0) return { numbers: new Set<number>(), cutoff: null };
-  const newest = tags
-    .filter((t) => t.type === "tool" && t.status === "active")
-    .sort((a, b) => b.tagNumber - a.tagNumber)
-    .slice(0, newestCount);
-  const oldestProtected = newest[newest.length - 1];
-  return {
-    numbers: new Set(newest.map((t) => t.tagNumber)),
-    cutoff: oldestProtected === undefined ? null : oldestProtected.tagNumber,
-  };
-}
-
 /** How many tool outputs are reclaimable (active and outside the window). */
 function reclaimableOutputCount(
   tags: readonly TagEntry[],
@@ -137,8 +118,9 @@ function injectNudge(
 export interface NudgeOptions {
   /** execute-threshold percentage (default 65). */
   threshold?: number;
-  /** Protected-tag tail (default 20). */
-  protectedTags?: number;
+  /** Token floor for the protection window (upstream `protected_tokens`).
+   *  Undefined defers to the core's persisted epoch floor snapshot. */
+  protectedTokens?: number;
   /** Override context window (default: scan the session events). */
   contextWindow?: number;
   /** Logger sink (optional). */
@@ -157,14 +139,15 @@ export function maybeNudgeChannels(
 ): void {
   try {
     const threshold = Math.max(0, opts.threshold ?? 65);
-    const protectedTags = Math.max(0, opts.protectedTags ?? 20);
     const { lastInputTokens, contextWindow: scanWindow } = scanSessionMetrics(agent);
     const contextWindow = opts.contextWindow ?? scanWindow ?? 1_000_000;
     if (typeof contextWindow !== "number" || contextWindow <= 0) return;
 
+    // Same protection window as the plan path and ctx_reduce (a token floor with
+    // an exact membership set), not the retired newest-N tag count.
+    const protection = getProtectionWindowForSession(db, sessionId, opts.protectedTokens);
     const tags = getTagsBySession(db, sessionId);
-    const window = protectedWindow(tags, protectedTags);
-    const agg = getActiveTagTokenAggregate(db, sessionId, window.cutoff);
+    const agg = getActiveTagTokenAggregate(db, sessionId, protection.cutoff);
     const reclaimable = agg.toolOutput ?? 0;
 
     // Project the tag aggregate onto the v0.42.6 tail-hygiene baseline form.
@@ -200,11 +183,11 @@ export function maybeNudgeChannels(
           : nudgeState.postReduceGracePreLevel,
       });
       if (decision.fire) {
-        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, protection.protectedTagNumbers, 4);
         const reminder = buildChannel1Reminder(
           decision.level,
           decision.undroppedTokens,
-          reclaimableOutputCount(tags, window.numbers),
+          reclaimableOutputCount(tags, protection.protectedTagNumbers),
           hint,
           decision.sticky,
         );
@@ -226,10 +209,10 @@ export function maybeNudgeChannels(
     if (evaluation.shouldTrigger) {
       const state = getChannel2NudgeState(db, sessionId);
       if (state === "") {
-        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, window.numbers, 4);
+        const hint = getOldestActiveUnprotectedToolTags(db, sessionId, protection.protectedTagNumbers, 4);
         const reminder = buildChannel2Reminder(
           evaluation.reclaimableTokens,
-          reclaimableOutputCount(tags, window.numbers),
+          reclaimableOutputCount(tags, protection.protectedTagNumbers),
           hint,
         );
         // 一次性发送语义：注入前占位的状态机（pending → delivered）。

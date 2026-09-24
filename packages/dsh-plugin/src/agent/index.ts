@@ -194,7 +194,6 @@ export function bridgeMagicConfig(
     context: {
       ...config.context,
       protectedTokens: config.context?.protectedTokens ?? cfg.protected_tokens,
-      protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
       heuristicCleanup:
         config.context?.heuristicCleanup ??
         (() => {

@@ -114,7 +114,6 @@ export interface CtxCommandSeams {
 
 /** Options for {@link registerCtxCommands}. */
 export interface CtxCommandsOptions extends CtxRuntimeOptions, CtxCommandSeams {
-  protectedTags?: number;
   executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
   executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
   historyBudgetPercentage?: number;

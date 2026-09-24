@@ -32,7 +32,7 @@ describe("nudge (ctx_reduce Channel-1 parity)", () => {
       const agent = fakeAgent([{ type: "request/context", data: { contextWindow: 1000000 } }]);
       const injected: unknown[] = [];
       (agent as unknown as { inject: (m: unknown) => void }).inject = (m) => injected.push(m);
-      maybeNudgeChannels(db, sessionId, agent, { threshold: 65, protectedTags: 0, log: () => {} });
+      maybeNudgeChannels(db, sessionId, agent, { threshold: 65, protectedTokens: 0, log: () => {} });
       expect(injected.length).toBe(0);
       // 无工具标签 → 低于地板 → 不触达（也不建 meta 行）。
       const row = db
@@ -62,7 +62,7 @@ describe("nudge (ctx_reduce Channel-1 parity)", () => {
         (m) => injected.push({ text: m.content[0].text, messageId: m.source.messageId });
       maybeNudgeChannels(db, sessionId, agent, {
         threshold: 65,
-        protectedTags: 20,
+        protectedTokens: 20,
         log: () => {},
       });
       // 20000 >= 10000 地板；压力 100000/1000000 = 0.1 < 0.8 → 压力门不过 → 不 fire。

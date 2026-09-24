@@ -166,12 +166,6 @@ export interface DshOrdinalMap {
 export interface PlanContext {
   readonly db: Database;
   /**
-   * Deprecated and ignored (upstream parity: the newest-N `protected_tags`
-   * count was replaced by the token window). Kept so existing call sites still
-   * type-check; behaviour comes from `protectedTokens` + the core's window.
-   */
-  readonly protectedTags?: number;
-  /**
    * Token floor for the protection window (upstream `protected_tokens`).
    * Undefined defers to the core's persisted epoch floor snapshot.
    */

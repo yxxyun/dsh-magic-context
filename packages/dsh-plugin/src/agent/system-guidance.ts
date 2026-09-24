@@ -33,6 +33,10 @@ export interface GuidanceConfig {
   enabled?: boolean;
   /** Workspace directory for prompt-surface config resolution. */
   directory?: string;
+  /** INERT: the core's section builder names this parameter
+   *  `_legacyProtectionCount` and never reads it (upstream retired the newest-N
+   *  count in favour of `protected_tokens`). Kept only because the key is part of
+   *  the user-facing plugin config; it changes no text. */
   protectedTags?: number;
   ctxReduceCallable?: boolean;
   dreamerEnabled?: boolean;

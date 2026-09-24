@@ -16,6 +16,10 @@ import type { DshStorageBootstrap } from "../host/bootstrap";
 import { isMagicSource, MAGIC_SOURCE_KIND, sessionEvents } from "../compat/dsh-0.1/session";
 import { scheduleReconciliation } from "@magic-context/core/features/magic-context/message-index-async";
 import {
+  getObservedEpochFloor,
+  resolveEpochFloorForPass,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
   registerPreStepGate,
   type PreStepDecision,
   type PreStepPayload,
@@ -58,14 +62,9 @@ export interface ContextPlaneHostView {
 
 export interface ContextPlaneConfig {
   enabled?: boolean;
-  /** Token floor for the protection window (upstream `protected_tokens`). */
+  /** Token floor for the protection window (upstream `protected_tokens`).
+   *  Unset means "derive from the context geometry", not "protect nothing". */
   protectedTokens?: number;
-  /**
-   * Legacy newest-N count. The drop/plan paths no longer use it (they use the
-   * token window); it still feeds the nudge subsystem's message, which is a
-   * separate follow-up migration.
-   */
-  protectedTags?: number;
   /** Heuristic cleanup options (routed from the shared config). */
   heuristicCleanup?: { readonly caveman?: { readonly enabled: boolean; readonly minChars: number } };
 }
@@ -357,6 +356,63 @@ function previewTagPayloadMessages(
   }
 }
 
+/**
+ * Resolve the epoch protection floor (upstream `protected_tokens` lifecycle) and
+ * persist it, so the protection window is token-derived instead of empty.
+ *
+ * The port used to hand the raw config value to `getProtectionWindowForSession`;
+ * with no configured value that argument was undefined and the core fell back to
+ * a floor of 0 — nothing protected, so ctx_reduce could drop the newest tool
+ * output. The core's lifecycle derives the default from the usable soft window
+ * and snapshots it into `session_meta.protected_tokens_effective`, which every
+ * reader that passes no explicit floor (ctx_reduce, status, RPC) then sees.
+ *
+ * Deliberate deviations from upstream: the DSH port has no cache-pricing signal,
+ * so it treats every pre-step as a resolving pass (upstream resolves only on
+ * cache-busting passes and otherwise reads the snapshot). Without geometry we do
+ * not invent a floor — we fall back to what is persisted or configured.
+ */
+/**
+ * Conventional soft usable window used only when the host publishes no pressure
+ * sample. 128k is the figure the port already assumes elsewhere (historian
+ * trigger budgets); it yields upstream's familiar 10,240-token derived floor.
+ */
+const DEFAULT_USABLE_SOFT = 128_000;
+
+function resolveProtectionFloor(
+  db: Database,
+  sessionId: string,
+  deps: ContextPlaneDeps,
+  agent: Agent,
+): number | undefined {
+  try {
+    const observed = deps.historian?.readPressure?.(agent)?.contextWindow;
+    // No pressure sample (the host may not publish request/context) must NOT mean
+    // "protect nothing": a floor of 0 lets ctx_reduce drop the newest tool output,
+    // which is exactly what upstream's derived default exists to prevent. Fall
+    // back to a conventional 128k soft window (deriveDefaultProtectedTokens(128k)
+    // = 10,240, the same figure upstream's own fixtures use).
+    const usableSoft = typeof observed === "number" && observed > 0 ? observed : DEFAULT_USABLE_SOFT;
+    const resolution = resolveEpochFloorForPass(db, sessionId, {
+      configuredOverride: deps.config?.protectedTokens,
+      usableSoft,
+      isCacheBustingPass: true,
+    });
+    if (resolution.snapshotChanged) {
+      coreLog(
+        `[magic-context] protected token floor snapshot: floor=${resolution.floor}` +
+          ` provenance=${resolution.provenance} usableSoft=${usableSoft}`,
+      );
+    }
+    return resolution.floor;
+  } catch (error) {
+    deps.log?.(
+      `[magic-context] protected token floor resolution failed (fail-open): ${String(error)}`,
+    );
+    return deps.config?.protectedTokens ?? getObservedEpochFloor(db, sessionId) ?? undefined;
+  }
+}
+
 /** The full pre-step body: reconcile → derive → apply → next. */
 export async function runContextPlaneStep(
   state: ContextPlaneState,
@@ -387,6 +443,10 @@ export async function runContextPlaneStep(
       reconcileSessionOutbox(db, canonicalSessionId, sessionLogView(db, canonicalSessionId, agent, canonicalSessionId));
     }
 
+    // Protection floor for this pass: resolved and snapshotted once, then shared
+    // by the plan, the nudge and (through the snapshot) ctx_reduce.
+    const protectionFloor = resolveProtectionFloor(db, canonicalSessionId, deps, agent);
+
     // Plan derivation + application (gated by enabled; the historian trigger
     // below is independent of the plan gate).
     if (deps.config?.enabled !== false) {
@@ -402,7 +462,7 @@ export async function runContextPlaneStep(
       });
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTokens: deps.config?.protectedTokens,
+        protectedTokens: protectionFloor,
         heuristicCleanup: deps.heuristicCleanup,
         // Tag without prefixing — see PlanContext.skipPrefixInjection. Prefix
         // injection rewrites message text, forcing a surface replace per
@@ -448,7 +508,7 @@ export async function runContextPlaneStep(
     // 决策/正文/状态持久化复用共享核心；fail-open。
     maybeNudgeChannels(db, canonicalSessionId, agent, {
       threshold: deps.historian?.config?.executeThresholdPercentage ?? 65,
-      protectedTags: deps.config?.protectedTags ?? 20,
+      protectedTokens: protectionFloor,
       log: deps.log,
     });
 
