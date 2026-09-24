@@ -58,7 +58,13 @@ export interface ContextPlaneHostView {
 
 export interface ContextPlaneConfig {
   enabled?: boolean;
-  /** Protected-tag tail for drop selection (default 20). */
+  /** Token floor for the protection window (upstream `protected_tokens`). */
+  protectedTokens?: number;
+  /**
+   * Legacy newest-N count. The drop/plan paths no longer use it (they use the
+   * token window); it still feeds the nudge subsystem's message, which is a
+   * separate follow-up migration.
+   */
   protectedTags?: number;
   /** Heuristic cleanup options (routed from the shared config). */
   heuristicCleanup?: { readonly caveman?: { readonly enabled: boolean; readonly minChars: number } };
@@ -396,7 +402,7 @@ export async function runContextPlaneStep(
       });
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTags: deps.config?.protectedTags ?? 20,
+        protectedTokens: deps.config?.protectedTokens,
         heuristicCleanup: deps.heuristicCleanup,
         // Tag without prefixing — see PlanContext.skipPrefixInjection. Prefix
         // injection rewrites message text, forcing a surface replace per

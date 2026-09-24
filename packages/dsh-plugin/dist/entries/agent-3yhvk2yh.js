@@ -27077,7 +27077,7 @@ function planReasoningReplay(view, byMessageId, targets, db) {
 function deriveMutationPlan(view, ctx) {
   const db = ctx.db;
   const sessionId = view.sessionId;
-  const protectionWindow = getProtectionWindowForSession(db, sessionId);
+  const protectionWindow = getProtectionWindowForSession(db, sessionId, ctx.protectedTokens);
   const protectedTagNumbers = protectionWindow.protectedTagNumbers;
   const protectedCutoff = protectionWindow.cutoff;
   const ops = [...planTemporalMarkers(view)];
@@ -27751,7 +27751,7 @@ var FILTER_VALUES = ["active", "pending", "ready", "dismissed", "all"];
 var DEFAULT_READ_LIMIT = 25;
 var DISMISS_FOOTER = `
 
-To dismiss a stale note: ctx_note(action="dismiss", note_id=N)`;
+To dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])`;
 function captureAnchorOrdinal(db, sessionId) {
   try {
     const ordinal = getLastIndexedOrdinal(db, sessionId);
@@ -27845,6 +27845,19 @@ ${footer}` : ""}`);
   }
   return sections;
 }
+function parseNoteIds(action, value) {
+  const max = action === "update" ? 1 : 50;
+  if (!Array.isArray(value) || value.length < 1 || value.length > max || value.some((id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0)) {
+    throw toolError(action === "update" ? "'note_ids' must contain exactly one positive integer id when action is 'update'." : "'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.");
+  }
+  return value;
+}
+function formatDismissResults(results) {
+  const dismissedCount = results.filter((result) => result.outcome === "dismissed").length;
+  return `Dismissed ${dismissedCount} of ${results.length} notes.
+${results.map((result) => `- Note #${result.noteId}: ${result.outcome}`).join(`
+`)}`;
+}
 function createCtxNoteTool(ctx, opts) {
   return defineTool2({
     name: "ctx_note",
@@ -27860,7 +27873,11 @@ function createCtxNoteTool(ctx, opts) {
         type: "string",
         description: "Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead."
       },
-      note_id: { type: "integer", description: "Note ID (required for 'dismiss' and 'update' actions)." },
+      note_ids: {
+        type: "array",
+        items: { type: "integer" },
+        description: "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'."
+      },
       filter: {
         type: "string",
         enum: [...FILTER_VALUES],
@@ -27878,7 +27895,7 @@ function createCtxNoteTool(ctx, opts) {
         action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
         content: "string",
         surface_condition: "string",
-        note_id: "number",
+        note_ids: { type: "array", items: "number", maxItems: 50 },
         filter: { type: "enum", values: FILTER_VALUES },
         limit: "number",
         offset: "number"
@@ -27922,27 +27939,24 @@ function createCtxNoteTool(ctx, opts) {
         return { text: `Saved session note #${note.id}.` };
       }
       if (action === "dismiss") {
-        if (typeof params.note_id !== "number") {
-          throw toolError("'note_id' is required when action is 'dismiss'.");
-        }
+        const ids = parseNoteIds(action, params.note_ids);
         if (!runtime.cwd)
           throw toolError("Could not resolve the working directory for this agent.");
         if (!runtime.projectIdentity) {
           throw toolError("Could not resolve project identity for note dismiss.");
         }
-        const dismissed = dismissNote(db, params.note_id, {
-          projectPath: runtime.projectIdentity,
-          sessionId
-        });
-        if (!dismissed) {
-          throw toolError(`Note #${params.note_id} not found in your session/project or already dismissed.`);
+        const scope = { projectPath: runtime.projectIdentity, sessionId };
+        if (ids.length === 1) {
+          const dismissed = dismissNote(db, ids[0], scope);
+          if (!dismissed) {
+            throw toolError(`Note #${ids[0]} not found in your session/project or already dismissed.`);
+          }
+          return { text: `Note #${ids[0]} dismissed.` };
         }
-        return { text: `Note #${params.note_id} dismissed.` };
+        return { text: formatDismissResults(dismissNotes(db, ids, scope)) };
       }
       if (action === "update") {
-        if (typeof params.note_id !== "number") {
-          throw toolError("'note_id' is required when action is 'update'.");
-        }
+        const noteId = parseNoteIds(action, params.note_ids)[0];
         const updates = {};
         if (params.content?.trim())
           updates.content = params.content.trim();
@@ -27956,18 +27970,18 @@ function createCtxNoteTool(ctx, opts) {
         if (!runtime.projectIdentity) {
           throw toolError("Could not resolve project identity for note update.");
         }
-        const updated = updateNote(db, params.note_id, updates, {
+        const updated = updateNote(db, noteId, updates, {
           projectPath: runtime.projectIdentity,
           sessionId
         });
         if (!updated)
-          throw toolError(`Note #${params.note_id} not found in your session/project.`);
+          throw toolError(`Note #${noteId} not found in your session/project.`);
         const parts = [];
         if (updates.content)
           parts.push(`content: ${updates.content}`);
         if (updates.surfaceCondition)
           parts.push(`condition: ${updates.surfaceCondition}`);
-        return { text: `Updated note #${params.note_id}
+        return { text: `Updated note #${noteId}
 - ${parts.join(`
 - `)}` };
       }
@@ -28118,7 +28132,6 @@ function createCtxReduceTool(ctx, opts) {
       if (!runtime.sessionId)
         throw toolError("Could not resolve the canonical session id for this agent.");
       const sessionId = runtime.sessionId;
-      const protectedTags = Math.max(0, Math.floor(opts.protectedTags ?? 20));
       if (!params.drop)
         throw toolError("'drop' must be provided.");
       let dropIds = [];
@@ -28135,9 +28148,7 @@ function createCtxReduceTool(ctx, opts) {
       if (unknownIds.length > 0) {
         throw toolError(`Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`);
       }
-      const activeTags = allTags.filter((tag) => tag.status === "active");
-      const protectedTagIds = activeTags.map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, protectedTags);
-      const protectedSet = new Set(protectedTagIds);
+      const protectedSet = getProtectionWindowForSession(db, sessionId, opts.protectedTokens).protectedTagNumbers;
       const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
       const pendingOps = getPendingOps(db, sessionId);
       const pendingMap = new Map(pendingOps.map((op) => [op.tagId, op.operation]));

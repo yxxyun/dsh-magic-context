@@ -11,7 +11,7 @@
  * embedding provider or network is touched (documented test seam).
  */
 import { describe, expect, it, spyOn } from "bun:test";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
@@ -86,7 +86,7 @@ function baseOpts(db: Database): CtxToolsOptions {
     memoryEnabled: true,
     dreamerEnabled: true,
     // No protected tail in tests → ctx_reduce drops are immediate.
-    protectedTags: 0,
+    protectedTokens: 0,
   };
 }
 
@@ -242,6 +242,68 @@ describe("ctx_note write path", () => {
   });
 });
 
+describe("ctx_note note_ids contract", () => {
+  // The description the model reads is IMPORTED from the core, so the schema it
+  // is paired with must speak the same dialect. The upstream core keeps this
+  // parity test (tools/ctx-note/schema.test.ts:36-42); the port shipped a scalar
+  // `note_id` next to a description promising `note_ids` because nothing here
+  // asserted it — the model followed the description and the call failed.
+  it("declares the array field the imported description promises", () => {
+    const source = readFileSync(join(__dirname, "tools.ts"), "utf8");
+    expect(source).not.toMatch(/note_id\??:\s/);
+    expect(source).toContain("note_ids: {");
+    expect(source).toContain('ctx_note(action="dismiss", note_ids=[N])');
+    expect(source).toContain('note_ids: { type: "array", items: "number", maxItems: 50 }');
+  });
+
+  it("dismisses every id in one call", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      const tool = findTool(registered, "ctx_note");
+      const exec = toolExec(makeFakeAgent(SESSION_ID, "/tmp/dsh-proj"));
+      const idOf = (value: unknown): number =>
+        Number(/Saved session note #(\d+)/.exec(textOf(value))?.[1]);
+
+      const first = idOf(await tool.execute({ action: "write", content: "note one" }, exec));
+      const second = idOf(await tool.execute({ action: "write", content: "note two" }, exec));
+      expect(Number.isInteger(first) && Number.isInteger(second)).toBe(true);
+
+      const value = await tool.execute({ action: "dismiss", note_ids: [first, second] }, exec);
+      expect(textOf(value)).toContain("Dismissed 2 of 2 notes.");
+
+      const active = db
+        .prepare("SELECT COUNT(*) AS n FROM notes WHERE session_id = ? AND status != 'dismissed'")
+        .get(CANONICAL) as { n: number };
+      expect(active.n).toBe(0);
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+
+  it("rejects the retired scalar shape and a multi-id update", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      const tool = findTool(registered, "ctx_note");
+      const exec = toolExec(makeFakeAgent(SESSION_ID, "/tmp/dsh-proj"));
+
+      await expect(tool.execute({ action: "dismiss", note_id: 1 }, exec)).rejects.toThrow(
+        /note_ids/,
+      );
+      await expect(
+        tool.execute({ action: "update", note_ids: [1, 2], content: "x" }, exec),
+      ).rejects.toThrow(/exactly one positive integer/);
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+});
+
 describe("ctx_memory write path", () => {
   it("inserts a memory row for the project and dedups identical content", async () => {
     const { db, dir } = await openDb();
@@ -321,6 +383,28 @@ describe("ctx_reduce drop path", () => {
       expect(pending.length).toBe(1);
       expect(pending[0]?.tag_id).toBe(1);
       expect(pending[0]?.operation).toBe("drop");
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+
+  it("defers a drop that falls inside the protected token window", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      // protected_tokens is a token FLOOR covering the newest tool mass; with a
+      // floor far above this tag's mass the drop must be deferred, not applied.
+      registerCtxTools(ctx, { ...baseOpts(db), protectedTokens: 1_000_000 });
+      const tool = findTool(registered, "ctx_reduce");
+      const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
+
+      db.prepare(
+        "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number) VALUES (?, ?, 'tool', 'active', 100, 1)",
+      ).run(CANONICAL, "call-1");
+
+      const value = await tool.execute({ drop: "1" }, toolExec(agent));
+      expect(textOf(value)).toContain("deferred drop §1§");
     } finally {
       db.close();
       await removeTestDir(dir);

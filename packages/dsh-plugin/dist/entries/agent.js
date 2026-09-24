@@ -209,7 +209,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-108znazq.js";
+} from "./agent-3yhvk2yh.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -272,7 +272,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-x5zygfb0.js";
+} from "./agent-n5kxd04y.js";
 import {
   getHarness,
   getDataDir,
@@ -5635,7 +5635,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       });
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTags: deps.config?.protectedTags ?? 20,
+        protectedTokens: deps.config?.protectedTokens,
         heuristicCleanup: deps.heuristicCleanup,
         skipPrefixInjection: true
       });
@@ -13256,7 +13256,8 @@ function buildDreamExecutor(facade, state) {
     client: facade,
     sessionDirectory: state.directory,
     openOpenCodeDb: () => null,
-    userMemoryCollectionEnabled: userMemoryCollectionEnabled(state.coreConfig)
+    userMemoryCollectionEnabled: userMemoryCollectionEnabled(state.coreConfig),
+    mural: { enabled: state.mural?.enabled === true, model: state.mural?.model }
   });
 }
 async function runDreamTick(db, projectIdentity, executor, state, log) {
@@ -13291,6 +13292,7 @@ function registerDshDreamer(ctx, deps) {
     tickMs,
     coreConfig: synthesizeDreamerConfig(deps.coreConfig),
     directory: deps.directory ?? process.cwd(),
+    mural: deps.mural,
     facade: null
   };
   dreamerRuntime.set(ctx, state);
@@ -18163,6 +18165,8 @@ function bridgeMagicConfig(config, directory) {
   const commitCluster = cfg.commit_cluster_trigger;
   return {
     ...config,
+    enabled: config.enabled ?? cfg.enabled !== false,
+    mural: { enabled: muralCfg?.enabled === true, model: muralCfg?.model },
     knowledge: {
       ...config.knowledge,
       injectDocs: config.knowledge?.injectDocs ?? dreamerCfg?.inject_docs ?? true,
@@ -18173,6 +18177,7 @@ function bridgeMagicConfig(config, directory) {
     },
     context: {
       ...config.context,
+      protectedTokens: config.context?.protectedTokens ?? cfg.protected_tokens,
       protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
       heuristicCleanup: config.context?.heuristicCleanup ?? (() => {
         const caveman = cfg.caveman_text_compression;
@@ -18202,7 +18207,7 @@ function bridgeMagicConfig(config, directory) {
       memoryToolEnabled: config.tools?.memoryToolEnabled ?? memoryCfg?.enabled !== false,
       dreamerEnabled: config.tools?.dreamerEnabled ?? isDreamerRunnable(cfg),
       compactionOff: config.tools?.compactionOff ?? !isCompactionEnabled(cfg),
-      protectedTags: config.tools?.protectedTags ?? cfg.protected_tags
+      protectedTokens: config.tools?.protectedTokens ?? cfg.protected_tokens
     },
     guidance: {
       ...config.guidance,
@@ -18213,7 +18218,8 @@ function bridgeMagicConfig(config, directory) {
       temporalAwarenessEnabled: config.guidance?.temporalAwarenessEnabled ?? cfg.temporal_awareness === true,
       cavemanTextCompressionEnabled: config.guidance?.cavemanTextCompressionEnabled ?? (typeof cfg.caveman_text_compression === "object" && cfg.caveman_text_compression !== null && cfg.caveman_text_compression.enabled === true),
       memoryEnabled: config.guidance?.memoryEnabled ?? memoryCfg?.enabled !== false,
-      promptSurface: config.guidance?.promptSurface ?? cfg.prompt_surface
+      promptSurface: config.guidance?.promptSurface ?? cfg.prompt_surface,
+      language: config.guidance?.language ?? cfg.language
     },
     commands: {
       ...config.commands,
@@ -18236,6 +18242,12 @@ function dreamerCoreConfigOf(config) {
 function apply(ctx, config = {}) {
   setDshHarness();
   config = bridgeMagicConfig(config, config.directory ?? process.cwd());
+  if (config.enabled === false) {
+    const message = "[magic-context] agent plane disabled (enabled=false): registered no tools, commands, or planes";
+    log(message);
+    ctx.logger?.info?.(message);
+    return;
+  }
   const host = readMagicContextHost(ctx);
   if (!host) {
     throw new Error("magic-context-agent: magicContextHost service unavailable");
@@ -18294,6 +18306,7 @@ function apply(ctx, config = {}) {
     directory,
     config: config.dreamer,
     coreConfig: dreamerCoreConfigOf(config),
+    mural: config.mural,
     parentAgent: dreamParents.resolve,
     log: log2
   });
@@ -18322,7 +18335,14 @@ function apply(ctx, config = {}) {
       compactionOff: config.commands?.compactionOff === true,
       parentAgent: dreamParents.resolve
     }));
-    seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log: log2 }));
+    seams.set("recomp", createRecompSeams({
+      ctx,
+      host,
+      directory,
+      db: bootstrap.db,
+      log: log2,
+      language: config.guidance?.language
+    }));
   });
   registerCtxCommands(ctx, {
     ...runtime,

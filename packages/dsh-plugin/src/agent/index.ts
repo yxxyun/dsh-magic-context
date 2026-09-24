@@ -98,6 +98,20 @@ export const inject = ["magicContextHost"];
 
 /** Agent-plane plugin configuration (all sections optional; defaults are knowledge-mode). */
 export interface MagicAgentConfig {
+  /**
+   * Top-level kill switch, upstream parity (core schema default: true). When
+   * false the agent plane registers nothing at all — no ctx_* tools, no
+   * commands, no knowledge gate, no historian plane, no dreamer — because
+   * surfacing entries the runtime will not service is pure UX confusion
+   * (packages/plugin/src/index.ts:900-907).
+   */
+  enabled?: boolean;
+  /**
+   * Core `mural` section. It enables the knowledge gate's vision-gated image
+   * block AND the dreamer's `compress-cues` task (the core skips that task
+   * unless mural is enabled).
+   */
+  mural?: { enabled?: boolean; model?: string };
   /** Session workspace directory (header cwd wins per session). */
   directory?: string;
   /** m[0]/m[1] knowledge gate options. */
@@ -164,6 +178,8 @@ export function bridgeMagicConfig(
   const commitCluster = cfg.commit_cluster_trigger;
   return {
     ...config,
+    enabled: config.enabled ?? (cfg.enabled !== false),
+    mural: { enabled: muralCfg?.enabled === true, model: muralCfg?.model },
     knowledge: {
       ...config.knowledge,
       injectDocs: config.knowledge?.injectDocs ?? dreamerCfg?.inject_docs ?? true,
@@ -176,6 +192,7 @@ export function bridgeMagicConfig(
     },
     context: {
       ...config.context,
+      protectedTokens: config.context?.protectedTokens ?? cfg.protected_tokens,
       protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
       heuristicCleanup:
         config.context?.heuristicCleanup ??
@@ -216,7 +233,7 @@ export function bridgeMagicConfig(
       memoryToolEnabled: config.tools?.memoryToolEnabled ?? memoryCfg?.enabled !== false,
       dreamerEnabled: config.tools?.dreamerEnabled ?? isDreamerRunnable(cfg),
       compactionOff: config.tools?.compactionOff ?? !isCompactionEnabled(cfg),
-      protectedTags: config.tools?.protectedTags ?? cfg.protected_tags,
+      protectedTokens: config.tools?.protectedTokens ?? cfg.protected_tokens,
     },
     guidance: {
       ...config.guidance,
@@ -233,6 +250,10 @@ export function bridgeMagicConfig(
         (cfg.caveman_text_compression as { enabled?: unknown }).enabled === true),
       memoryEnabled: config.guidance?.memoryEnabled ?? memoryCfg?.enabled !== false,
       promptSurface: config.guidance?.promptSurface ?? cfg.prompt_surface,
+      // The guidance builder and the recomp prompts both read `language`; the
+      // bridge never mapped it, so a user's `language` setting was silently
+      // ignored by every consumer (guidance, recomp, historian wording).
+      language: config.guidance?.language ?? cfg.language,
     },
     commands: {
       ...config.commands,
@@ -268,6 +289,16 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   // setHarness is idempotent for the same value and throws only on a mismatch.
   setDshHarness();
   config = bridgeMagicConfig(config, config.directory ?? process.cwd());
+  // Top-level kill switch (upstream parity). This runs BEFORE the host check so
+  // a deliberately disabled plane can never fail the boot, and it logs to the
+  // core sink because `ctx.logger` is not persisted anywhere on DSH.
+  if (config.enabled === false) {
+    const message =
+      "[magic-context] agent plane disabled (enabled=false): registered no tools, commands, or planes";
+    coreLog(message);
+    ctx.logger?.info?.(message);
+    return;
+  }
   const host = readMagicContextHost(ctx);
   if (!host) {
     throw new Error("magic-context-agent: magicContextHost service unavailable");
@@ -359,6 +390,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     directory,
     config: config.dreamer,
     coreConfig: dreamerCoreConfigOf(config),
+    mural: config.mural,
     parentAgent: dreamParents.resolve,
     log,
   });
@@ -399,7 +431,18 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
         parentAgent: dreamParents.resolve,
       }),
     );
-    seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log }));
+    seams.set(
+      "recomp",
+      createRecompSeams({
+        ctx,
+        host,
+        directory,
+        db: bootstrap.db,
+        log,
+        // Already bridged into guidance above (the seam closure has no `cfg`).
+        language: config.guidance?.language,
+      }),
+    );
   });
   registerCtxCommands(ctx, {
     ...runtime,

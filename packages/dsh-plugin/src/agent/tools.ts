@@ -67,6 +67,7 @@ import {
 import {
   addNote,
   dismissNote,
+  dismissNotes,
   getNotes,
   getOrCreateSessionMeta,
   getPendingOps,
@@ -79,6 +80,7 @@ import {
   updateNote,
   updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
   normalizeTodoStateJson,
@@ -144,8 +146,14 @@ export interface CtxToolsOptions extends CtxRuntimeOptions {
   sessionScopedToolsDisabled?: boolean;
   /** When true, omit ctx_reduce (compaction-off mode). */
   compactionOff?: boolean;
-  /** Number of recent tags ctx_reduce treats as protected (deferred drops). */
-  protectedTags?: number;
+  /**
+   * Token floor for the protection window (upstream `protected_tokens`): the
+   * newest tool mass up to this many tokens stays protected, so drops there are
+   * deferred rather than applied. Undefined defers to the core's persisted epoch
+   * floor snapshot. Replaces the retired newest-N `protected_tags` count, which
+   * upstream ignores for behaviour.
+   */
+  protectedTokens?: number;
   /** When true, ctx_note accepts smart notes (dreamer will evaluate them). */
   dreamerEnabled?: boolean;
   /** When true, ctx_memory exposes the dreamer-only `list` action. */
@@ -922,13 +930,13 @@ const FILTER_VALUES = ["active", "pending", "ready", "dismissed", "all"] as cons
 type CtxNoteReadFilter = (typeof FILTER_VALUES)[number];
 const DEFAULT_READ_LIMIT = 25;
 const DISMISS_FOOTER =
-  '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
+  '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])';
 
 interface CtxNoteArgs {
   action?: "write" | "read" | "dismiss" | "update";
   content?: string;
   surface_condition?: string;
-  note_id?: number;
+  note_ids?: number[];
   filter?: CtxNoteReadFilter;
   limit?: number;
   offset?: number;
@@ -1060,6 +1068,37 @@ function readNotes(args: {
   return sections;
 }
 
+/**
+ * Read `note_ids` for the actions that use it. `write` and `read` never look at
+ * it: a tool surface that requires every declared property makes the model send
+ * filler there (upstream issue 460), and filler on an action that does not use
+ * the field must not fail the call. `update` addresses exactly one note;
+ * `dismiss` takes one to fifty. Mirrors the upstream contract.
+ */
+function parseNoteIds(action: string, value: unknown): number[] {
+  const max = action === "update" ? 1 : 50;
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > max ||
+    value.some((id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0)
+  ) {
+    throw toolError(
+      action === "update"
+        ? "'note_ids' must contain exactly one positive integer id when action is 'update'."
+        : "'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
+    );
+  }
+  return value as number[];
+}
+
+function formatDismissResults(results: Array<{ noteId: number; outcome: string }>): string {
+  const dismissedCount = results.filter((result) => result.outcome === "dismissed").length;
+  return `Dismissed ${dismissedCount} of ${results.length} notes.\n${results
+    .map((result) => `- Note #${result.noteId}: ${result.outcome}`)
+    .join("\n")}`;
+}
+
 export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefinition {
   return defineTool({
     name: "ctx_note",
@@ -1076,7 +1115,12 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         description:
           "Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead.",
       },
-      note_id: { type: "integer", description: "Note ID (required for 'dismiss' and 'update' actions)." },
+      note_ids: {
+        type: "array",
+        items: { type: "integer" },
+        description:
+          "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.",
+      },
       filter: {
         type: "string",
         enum: [...FILTER_VALUES],
@@ -1094,7 +1138,7 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
         content: "string",
         surface_condition: "string",
-        note_id: "number",
+        note_ids: { type: "array", items: "number", maxItems: 50 },
         filter: { type: "enum", values: FILTER_VALUES },
         limit: "number",
         offset: "number",
@@ -1139,27 +1183,24 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
       }
 
       if (action === "dismiss") {
-        if (typeof params.note_id !== "number") {
-          throw toolError("'note_id' is required when action is 'dismiss'.");
-        }
+        const ids = parseNoteIds(action, params.note_ids);
         if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
         if (!runtime.projectIdentity) {
           throw toolError("Could not resolve project identity for note dismiss.");
         }
-        const dismissed = dismissNote(db, params.note_id, {
-          projectPath: runtime.projectIdentity,
-          sessionId,
-        });
-        if (!dismissed) {
-          throw toolError(`Note #${params.note_id} not found in your session/project or already dismissed.`);
+        const scope = { projectPath: runtime.projectIdentity, sessionId };
+        if (ids.length === 1) {
+          const dismissed = dismissNote(db, ids[0], scope);
+          if (!dismissed) {
+            throw toolError(`Note #${ids[0]} not found in your session/project or already dismissed.`);
+          }
+          return { text: `Note #${ids[0]} dismissed.` };
         }
-        return { text: `Note #${params.note_id} dismissed.` };
+        return { text: formatDismissResults(dismissNotes(db, ids, scope)) };
       }
 
       if (action === "update") {
-        if (typeof params.note_id !== "number") {
-          throw toolError("'note_id' is required when action is 'update'.");
-        }
+        const noteId = parseNoteIds(action, params.note_ids)[0];
         const updates: {
           content?: string;
           surfaceCondition?: string;
@@ -1173,15 +1214,15 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         if (!runtime.projectIdentity) {
           throw toolError("Could not resolve project identity for note update.");
         }
-        const updated = updateNote(db, params.note_id, updates, {
+        const updated = updateNote(db, noteId, updates, {
           projectPath: runtime.projectIdentity,
           sessionId,
         });
-        if (!updated) throw toolError(`Note #${params.note_id} not found in your session/project.`);
+        if (!updated) throw toolError(`Note #${noteId} not found in your session/project.`);
         const parts: string[] = [];
         if (updates.content) parts.push(`content: ${updates.content}`);
         if (updates.surfaceCondition) parts.push(`condition: ${updates.surfaceCondition}`);
-        return { text: `Updated note #${params.note_id}\n- ${parts.join("\n- ")}` };
+        return { text: `Updated note #${noteId}\n- ${parts.join("\n- ")}` };
       }
 
       const limit =
@@ -1373,7 +1414,6 @@ export function createCtxReduceTool(ctx: Context, opts: CtxToolsOptions): ToolDe
       const runtime = resolveAgentContext(ctx, opts, agent);
       if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
       const sessionId = runtime.sessionId;
-      const protectedTags = Math.max(0, Math.floor(opts.protectedTags ?? 20));
 
       if (!params.drop) throw toolError("'drop' must be provided.");
 
@@ -1395,12 +1435,13 @@ export function createCtxReduceTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         );
       }
 
-      const activeTags = allTags.filter((tag) => tag.status === "active");
-      const protectedTagIds = activeTags
-        .map((tag) => tag.tagNumber)
-        .sort((left, right) => right - left)
-        .slice(0, protectedTags);
-      const protectedSet = new Set(protectedTagIds);
+      // v0.42.6 replaced the newest-N protected_tags count with an exact token
+      // window. The plan path (transcript.ts deriveMutationPlan) already calls
+      // this same helper, so the tool and the plan can never disagree about what
+      // is protected. `opts.protectedTokens` is the upstream protected_tokens
+      // floor; undefined lets the core read its persisted epoch floor snapshot.
+      const protectedSet = getProtectionWindowForSession(db, sessionId, opts.protectedTokens)
+        .protectedTagNumbers;
 
       const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
       const pendingOps = getPendingOps(db, sessionId);

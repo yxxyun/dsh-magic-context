@@ -167,6 +167,12 @@ export interface DreamerWiringDeps {
   readonly config?: { enabled?: boolean; tickMs?: number };
   /** Parsed core DreamerConfig (from magic-context.jsonc `dreamer` section). */
   readonly coreConfig?: unknown;
+  /**
+   * Core `mural` section. It gates the `compress-cues` dream task: the core
+   * skips that task outright unless `mural.enabled` is true, which is why the
+   * task was a permanent no-op before this was threaded through.
+   */
+  readonly mural?: { enabled?: boolean; model?: string };
   /** Resolve the live agent a tool-requiring dream worker spawns from. */
   readonly parentAgent?: DreamParentResolver;
   /** Worker budget override (tests). */
@@ -484,6 +490,8 @@ interface DreamerRuntimeState {
   tickMs: number;
   coreConfig: DreamerConfig;
   directory: string;
+  /** Core `mural` section (gates compress-cues). */
+  mural?: { enabled?: boolean; model?: string };
   /** Lazily created once; both the timer and the seam share one facade. */
   facade: DshDreamSessionFacade | null;
 }
@@ -527,7 +535,8 @@ export function discoverDreamProjects(db: Database): string[] {
 /** The TaskExecutor the scheduler drives: core `createDreamTaskExecutor`
  *  closed over the DSH facade. `openOpenCodeDb` → null (no OpenCode store);
  *  no retrospective raw provider (retrospective becomes a clean no-op until a
- *  DSH raw-source provider lands); no mural (compress-cues no-ops). */
+ *  DSH raw-source provider lands); `mural` is passed through so `compress-cues`
+ *  can run when the user enabled it. */
 function buildDreamExecutor(
   facade: DshDreamSessionFacade,
   state: DreamerRuntimeState,
@@ -537,6 +546,7 @@ function buildDreamExecutor(
     sessionDirectory: state.directory,
     openOpenCodeDb: () => null,
     userMemoryCollectionEnabled: userMemoryCollectionEnabled(state.coreConfig),
+    mural: { enabled: state.mural?.enabled === true, model: state.mural?.model },
   });
 }
 
@@ -605,6 +615,7 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
     // 缺失时回落核心默认调度（v1 保真）。
     coreConfig: synthesizeDreamerConfig(deps.coreConfig),
     directory: deps.directory ?? process.cwd(),
+    mural: deps.mural,
     facade: null,
   };
   dreamerRuntime.set(ctx, state);

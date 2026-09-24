@@ -165,8 +165,17 @@ export interface DshOrdinalMap {
 /** Plan-derivation context (design §3). */
 export interface PlanContext {
   readonly db: Database;
-  /** Newest-N active tags exempt from pending drops (applyPendingOperations). */
+  /**
+   * Deprecated and ignored (upstream parity: the newest-N `protected_tags`
+   * count was replaced by the token window). Kept so existing call sites still
+   * type-check; behaviour comes from `protectedTokens` + the core's window.
+   */
   readonly protectedTags?: number;
+  /**
+   * Token floor for the protection window (upstream `protected_tokens`).
+   * Undefined defers to the core's persisted epoch floor snapshot.
+   */
+  readonly protectedTokens?: number;
   /** Injectable clock; reserved for later stages (decay/nudge). Unused by this slice. */
   readonly now?: () => number;
   /**
@@ -1295,7 +1304,7 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
   const sessionId = view.sessionId;
   // v0.42.6 replaced the newest-N protected_tags count with an exact
   // token-window membership set (+ cutoff) derived from the tag population.
-  const protectionWindow = getProtectionWindowForSession(db, sessionId);
+  const protectionWindow = getProtectionWindowForSession(db, sessionId, ctx.protectedTokens);
   const protectedTagNumbers = protectionWindow.protectedTagNumbers;
   const protectedCutoff = protectionWindow.cutoff;
 
