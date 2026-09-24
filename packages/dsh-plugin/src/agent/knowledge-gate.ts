@@ -132,6 +132,16 @@ export interface KnowledgeGateDeps {
     agent: import("@deepseek-ai/dsh-agent").Agent,
   ) => void;
   readonly log?: (message: string) => void;
+  /**
+   * Register the project's embedding provider for this session's directory
+   * (upstream `hook.ts:617` does the same on the session path). Without it the
+   * semantic lanes resolved to null until some ctx_* tool call happened to
+   * register the project first, so auto-search silently ran lexical-only.
+   */
+  readonly ensureProjectRegistered?: (
+    directory: string,
+    db: import("@magic-context/core/shared/sqlite").Database,
+  ) => Promise<void>;
 }
 
 /** Per-plugin gate state (owned by the registration, reset on plugin reload). */
@@ -648,6 +658,22 @@ export async function runKnowledgeGateStep(
       const magicSessionId = deps.host.canonicalKey(agent.id);
       const directory = sessionProjectPath(agent, deps.config.directory);
       const projectPath = resolveKnowledgeProjectPath(directory);
+      // Fire-and-forget, exactly like the upstream hook: the pre-step must never
+      // hang on (or fail because of) an embedding provider. The registration
+      // itself already logs and degrades, so the catch here only guards against
+      // an injected registrar that rejects.
+      const registration = directory
+        ? deps.ensureProjectRegistered?.(directory, db)
+        : undefined;
+      if (registration) {
+        void registration.catch((error: unknown) => {
+          deps.log?.(
+            `[magic-context] embedding registration (pre-step) failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
 
       // Publish the live agent so a tool-requiring dream task can spawn a worker
       // from it (the dreamer's timer has no agent of its own).

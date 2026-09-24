@@ -8705,6 +8705,27 @@ var embeddingRowMetadata = new WeakMap;
 function isSynapseEmbeddingTruncated(vector) {
   return embeddingRowMetadata.get(vector)?.truncated === true;
 }
+function toSynapseLaneDescriptor(metadata) {
+  const tokenBudget = metadata.recommended_token_budget;
+  return {
+    lane: metadata.model,
+    ...metadata.device_class ? { device_class: metadata.device_class } : {},
+    max_tokens: metadata.max_tokens,
+    max_tokens_source: metadata.max_tokens_source,
+    ...metadata.bucket_ladder ? { bucket_ladder: [...metadata.bucket_ladder] } : {},
+    ...metadata.dims ? { dims: metadata.dims } : {},
+    ...metadata.dtype ? { dtype: metadata.dtype } : {},
+    ...typeof metadata.certified === "boolean" ? { certified: metadata.certified } : {},
+    ...metadata.warm_load_cost_hint_ms !== undefined ? { warm_load_cost_hint_ms: metadata.warm_load_cost_hint_ms } : {},
+    ...metadata.recommended_batch ? {
+      recommended_batch: {
+        rows: metadata.recommended_batch,
+        ...tokenBudget !== undefined ? { token_budget: tokenBudget } : {}
+      }
+    } : {},
+    warm: metadata.max_tokens_source === "runtime_bucket" || metadata.max_tokens_source === "worker_bucket"
+  };
+}
 function formatSynapseLaneDescriptor(descriptor) {
   const certified = descriptor.certified === undefined ? "unknown" : String(descriptor.certified);
   return `lane=${descriptor.lane}; device_class=${descriptor.device_class ?? "unknown"}; ` + `max_tokens=${descriptor.max_tokens} (${descriptor.max_tokens_source}); ` + `certified=${certified}; warm=${descriptor.warm ? "yes" : "no"}; ` + `warm_load_cost_hint_ms=${descriptor.warm_load_cost_hint_ms ?? "unknown"}`;
@@ -11661,6 +11682,32 @@ function getRepairSessionChunkProjectStatement(db) {
   }
   return stmt;
 }
+function getRepairProjectChunkProjectStatement(db) {
+  let stmt = repairProjectChunkProjectStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`UPDATE compartment_chunk_embeddings
+             SET project_path = (
+                 SELECT sp.project_path
+                 FROM session_projects sp
+                 WHERE sp.session_id = compartment_chunk_embeddings.session_id
+                   AND sp.harness = compartment_chunk_embeddings.harness
+                 LIMIT 1
+             )
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM session_projects sp
+                 WHERE sp.session_id = compartment_chunk_embeddings.session_id
+                   AND sp.harness = compartment_chunk_embeddings.harness
+                   AND sp.project_path <> compartment_chunk_embeddings.project_path
+                   AND (
+                       sp.project_path = ?
+                       OR compartment_chunk_embeddings.project_path = ?
+                   )
+             )`);
+    repairProjectChunkProjectStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function recordSessionProjectIdentity(db, sessionId, projectPath) {
   if (!sessionId || !projectPath)
     return;
@@ -11672,6 +11719,11 @@ function recordSessionProjectIdentity(db, sessionId, projectPath) {
     getUpsertSessionProjectStatement(db).run(sessionId, harness, projectPath, now);
     getRepairSessionChunkProjectStatement(db).run(projectPath, sessionId, harness, projectPath, SESSION_CHUNK_REPAIR_BATCH_SIZE);
   })();
+}
+function repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectPath) {
+  if (!projectPath)
+    return 0;
+  return getRepairProjectChunkProjectStatement(db).run(projectPath, projectPath).changes;
 }
 
 // ../plugin/src/features/magic-context/shadow-backfill-state.ts
@@ -11793,6 +11845,12 @@ function finishSynapseBatchLedger(db, sessionId, requestKey, status, now = Date.
   db.prepare("UPDATE synapse_batch_ledger SET status = ?, updated_at = ? WHERE session_id = ? AND request_key = ?").run(status, now, sessionId, requestKey);
 }
 var SYNAPSE_BATCH_LEDGER_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+function pruneSynapseBatchLedgerForProject(db, projectIdentity, ttlMs = SYNAPSE_BATCH_LEDGER_TTL_MS) {
+  const ledgerTable = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'synapse_batch_ledger'").get();
+  if (!ledgerTable)
+    return 0;
+  return db.prepare("DELETE FROM synapse_batch_ledger WHERE session_id IN (?, ?) AND updated_at < ?").run(projectIdentity, `shadow:${projectIdentity}`, Date.now() - ttlMs).changes;
+}
 
 // ../plugin/src/features/magic-context/project-embedding-registry.ts
 var OFF_PROVIDER_IDENTITY = "embedding-provider:off";
@@ -11824,7 +11882,11 @@ var upsertActiveIdentityStatements = new WeakMap;
 var backfillActiveIdentityStatements = new Map;
 var staleIdentityStatements = new Map;
 var deleteActiveIdentityStatements = new WeakMap;
+var globalRegistrationGeneration = 0;
 var untrustedLoadProjects = new Set;
+function markProjectLoadUntrusted(projectIdentity) {
+  untrustedLoadProjects.add(projectIdentity);
+}
 var testProviderFactory = null;
 
 class TestProviderFactoryRequiredError extends Error {
@@ -11895,6 +11957,125 @@ function updatePersistedShadowBackfillState(db, projectIdentity, scope, modelId,
          SET provenance_json = ?
          WHERE project_path = ? AND scope = ? AND model_id = ?`).run(JSON.stringify(provenance), projectIdentity, scope, modelId);
 }
+function shadowDescriptorProvenanceJson(db, projectIdentity, scope, modelId, synapseProvenance) {
+  const provenance = typeof synapseProvenance === "object" && synapseProvenance !== null && !Array.isArray(synapseProvenance) ? { ...synapseProvenance } : synapseProvenance === undefined ? {} : { synapse_provenance: synapseProvenance };
+  const existing = getPersistedShadowBackfillState(db, projectIdentity, scope, modelId);
+  if (existing)
+    provenance[SHADOW_BACKFILL_PROVENANCE_KEY2] = existing;
+  return JSON.stringify(provenance);
+}
+function persistPrimaryDescriptor(db, registration) {
+  const descriptorTable = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'embedding_registrations'").get();
+  if (!descriptorTable)
+    return;
+  const fields = synapseConfigFields(registration.config);
+  db.prepare(`INSERT INTO embedding_registrations
+            (project_path, provider_identity, model_id, chunk_model_id, fingerprint, table_epoch, dims, provenance_json, generation, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            provider_identity = excluded.provider_identity,
+            model_id = excluded.model_id,
+            chunk_model_id = excluded.chunk_model_id,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            generation = excluded.generation,
+            updated_at = excluded.updated_at`).run(registration.projectIdentity, registration.providerIdentity, registration.modelId, registration.chunkModelId, fields.fingerprint ?? "", fields.tableEpoch ?? 0, fields.dims ?? 0, JSON.stringify(fields.provenance ?? {}), registration.generation, Date.now());
+}
+function persistShadowDescriptor(db, registration) {
+  const descriptorTable = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'shadow_embedding_registrations'").get();
+  if (!descriptorTable)
+    return;
+  const fields = synapseConfigFields(registration.config);
+  const now = Date.now();
+  db.prepare(`INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`).run(registration.projectIdentity, "memory", registration.modelId, registration.generation, fields.fingerprint ?? "", fields.tableEpoch ?? 0, fields.dims ?? 0, shadowDescriptorProvenanceJson(db, registration.projectIdentity, "memory", registration.modelId, fields.provenance), now);
+  db.prepare(`INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`).run(registration.projectIdentity, "commit", registration.modelId, registration.generation, fields.fingerprint ?? "", fields.tableEpoch ?? 0, fields.dims ?? 0, shadowDescriptorProvenanceJson(db, registration.projectIdentity, "commit", registration.modelId, fields.provenance), now);
+  db.prepare(`INSERT INTO shadow_embedding_registrations
+            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+            generation = excluded.generation,
+            fingerprint = excluded.fingerprint,
+            table_epoch = excluded.table_epoch,
+            dims = excluded.dims,
+            provenance_json = excluded.provenance_json,
+            updated_at = excluded.updated_at`).run(registration.projectIdentity, "chunk", registration.chunkModelId, registration.generation, fields.fingerprint ?? "", fields.tableEpoch ?? 0, fields.dims ?? 0, shadowDescriptorProvenanceJson(db, registration.projectIdentity, "chunk", registration.chunkModelId, fields.provenance), now);
+}
+function resolveEmbeddingConfig(config) {
+  if (!config || config.provider === "local") {
+    return {
+      provider: "local",
+      model: config?.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+      local_runtime: config?.local_runtime ?? "auto",
+      ...config?.max_input_tokens ? {
+        max_input_tokens: normalizeCompartmentChunkMaxInputTokens(config.max_input_tokens)
+      } : {},
+      ...config?.local_dtype ? { local_dtype: config.local_dtype } : {}
+    };
+  }
+  if (config.provider === "openai-compatible") {
+    const apiKey = config.api_key?.trim();
+    const inputType = config.input_type?.trim();
+    const queryInputType = config.query_input_type?.trim();
+    const truncate = config.truncate?.trim();
+    return {
+      provider: "openai-compatible",
+      model: config.model.trim(),
+      endpoint: config.endpoint.trim(),
+      ...apiKey ? { api_key: apiKey } : {},
+      ...inputType ? { input_type: inputType } : {},
+      ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...config.query_instruction !== undefined ? { query_instruction: config.query_instruction } : {},
+      ...config.document_prefix !== undefined ? { document_prefix: config.document_prefix } : {},
+      ...truncate ? { truncate } : {},
+      ...config.max_input_tokens ? {
+        max_input_tokens: normalizeCompartmentChunkMaxInputTokens(config.max_input_tokens)
+      } : {}
+    };
+  }
+  if (config.provider === "off") {
+    return { provider: "off" };
+  }
+  if (config.provider === "synapse") {
+    const synapse = config;
+    const descriptor = synapseDescriptorFromConfig(config);
+    return {
+      provider: "synapse",
+      model: synapse.model?.trim() || "gte-modernbert-base-f16",
+      max_input_tokens: normalizeCompartmentChunkMaxInputTokens(descriptor?.max_tokens ?? synapse.max_input_tokens),
+      ...synapse.synapse_connection_file ? { synapse_connection_file: synapse.synapse_connection_file } : {},
+      ...synapse.synapse_fingerprint ? { synapse_fingerprint: synapse.synapse_fingerprint } : {},
+      ...typeof synapse.synapse_table_epoch === "number" ? { synapse_table_epoch: synapse.synapse_table_epoch } : {},
+      ...typeof synapse.synapse_dims === "number" ? { synapse_dims: synapse.synapse_dims } : {},
+      ...typeof synapse.synapse_recommended_batch === "number" ? { synapse_recommended_batch: synapse.synapse_recommended_batch } : {},
+      ...typeof synapse.synapse_recommended_token_budget === "number" ? {
+        synapse_recommended_token_budget: synapse.synapse_recommended_token_budget
+      } : {},
+      ...descriptor ? { synapse_descriptor: descriptor } : {},
+      ...synapse.synapse_provenance !== undefined ? { synapse_provenance: synapse.synapse_provenance } : {}
+    };
+  }
+  throw new Error("Unknown embedding provider");
+}
 function createProvider(config, context) {
   if (config.provider === "off") {
     return null;
@@ -11955,6 +12136,27 @@ function sha256Prefix(value, length = 16) {
 function contentSha256(value) {
   return createHash5("sha256").update(value).digest("hex");
 }
+function getRuntimeFingerprint(config) {
+  if (config.provider === "off") {
+    return OFF_PROVIDER_IDENTITY;
+  }
+  return `${getEmbeddingProviderIdentity(config)}:${sha256Prefix(stableStringify2(config))}`;
+}
+function getChunkEmbeddingModelId(config, providerIdentity) {
+  if (config.provider === "off") {
+    return OFF_PROVIDER_IDENTITY;
+  }
+  const chunkIdentity = {
+    providerIdentity,
+    chunkerVersion: 2,
+    maxInputTokens: normalizeCompartmentChunkMaxInputTokens("max_input_tokens" in config ? config.max_input_tokens : undefined),
+    truncate: config.provider === "openai-compatible" ? config.truncate ?? "" : ""
+  };
+  return `${providerIdentity}:chunk:${sha256Prefix(stableStringify2(chunkIdentity))}`;
+}
+function sameFeatures(a, b) {
+  return a.memoryEnabled === b.memoryEnabled && a.gitCommitEnabled === b.gitCommitEnabled;
+}
 function snapshotFor(registration) {
   const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
   const enabled = !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
@@ -11975,6 +12177,205 @@ function snapshotFor(registration) {
     model: registration.observationMode || !providerIsOn ? "off" : configuredModel ? configuredModel : registration.modelId,
     provider: registration.observationMode || !providerIsOn ? "off" : registration.config.provider ?? "local",
     ...synapseDescriptor ? { synapseDescriptor } : {}
+  };
+}
+function disposeProvider(provider) {
+  if (!provider)
+    return;
+  provider.dispose().catch((error) => {
+    log("[magic-context] embedding provider dispose failed:", error);
+  });
+}
+function getUpsertActiveIdentityStatement(db) {
+  let stmt = upsertActiveIdentityStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO embedding_identity_active (project_path, scope, model_id, last_active_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
+                 last_active_at = excluded.last_active_at`);
+    upsertActiveIdentityStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function statementMapFor(maps, key) {
+  let map = maps.get(key);
+  if (!map) {
+    map = new WeakMap;
+    maps.set(key, map);
+  }
+  return map;
+}
+function getBackfillActiveIdentityStatement(db, scope) {
+  const map = statementMapFor(backfillActiveIdentityStatements, scope);
+  let stmt = map.get(db);
+  if (!stmt) {
+    const selectByScope = {
+      memory: `SELECT DISTINCT e.model_id AS model_id
+                     FROM memory_embeddings e
+                     JOIN memories m ON m.id = e.memory_id
+                     WHERE m.project_path = ?`,
+      commit: `SELECT DISTINCT e.model_id AS model_id
+                     FROM git_commit_embeddings e
+                     JOIN git_commits c ON c.sha = e.sha
+                     WHERE c.project_path = ?`,
+      chunk: `SELECT DISTINCT e.model_id AS model_id
+                    FROM compartment_chunk_embeddings e
+                    WHERE e.project_path = ?`
+    };
+    stmt = db.prepare(`INSERT OR IGNORE INTO embedding_identity_active (project_path, scope, model_id, last_active_at)
+             SELECT ?, ?, model_id, ?
+             FROM (${selectByScope[scope]})
+             WHERE model_id IS NOT NULL`);
+    map.set(db, stmt);
+  }
+  return stmt;
+}
+function recordScopeActiveIdentity(db, projectIdentity, scope, modelId, now) {
+  getUpsertActiveIdentityStatement(db).run(projectIdentity, scope, modelId, now);
+  getBackfillActiveIdentityStatement(db, scope).run(projectIdentity, scope, now, projectIdentity);
+}
+function recordActiveEmbeddingIdentity(db, projectIdentity, currentProviderIdentity, currentChunkIdentity, features) {
+  if (currentProviderIdentity === OFF_PROVIDER_IDENTITY) {
+    return;
+  }
+  const now = Date.now();
+  const transactionStartedAt = performance.now();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (features.memoryEnabled) {
+      recordScopeActiveIdentity(db, projectIdentity, "memory", currentProviderIdentity, now);
+    }
+    if (features.gitCommitEnabled) {
+      recordScopeActiveIdentity(db, projectIdentity, "commit", currentProviderIdentity, now);
+    }
+    if (features.memoryEnabled) {
+      repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
+      recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
+    }
+    db.exec("COMMIT");
+    logSlowWriteTransaction("embedding_identity_record", transactionStartedAt);
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+}
+function registerProjectEmbedding(db, projectIdentity, config, features, sourceDirectory) {
+  const resolvedConfig = resolveEmbeddingConfig(config);
+  const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
+  const runtimeFingerprint = getRuntimeFingerprint(resolvedConfig);
+  const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+  const prior = projectRegistrations.get(projectIdentity);
+  const canReuseProvider = prior !== undefined && !prior.observationMode && prior.runtimeFingerprint === runtimeFingerprint && prior.providerIdentity === providerIdentity;
+  recordActiveEmbeddingIdentity(db, projectIdentity, providerIdentity, chunkModelId, features);
+  pruneSynapseBatchLedgerForProject(db, projectIdentity);
+  untrustedLoadProjects.delete(projectIdentity);
+  const generationChanged = prior === undefined || prior.observationMode || prior.runtimeFingerprint !== runtimeFingerprint || prior.chunkModelId !== chunkModelId || !sameFeatures(prior.features, features);
+  const generation = generationChanged ? ++globalRegistrationGeneration : prior.generation;
+  const registration = {
+    projectIdentity,
+    sourceDirectory,
+    config: resolvedConfig,
+    providerIdentity,
+    runtimeFingerprint,
+    provider: canReuseProvider ? prior.provider : null,
+    generation,
+    features: { ...features },
+    modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
+    chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
+    observationMode: false
+  };
+  projectRegistrations.set(projectIdentity, registration);
+  persistPrimaryDescriptor(db, registration);
+  if (!canReuseProvider) {
+    disposeProvider(prior?.provider ?? null);
+  }
+  return snapshotFor(registration);
+}
+function registerProjectShadowEmbedding(db, projectIdentity, config, sourceDirectory, options = {}) {
+  const resolvedConfig = resolveEmbeddingConfig(config);
+  if (resolvedConfig.provider !== "synapse") {
+    throw new Error("Shadow embedding registration requires the synapse provider");
+  }
+  const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
+  const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+  const provider = createProvider(resolvedConfig, {
+    projectRoot: sourceDirectory,
+    session: `shadow:${projectIdentity}`
+  });
+  if (!provider)
+    return null;
+  const prior = shadowRegistrations.get(projectIdentity);
+  if (prior && prior.providerIdentity === providerIdentity) {
+    provider.dispose();
+    dbForShadowQueue.set(projectIdentity, db);
+    persistShadowDescriptor(db, prior);
+    const backfillAlreadyArmed = hasPendingShadowBackfill(projectIdentity) || shadowQueue.some((item) => item.projectIdentity === projectIdentity);
+    if (!backfillAlreadyArmed || options.manualBackfill === true) {
+      maybeArmShadowBackfill(db, projectIdentity, prior, options.manualBackfill === true);
+    }
+    return {
+      ...snapshotFor({
+        projectIdentity,
+        sourceDirectory,
+        config: prior.config,
+        providerIdentity: prior.providerIdentity,
+        runtimeFingerprint: `shadow:${prior.providerIdentity}`,
+        provider: prior.provider,
+        generation: prior.generation,
+        features: { memoryEnabled: true, gitCommitEnabled: true },
+        modelId: prior.modelId,
+        chunkModelId: prior.chunkModelId,
+        observationMode: false
+      }),
+      provider: "synapse"
+    };
+  }
+  const generation = ++globalRegistrationGeneration;
+  const registration = {
+    projectIdentity,
+    sourceDirectory,
+    config: resolvedConfig,
+    provider,
+    providerIdentity,
+    modelId: providerIdentity,
+    chunkModelId,
+    generation
+  };
+  shadowRegistrations.set(projectIdentity, registration);
+  dbForShadowQueue.set(projectIdentity, db);
+  if (prior) {
+    disposeProvider(prior.provider);
+    for (const scope of ["memory", "commit", "chunk"]) {
+      const scopeKey = `${projectIdentity}:${scope}`;
+      shadowBackfillLastIds.delete(scopeKey);
+      shadowBackfillStopReasons.delete(scopeKey);
+      shadowBackfillLastWriteOutcomes.delete(scopeKey);
+    }
+  }
+  db.transaction(() => {
+    const now = Date.now();
+    recordScopeActiveIdentity(db, projectIdentity, "memory", registration.modelId, now);
+    recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
+    recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
+    persistShadowDescriptor(db, registration);
+  })();
+  maybeArmShadowBackfill(db, projectIdentity, registration, options.manualBackfill === true);
+  return {
+    projectIdentity,
+    sourceDirectory,
+    providerIdentity,
+    runtimeFingerprint: `shadow:${providerIdentity}`,
+    generation,
+    features: { memoryEnabled: true, gitCommitEnabled: true },
+    enabled: true,
+    gitCommitEnabled: true,
+    modelId: registration.modelId,
+    chunkModelId: registration.chunkModelId,
+    model: "model" in resolvedConfig && typeof resolvedConfig.model === "string" ? resolvedConfig.model : registration.modelId,
+    provider: "synapse",
+    ...synapseDescriptorFromConfig(resolvedConfig) ? { synapseDescriptor: synapseDescriptorFromConfig(resolvedConfig) } : {}
   };
 }
 function startShadowWorker() {
@@ -12163,6 +12564,56 @@ function pumpShadowBackfill() {
     if (scopes.size === 0)
       pendingShadowBackfills.delete(projectIdentity);
   }
+}
+function maybeArmShadowBackfill(db, projectIdentity, shadow, manualBackfill = false) {
+  if (untrustedLoadProjects.has(projectIdentity))
+    return;
+  const primary = projectRegistrations.get(projectIdentity);
+  if (!primary)
+    return;
+  const pending = new Set;
+  for (const scope of ["memory", "commit", "chunk"]) {
+    const primaryModelId = shadowModelIdForScope(primary, scope);
+    const shadowModelId = shadowModelIdForScope(shadow, scope);
+    const stallKey = `${projectIdentity}:${scope}`;
+    if (primaryModelId === "off" || shadowModelId === "off")
+      continue;
+    const batch = shadowBackfillCandidateBatch(db, projectIdentity, scope, primaryModelId, shadow, SHADOW_MAX_ITEMS_PER_TICK);
+    const persisted = getPersistedShadowBackfillState(db, projectIdentity, scope, shadowModelId);
+    if (batch.ids.length === 0) {
+      if (persisted?.stopReason === "stalled_no_progress") {
+        shadowBackfillStopReasons.set(stallKey, "drained");
+        updatePersistedShadowBackfillState(db, projectIdentity, scope, shadowModelId, (state) => ({
+          ...state,
+          stopReason: "drained",
+          candidateSignature: undefined,
+          writeRefusalReason: undefined,
+          stoppedAt: shadowBackfillNow()
+        }));
+      }
+      continue;
+    }
+    if (!manualBackfill && persisted?.stopReason === "stalled_no_progress" && persisted.candidateSignature === batch.signature) {
+      shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+      continue;
+    }
+    shadowBackfillStopReasons.delete(stallKey);
+    shadowBackfillLastIds.delete(stallKey);
+    shadowBackfillLastWriteOutcomes.delete(stallKey);
+    updatePersistedShadowBackfillState(db, projectIdentity, scope, shadowModelId, (state) => ({
+      ...state,
+      stopReason: undefined,
+      candidateSignature: undefined,
+      writeRefusalReason: undefined,
+      stoppedAt: undefined
+    }));
+    pending.add(scope);
+  }
+  if (pending.size === 0)
+    return;
+  pendingShadowBackfills.set(projectIdentity, pending);
+  pumpShadowBackfill();
+  startShadowWorker();
 }
 async function embedShadowItems(registration, items, db, scope) {
   const raw = registration.config;
@@ -12398,6 +12849,47 @@ async function runShadowWorker() {
     processed += item.ids.length;
     processedBytes += itemBytes;
     await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+function registerProjectInObservationMode(db, projectIdentity, sourceDirectory, failedConfig, failureSummary) {
+  const prior = projectRegistrations.get(projectIdentity);
+  const runtimeFingerprint = `observation:${sha256Prefix(failureSummary)}`;
+  const generation = prior?.runtimeFingerprint === runtimeFingerprint && prior.observationMode ? prior.generation : ++globalRegistrationGeneration;
+  const registration = {
+    projectIdentity,
+    sourceDirectory,
+    config: resolveEmbeddingConfig(failedConfig),
+    providerIdentity: OFF_PROVIDER_IDENTITY,
+    runtimeFingerprint,
+    provider: null,
+    generation,
+    features: { memoryEnabled: false, gitCommitEnabled: false },
+    modelId: "off",
+    chunkModelId: "off",
+    observationMode: true
+  };
+  projectRegistrations.set(projectIdentity, registration);
+  disposeProvider(prior?.provider ?? null);
+  return snapshotFor(registration);
+}
+function unregisterProjectShadowEmbedding(projectIdentity) {
+  const shadow = shadowRegistrations.get(projectIdentity);
+  shadowRegistrations.delete(projectIdentity);
+  dbForShadowQueue.delete(projectIdentity);
+  pendingShadowBackfills.delete(projectIdentity);
+  for (let index = shadowQueue.length - 1;index >= 0; index -= 1) {
+    if (shadowQueue[index].projectIdentity === projectIdentity)
+      shadowQueue.splice(index, 1);
+  }
+  for (const scope of ["memory", "commit", "chunk"]) {
+    const key = `${projectIdentity}:${scope}`;
+    shadowBackfillLastIds.delete(key);
+    shadowBackfillStopReasons.delete(key);
+    shadowBackfillLastWriteOutcomes.delete(key);
+  }
+  const primaryProvider = projectRegistrations.get(projectIdentity)?.provider ?? null;
+  if (shadow?.provider && shadow.provider !== primaryProvider) {
+    disposeProvider(shadow.provider);
   }
 }
 function getProjectEmbeddingSnapshot(projectIdentity) {
@@ -28283,4 +28775,4 @@ function registerCtxTools(ctx, opts = {}) {
   };
 }
 
-export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, stripJsonComments, isPrototypePollutionKey, parseJsoncRecovering, parseJsonc, detectConfigFile, modelRefLookupOrder, setWindowOverlayPath, formatWindowDerivationLine, setOutputReserveConfig, getSdkContextLimit, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigValue, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, PROTECTED_TOKENS_MIN, PER_HARNESS_MIGRATION_INVENTORY, PER_HARNESS_MODEL_KEYS, ConfigProfilesSchema, DreamerConfigSchema, MagicContextConfigSchema, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, releaseCompartmentLeaseBestEffort, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, isNoContentCompartment, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, SubcClient, connectionFileExists, formatSynapseLaneDescriptor, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, describeShadowBackfillWriteRefusal, contentSha256, enqueueShadowEmbeddingItems, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isRecord, buildSyntheticTodoPart, CHANNEL1_FLOOR_TOKENS, decideChannel1, evaluateChannel2, buildChannel2Reminder, buildChannel1Reminder, getActiveTagTokenAggregate, getOldestActiveUnprotectedToolTags, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, getMessageTimesFromOpenCodeDb, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForCompletedToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, hasRawMessageProvider, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, getMessageIndexReconciliationStartOrdinal, isMessageIndexReconciledThrough, indexMessagesAfterOrdinal, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, getProtectionWindowForSession, describeProtectedTailDrainBudgetSkip, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, getLastNudgeUndropped, setLastNudgeUndropped, getChannel1NudgeState, setChannel1NudgeState, getChannel2NudgeState, setChannel2NudgeState, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, BoundedSessionMap, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, onNoteTrigger, peekNoteNudgeText, markNoteNudgeDelivered, cavemanCompress, unifiedSearch, parseProviderModel, modelBodyField, toModelEntry, getPromptFailureDetail, promptSyncWithModelSuggestionRetry, promptSyncWithValidatedOutputRetry, normalizeSDKResponse, createTagger, convertDshEventsToRawMessages, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity, registerCtxTools };
+export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, stripJsonComments, isPrototypePollutionKey, parseJsoncRecovering, parseJsonc, detectConfigFile, modelRefLookupOrder, setWindowOverlayPath, formatWindowDerivationLine, setOutputReserveConfig, getSdkContextLimit, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigValue, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, PROTECTED_TOKENS_MIN, DEFAULT_LOCAL_EMBEDDING_MODEL, PER_HARNESS_MIGRATION_INVENTORY, PER_HARNESS_MODEL_KEYS, ConfigProfilesSchema, DreamerConfigSchema, MagicContextConfigSchema, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, releaseCompartmentLeaseBestEffort, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, isNoContentCompartment, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateProject, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, SubcClient, connectionFileExists, SYNAPSE_DEFAULT_MODEL, toSynapseLaneDescriptor, formatSynapseLaneDescriptor, SynapseEmbeddingProvider, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, describeShadowBackfillWriteRefusal, markProjectLoadUntrusted, contentSha256, registerProjectEmbedding, registerProjectShadowEmbedding, enqueueShadowEmbeddingItems, registerProjectInObservationMode, unregisterProjectShadowEmbedding, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isRecord, buildSyntheticTodoPart, CHANNEL1_FLOOR_TOKENS, decideChannel1, evaluateChannel2, buildChannel2Reminder, buildChannel1Reminder, getActiveTagTokenAggregate, getOldestActiveUnprotectedToolTags, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, getMessageTimesFromOpenCodeDb, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForCompletedToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, hasRawMessageProvider, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, getMessageIndexReconciliationStartOrdinal, isMessageIndexReconciledThrough, indexMessagesAfterOrdinal, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, getProtectionWindowForSession, describeProtectedTailDrainBudgetSkip, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, getLastNudgeUndropped, setLastNudgeUndropped, getChannel1NudgeState, setChannel1NudgeState, getChannel2NudgeState, setChannel2NudgeState, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, BoundedSessionMap, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, onNoteTrigger, peekNoteNudgeText, markNoteNudgeDelivered, cavemanCompress, unifiedSearch, parseProviderModel, modelBodyField, toModelEntry, getPromptFailureDetail, promptSyncWithModelSuggestionRetry, promptSyncWithValidatedOutputRetry, normalizeSDKResponse, createTagger, convertDshEventsToRawMessages, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity, registerCtxTools };

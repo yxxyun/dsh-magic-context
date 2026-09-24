@@ -19,6 +19,7 @@ import {
   DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
   DEFAULT_HISTORIAN_TIMEOUT_MS,
   PROTECTED_TOKENS_MIN,
+  DEFAULT_LOCAL_EMBEDDING_MODEL,
   PER_HARNESS_MIGRATION_INVENTORY,
   PER_HARNESS_MODEL_KEYS,
   ConfigProfilesSchema,
@@ -51,6 +52,7 @@ import {
   memoryNeedsCue,
   setMuralCue,
   recordMuralCueRejection,
+  invalidateProject,
   invalidateMemory,
   computeNormalizedHash,
   hasMemoryShareableColumn,
@@ -68,6 +70,9 @@ import {
   getMemoryCountsByStatus,
   SubcClient,
   connectionFileExists,
+  SYNAPSE_DEFAULT_MODEL,
+  toSynapseLaneDescriptor,
+  SynapseEmbeddingProvider,
   buildCanonicalChunkTextFromFts,
   buildCompartmentSummaryFallbackText,
   canonicalizeInMemoryChunkTextForEmbedding,
@@ -76,8 +81,13 @@ import {
   replaceCompartmentChunkEmbeddings,
   cosineSimilarity,
   recordSessionProjectIdentity,
+  markProjectLoadUntrusted,
   contentSha256,
+  registerProjectEmbedding,
+  registerProjectShadowEmbedding,
   enqueueShadowEmbeddingItems,
+  registerProjectInObservationMode,
+  unregisterProjectShadowEmbedding,
   getProjectEmbeddingSnapshot,
   getProjectChunkEmbeddingModelId,
   getProjectEmbeddingMaxInputTokens,
@@ -209,7 +219,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-3yhvk2yh.js";
+} from "./agent-mq47ctzw.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -272,7 +282,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-n5kxd04y.js";
+} from "./agent-dqdk0h0s.js";
 import {
   getHarness,
   getDataDir,
@@ -3834,6 +3844,12 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
       const magicSessionId = deps.host.canonicalKey(agent.id);
       const directory = sessionProjectPath(agent, deps.config.directory);
       const projectPath = resolveKnowledgeProjectPath(directory);
+      const registration = directory ? deps.ensureProjectRegistered?.(directory, db) : undefined;
+      if (registration) {
+        registration.catch((error) => {
+          deps.log?.(`[magic-context] embedding registration (pre-step) failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
       deps.rememberAgent?.(directory, agent);
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
       const deferred = consumeDshDeferredSignals(magicSessionId);
@@ -3867,6 +3883,280 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
 function registerKnowledgeGate(ctx, deps) {
   const state = createKnowledgeGateState();
   return registerPreStepGate(ctx, (payload, next) => runKnowledgeGateStep(state, deps, payload, next));
+}
+
+// ../plugin/src/plugin/embedding-bootstrap-helpers.ts
+import { createHash as createHash2 } from "node:crypto";
+var EMBEDDING_AFFECTING_KEYS = new Set([
+  "embedding.api_key",
+  "embedding.endpoint",
+  "embedding.model",
+  "embedding.provider",
+  "embedding.input_type",
+  "embedding.truncate",
+  "embedding.max_input_tokens",
+  "embedding.query_input_type",
+  "embedding.query_instruction",
+  "embedding.document_prefix",
+  "embedding.fallback_provider",
+  "subc",
+  "subc.connection_file",
+  "shadow_embedding"
+]);
+var LITERAL_CONFIG_TOKEN_RE = /\{(?:env|file):[^}]+\}/;
+function embeddingConfigHasLiteralTokens(embedding) {
+  if (!embedding)
+    return false;
+  for (const value of Object.values(embedding)) {
+    if (typeof value === "string" && LITERAL_CONFIG_TOKEN_RE.test(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+var EMBEDDING_AFFECTING_TOP_LEVEL_KEYS = new Set([
+  "embedding",
+  "memory",
+  "experimental",
+  "subc",
+  "shadow_embedding"
+]);
+var EMBEDDING_WARNING_TERMS = [
+  "api_key",
+  "endpoint",
+  "model",
+  "provider",
+  "embedding",
+  "input_type",
+  "truncate",
+  "subc",
+  "shadow_embedding"
+];
+var loggedFailureSignatures = new Map;
+function sha256Prefix(value, length = 16) {
+  return createHash2("sha256").update(value).digest("hex").slice(0, length);
+}
+function warningLooksEmbeddingRelated(message) {
+  const lower = message.toLowerCase();
+  return EMBEDDING_WARNING_TERMS.some((term) => lower.includes(term));
+}
+function isConfigLoadUntrusted(detailed) {
+  if (detailed.sources.userConfig === "project-file-parse-error" || detailed.sources.userConfig === "project-file-io-error" || detailed.sources.userConfig === "legacy-config-unmigrated" || detailed.sources.projectConfig === "project-file-parse-error" || detailed.sources.projectConfig === "project-file-io-error" || detailed.sources.projectConfig === "legacy-config-unmigrated") {
+    return true;
+  }
+  for (const failure of detailed.substitutionFailures) {
+    if (EMBEDDING_AFFECTING_KEYS.has(failure.keyPath)) {
+      return true;
+    }
+    if (failure.keyPath === "<unknown>" && warningLooksEmbeddingRelated(failure.message)) {
+      return true;
+    }
+  }
+  for (const recoveredKey of detailed.recoveredTopLevelKeys) {
+    if (EMBEDDING_AFFECTING_TOP_LEVEL_KEYS.has(recoveredKey)) {
+      return true;
+    }
+  }
+  if (embeddingConfigHasLiteralTokens(detailed.config.embedding)) {
+    return true;
+  }
+  return false;
+}
+function describeFailure(detailed) {
+  const parts = [];
+  for (const [source, outcome] of Object.entries(detailed.sources)) {
+    if (outcome !== "ok") {
+      parts.push(`${source}=${outcome}`);
+    }
+  }
+  if (detailed.substitutionFailures.length > 0) {
+    parts.push(`substitution=${detailed.substitutionFailures.map((failure) => `${failure.source}:${failure.keyPath}`).join(",")}`);
+  }
+  if (detailed.recoveredTopLevelKeys.length > 0) {
+    parts.push(`recovered=${detailed.recoveredTopLevelKeys.join(",")}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : detailed.loadOutcome;
+}
+function logConfigFailureOnce(projectIdentity, detailed) {
+  const signature = sha256Prefix(JSON.stringify({
+    outcomes: detailed.sources,
+    substitutions: detailed.substitutionFailures.map((failure) => `${failure.source}:${failure.keyPath}:${failure.message}`).sort(),
+    recoveredTopLevelKeys: [...detailed.recoveredTopLevelKeys].sort()
+  }));
+  const existing = loggedFailureSignatures.get(projectIdentity) ?? new Set;
+  if (existing.has(signature))
+    return;
+  existing.add(signature);
+  loggedFailureSignatures.set(projectIdentity, existing);
+  log(`[mc][embedding] config load untrusted, preserving last-known-good for ${projectIdentity} — ${describeFailure(detailed)}`);
+}
+function handleUntrustedLoad(db, projectIdentity, directory, detailed) {
+  markProjectLoadUntrusted(projectIdentity);
+  const prior = getProjectEmbeddingSnapshot(projectIdentity);
+  if (prior && !prior.runtimeFingerprint.startsWith("observation:")) {
+    logConfigFailureOnce(projectIdentity, detailed);
+    return true;
+  }
+  registerProjectInObservationMode(db, projectIdentity, directory, detailed.config.embedding, describeFailure(detailed));
+  return true;
+}
+
+// ../plugin/src/plugin/embedding-routing.ts
+var SYNAPSE_PROBE_TTL_MS = 60000;
+var synapseProbeCache = new Map;
+function fallbackConfig(config, provider) {
+  const raw = config;
+  const model = typeof raw.model === "string" ? raw.model.trim() : "";
+  const endpoint = typeof raw.endpoint === "string" ? raw.endpoint.trim() : "";
+  const apiKey = typeof raw.api_key === "string" ? raw.api_key.trim() : "";
+  const inputType = typeof raw.input_type === "string" ? raw.input_type.trim() : "";
+  const queryInputType = typeof raw.query_input_type === "string" ? raw.query_input_type.trim() : "";
+  const queryInstruction = typeof raw.query_instruction === "string" || raw.query_instruction === false ? raw.query_instruction : undefined;
+  const documentPrefix = typeof raw.document_prefix === "string" ? raw.document_prefix : undefined;
+  const truncate = typeof raw.truncate === "string" ? raw.truncate.trim() : "";
+  const maxInputTokens = typeof raw.max_input_tokens === "number" ? raw.max_input_tokens : undefined;
+  if (provider === "off")
+    return { provider: "off" };
+  if (provider === "openai-compatible") {
+    return {
+      provider: "openai-compatible",
+      model,
+      endpoint,
+      ...apiKey ? { api_key: apiKey } : {},
+      ...inputType ? { input_type: inputType } : {},
+      ...queryInputType ? { query_input_type: queryInputType } : {},
+      ...queryInstruction !== undefined ? { query_instruction: queryInstruction } : {},
+      ...documentPrefix !== undefined ? { document_prefix: documentPrefix } : {},
+      ...truncate ? { truncate } : {},
+      ...maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}
+    };
+  }
+  return {
+    provider: "local",
+    model: model || DEFAULT_LOCAL_EMBEDDING_MODEL,
+    local_runtime: raw.local_runtime === "native" || raw.local_runtime === "wasm" ? raw.local_runtime : "auto",
+    ...maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}
+  };
+}
+function synapseOptions(config, subc, projectRoot, session, metadata) {
+  return {
+    connectionFile: subc.connection_file,
+    projectRoot,
+    session,
+    model: metadata?.model ?? (config.provider === "synapse" && "model" in config ? config.model : undefined) ?? SYNAPSE_DEFAULT_MODEL,
+    ...metadata ? {
+      metadata
+    } : {}
+  };
+}
+function probeKey(subc, config) {
+  const model = config.provider === "synapse" && "model" in config ? config.model : SYNAPSE_DEFAULT_MODEL;
+  return `${subc.connection_file}\x00${model ?? SYNAPSE_DEFAULT_MODEL}`;
+}
+function discoverSynapseLane(config, subc, projectRoot, session) {
+  const key = probeKey(subc, config);
+  const cached = synapseProbeCache.get(key);
+  if (cached && cached.expiresAt > Date.now())
+    return cached.promise;
+  const promise = SynapseEmbeddingProvider.discover(synapseOptions(config, subc, projectRoot, session));
+  synapseProbeCache.set(key, { expiresAt: Date.now() + SYNAPSE_PROBE_TTL_MS, promise });
+  promise.catch(() => {
+    return;
+  });
+  return promise;
+}
+function resolvedSynapseConfig(subc, metadata, projectRoot, session) {
+  return {
+    provider: "synapse",
+    model: metadata.model,
+    max_input_tokens: metadata.max_tokens,
+    synapse_connection_file: subc.connection_file,
+    synapse_fingerprint: metadata.fingerprint,
+    synapse_table_epoch: metadata.table_epoch,
+    ...typeof metadata.dims === "number" ? { synapse_dims: metadata.dims } : {},
+    ...metadata.recommended_batch ? { synapse_recommended_batch: metadata.recommended_batch } : {},
+    ...metadata.recommended_token_budget ? { synapse_recommended_token_budget: metadata.recommended_token_budget } : {},
+    synapse_descriptor: toSynapseLaneDescriptor(metadata),
+    ...metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}
+  };
+}
+async function resolveEmbeddingRouting(args) {
+  const config = args.config.embedding;
+  const subc = args.config.subc;
+  const shadowEnabled = args.config.shadow_embedding?.enabled === true;
+  const warnings = [];
+  if (config.provider !== "synapse") {
+    let shadow = null;
+    if (shadowEnabled && config.provider === "off") {
+      warnings.push("shadow_embedding is ignored when embedding.provider is off");
+    } else if (shadowEnabled && !subc) {
+      warnings.push("shadow_embedding requires a subc block; shadow lane is disabled");
+    } else if (shadowEnabled && subc) {
+      try {
+        const metadata = await discoverSynapseLane(config, subc, args.projectRoot, args.session ?? "routing");
+        shadow = resolvedSynapseConfig(subc, metadata, args.projectRoot, args.session ?? "routing");
+      } catch (error) {
+        warnings.push(`shadow_embedding is unavailable; using the primary ${config.provider} lane: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { primary: config, shadow, warnings };
+  }
+  if (shadowEnabled) {
+    warnings.push("shadow_embedding is ignored when the primary provider is synapse");
+  }
+  const fallbackProvider = config.fallback_provider;
+  const fallback = fallbackConfig(config, fallbackProvider);
+  if (!subc) {
+    warnings.push("embedding.provider synapse requires a subc block; using fallback provider");
+    return { primary: fallback, shadow: null, warnings };
+  }
+  if (!fallbackProvider) {
+    warnings.push("embedding.provider synapse requires embedding.fallback_provider; using local fallback");
+    return { primary: fallbackConfig(config, "local"), shadow: null, warnings };
+  }
+  try {
+    const metadata = await discoverSynapseLane(config, subc, args.projectRoot, args.session ?? "routing");
+    return {
+      primary: resolvedSynapseConfig(subc, metadata, args.projectRoot, args.session ?? "routing"),
+      shadow: null,
+      warnings
+    };
+  } catch (error) {
+    warnings.push(`Synapse is not ready; using embedding.fallback_provider=${fallbackProvider}: ${error instanceof Error ? error.message : String(error)}`);
+    log(`[magic-context] Synapse routing fell back: ${warnings.at(-1)}`);
+    return { primary: fallback, shadow: null, warnings };
+  }
+}
+
+// ../plugin/src/plugin/embedding-bootstrap.ts
+async function ensureProjectRegisteredFromOpenCodeDirectory(directory, db) {
+  const detailed = loadPluginConfigDetailed(directory);
+  const projectIdentity = resolveProjectIdentityForSession(directory, detailed.config.allow_home_project);
+  if (!projectIdentity)
+    return;
+  invalidateProject(projectIdentity);
+  if (isConfigLoadUntrusted(detailed)) {
+    handleUntrustedLoad(db, projectIdentity, directory, detailed);
+    return;
+  }
+  const routing = await resolveEmbeddingRouting({
+    config: detailed.config,
+    projectRoot: directory,
+    session: `bootstrap:${projectIdentity}`
+  });
+  for (const warning of routing.warnings) {
+    log(`[magic-context] ${warning}`);
+  }
+  const features = {
+    memoryEnabled: detailed.config.memory.enabled,
+    gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled
+  };
+  registerProjectEmbedding(db, projectIdentity, routing.primary, features, directory);
+  if (routing.shadow) {
+    registerProjectShadowEmbedding(db, projectIdentity, routing.shadow, directory);
+  } else {
+    unregisterProjectShadowEmbedding(projectIdentity);
+  }
 }
 
 // ../plugin/src/agents/magic-context-prompt.ts
@@ -5845,7 +6135,7 @@ function summarizeDreamSchedule(dreamer) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/task-executor.ts
-import { createHash as createHash8 } from "node:crypto";
+import { createHash as createHash9 } from "node:crypto";
 import { existsSync as existsSync6 } from "node:fs";
 
 // ../plugin/src/agents/dreamer.ts
@@ -6058,7 +6348,7 @@ async function teardownChildSession(args) {
 }
 
 // ../plugin/src/features/magic-context/mural/compress-cues.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 
 // ../plugin/src/hooks/magic-context/compartment-runner-historian.ts
 import { mkdirSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
@@ -6754,7 +7044,7 @@ function getModuleMemoryIdentities(db, projectIdentity, contextIds) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/provider-output-failure.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 var MAX_NEAR_ZERO_OUTPUT_TOKENS = 32;
 
 class DreamerProviderOutputFailureError extends Error {
@@ -6811,7 +7101,7 @@ function providerOutputFailureFromInvalidManifest(messages, responseText) {
   const normalized = responseText.trim().replace(/\s+/g, " ").toLowerCase();
   if (!normalized)
     return null;
-  const fingerprint = createHash2("sha256").update(normalized).digest("hex").slice(0, 16);
+  const fingerprint = createHash3("sha256").update(normalized).digest("hex").slice(0, 16);
   return new DreamerProviderOutputFailureError(fingerprint, completion.outputTokens, completion.reasoningTokens, responseText);
 }
 
@@ -7218,7 +7508,7 @@ async function applyCuesThroughModule(args, chunk, manifestText, signal) {
       log(`[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`);
     }
   }
-  const commandId = `mural-cues:${route.moduleCommandId}:${createHash3("sha256").update(chunk.map((candidate) => candidate.memory.id).join(",")).digest("hex").slice(0, 24)}`;
+  const commandId = `mural-cues:${route.moduleCommandId}:${createHash4("sha256").update(chunk.map((candidate) => candidate.memory.id).join(",")).digest("hex").slice(0, 24)}`;
   let response;
   try {
     response = await route.moduleClient.call({
@@ -7779,7 +8069,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
 }
 
 // ../plugin/src/features/magic-context/dreamer/classify.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 
 // ../plugin/src/plugin/rust-tool-backends.ts
 function isRustAuthorityDrainingError(error) {
@@ -8167,7 +8457,7 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
       v: 1,
       session_id: args.moduleSessionId,
       task: "classify",
-      command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash4("sha256").update(chunk.map((candidate) => candidate.id).join(",")).digest("hex").slice(0, 24)}`,
+      command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash5("sha256").update(chunk.map((candidate) => candidate.id).join(",")).digest("hex").slice(0, 24)}`,
       authority_generation: args.moduleAuthorityGeneration,
       ...resolvedModelChain.length > 0 ? { model_chain: resolvedModelChain } : {},
       payload: {
@@ -8840,7 +9130,7 @@ function throwIfAborted2(signal) {
 }
 
 // ../plugin/src/features/magic-context/smart-notes/compiler.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/smart-notes/compiler-prompt.ts
 var SMART_NOTE_COMPILER_SYSTEM_PROMPT = `You are the Magic Context smart-note compiler for the magic-context system.
@@ -9326,7 +9616,7 @@ function manifestAdvisoryWarnings(code, manifest) {
   return warnings;
 }
 function hashCheck(surfaceCondition, compiledCheck, manifest, checkCron) {
-  return createHash5("sha256").update(surfaceCondition ?? "").update("\x00").update(compiledCheck).update("\x00").update(JSON.stringify(manifest)).update("\x00").update(checkCron).digest("hex");
+  return createHash6("sha256").update(surfaceCondition ?? "").update("\x00").update(compiledCheck).update("\x00").update(JSON.stringify(manifest)).update("\x00").update(checkCron).digest("hex");
 }
 function extractJsonObject(output) {
   const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -10191,7 +10481,7 @@ function enforceMaintainDocsProtectedRegions(args) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/map-memories.ts
-import { createHash as createHash6 } from "node:crypto";
+import { createHash as createHash7 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/dreamer/map-memories-prompt.ts
 import { existsSync as existsSync5, statSync as statSync2 } from "node:fs";
@@ -10618,7 +10908,7 @@ async function applyParsedBatchMappings(args, batch, parsed) {
             memory_project: args.projectIdentity,
             context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
             authority_generation: args.moduleRoute.moduleAuthorityGeneration,
-            command_id: `${args.moduleRoute.moduleCommandId}:${createHash6("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
+            command_id: `${args.moduleRoute.moduleCommandId}:${createHash7("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
             rows
           }
         }
@@ -11441,7 +11731,7 @@ function insertDreamRun(db, run) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/verify.ts
-import { createHash as createHash7 } from "node:crypto";
+import { createHash as createHash8 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/dreamer/verify-gate.ts
 import path3 from "node:path";
@@ -11968,7 +12258,7 @@ async function applyParsedVerifyManifest(args, batch, parsed) {
             memory_project: args.projectIdentity,
             context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
             authority_generation: args.moduleRoute.moduleAuthorityGeneration,
-            command_id: `${args.moduleRoute.moduleCommandId}:${createHash7("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
+            command_id: `${args.moduleRoute.moduleCommandId}:${createHash8("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
             rows
           }
         }
@@ -12611,7 +12901,7 @@ function parseFrictionGateVerdict(verdict) {
 }
 function computeRetrospectiveWindowKey(flagged) {
   const anchors = flagged.map((message) => `${message.sessionId}:${message.ts}`).sort().join("|");
-  return createHash8("sha256").update(anchors).digest("hex").slice(0, 32);
+  return createHash9("sha256").update(anchors).digest("hex").slice(0, 32);
 }
 function renderFrictionWindow(messages, flaggedOrdinals, radius = 2) {
   const flagged = new Set(flaggedOrdinals);
@@ -18239,6 +18529,15 @@ function bridgeMagicConfig(config, directory) {
 function dreamerCoreConfigOf(config) {
   return config._dreamerCore;
 }
+function createEnsureProjectRegistered(log, registrar = ensureProjectRegisteredFromOpenCodeDirectory) {
+  return async (directory, db) => {
+    try {
+      await registrar(directory, db);
+    } catch (error) {
+      log(`[magic-context] embedding registration failed for ${directory} (degrading to the lexical lane): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+}
 function apply(ctx, config = {}) {
   setDshHarness();
   config = bridgeMagicConfig(config, config.directory ?? process.cwd());
@@ -18260,6 +18559,7 @@ function apply(ctx, config = {}) {
     log2(`[magic-context] session log unreadable (degraded to empty): ${detail}`);
   });
   const directory = config.directory ?? process.cwd();
+  const ensureProjectRegistered = createEnsureProjectRegistered(log2);
   registerSystemGuidance(ctx, { config: config.guidance, log: log2 });
   registerSessionProjectTracking(ctx, {
     host,
@@ -18317,11 +18617,13 @@ function apply(ctx, config = {}) {
     autoSearch: config.autoSearch ?? {},
     mural: createMuralWiring(ctx, config.knowledge?.muralEnabled === true),
     now: config.now,
+    ensureProjectRegistered,
     log: log2
   });
   const runtime = {
     canonicalKey: (dshSessionId) => host.canonicalKey(dshSessionId),
     resolveProjectIdentity: undefined,
+    ensureProjectRegistered,
     log: log2
   };
   registerCtxTools(ctx, { ...runtime, ...config.tools ?? {} });

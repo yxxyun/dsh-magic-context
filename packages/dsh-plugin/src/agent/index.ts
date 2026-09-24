@@ -24,6 +24,7 @@ import { log as coreLog } from "@magic-context/core/shared/logger";
 import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@magic-context/core/config/agent-disable";
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
+import { ensureProjectRegisteredFromOpenCodeDirectory } from "@magic-context/core/plugin/embedding-bootstrap";
 import type { KnowledgeConfig } from "./knowledge-gate";
 import { setSessionEventsFailureReporter } from "../compat/dsh-0.1/session";
 import { registerSystemGuidance } from "./system-guidance";
@@ -281,6 +282,41 @@ export function dreamerCoreConfigOf(config: MagicAgentConfig): unknown {
   return (config as unknown as { _dreamerCore?: unknown })._dreamerCore;
 }
 
+/**
+ * Embedding-provider registration for a project directory — the hook the ctx_*
+ * tools, /ctx-embed and the pre-step auto-search lane all rely on.
+ *
+ * Upstream registers the project on boot, on the tool path and on the session
+ * path (tool-registry.ts:112/157, hook.ts:617). The port wired none of them, so
+ * `embedTextForProject()` always returned null: /ctx-embed answered "No
+ * embedding provider is configured" and every vector lane silently degraded to
+ * lexical search. The core's own `embedding` schema defaults to the LOCAL
+ * provider, i.e. this is the intended default, not an opt-in.
+ *
+ * Embedding is an enhancement: a failure is logged (to the sink an operator can
+ * read) and the caller degrades, never breaks. `registrar` is injectable so the
+ * contract can be tested without loading a model.
+ */
+export function createEnsureProjectRegistered(
+  log: (message: string) => void,
+  registrar: (
+    directory: string,
+    db: import("@magic-context/core/shared/sqlite").Database,
+  ) => Promise<void> = ensureProjectRegisteredFromOpenCodeDirectory,
+): (directory: string, db: import("@magic-context/core/shared/sqlite").Database) => Promise<void> {
+  return async (directory, db) => {
+    try {
+      await registrar(directory, db);
+    } catch (error) {
+      log(
+        `[magic-context] embedding registration failed for ${directory} (degrading to the lexical lane): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+}
+
 export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   // The AGENT plane is a separate bundle from the host plane: each inlines its
   // own copy of the core's harness module, so the host's setDshHarness() never
@@ -321,6 +357,9 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     log(`[magic-context] session log unreadable (degraded to empty): ${detail}`);
   });
   const directory = config.directory ?? process.cwd();
+  // One shared registration hook: the knowledge gate fires it per pre-step and
+  // the tools/commands fire it before touching a vector lane.
+  const ensureProjectRegistered = createEnsureProjectRegistered(log);
 
   registerSystemGuidance(ctx, { config: config.guidance, log });
 
@@ -402,6 +441,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     autoSearch: config.autoSearch ?? {},
     mural: createMuralWiring(ctx, config.knowledge?.muralEnabled === true),
     now: config.now,
+    ensureProjectRegistered,
     log,
   });
 
@@ -411,6 +451,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   const runtime = {
     canonicalKey: (dshSessionId: string) => host.canonicalKey(dshSessionId),
     resolveProjectIdentity: undefined,
+    ensureProjectRegistered,
     log,
   };
   registerCtxTools(ctx, { ...runtime, ...(config.tools ?? {}) });

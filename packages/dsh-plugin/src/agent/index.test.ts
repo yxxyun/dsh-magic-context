@@ -11,7 +11,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
-import { apply, bridgeMagicConfig } from "./index";
+import { apply, bridgeMagicConfig, createEnsureProjectRegistered } from "./index";
 
 function withProjectConfig(
   configText: string | null,
@@ -67,6 +67,34 @@ function makeBareCtx(): Context {
     get: () => undefined,
   } as unknown as Context;
 }
+
+describe("embedding registration hook", () => {
+  it("passes the directory and database through to the core registrar", async () => {
+    const calls: Array<{ directory: string; db: unknown }> = [];
+    const hook = createEnsureProjectRegistered(
+      () => {},
+      async (directory, db) => {
+        calls.push({ directory, db });
+      },
+    );
+    await hook("/proj", {} as never);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.directory).toBe("/proj");
+  });
+
+  it("logs and degrades instead of rejecting when registration fails", async () => {
+    const lines: string[] = [];
+    const hook = createEnsureProjectRegistered(
+      (message) => lines.push(message),
+      async () => {
+        throw new Error("model download refused");
+      },
+    );
+    await expect(hook("/proj", {} as never)).resolves.toBeUndefined();
+    expect(lines.join("\n")).toContain("model download refused");
+    expect(lines.join("\n")).toContain("lexical lane");
+  });
+});
 
 describe("magic-context agent plane: bridge mappings", () => {
   it("bridges language into the guidance config consumers read", () => {
