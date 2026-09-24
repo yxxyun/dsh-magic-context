@@ -34,11 +34,13 @@
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  rmSync,
+  rmdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -63,13 +65,58 @@ const installDir =
 const PAYLOAD = ["dist", "src", "cordis.patch.yml", "NOTICE"];
 
 /**
+ * Recursive delete that ACTUALLY deletes here.
+ *
+ * `fs.rmSync(path, {recursive:true, force:true})` returns successfully and
+ * leaves the tree in place on this machine (verified 2026-09-24 on the
+ * non-ASCII `默认工作区` path): it silently accumulated stale build chunks in
+ * both `stage/` and the installed profile, so a "replacing" deploy was really
+ * additive. `unlinkSync` and `rmdirSync` both work, so walk bottom-up and let
+ * the caller verify the outcome instead of trusting rmSync.
+ */
+function removeTree(dir) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (lstatSync(full).isDirectory()) removeTree(full);
+    else unlinkSync(full);
+  }
+  rmdirSync(dir);
+}
+
+/**
+ * Destination-relative paths that exist in `dest` but not in `src` — the
+ * post-copy proof that a deploy actually replaced the tree. Silent leftovers
+ * are the whole failure mode this guards.
+ */
+function extraFiles(src, dest, prefix = "") {
+  if (!existsSync(dest)) return [];
+  // Payload entries may be plain files (cordis.patch.yml, NOTICE): a copied
+  // file supersedes the destination one, so there is nothing to walk.
+  if (!lstatSync(dest).isDirectory()) return [];
+  const found = [];
+  for (const entry of readdirSync(dest)) {
+    const from = join(src, entry);
+    const to = join(dest, entry);
+    if (!existsSync(from)) {
+      found.push(`${prefix}${entry}`);
+      continue;
+    }
+    if (lstatSync(to).isDirectory() && lstatSync(from).isDirectory()) {
+      found.push(...extraFiles(from, to, `${prefix}${entry}/`));
+    }
+  }
+  return found;
+}
+
+/**
  * Recursive copy that replaces `dest`. Avoids fs.cpSync, whose Windows
  * non-ASCII-destination EIO is the whole reason this is hand-rolled.
  */
 function copyTree(src, dest) {
   const st = statSync(src);
   if (st.isDirectory()) {
-    rmSync(dest, { recursive: true, force: true });
+    removeTree(dest);
     mkdirSync(dest, { recursive: true });
     for (const entry of readdirSync(src)) copyTree(join(src, entry), join(dest, entry));
     return;
@@ -123,6 +170,25 @@ for (const item of PAYLOAD) {
 }
 writeFileSync(join(STAGE, "package.json"), JSON.stringify(publishableManifest(srcManifest), null, 2) + "\n", "utf8");
 console.log(`stage  : refreshed (${PAYLOAD.join(", ")}, package.json rewritten)`);
+for (const item of PAYLOAD) {
+  const leftovers = extraFiles(join(SRC, item), join(STAGE, item));
+  if (leftovers.length) {
+    console.error(
+      `\nFAIL: stage/${item} kept ${leftovers.length} file(s) the source does not have: ` +
+        `${leftovers.slice(0, 5).join(", ")}${leftovers.length > 5 ? " …" : ""}`,
+    );
+    process.exit(1);
+  }
+}
+const stageStrays = extraFiles(SRC, STAGE);
+if (stageStrays.length) {
+  console.error(
+    `\nFAIL: the stage kept ${stageStrays.length} entry(ies) the source does not have: ` +
+      `${stageStrays.slice(0, 5).join(", ")}${stageStrays.length > 5 ? " …" : ""}`,
+  );
+  process.exit(1);
+}
+console.log("stage  : verified — no stale entries");
 
 // --- 2. install into the profile ------------------------------------------
 if (!stageOnly) {
@@ -137,6 +203,15 @@ if (!stageOnly) {
   for (const item of PAYLOAD) copyTree(join(STAGE, item), join(installDir, item));
   copyFileSync(join(STAGE, "package.json"), join(installDir, "package.json"));
   console.log(`install: deployed (${PAYLOAD.join(", ")}, package.json)`);
+  const stale = extraFiles(STAGE, installDir);
+  if (stale.length) {
+    console.error(
+      `\nFAIL: the install dir kept ${stale.length} file(s) the stage does not have: ` +
+        `${stale.slice(0, 5).join(", ")}${stale.length > 5 ? " …" : ""}`,
+    );
+    process.exit(1);
+  }
+  console.log("install: verified — the destination carries no stale files");
 }
 
 // --- 3. verify -------------------------------------------------------------
