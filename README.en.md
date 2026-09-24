@@ -4,7 +4,7 @@
 
 **English** | [中文](./README.md)
 
-![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)
 ![DSH](https://img.shields.io/badge/DSH-0.1.7--rc.1-111827.svg)
 ![Magic Context](https://img.shields.io/badge/Magic%20Context-0.42.6-7C3AED.svg)
 ![Harness](https://img.shields.io/badge/harness-dsh-5391FE.svg)
@@ -52,7 +52,7 @@ In your DSH profile's `package.json` (the profile directory is
 ```json
 {
   "dependencies": {
-    "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.3&path:/packages/dsh-plugin"
+    "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.4&path:/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {
