@@ -125,6 +125,33 @@ function findSessionKey(db) {
   return hit ?? null;
 }
 
+/**
+ * The session that actually OWNS the newest tag.
+ *
+ * Resolving tags purely by the session DIRECTORY is unsafe: a DSH restart can
+ * create a newer directory (a fork) that owns no tags while the conversation's
+ * tags keep accumulating under the parent's key. On 2026-09-24 that made this
+ * verifier — and a scratch script of ours — report "no tags, nothing to reduce"
+ * for a session that in fact had 384 active tool tags. So: prefer the requested
+ * session when it owns rows, otherwise fall back to the newest-tag session and
+ * SAY SO rather than skipping silently.
+ */
+function resolveTagSessionKey(db) {
+  const requested = findSessionKey(db);
+  if (requested !== null) {
+    const count = db.prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id=?").get(requested).n;
+    if (count > 0) return { key: requested, note: null };
+  }
+  const newest = db
+    .prepare("SELECT session_id FROM tags WHERE harness='dsh' GROUP BY session_id ORDER BY MAX(id) DESC LIMIT 1")
+    .get();
+  if (newest === undefined) return { key: null, note: "no harness='dsh' tags at all" };
+  return {
+    key: newest.session_id,
+    note: `session ${sessionId} owns 0 tags; using the newest-tag session ${newest.session_id.split(":").pop()} instead`,
+  };
+}
+
 const checks = [];
 function check(name, run) {
   try {
@@ -221,7 +248,7 @@ check("tag-prefix-integrity", () => {
   if (!existsSync(DB)) return { status: "skip", detail: [`no Magic DB at ${DB}`] };
   const db = new DatabaseSync(DB, { readOnly: true });
   try {
-    const sessionKey = findSessionKey(db);
+    const { key: sessionKey, note } = resolveTagSessionKey(db);
     if (sessionKey === null) return { status: "skip", detail: [`no harness='dsh' tags for session ${sessionId}`] };
     const rows = db.prepare("SELECT tag_number, message_id, type FROM tags WHERE session_id=?").all(sessionKey);
     const rowsByMessage = new Map();
@@ -281,6 +308,7 @@ check("tag-prefix-integrity", () => {
       ...scars.slice(0, 4).map((line) => `  (info) ${line}`),
       `bare-id MESSAGE rows in this session, whole history (informational)=${bareMessageRows.length}`,
     ];
+    if (note !== null) detail.push(note);
     const status = problems.length > 0 ? "fail" : anomalies.length > 0 ? "warn" : "pass";
     return { status, detail };
   } finally {
@@ -293,7 +321,7 @@ check("tag-number-integrity", () => {
   if (!existsSync(DB)) return { status: "skip", detail: [`no Magic DB at ${DB}`] };
   const db = new DatabaseSync(DB, { readOnly: true });
   try {
-    const sessionKey = findSessionKey(db);
+    const { key: sessionKey, note } = resolveTagSessionKey(db);
     if (sessionKey === null) return { status: "skip", detail: [`no harness='dsh' tags for session ${sessionId}`] };
     const numbers = db
       .prepare("SELECT tag_number FROM tags WHERE session_id=? ORDER BY tag_number")
@@ -312,7 +340,41 @@ check("tag-number-integrity", () => {
       `duplicate numbers=${duplicates.length}${duplicates.length ? ` (${duplicates.slice(0, 8).join(", ")})` : ""}`,
       `non-contiguous positions=${gaps} (informational: deleting a scar row leaves a gap)`,
     ];
+    if (note !== null) detail.push(note);
     return { status: duplicates.length === 0 ? "pass" : "fail", detail };
+  } finally {
+    db.close();
+  }
+});
+
+// --------------------------------------------------------- context-hygiene
+// The one check that exists because the ASSISTANT kept deferring ctx_reduce:
+// it measures how much spent tool output is still live in the tag index, so the
+// backlog is a number on demand instead of a feeling. Informational by default;
+// `--since` (strict mode) turns a large backlog into a failure.
+check("context-hygiene", () => {
+  if (!existsSync(DB)) return { status: "skip", detail: [`no Magic DB at ${DB}`] };
+  const db = new DatabaseSync(DB, { readOnly: true });
+  try {
+    const { key: sessionKey, note } = resolveTagSessionKey(db);
+    if (sessionKey === null) return { status: "skip", detail: [`no harness='dsh' tags for session ${sessionId}`] };
+    const active = db
+      .prepare("SELECT tag_number, byte_size FROM tags WHERE session_id=? AND type='tool' AND status='active' ORDER BY tag_number DESC")
+      .all(sessionKey);
+    const RESERVE = 25; // the newest tool outputs are the ones still in play
+    const droppable = active.slice(RESERVE);
+    const bytes = droppable.reduce((sum, row) => sum + (row.byte_size ?? 0), 0);
+    const kb = Math.round(bytes / 1024);
+    const detail = [
+      `active tool tags=${active.length} droppable=${droppable.length} (~${kb} KB)`,
+      `oldest droppable=§${droppable.length ? droppable[droppable.length - 1].tag_number : "-"}§`,
+      kb > 256
+        ? "run ctx_reduce over the droppable range (see .scratch/reduce-plan.mjs), then /ctx-flush"
+        : "backlog is small enough to carry",
+    ];
+    if (note !== null) detail.push(note);
+    const status = kb <= 256 ? "pass" : SINCE === null ? "warn" : "fail";
+    return { status, detail };
   } finally {
     db.close();
   }
