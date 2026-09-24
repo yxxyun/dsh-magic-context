@@ -23,7 +23,11 @@
  *
  *   bun tools/audit-host-symbols.mjs <dist-dir>
  *
- * Env: DSH_ASAR overrides the app.asar path.
+ * Exit codes: 0 all symbols present, 1 a host symbol is missing (real
+ * incompatibility), 2 the audit could not run (bad args, missing app.asar, or a
+ * broken asar reader) — a 2 never masquerades as a clean result.
+ *
+ * Env: DSH_ASAR overrides the app.asar path; DSH_ASAR2 the asar2.mjs helper.
  */
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from "node:fs";
 import { join, posix } from "node:path";
@@ -33,9 +37,15 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ASAR = process.env.DSH_ASAR?.trim() || "D:/DeepSeekHarness/resources/app.asar";
-const ASAR2 = join(HERE, "asar2.mjs");
 const DIST = process.argv[2];
 const TMP = join(process.env.TEMP ?? "/tmp", "dsh-runtime-audit");
+
+// The asar reader is a workspace tool, not a repo one, so look in both places
+// (and honour an explicit override) instead of assuming a single layout.
+const ASAR2 =
+  [process.env.DSH_ASAR2?.trim(), join(HERE, "asar2.mjs"), join(HERE, "..", "..", "tools", "asar2.mjs")]
+    .filter((candidate) => typeof candidate === "string" && candidate.length > 0)
+    .find((candidate) => existsSync(candidate));
 
 if (!DIST || !existsSync(DIST)) {
   console.error("usage: bun tools/audit-host-symbols.mjs <dist-dir>");
@@ -43,7 +53,13 @@ if (!DIST || !existsSync(DIST)) {
 }
 if (!existsSync(ASAR)) {
   console.error(`error: app.asar not found at ${ASAR} (set DSH_ASAR to override)`);
-  process.exit(1);
+  process.exit(2);
+}
+if (ASAR2 === undefined) {
+  console.error(
+    "error: asar2.mjs not found. Looked next to this script, in <repo>/../tools/, and at $DSH_ASAR2.",
+  );
+  process.exit(2);
 }
 mkdirSync(TMP, { recursive: true });
 
@@ -85,6 +101,17 @@ function fetchAsar(pathInAsar) {
   }
   cache.set(pathInAsar, text);
   return text;
+}
+
+// Preflight: prove the reader works on a path that certainly exists, so a broken
+// reader is reported AS a broken reader. Without this, a mis-resolved helper makes
+// every package look like it is missing from the app — which is exactly how the
+// first version of this script failed: it reported 24 missing symbols that were
+// all present, the same silent-degradation shape this repo keeps hunting.
+if (fetchAsar("dsh/package.json") === null) {
+  console.error(`error: cannot read dsh/package.json from ${ASAR} using ${ASAR2}`);
+  console.error("       the asar reader is not working; refusing to report results that would be nonsense");
+  process.exit(2);
 }
 
 /** Exported names, following `export * from "./x.js"` inside the package. */
