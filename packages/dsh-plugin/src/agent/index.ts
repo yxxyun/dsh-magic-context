@@ -45,7 +45,7 @@ import {
   signalDshDeferredHistoryRefresh,
   signalDshDeferredMaterialization,
 } from "./historian";
-import { dshDreamSeams, registerDshDreamer } from "./dreamer";
+import { dshDreamSeams, registerDshDreamer, createDreamParentRegistry } from "./dreamer";
 import { createRecompSeams } from "./recomp";
 import { createEmbedSeam } from "./embed";
 import { dshModelRefToCanonical } from "dsh-magic-context-adapter";
@@ -344,6 +344,13 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     log,
   });
 
+  // Live-agent registry for the dreamer's tool workers. `ctx.subagents.start`
+  // requires `parent: Agent`, but the dreamer fires from a background timer with
+  // no agent on hand; the knowledge gate records the live top-level agent per
+  // project on every pre-step and the dream facade resolves it when a
+  // tool-requiring task runs (see dreamer.ts's DreamParentRegistry).
+  const dreamParents = createDreamParentRegistry();
+
   // Dreamer plane: per-project background scheduler (core lease/gate/telemetry
   // reused; self-built ctx timers — see dreamer.ts module doc for the
   // deviation from the core's process-singleton timer).
@@ -352,11 +359,13 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     directory,
     config: config.dreamer,
     coreConfig: dreamerCoreConfigOf(config),
+    parentAgent: dreamParents.resolve,
     log,
   });
 
   registerKnowledgeGate(ctx, {
     host,
+    rememberAgent: dreamParents.remember,
     config: { ...(config.knowledge ?? {}), directory },
     autoSearch: config.autoSearch ?? {},
     mural: createMuralWiring(ctx, config.knowledge?.muralEnabled === true),
@@ -387,6 +396,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
         db: bootstrap.db,
         log,
         compactionOff: config.commands?.compactionOff === true,
+        parentAgent: dreamParents.resolve,
       }),
     );
     seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log }));

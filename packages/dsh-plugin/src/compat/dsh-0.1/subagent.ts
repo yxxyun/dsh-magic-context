@@ -27,13 +27,24 @@ export {
 };
 export type { SubagentRuntime, SubagentStartRequest, ToolRestriction };
 
-/** Tool allowlist for a Magic worker (read-only maintenance surface). */
-export const MAGIC_WORKER_READONLY_TOOLS: readonly string[] = [
-  "read",
-  "grep",
-  "glob",
-  "fs_search",
-];
+/**
+ * Read-only tool allowlist for a Magic worker, using DSH's ACTUAL tool names.
+ *
+ * Verified against the shipped app (2026-09-24): `dsh-tool-fs` registers
+ * `read`/`write`/`edit`/`read_image`, `dsh-tool-fs-search` registers
+ * `grep`/`glob`, and the shell tool is `dsh-tool-pwsh` → `pwsh` on Windows /
+ * `dsh-tool-bash` → `bash` elsewhere. There is NO `fs_search` tool: the earlier
+ * value here listed one, and `ToolRuntime.restrict` fails on unknown names
+ * ("Empty filters, unknown names, scope-local names ... fail" —
+ * dsh-tools/lib/types), so every worker spawn using this list would have thrown
+ * and returned null. That is why `runMagicWorker` had never been wired up.
+ */
+export const MAGIC_WORKER_READONLY_TOOLS: readonly string[] = ["read", "grep", "glob"];
+
+/** The platform's shell tool name, as the preset registers it. */
+export function magicShellToolName(platform: string = process.platform): string {
+  return platform === "win32" ? "pwsh" : "bash";
+}
 
 /**
  * Build the one-shot spawn request for a Magic worker: depth pinned, tools

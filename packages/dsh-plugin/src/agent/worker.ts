@@ -24,6 +24,7 @@ import {
   appendDelegatedPolicyOverrides,
   captureDelegatedPolicyOverrides,
   magicWorkerRequest,
+  MAGIC_WORKER_READONLY_TOOLS,
   subagentsOf,
   type SubagentStartRequest,
 } from "../compat/dsh-0.1/subagent";
@@ -82,7 +83,7 @@ export async function runMagicWorker(
     const request: SubagentStartRequest = magicWorkerRequest(deps.parent, {
       label: deps.label,
       prompt: [textBlock(deps.prompt)],
-      allow: deps.allow ?? ["read", "grep", "glob", "fs_search"],
+      allow: deps.allow ?? MAGIC_WORKER_READONLY_TOOLS,
       maxDepth: 0, // workers can never spawn further (recursion cap)
       signal: deps.signal,
       persona: deps.systemPrompt,
@@ -99,22 +100,25 @@ export async function runMagicWorker(
     }
 
     const timeout = deps.timeoutMs ?? 120_000;
+    // The winner must clear the loser: without this the success path left a live
+    // setTimeout behind (a 10-minute one for a dream task), i.e. one leaked timer
+    // per worker run.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settleTimeout: ((value: null) => void) | undefined;
+    const giveUp = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      run.dispose();
+      settleTimeout?.(null);
+    };
     const result = await Promise.race([
-      run.result,
+      run.result.finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+        deps.signal.removeEventListener("abort", giveUp);
+      }),
       new Promise<null>((resolve) => {
-        const timer = setTimeout(() => {
-          run.dispose();
-          resolve(null);
-        }, timeout);
-        deps.signal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(timer);
-            run.dispose();
-            resolve(null);
-          },
-          { once: true },
-        );
+        settleTimeout = resolve;
+        timer = setTimeout(giveUp, timeout);
+        deps.signal.addEventListener("abort", giveUp, { once: true });
       }),
     ]);
     if (result === null) return null;

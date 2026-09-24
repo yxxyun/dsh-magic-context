@@ -117,6 +117,20 @@ export interface KnowledgeGateDeps {
   };
   /** Injectable clock (tests). */
   readonly now?: () => number;
+  /**
+   * Record the live top-level agent for a project.
+   *
+   * The Dreamer's tool-requiring tasks run as SUBAGENT workers, and
+   * `ctx.subagents.start` needs a live `parent: Agent` — which the background
+   * timer does not have. This gate is the outermost pre-step listener, so it
+   * sees every top-level agent and is the natural place to publish one per
+   * project (see dreamer.ts `createDreamParentRegistry`). Child sessions never
+   * reach this point, so a worker can never become a parent.
+   */
+  readonly rememberAgent?: (
+    directory: string | undefined,
+    agent: import("@deepseek-ai/dsh-agent").Agent,
+  ) => void;
   readonly log?: (message: string) => void;
 }
 
@@ -634,6 +648,10 @@ export async function runKnowledgeGateStep(
       const magicSessionId = deps.host.canonicalKey(agent.id);
       const directory = sessionProjectPath(agent, deps.config.directory);
       const projectPath = resolveKnowledgeProjectPath(directory);
+
+      // Publish the live agent so a tool-requiring dream task can spawn a worker
+      // from it (the dreamer's timer has no agent of its own).
+      deps.rememberAgent?.(directory, agent as unknown as import("@deepseek-ai/dsh-agent").Agent);
 
       // Session → project attribution (once per session).
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);

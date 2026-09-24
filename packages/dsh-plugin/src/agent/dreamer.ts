@@ -6,14 +6,17 @@
  * session facade (`session.create/prompt/messages/list/delete`). This module
  * supplies the DSH half of that boundary:
  *
- *   1. `createDshDreamClient(ctx, deps)` — the client facade. `prompt` runs one
- *      direct `ctx.llm.stream` turn (system + user; `purpose` omitted — an
- *      ordinary auxiliary call). Dream agents whose prompts REQUIRE tools
- *      (curate / maintain-docs / refresh-primers / map-memories / verify /
- *      verify-broad) fail with an explicit "tool worker not wired" error
- *      instead of pretending a tool-less answer is valid. `messages` returns the
- *      synthetic OpenCode-shaped message list for the turn (text result +
- *      `toolCallCount = 0` synthetic tool parts — the Pi facade's trick).
+ *   1. `createDshDreamClient(ctx, deps)` — the client facade. `prompt` runs the
+ *      dream agent either as a one-shot `ctx.llm.stream` turn (zero-tool agents;
+ *      system + user, `purpose` omitted — an ordinary auxiliary call) OR as a
+ *      tool-scoped SUBAGENT worker (`runMagicWorker`: `ctx.subagents.start` +
+ *      `toolFilter` allowlist) for the agents the core's registry marks as
+ *      tool-requiring. A worker needs a live parent agent to spawn from, so the
+ *      facade takes a `parentAgent` resolver; when no session is open for the
+ *      project the task fails with an explicit, PERMANENT error instead of
+ *      pretending a tool-less answer is valid. `messages` returns the synthetic
+ *      OpenCode-shaped message list for the turn (text result + the worker's real
+ *      `toolCallCount` synthetic tool parts — the Pi facade's trick).
  *
  *   2. `registerDshDreamer(ctx, deps)` — project discovery from
  *      `session_projects` (deduped, DSH-harness only) + one fiber-owned
@@ -37,15 +40,22 @@
  *     portion (`runDueTasksForProject` → lease/gate/telemetry). The
  *     singleton's extra maintenance (message-history privacy sweep, compiled
  *     smart-note surfacing, embedding backfill) is deferred to a later slice.
- *   - Tool workers (`ctx.subagents.start` + `toolFilter` allowlist) are a
- *     Phase 4 follow-up / integrator decision; this slice is direct-LLM only.
+ *   - Tool workers are now wired for every READ-ONLY and memory-tool dream agent
+ *     (see {@link DREAM_AGENT_TOOL_ALLOWLIST}). `dreamer-docs` stays deferred: its
+ *     core profile grants write/edit, and a timer-driven subagent runs with
+ *     approval pinned to 'never' and the parent's sandbox, so letting an
+ *     unsupervised background pass edit user files is an explicit integrator
+ *     decision rather than a default. It fails with a message saying exactly that.
  *   - `createDshDreamClient`'s `db` parameter is accepted per contract but
  *     reserved (the facade is in-memory, exactly like the Pi facade); `log` is
  *     used for diagnostics.
  */
 import type { Context } from "@deepseek-ai/cordis";
+import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
 import { MAGIC_SOURCE_KIND, magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
+import { magicShellToolName } from "../compat/dsh-0.1/subagent";
+import { runMagicWorker } from "./worker";
 import { DSH_HARNESS } from "dsh-magic-context-adapter";
 import {
   DreamerConfigSchema,
@@ -67,26 +77,81 @@ import type { CtxCommandSeams } from "./commands";
 export const DEFAULT_DREAM_TICK_MS = 15 * 60 * 1000;
 
 /**
- * Dream agents whose prompts REQUIRE tools — a direct single-turn LLM call
- * cannot produce a valid result for them. Mirrors the tool profiles in core
- * `agents/dreamer.ts` + `agents/hidden-agent-registrations.ts`:
- *   - `dreamer`                    (curate)              → ctx_memory only
- *   - `dreamer-docs`               (maintain-docs)       → read/grep/glob/bash/write/edit/aft
- *   - `dreamer-primer-investigator`(refresh-primers)     → read-only code investigation
- *   - `dreamer-memory-mapper`      (map-memories/verify/verify-broad) → read-only source reader
- * The remaining dream agents are zero-tool single-shot transforms and work
- * through the direct LLM path: `dreamer-classifier` (classify-memories +
- * compress-cues), `smart-note-compiler` (evaluate-smart-notes),
- * `dreamer-reviewer` (review-user-memories), `dreamer-retrospective` (friction
- * gate + deepen turns). Tool workers are a Phase 4 follow-up / integrator
- * decision (ctx.subagents.start + toolFilter allowlist).
+ * Per-dream-agent tool allowlist, mirroring the core's AUTHORITATIVE profiles in
+ * `packages/plugin/src/agents/hidden-agent-registrations.ts` (where
+ * `agent-registration-drift.test.ts` locks each inline literal to its canonical
+ * constant). Read those lists, not this table's history: an earlier version of
+ * this file hand-listed only four tool-requiring agents and missed
+ * `dreamer-retrospective`'s `ctx_search`, which silently ran it tool-less.
+ *
+ * Translated for DSH, which does not ship every upstream tool:
+ *   - `aft_outline` / `aft_zoom` / `aft_search` are OpenCode/Pi code-navigation
+ *     tools with no DSH counterpart, so they are omitted; DSH reads a tree with
+ *     `read` / `grep` / `glob` (dsh-tool-fs + dsh-tool-fs-search).
+ *   - `bash` becomes the platform shell tool's name (dsh-tool-pwsh → `pwsh` on
+ *     Windows, dsh-tool-bash → `bash` elsewhere).
+ *   - `ctx_memory` / `ctx_search` are registered by this port.
+ * An agent mapped to an EMPTY list is a genuine zero-tool transform and stays on
+ * the direct-LLM path. An agent ABSENT from the table keeps the direct-LLM path
+ * too (forward compatible if upstream adds an agent).
  */
-const TOOL_REQUIRING_DREAM_AGENTS = new Set([
-  "dreamer",
-  "dreamer-docs",
-  "dreamer-primer-investigator",
-  "dreamer-memory-mapper",
-]);
+const DREAM_AGENT_TOOL_ALLOWLIST: Record<string, readonly string[]> = {
+  // curate: whole-pool memory hygiene loop; the only tool it may use.
+  dreamer: ["ctx_memory"],
+  // map-memories / verify / verify-broad: read-only local-source reader. No
+  // ctx_search (these check local code) and no memory mutations (the host
+  // applies the manifest's DB writes itself).
+  "dreamer-memory-mapper": ["read", "grep", "glob"],
+  // refresh-primers / promote-primers: read-only code investigation + recall.
+  "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
+  // friction gate + deepen turns: reads prior sessions, never writes.
+  "dreamer-retrospective": ["ctx_search"],
+  // Zero-tool single-shot transforms (locked to [] upstream).
+  "dreamer-classifier": [],
+  "dreamer-reviewer": [],
+  "smart-note-compiler": [],
+};
+
+/**
+ * Agents whose core profile grants WRITE access and are therefore NOT wired.
+ *
+ * `dreamer-docs` (maintain-docs) holds read/grep/glob/bash/write/edit upstream.
+ * A worker runs with delegated approval pinned to 'never' and inherits the
+ * parent's sandbox mode, so wiring it would let a background timer edit the
+ * user's files unsupervised. Failing loudly keeps that an explicit decision.
+ */
+const DEFERRED_WRITE_DREAM_AGENTS: readonly string[] = ["dreamer-docs"];
+
+/** Resolve the live top-level agent that owns a project (a worker needs one). */
+export type DreamParentResolver = (directory: string) => Agent | undefined;
+
+/** Live-agent registry: dream tool workers must spawn from a real `Agent`. */
+export interface DreamParentRegistry {
+  remember(directory: string | undefined, agent: Agent): void;
+  readonly resolve: DreamParentResolver;
+}
+
+/**
+ * Build the registry the agent plane feeds on every pre-step.
+ *
+ * `ctx.subagents.start` requires `parent: Agent`, but the dreamer runs from a
+ * timer with no agent on hand. The agent plane therefore records the live
+ * top-level agent per project directory and the facade resolves it when a
+ * tool-requiring task fires. References are WEAK: a finished session's object
+ * graph must stay collectable, and a dead reference simply means "no live
+ * session for this project right now" — which the facade reports explicitly.
+ */
+export function createDreamParentRegistry(): DreamParentRegistry {
+  const parents = new Map<string, WeakRef<Agent>>();
+  return {
+    remember(directory: string | undefined, agent: Agent): void {
+      const key = (directory ?? "").trim();
+      if (key.length === 0 || typeof agent !== "object" || agent === null) return;
+      parents.set(key, new WeakRef(agent));
+    },
+    resolve: (directory: string): Agent | undefined => parents.get(directory.trim())?.deref(),
+  };
+}
 
 /** Magic-owned message source marker for dreamer LLM turns. */
 const DREAM_SOURCE = { kind: MAGIC_SOURCE_KIND } as const;
@@ -105,8 +170,17 @@ export interface DreamerWiringDeps {
   readonly config?: { enabled?: boolean; tickMs?: number };
   /** Parsed core DreamerConfig (from magic-context.jsonc `dreamer` section). */
   readonly coreConfig?: unknown;
+  /** Resolve the live agent a tool-requiring dream worker spawns from. */
+  readonly parentAgent?: DreamParentResolver;
+  /** Worker budget override (tests). */
+  readonly workerTimeoutMs?: number;
   readonly log?: (message: string) => void;
 }
+
+/** Default dream-worker budget. A tool-requiring task is a multi-step lookup
+ *  loop (the core allows up to 150 steps for curate), so the 120s worker default
+ *  is far too tight; this still stays under the 15-minute schedule tick. */
+export const DEFAULT_DREAM_WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Deps for {@link createDshDreamClient}. */
 export interface DshDreamClientDeps {
@@ -114,6 +188,10 @@ export interface DshDreamClientDeps {
    *  `db` is accepted for signature stability / future persistence. */
   readonly db: Database;
   readonly log?: (message: string) => void;
+  /** Resolve the live agent a tool-requiring dream worker spawns from. */
+  readonly parentAgent?: DreamParentResolver;
+  /** Worker budget (default {@link DEFAULT_DREAM_WORKER_TIMEOUT_MS}). */
+  readonly workerTimeoutMs?: number;
 }
 
 /* ─────────────────────────── client facade ────────────────────────────── */
@@ -320,14 +398,59 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
         throw new Error("prompt aborted by external signal");
       }
       const agent = extractBodyAgent(args);
-      if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
-        // Explicit, non-transient failure: tool worker wiring (ctx.subagents.start
-        // + toolFilter allowlist) is a Phase 4 follow-up / integrator decision.
+      if (agent !== undefined && DEFERRED_WRITE_DREAM_AGENTS.includes(agent)) {
+        // Permanent by design: see DEFERRED_WRITE_DREAM_AGENTS.
         throw new Error(
-          `dreamer tool worker not wired for agent "${agent}": this task requires tools ` +
-            `(ctx_memory / read / grep / write / edit), which the direct-LLM facade cannot provide. ` +
-            `Wire ctx.subagents.start workers in a later Phase 4 slice or disable this task.`,
+          `dreamer agent "${agent}" is not wired on DSH: its core profile grants write access, and a ` +
+            `timer-driven worker spawns with approval pinned to never under the parent's sandbox. ` +
+            `Disable this dream task, or wire the write-capable worker deliberately.`,
         );
+      }
+      const allow = agent === undefined ? undefined : DREAM_AGENT_TOOL_ALLOWLIST[agent];
+      if (allow !== undefined && allow.length > 0) {
+        const workerUserText = extractUserMessage(args);
+        const parent = deps.parentAgent?.(dreamSession.directory);
+        if (parent === undefined) {
+          // Permanent, and worded to avoid the core's transient-failure
+          // vocabulary (abort/lease/timeout/network/...): the scheduler should
+          // advance to the next cron slot rather than hot-retry.
+          throw new Error(
+            `dreamer tool worker has no live session to spawn from for agent "${agent}" ` +
+              `(project ${dreamSession.directory || "(unknown)"}). A worker is a subagent of a live ` +
+              `session, so this task can only run while a session for that project is open.`,
+          );
+        }
+        const result = await runMagicWorker(ctx, {
+          parent,
+          label: `magic-dream-${agent}`,
+          prompt: workerUserText,
+          allow,
+          systemPrompt: extractSystemPrompt(args),
+          signal: args.signal ?? new AbortController().signal,
+          timeoutMs: deps.workerTimeoutMs ?? DEFAULT_DREAM_WORKER_TIMEOUT_MS,
+          log,
+        });
+        if (result === null) {
+          // Permanent: runMagicWorker already logged the cause (subagents service
+          // absent, spawn refused, or an empty run). Retrying the same task on the
+          // next tick is what produced the noise this wiring replaces.
+          throw new Error(
+            `dreamer tool worker produced no result for agent "${agent}" — see the [magic-context] ` +
+              `worker log line for the cause.`,
+          );
+        }
+        dreamSession.messages = [
+          makeMessage("user", [{ type: "text", text: workerUserText }]),
+          makeMessage("assistant", [
+            ...syntheticToolParts(result.toolCallCount),
+            { type: "text", text: result.text },
+          ]),
+        ];
+        log(
+          `[dreamer] tool worker ran ${agent} for ${dreamSession.directory || "(unknown)"} ` +
+            `(${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`,
+        );
+        return {};
       }
       const userText = extractUserMessage(args);
       const model = resolveDreamModel(ctx, extractBodyModel(args));
@@ -538,7 +661,12 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
         log("[dreamer] no projects discovered from session_projects — timer idle");
         return;
       }
-      const facade = (state.facade ??= createDshDreamClient(ctx, { db, log }));
+      const facade = (state.facade ??= createDshDreamClient(ctx, {
+        db,
+        log,
+        parentAgent: deps.parentAgent,
+        workerTimeoutMs: deps.workerTimeoutMs,
+      }));
       const executor = buildDreamExecutor(facade, state);
       for (const projectIdentity of projects) {
         disposers.push(
@@ -574,7 +702,13 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
  */
 export function dshDreamSeams(
   ctx: Context,
-  deps: { db: Database; log?: (message: string) => void; compactionOff?: boolean },
+  deps: {
+    db: Database;
+    log?: (message: string) => void;
+    compactionOff?: boolean;
+    parentAgent?: DreamParentResolver;
+    workerTimeoutMs?: number;
+  },
 ): NonNullable<CtxCommandSeams["dreamer"]> {
   const state = dreamerRuntime.get(ctx) ?? defaultState();
   const facade = (state.facade ??= createDshDreamClient(ctx, deps));

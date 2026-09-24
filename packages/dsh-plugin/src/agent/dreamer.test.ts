@@ -26,6 +26,7 @@ import { extractLatestAssistantText } from "@magic-context/core/shared/assistant
 import { createTestDb, createTestStorageDir } from "../test-utils";
 import {
   __test,
+  createDreamParentRegistry,
   createDshDreamClient,
   DEFAULT_DREAM_TICK_MS,
   discoverDreamProjects,
@@ -92,13 +93,19 @@ interface FakeCtx {
 }
 
 function makeFakeCtx(
-  opts: { llm?: LlmRuntime; config?: unknown; agentDefaultModel?: unknown } = {},
+  opts: {
+    llm?: LlmRuntime;
+    config?: unknown;
+    agentDefaultModel?: unknown;
+    subagents?: unknown;
+  } = {},
 ): FakeCtx {
   const disposers: Array<() => void> = [];
   const ctx = {
     get: (name: string) => {
       if (name === "llm") return opts.llm;
       if (name === "agentDefaultModel") return opts.agentDefaultModel;
+      if (name === "subagents") return opts.subagents;
       return undefined;
     },
     effect: (execute: () => () => void) => {
@@ -108,6 +115,28 @@ function makeFakeCtx(
     config: opts.config,
   };
   return { ctx: ctx as unknown as Context, disposers };
+}
+
+/** Fake subagents service capturing spawn requests. */
+function stubSubagents(): {
+  service: unknown;
+  starts: Array<{ provider: string; request: Record<string, unknown> }>;
+} {
+  const starts: Array<{ provider: string; request: Record<string, unknown> }> = [];
+  const service = {
+    start: async (provider: string, request: Record<string, unknown>) => {
+      starts.push({ provider, request });
+      return {
+        id: `child-${starts.length}`,
+        result: Promise.resolve({
+          stopReason: "stop",
+          output: [{ type: "text", text: "worker mapped the sources" }],
+        }),
+        dispose: () => {},
+      };
+    },
+  };
+  return { service, starts };
 }
 
 interface CapturedInterval {
@@ -206,26 +235,144 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
     }
   });
 
-  it("fails explicitly for tool-requiring dream agents (P1: no tool workers)", async () => {
+  it("runs a tool-requiring dream agent as a tool-scoped subagent worker", async () => {
     const { db, cleanup } = await openDb();
     try {
-      const { ctx } = makeFakeCtx({ llm: stubLlm() });
-      const facade = createDshDreamClient(ctx, { db });
-      for (const agent of [
-        "dreamer", // curate
-        "dreamer-docs", // maintain-docs
-        "dreamer-primer-investigator", // refresh-primers
-        "dreamer-memory-mapper", // map-memories / verify / verify-broad
-      ]) {
-        const { id } = await facade.session.create({});
-        await expect(
-          facade.session.prompt({ path: { id }, body: { agent, parts: [{ type: "text", text: "x" }] } }),
-        ).rejects.toThrow(/tool worker not wired/);
-      }
+      const { service, starts } = stubSubagents();
+      const calls: GenerateOptions[] = [];
+      const parent = { session: { header: {} } } as never;
+      const { ctx } = makeFakeCtx({ llm: stubLlm({ calls }), subagents: service });
+      const facade = createDshDreamClient(ctx, {
+        db,
+        parentAgent: (directory) => (directory === PROJECT_A ? parent : undefined),
+      });
+
+      const { id } = await facade.session.create({ query: { directory: PROJECT_A } });
+      await facade.session.prompt({
+        path: { id },
+        body: { agent: "dreamer-memory-mapper", parts: [{ type: "text", text: "map the sources" }] },
+      });
+
+      // Spawned as a depth-0 worker with the core's read-only profile, minus the
+      // OpenCode-only aft_* tools DSH does not ship.
+      expect(starts).toHaveLength(1);
+      expect(starts[0]?.provider).toBe("spawn");
+      const request = starts[0]?.request as {
+        maxDepth?: number;
+        label?: string;
+        toolFilter?: { allow?: string[] };
+      };
+      expect(request.maxDepth).toBe(0);
+      expect(request.label).toBe("magic-dream-dreamer-memory-mapper");
+      expect(request.toolFilter?.allow).toEqual(["read", "grep", "glob"]);
+      // The direct-LLM path was NOT used for a tool-requiring agent.
+      expect(calls).toHaveLength(0);
+
+      const messages = (await facade.session.messages({ path: { id } })).data as Array<{
+        parts: Array<{ type: string; text?: string }>;
+      }>;
+      const assistant = messages[messages.length - 1];
+      expect(
+        assistant?.parts.some((part) => part.type === "text" && part.text === "worker mapped the sources"),
+      ).toBe(true);
     } finally {
       db.close();
       await cleanup();
     }
+  });
+
+  it("reports a permanent failure when no live session can parent the worker", async () => {
+    const { db, cleanup } = await openDb();
+    try {
+      const { service, starts } = stubSubagents();
+      const { ctx } = makeFakeCtx({ llm: stubLlm(), subagents: service });
+      const facade = createDshDreamClient(ctx, { db, parentAgent: () => undefined });
+      const { id } = await facade.session.create({ query: { directory: PROJECT_A } });
+
+      let message = "";
+      await expect(
+        facade.session.prompt({
+          path: { id },
+          body: { agent: "dreamer-memory-mapper", parts: [{ type: "text", text: "x" }] },
+        }),
+      ).rejects.toThrow(/no live session to spawn from/);
+      try {
+        await facade.session.prompt({
+          path: { id },
+          body: { agent: "dreamer-memory-mapper", parts: [{ type: "text", text: "x" }] },
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(starts).toHaveLength(0);
+      // The core classifies a failure as TRANSIENT (hot-retry every tick) when the
+      // message matches this vocabulary. This condition is structural, so the
+      // wording must stay out of it.
+      expect(message).not.toMatch(
+        /abort|lease|timeout|timed out|econn|socket|network|rate.?limit|429|503|overloaded|sqlite_busy|database is locked/i,
+      );
+    } finally {
+      db.close();
+      await cleanup();
+    }
+  });
+
+  it("keeps the write-capable dream agent deferred, with a reason", async () => {
+    const { db, cleanup } = await openDb();
+    try {
+      const { service, starts } = stubSubagents();
+      const parent = { session: { header: {} } } as never;
+      const { ctx } = makeFakeCtx({ llm: stubLlm(), subagents: service });
+      const facade = createDshDreamClient(ctx, { db, parentAgent: () => parent });
+      const { id } = await facade.session.create({ query: { directory: PROJECT_A } });
+
+      await expect(
+        facade.session.prompt({
+          path: { id },
+          body: { agent: "dreamer-docs", parts: [{ type: "text", text: "x" }] },
+        }),
+      ).rejects.toThrow(/not wired on DSH/);
+      // Even with a live parent, a write-capable agent must not spawn.
+      expect(starts).toHaveLength(0);
+    } finally {
+      db.close();
+      await cleanup();
+    }
+  });
+
+  it("keeps zero-tool dream agents on the direct-LLM path", async () => {
+    const { db, cleanup } = await openDb();
+    try {
+      const { service, starts } = stubSubagents();
+      const calls: GenerateOptions[] = [];
+      const parent = { session: { header: {} } } as never;
+      const { ctx } = makeFakeCtx({ llm: stubLlm({ calls }), subagents: service });
+      const facade = createDshDreamClient(ctx, { db, parentAgent: () => parent });
+      const { id } = await facade.session.create({ query: { directory: PROJECT_A } });
+
+      await facade.session.prompt({
+        path: { id },
+        body: { agent: "dreamer-classifier", parts: [{ type: "text", text: "classify" }] },
+      });
+
+      expect(starts).toHaveLength(0);
+      expect(calls).toHaveLength(1);
+    } finally {
+      db.close();
+      await cleanup();
+    }
+  });
+
+  it("publishes and resolves live parent agents per project, ignoring empty ones", async () => {
+    const registry = createDreamParentRegistry();
+    const agent = { session: { header: {} } } as never;
+    registry.remember("dir:/tmp/proj", agent as never);
+    expect(registry.resolve("dir:/tmp/proj")).toBe(agent as never);
+    expect(registry.resolve("dir:/tmp/other")).toBeUndefined();
+    registry.remember(undefined, agent as never);
+    registry.remember("   ", agent as never);
+    expect(registry.resolve("")).toBeUndefined();
   });
 
   it("propagates LLM error / abort / empty output as rejected prompts", async () => {

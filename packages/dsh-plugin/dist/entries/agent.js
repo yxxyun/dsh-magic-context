@@ -315,6 +315,7 @@ import {
 } from "./agent-5gth7qh5.js";
 import {
   deriveEventMessage2,
+  textBlock2,
   MAGIC_SOURCE_KIND2,
   magicSource2,
   isMagicSource2,
@@ -3159,6 +3160,21 @@ import {
   resolveChildDepth,
   SubagentDepthError
 } from "@deepseek-ai/dsh-subagent";
+var MAGIC_WORKER_READONLY_TOOLS = ["read", "grep", "glob"];
+function magicWorkerRequest(parent, opts) {
+  return {
+    label: opts.label,
+    prompt: opts.prompt,
+    parent,
+    signal: opts.signal,
+    maxDepth: opts.maxDepth ?? 1,
+    toolFilter: { allow: [...opts.allow] },
+    ...opts.persona === undefined ? {} : { persona: opts.persona }
+  };
+}
+function subagentsOf(ctx) {
+  return ctx.get("subagents");
+}
 
 // src/agent/worker.ts
 function isMagicChildSession(agent) {
@@ -3166,6 +3182,69 @@ function isMagicChildSession(agent) {
   if (header?.origin === "subagent")
     return true;
   return typeof header?.delegationDepth === "number" && header.delegationDepth >= 1;
+}
+async function runMagicWorker(ctx, deps) {
+  const log = deps.log ?? (() => {});
+  try {
+    const subagents = subagentsOf(ctx);
+    if (subagents === undefined) {
+      log("[magic-context] worker skipped: subagents service unavailable");
+      return null;
+    }
+    const started = Date.now();
+    const request = magicWorkerRequest(deps.parent, {
+      label: deps.label,
+      prompt: [textBlock2(deps.prompt)],
+      allow: deps.allow ?? MAGIC_WORKER_READONLY_TOOLS,
+      maxDepth: 0,
+      signal: deps.signal,
+      persona: deps.systemPrompt
+    });
+    const run = await subagents.start("spawn", request);
+    const childSession = run.localAgent?.session;
+    if (childSession !== undefined) {
+      appendDelegatedPolicyOverrides(childSession, captureDelegatedPolicyOverrides(deps.parent));
+    }
+    const timeout = deps.timeoutMs ?? 120000;
+    let timer;
+    let settleTimeout;
+    const giveUp = () => {
+      if (timer !== undefined)
+        clearTimeout(timer);
+      run.dispose();
+      settleTimeout?.(null);
+    };
+    const result = await Promise.race([
+      run.result.finally(() => {
+        if (timer !== undefined)
+          clearTimeout(timer);
+        deps.signal.removeEventListener("abort", giveUp);
+      }),
+      new Promise((resolve) => {
+        settleTimeout = resolve;
+        timer = setTimeout(giveUp, timeout);
+        deps.signal.addEventListener("abort", giveUp, { once: true });
+      })
+    ]);
+    if (result === null)
+      return null;
+    const stopReason = result.stopReason;
+    if (stopReason === "error" || stopReason === "aborted" || stopReason === "refusal") {
+      return null;
+    }
+    const text = result.output.map((block) => block.type === "text" ? block.text : "").join(`
+`).trim();
+    if (text.length === 0)
+      return null;
+    return {
+      text,
+      durationMs: Date.now() - started,
+      toolCallCount: result.structured !== undefined ? 1 : 0
+    };
+  } catch (error) {
+    log(`[magic-context] worker failed (returns null): ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
 }
 
 // src/agent/session-track.ts
@@ -3720,6 +3799,7 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
       const magicSessionId = deps.host.canonicalKey(agent.id);
       const directory = sessionProjectPath(agent, deps.config.directory);
       const projectPath = resolveKnowledgeProjectPath(directory);
+      deps.rememberAgent?.(directory, agent);
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
       const deferred = consumeDshDeferredSignals(magicSessionId);
       const incomingWatermarks = collectMagicWatermarks(payload.messages);
@@ -12920,13 +13000,30 @@ async function runAgenticTask(config, ctx, helpers) {
 
 // src/agent/dreamer.ts
 var DEFAULT_DREAM_TICK_MS = 15 * 60 * 1000;
-var TOOL_REQUIRING_DREAM_AGENTS = new Set([
-  "dreamer",
-  "dreamer-docs",
-  "dreamer-primer-investigator",
-  "dreamer-memory-mapper"
-]);
+var DREAM_AGENT_TOOL_ALLOWLIST = {
+  dreamer: ["ctx_memory"],
+  "dreamer-memory-mapper": ["read", "grep", "glob"],
+  "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
+  "dreamer-retrospective": ["ctx_search"],
+  "dreamer-classifier": [],
+  "dreamer-reviewer": [],
+  "smart-note-compiler": []
+};
+var DEFERRED_WRITE_DREAM_AGENTS = ["dreamer-docs"];
+function createDreamParentRegistry() {
+  const parents = new Map;
+  return {
+    remember(directory, agent) {
+      const key = (directory ?? "").trim();
+      if (key.length === 0 || typeof agent !== "object" || agent === null)
+        return;
+      parents.set(key, new WeakRef(agent));
+    },
+    resolve: (directory) => parents.get(directory.trim())?.deref()
+  };
+}
 var DREAM_SOURCE = { kind: MAGIC_SOURCE_KIND2 };
+var DEFAULT_DREAM_WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 function syntheticToolParts(count) {
   const safe = Math.max(0, Math.floor(count));
   return Array.from({ length: safe }, () => ({
@@ -13037,8 +13134,38 @@ function createDshDreamClient(ctx, deps) {
         throw new Error("prompt aborted by external signal");
       }
       const agent = extractBodyAgent(args);
-      if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
-        throw new Error(`dreamer tool worker not wired for agent "${agent}": this task requires tools ` + `(ctx_memory / read / grep / write / edit), which the direct-LLM facade cannot provide. ` + `Wire ctx.subagents.start workers in a later Phase 4 slice or disable this task.`);
+      if (agent !== undefined && DEFERRED_WRITE_DREAM_AGENTS.includes(agent)) {
+        throw new Error(`dreamer agent "${agent}" is not wired on DSH: its core profile grants write access, and a ` + `timer-driven worker spawns with approval pinned to never under the parent's sandbox. ` + `Disable this dream task, or wire the write-capable worker deliberately.`);
+      }
+      const allow = agent === undefined ? undefined : DREAM_AGENT_TOOL_ALLOWLIST[agent];
+      if (allow !== undefined && allow.length > 0) {
+        const workerUserText = extractUserMessage(args);
+        const parent = deps.parentAgent?.(dreamSession.directory);
+        if (parent === undefined) {
+          throw new Error(`dreamer tool worker has no live session to spawn from for agent "${agent}" ` + `(project ${dreamSession.directory || "(unknown)"}). A worker is a subagent of a live ` + `session, so this task can only run while a session for that project is open.`);
+        }
+        const result = await runMagicWorker(ctx, {
+          parent,
+          label: `magic-dream-${agent}`,
+          prompt: workerUserText,
+          allow,
+          systemPrompt: extractSystemPrompt(args),
+          signal: args.signal ?? new AbortController().signal,
+          timeoutMs: deps.workerTimeoutMs ?? DEFAULT_DREAM_WORKER_TIMEOUT_MS,
+          log
+        });
+        if (result === null) {
+          throw new Error(`dreamer tool worker produced no result for agent "${agent}" — see the [magic-context] ` + `worker log line for the cause.`);
+        }
+        dreamSession.messages = [
+          makeMessage("user", [{ type: "text", text: workerUserText }]),
+          makeMessage("assistant", [
+            ...syntheticToolParts(result.toolCallCount),
+            { type: "text", text: result.text }
+          ])
+        ];
+        log(`[dreamer] tool worker ran ${agent} for ${dreamSession.directory || "(unknown)"} ` + `(${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`);
+        return {};
       }
       const userText = extractUserMessage(args);
       const model = resolveDreamModel(ctx, extractBodyModel(args));
@@ -13170,7 +13297,12 @@ function registerDshDreamer(ctx, deps) {
         log("[dreamer] no projects discovered from session_projects — timer idle");
         return;
       }
-      const facade = state.facade ??= createDshDreamClient(ctx, { db, log });
+      const facade = state.facade ??= createDshDreamClient(ctx, {
+        db,
+        log,
+        parentAgent: deps.parentAgent,
+        workerTimeoutMs: deps.workerTimeoutMs
+      });
       const executor = buildDreamExecutor(facade, state);
       for (const projectIdentity of projects) {
         disposers.push(intervalFactory(() => {
@@ -18124,15 +18256,18 @@ function apply(ctx, config = {}) {
     directory,
     log: log2
   });
+  const dreamParents = createDreamParentRegistry();
   registerDshDreamer(ctx, {
     host,
     directory,
     config: config.dreamer,
     coreConfig: dreamerCoreConfigOf(config),
+    parentAgent: dreamParents.resolve,
     log: log2
   });
   registerKnowledgeGate(ctx, {
     host,
+    rememberAgent: dreamParents.remember,
     config: { ...config.knowledge ?? {}, directory },
     autoSearch: config.autoSearch ?? {},
     mural: createMuralWiring(ctx, config.knowledge?.muralEnabled === true),
@@ -18152,7 +18287,8 @@ function apply(ctx, config = {}) {
     seams.set("dreamer", dshDreamSeams(ctx, {
       db: bootstrap.db,
       log: log2,
-      compactionOff: config.commands?.compactionOff === true
+      compactionOff: config.commands?.compactionOff === true,
+      parentAgent: dreamParents.resolve
     }));
     seams.set("recomp", createRecompSeams({ ctx, host, directory, db: bootstrap.db, log: log2 }));
   });
