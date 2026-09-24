@@ -6052,10 +6052,21 @@ function findPresetRow(plugins, rowId) {
   }
   return;
 }
+function readDeclaredRow(patch, rowId) {
+  const direct = patch.find((entry) => entry.id === rowId);
+  if (direct !== undefined)
+    return direct;
+  const inserts = patch.filter((entry) => entry.insert !== undefined);
+  if (inserts.length === 0)
+    return;
+  const materialized = applyEntryPatches([], inserts, () => {});
+  return materialized.find((entry) => entry.id === rowId);
+}
 
 // src/doctor/env.ts
 import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, join as join2 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 import {
   existsSync as existsSync2,
   mkdirSync,
@@ -6080,6 +6091,35 @@ function resolveDshHome(env = process.env) {
   if (explicit !== undefined && explicit.trim() !== "")
     return explicit;
   return join2(homedir2(), ".dsh");
+}
+function resolveOwnPatchPath(fromUrl = import.meta.url) {
+  let dir = dirname2(fileURLToPath2(fromUrl));
+  for (let depth = 0;depth < 4; depth += 1) {
+    const candidate = join2(dir, "cordis.patch.yml");
+    if (existsSync2(candidate))
+      return candidate;
+    const parent = dirname2(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return;
+}
+function resourcesPathOf(opts) {
+  if (opts.resourcesPath !== undefined && opts.resourcesPath.trim() !== "")
+    return opts.resourcesPath;
+  const candidate = process.resourcesPath;
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined;
+}
+function desktopInstallCandidates(resourcesPath) {
+  if (resourcesPath === undefined)
+    return [];
+  const roots = [
+    join2(resourcesPath, "app.asar", "dsh"),
+    join2(resourcesPath, "app.asar.unpacked", "dsh"),
+    join2(resourcesPath, "app", "dsh")
+  ];
+  return roots.map((root) => join2(root, "node_modules", DSH_PACKAGE));
 }
 function locateDshInstall(opts) {
   if (opts.stockPresetPath !== undefined) {
@@ -6106,6 +6146,7 @@ function locateDshInstall(opts) {
     }
   } catch {}
   installCandidates.push(...findDshInstallOnPath(env));
+  installCandidates.push(...desktopInstallCandidates(resourcesPathOf(opts)));
   for (const candidate of installCandidates) {
     tried.push(candidate);
     if (!isDshInstallRoot(candidate))
@@ -6269,7 +6310,7 @@ function parseEntryListYaml(text) {
   return load(text, { schema: entryListSchema });
 }
 function readPresetDeclaration(patch, rowId) {
-  const row = patch.find((entry) => entry.id === rowId);
+  const row = readDeclaredRow(patch, rowId);
   if (row === undefined)
     return `patch layer declares no row "${rowId}"`;
   const config = row.config;
@@ -6389,14 +6430,16 @@ Fix: install DSH ${DSH_COMPAT_EXPECTED_VERSION}, or pass ` + `--dsh-install <dir
   }
   if (!failed && stockPlugins !== undefined) {
     try {
-      const ownPatchPath = new URL("../../cordis.patch.yml", import.meta.url);
+      const ownPatchPath = resolveOwnPatchPath();
+      if (ownPatchPath === undefined)
+        throw new Error("could not locate this bundle's cordis.patch.yml");
       const ownPatch = parseEntryListYaml(readFileSync3(ownPatchPath, "utf8"));
       const own = readPresetDeclaration(ownPatch, STOCK_PRESET_ROW_ID);
       if (typeof own === "string") {
         steps.push({
           status: "fail",
           title: "Bundle preset override",
-          detail: `${ownPatchPath.pathname}: ${own}`
+          detail: `${ownPatchPath}: ${own}`
         });
         failed = true;
       } else {
@@ -21100,7 +21143,8 @@ async function runDshDoctor(argv, options = {}) {
       status: "fail",
       detail: `Could not locate the DSH install (expected ${DSH_COMPAT_EXPECTED_VERSION}). Probed:
 ` + located.tried.map((candidate) => `  - ${candidate}`).join(`
-`),
+`) + `
+Note: the DSH DESKTOP app packages its runtime inside resources/app.asar, which a ` + `plain-node CLI cannot read (this check only sees it when the doctor runs inside DSH). ` + `Pass --dsh-install <an unpacked @deepseek-ai/dsh> in that case.`,
       fix: `Install DSH ${DSH_COMPAT_EXPECTED_VERSION} or pass --dsh-install <dir>.`
     });
   } else {
@@ -21176,11 +21220,11 @@ async function runDshDoctor(argv, options = {}) {
   {
     let presetStatus = "ok";
     let presetDetail = "";
-    const ownPatchUrl = new URL("../../cordis.patch.yml", import.meta.url);
+    const ownPatchPath = resolveOwnPatchPath();
     try {
       if (located.stockPresetPath === undefined) {
         presetStatus = "fail";
-        presetDetail = `could not locate the shipped standard preset patch for ${dshHome} ` + `(probed: ${located.tried.join(", ")}).`;
+        presetDetail = `could not locate the shipped standard preset patch for ${dshHome} ` + `(probed: ${located.tried.join(", ")}). ` + `On the DSH desktop app this file lives inside resources/app.asar and is only ` + `readable from inside DSH; pass --dsh-install <an unpacked @deepseek-ai/dsh> to check it here.`;
       } else {
         const shipped = parseEntryListYaml(readFileSync8(located.stockPresetPath, "utf8"));
         const declared = readPresetDeclaration(shipped, STOCK_PRESET_ROW_ID);
@@ -21189,7 +21233,9 @@ async function runDshDoctor(argv, options = {}) {
           presetDetail = `${located.stockPresetPath}: ${typeof declared === "string" ? declared : "no plugin list"} ` + `— this bundle overrides that row and cannot be verified.`;
         } else {
           const stockPlugins = declared.plugins;
-          const ownPatch = parseEntryListYaml(readFileSync8(ownPatchUrl, "utf8"));
+          if (ownPatchPath === undefined)
+            throw new Error("could not locate this bundle's cordis.patch.yml");
+          const ownPatch = parseEntryListYaml(readFileSync8(ownPatchPath, "utf8"));
           const own = readPresetDeclaration(ownPatch, STOCK_PRESET_ROW_ID);
           if (typeof own === "string") {
             presetStatus = "fail";
@@ -21252,7 +21298,7 @@ async function runDshDoctor(argv, options = {}) {
       }
     } catch (error) {
       presetStatus = "fail";
-      presetDetail = `${ownPatchUrl.pathname}: ${errorMessage(error)}`;
+      presetDetail = `${ownPatchPath ?? (located.stockPresetPath ?? "cordis.patch.yml")}: ${errorMessage(error)}`;
     }
     checks.push({
       id: "preset-override",

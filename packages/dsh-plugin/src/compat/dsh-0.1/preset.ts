@@ -201,6 +201,39 @@ export function buildPresetPatchEntries(opts: MagicPresetOptions): Record<string
 }
 
 /**
+ * Find the row a patch layer declares for `rowId`.
+ *
+ * Two layer shapes occur and both must be supported:
+ *
+ *   - the PORT's own layer is a MODIFY layer — a top-level `- id: <rowId>` entry;
+ *   - the SHIPPED layer is an INSERT layer — `- insert: [ { id: <rowId>, … } ]`
+ *     (the row rides inside a patch operation, not at the top level).
+ *
+ * A top-level `find` misses the second shape, which is exactly what made `setup`
+ * and the doctor's preset check fail on the DSH 0.1.7 desktop install with
+ * `patch layer declares no row "preset-standard"` — a failure that had been
+ * masked by the install-locator failing first. Insert ops are materialized with
+ * the loader's own engine so the row read here is the row the loader builds;
+ * modify ops are read directly (materializing those over an empty base would
+ * warn and be skipped as "matches nothing").
+ */
+export function readDeclaredRow(
+  patch: readonly Record<string, unknown>[],
+  rowId: string,
+): Record<string, unknown> | undefined {
+  const direct = patch.find((entry) => entry.id === rowId);
+  if (direct !== undefined) return direct;
+  const inserts = patch.filter((entry) => entry.insert !== undefined);
+  if (inserts.length === 0) return undefined;
+  const materialized = applyEntryPatches(
+    [] as unknown as Parameters<typeof applyEntryPatches>[0],
+    inserts as unknown as Parameters<typeof applyEntryPatches>[1],
+    () => {},
+  ) as unknown as Record<string, unknown>[];
+  return materialized.find((entry) => entry.id === rowId);
+}
+
+/**
  * Apply the preset override over a parsed patch layer (structure-level
  * verification used by tests and doctor dry-runs). Reuses the loader's own
  * patch engine, so the dump can never drift from what boots.
@@ -209,7 +242,7 @@ export function applyMagicPatches(
   entries: readonly Record<string, unknown>[],
   opts: MagicPresetOptions,
 ): Record<string, unknown>[] {
-  const row = entries.find((entry) => entry.id === STOCK_PRESET_ROW_ID);
+  const row = readDeclaredRow(entries, STOCK_PRESET_ROW_ID);
   if (row === undefined) {
     throw new Error(`magic-standard: preset row "${STOCK_PRESET_ROW_ID}" missing from the patch layer`);
   }

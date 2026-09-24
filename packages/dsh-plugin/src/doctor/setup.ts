@@ -38,6 +38,7 @@ import {
   STOCK_PRESET_CONFIG_ID,
   STOCK_PRESET_ROW_ID,
   findPresetRow,
+  readDeclaredRow,
 } from "../compat/dsh-0.1/preset";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
@@ -49,6 +50,7 @@ import {
   magicEntryPath,
   parseFlags,
   resolveDshHome,
+  resolveOwnPatchPath,
   stringFlag,
 } from "./env";
 import { writeFileAtomic } from "./env";
@@ -152,7 +154,7 @@ export function readPresetDeclaration(
   patch: readonly Record<string, unknown>[],
   rowId: string,
 ): { plugins?: readonly Record<string, unknown>[] } | string {
-  const row = patch.find((entry) => entry.id === rowId);
+  const row = readDeclaredRow(patch, rowId);
   if (row === undefined) return `patch layer declares no row "${rowId}"`;
   const config = row.config as
     | { id?: unknown; plugins?: readonly Record<string, unknown>[] }
@@ -307,14 +309,15 @@ export async function runDshSetup(
   // 4. Verify this bundle's own preset override against the shipped list.
   if (!failed && stockPlugins !== undefined) {
     try {
-      const ownPatchPath = new URL("../../cordis.patch.yml", import.meta.url);
+      const ownPatchPath = resolveOwnPatchPath();
+      if (ownPatchPath === undefined) throw new Error("could not locate this bundle's cordis.patch.yml");
       const ownPatch = parseEntryListYaml(readFileSync(ownPatchPath, "utf8"));
       const own = readPresetDeclaration(ownPatch, STOCK_PRESET_ROW_ID);
       if (typeof own === "string") {
         steps.push({
           status: "fail",
           title: "Bundle preset override",
-          detail: `${ownPatchPath.pathname}: ${own}`,
+          detail: `${ownPatchPath}: ${own}`,
         });
         failed = true;
       } else {

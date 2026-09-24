@@ -5,18 +5,42 @@ import {
 } from "./agent-5gth7qh5.js";
 
 // src/host/remote.ts
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
 import { homedir } from "node:os";
 import { join as join2 } from "node:path";
 import { Service } from "@deepseek-ai/cordis";
 
-// src/compat/dsh-0.1/typert.ts
-var MAGIC_CONTEXT_REMOTE_NAMESPACE = "magicContext";
-
 // src/doctor/env.ts
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 var MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 var STOCK_PRESET_REL = join("presets", "standard.patch.yml");
+function resolveOwnPatchPath(fromUrl = import.meta.url) {
+  let dir = dirname(fileURLToPath(fromUrl));
+  for (let depth = 0;depth < 4; depth += 1) {
+    const candidate = join(dir, "cordis.patch.yml");
+    if (existsSync(candidate))
+      return candidate;
+    const parent = dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return;
+}
+
+// src/compat/dsh-0.1/typert.ts
+var MAGIC_CONTEXT_REMOTE_NAMESPACE = "magicContext";
 
 // src/host/remote.ts
 var MAGIC_STATUS_METHOD = "status";
@@ -30,8 +54,11 @@ function dshHome() {
 function readPresetDeclarationState() {
   const rowId = "preset-standard";
   try {
-    const url = new URL("../../cordis.patch.yml", import.meta.url);
-    const text = readFileSync(url, "utf8");
+    const patchPath = resolveOwnPatchPath();
+    if (patchPath === undefined) {
+      return { rowId, declared: false, detail: "could not locate this bundle's cordis.patch.yml" };
+    }
+    const text = readFileSync2(patchPath, "utf8");
     const declared = new RegExp(`^\\s*-?\\s*id:\\s*['"]?${rowId}['"]?\\s*$`, "m").test(text);
     return { rowId, declared };
   } catch (error) {
@@ -75,7 +102,7 @@ class MagicContextRemoteService extends Service {
       package: MAGIC_CONTEXT_PACKAGE,
       harness: "dsh",
       storage,
-      config: { path: configPath, exists: existsSync(configPath) },
+      config: { path: configPath, exists: existsSync2(configPath) },
       preset,
       ...args.sessionId === undefined ? {} : { sessionId: args.sessionId }
     };

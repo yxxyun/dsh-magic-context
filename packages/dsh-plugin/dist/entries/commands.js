@@ -2,7 +2,7 @@ import"./agent-5gth7qh5.js";
 import"./agent-108znazq.js";
 import {
   registerCtxCommands
-} from "./agent-4dxcke1k.js";
+} from "./agent-x5zygfb0.js";
 import"./agent-p7nkw8zz.js";
 
 // src/entries/commands.ts

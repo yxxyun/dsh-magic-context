@@ -69,6 +69,30 @@ export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".dsh");
 }
 
+/**
+ * Absolute path of THIS bundle's own `cordis.patch.yml`.
+ *
+ * A hardcoded relative depth is a trap: the code-splitting build emits these
+ * modules at the `dist/` ROOT, while the sources live one level deeper
+ * (`src/doctor/`). `new URL("../../cordis.patch.yml", import.meta.url)` is
+ * therefore correct in tests (source layout) and WRONG in every build
+ * (`packages/cordis.patch.yml` — ENOENT), which is how the doctor's preset
+ * check and the Remote diagnostics endpoint both broke without a single test
+ * failing. Walk up from the module instead, so the resolution survives any
+ * future output layout.
+ */
+export function resolveOwnPatchPath(fromUrl: string = import.meta.url): string | undefined {
+  let dir = dirname(fileURLToPath(fromUrl));
+  for (let depth = 0; depth < 4; depth += 1) {
+    const candidate = join(dir, "cordis.patch.yml");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
 export interface DshInstallLocateResult {
   /** Package root of the resolved `@deepseek-ai/dsh` install (if found). */
   readonly dshInstallDir?: string;
@@ -85,6 +109,46 @@ export interface DshInstallLocateOptions {
   /** Explicit stock preset patch override (tests / `--stock-preset`). */
   readonly stockPresetPath?: string;
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Electron's `process.resourcesPath` — set only when this code runs inside the
+   * DSH desktop app. The desktop install keeps the runtime inside
+   * `resources/app.asar/dsh/node_modules/@deepseek-ai/dsh`, which no
+   * profile-relative anchor can reach, so it must be probed explicitly.
+   * Injecting it also makes the desktop layout testable from plain node.
+   */
+  readonly resourcesPath?: string;
+}
+
+/**
+ * Electron's `process.resourcesPath`, when this runs inside the desktop app.
+ * Typed through a local shape so the plugin needs no Electron type dependency.
+ */
+export function resourcesPathOf(opts: DshInstallLocateOptions): string | undefined {
+  if (opts.resourcesPath !== undefined && opts.resourcesPath.trim() !== "") return opts.resourcesPath;
+  const candidate = (process as unknown as { resourcesPath?: unknown }).resourcesPath;
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined;
+}
+
+/**
+ * Install roots of the DSH DESKTOP app. Its runtime is not in any profile's
+ * `node_modules`; it ships inside the packaged app:
+ *
+ *   <resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh        <- package root
+ *   <resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh-web-app/presets/…
+ *
+ * The asar container is readable only inside Electron's runtime (its fs is
+ * patched to traverse archives), which is why this anchor cannot be reached by
+ * the profile/PATH anchors and is probed only when `resourcesPath` exists.
+ * `findStockPresetPatch` then finds the hoisted web-app preset one level up.
+ */
+export function desktopInstallCandidates(resourcesPath: string | undefined): string[] {
+  if (resourcesPath === undefined) return [];
+  const roots = [
+    join(resourcesPath, "app.asar", "dsh"), // packaged (asar)
+    join(resourcesPath, "app.asar.unpacked", "dsh"), // unpacked overrides
+    join(resourcesPath, "app", "dsh"), // unpackaged/dev app dir
+  ];
+  return roots.map((root) => join(root, "node_modules", DSH_PACKAGE));
 }
 
 /**
@@ -98,7 +162,9 @@ export interface DshInstallLocateOptions {
  *   2. the home-level fallback closure `$DSH_HOME/profiles/node_modules/…`
  *      (healProfilesModuleFallback);
  *   3. every `$DSH_HOME/profiles/<name>/node_modules/…` (profile anchor);
- *   4. the `dsh` executable on PATH, walked up to its package root.
+ *   4. the `dsh` executable on PATH, walked up to its package root;
+ *   5. the DSH desktop app's own packaged install (see
+ *      {@link desktopInstallCandidates}), probed only under Electron.
  *
  * A candidate counts only when it is the DSH package root AND carries the
  * shipped preset patch — an install missing it cannot be composed against, and
@@ -134,6 +200,7 @@ export function locateDshInstall(
     // Unreadable profiles dir — PATH fallback still applies.
   }
   installCandidates.push(...findDshInstallOnPath(env));
+  installCandidates.push(...desktopInstallCandidates(resourcesPathOf(opts)));
 
   for (const candidate of installCandidates) {
     tried.push(candidate);

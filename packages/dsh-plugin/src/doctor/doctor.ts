@@ -2,7 +2,8 @@
  * doctor/doctor — `dsh-magic-context doctor` (Phase 2 slice C).
  *
  * Checklist (each item reports ok/warn/fail + a fix hint):
- *   1. DSH version vs the compatibility expectation (exact rc 0.1.0-rc.6);
+ *   1. DSH version vs the compatibility expectation (DSH 0.1.7; any
+ *      `-alpha.N` / `-rc.N` suffix is accepted, see isSupportedDshVersion);
  *   2. bundle install state (profile package.json `dsh.profile.bundles`);
  *   3. magic-standard preset generated + stock layout still contract-valid
  *      (re-runs scanStockPresetLayout against the stock file the include row
@@ -44,6 +45,7 @@ import {
   locateDshInstall,
   parseFlags,
   resolveDshHome,
+  resolveOwnPatchPath,
   stringFlag,
 } from "./env";
 import { parseEntryListYaml, readPresetDeclaration } from "./setup";
@@ -256,7 +258,10 @@ export async function runDshDoctor(
       status: "fail",
       detail:
         `Could not locate the DSH install (expected ${DSH_COMPAT_EXPECTED_VERSION}). Probed:\n` +
-        located.tried.map((candidate) => `  - ${candidate}`).join("\n"),
+        located.tried.map((candidate) => `  - ${candidate}`).join("\n") +
+        `\nNote: the DSH DESKTOP app packages its runtime inside resources/app.asar, which a ` +
+        `plain-node CLI cannot read (this check only sees it when the doctor runs inside DSH). ` +
+        `Pass --dsh-install <an unpacked @deepseek-ai/dsh> in that case.`,
       fix: `Install DSH ${DSH_COMPAT_EXPECTED_VERSION} or pass --dsh-install <dir>.`,
     });
   } else {
@@ -352,7 +357,7 @@ export async function runDshDoctor(
   {
     let presetStatus: CheckStatus = "ok";
     let presetDetail = "";
-    const ownPatchUrl = new URL("../../cordis.patch.yml", import.meta.url);
+    const ownPatchPath = resolveOwnPatchPath();
     try {
       // Reuse the location resolved above: it honours --dsh-install and
       // --stock-preset. Re-probing with `dshHome` alone would ignore both and
@@ -361,7 +366,9 @@ export async function runDshDoctor(
         presetStatus = "fail";
         presetDetail =
           `could not locate the shipped standard preset patch for ${dshHome} ` +
-          `(probed: ${located.tried.join(", ")}).`;
+          `(probed: ${located.tried.join(", ")}). ` +
+          `On the DSH desktop app this file lives inside resources/app.asar and is only ` +
+          `readable from inside DSH; pass --dsh-install <an unpacked @deepseek-ai/dsh> to check it here.`;
       } else {
         const shipped = parseEntryListYaml(readFileSync(located.stockPresetPath, "utf8"));
         const declared = readPresetDeclaration(shipped, STOCK_PRESET_ROW_ID);
@@ -372,7 +379,8 @@ export async function runDshDoctor(
             `— this bundle overrides that row and cannot be verified.`;
         } else {
           const stockPlugins = declared.plugins;
-          const ownPatch = parseEntryListYaml(readFileSync(ownPatchUrl, "utf8"));
+          if (ownPatchPath === undefined) throw new Error("could not locate this bundle's cordis.patch.yml");
+          const ownPatch = parseEntryListYaml(readFileSync(ownPatchPath, "utf8"));
           const own = readPresetDeclaration(ownPatch, STOCK_PRESET_ROW_ID);
           if (typeof own === "string") {
             presetStatus = "fail";
@@ -443,7 +451,7 @@ export async function runDshDoctor(
       }
     } catch (error) {
       presetStatus = "fail";
-      presetDetail = `${ownPatchUrl.pathname}: ${errorMessage(error)}`;
+      presetDetail = `${ownPatchPath ?? (located.stockPresetPath ?? "cordis.patch.yml")}: ${errorMessage(error)}`;
     }
     checks.push({
       id: "preset-override",

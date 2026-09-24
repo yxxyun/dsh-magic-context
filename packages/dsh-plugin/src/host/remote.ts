@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
+import { resolveOwnPatchPath } from "../doctor/env";
 import {
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion,
@@ -90,8 +91,15 @@ function dshHome(): string {
 function readPresetDeclarationState(): MagicStatus["preset"] {
   const rowId = "preset-standard";
   try {
-    const url = new URL("../../cordis.patch.yml", import.meta.url);
-    const text = readFileSync(url, "utf8");
+    // Resolve by walking up from this module: a hardcoded relative depth is
+    // correct in the source tree and wrong in the build (the code-splitting
+    // output sits at `dist/` root), which made this report `declared: false` on
+    // every real install instead of failing loudly.
+    const patchPath = resolveOwnPatchPath();
+    if (patchPath === undefined) {
+      return { rowId, declared: false, detail: "could not locate this bundle's cordis.patch.yml" };
+    }
+    const text = readFileSync(patchPath, "utf8");
     // The override is a top-level mapping with this id and no `insert`; a
     // targeted scan avoids pulling a YAML parser into the host-plane bundle.
     const declared = new RegExp(`^\\s*-?\\s*id:\\s*['"]?${rowId}['"]?\\s*$`, "m").test(text);

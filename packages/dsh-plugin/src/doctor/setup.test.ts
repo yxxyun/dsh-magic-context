@@ -17,7 +17,12 @@ import {
   STOCK_PRESET_CONFIG_ID,
   STOCK_PRESET_ROW_ID,
 } from "../compat/dsh-0.1/preset";
-import { DSH_COMPAT_EXPECTED_VERSION, legacyMagicStandardDir, magicEntryPath } from "./env";
+import {
+  DSH_COMPAT_EXPECTED_VERSION,
+  legacyMagicStandardDir,
+  magicEntryPath,
+  resolveOwnPatchPath,
+} from "./env";
 
 /**
  * Stand-in for the shipped standard preset plugin list. It must carry every
@@ -353,9 +358,12 @@ describe("readPresetDeclaration", () => {
 
 describe("shipped patch is the real one", () => {
   it("this bundle's cordis.patch.yml parses and declares the override", async () => {
-    const own = parseEntryListYaml(
-      readFileSync(new URL("../../cordis.patch.yml", import.meta.url), "utf8"),
-    );
+    // Resolve exactly the way production does. A plain relative URL is correct
+    // in the source tree and wrong in the build, which is how the doctor's
+    // preset check shipped broken while this test stayed green.
+    const ownPatchPath = resolveOwnPatchPath();
+    expect(ownPatchPath).toBeDefined();
+    const own = parseEntryListYaml(readFileSync(ownPatchPath as string, "utf8"));
     const declared = readPresetDeclaration(own, STOCK_PRESET_ROW_ID);
     expect(typeof declared).not.toBe("string");
     // The row must NOT carry `insert`: that would duplicate, not override.

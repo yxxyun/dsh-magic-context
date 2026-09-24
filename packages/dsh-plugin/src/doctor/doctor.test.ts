@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dump as yamlDump } from "js-yaml";
 import { entryListSchema } from "@deepseek-ai/cordis-plugin-include";
 import { Database } from "@magic-context/core/shared/sqlite";
@@ -27,7 +28,10 @@ import { runDshSetup } from "./setup";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   MAGIC_CONTEXT_PACKAGE,
+  isSupportedDshVersion,
+  locateDshInstall,
   magicEntryPath,
+  resolveOwnPatchPath,
 } from "./env";
 import {
   MAGIC_AGENT_ROW_ID,
@@ -109,9 +113,16 @@ function fakeInstall(
     yamlDump(
       [
         {
-          id: STOCK_PRESET_ROW_ID,
-          name: "@deepseek-ai/dsh-agent-preset",
-          config: { id: STOCK_PRESET_CONFIG_ID, order: 1, plugins: mutate(stockLayout()) },
+          // The SHIPPED layer wraps its declaration in an `insert` operation —
+          // a top-level row here would hide the very bug this fixture exists to
+          // catch (setup/doctor reading only the top level of the layer).
+          insert: [
+            {
+              id: STOCK_PRESET_ROW_ID,
+              name: "@deepseek-ai/dsh-agent-preset",
+              config: { id: STOCK_PRESET_CONFIG_ID, order: 1, plugins: mutate(stockLayout()) },
+            },
+          ],
         },
       ],
       { schema: entryListSchema },
@@ -423,5 +434,96 @@ describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
     }
+  });
+});
+
+describe("locateDshInstall — DSH desktop app layout", () => {
+  /**
+   * The desktop app ships its runtime inside the packaged archive:
+   *   <resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh          (package root)
+   *   <resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh-web-app/presets/…  (hoisted)
+   * No profile-relative anchor can reach it, so before the resourcesPath anchor
+   * existed the doctor failed BOTH the version and the preset checks on every
+   * desktop install (observed 2026-09-24).
+   */
+  function fakeDesktopApp(resources: string): { installDir: string; stock: string } {
+    const installDir = join(resources, "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh");
+    mkdirSync(installDir, { recursive: true });
+    writeFileSync(
+      join(installDir, "package.json"),
+      JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.7-rc.1" }),
+    );
+    // Hoisted beside the package, not nested inside it — the real asar layout,
+    // which findStockPresetPatch reaches through its `..`/`../..` walk-up.
+    const stock = join(resources, "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-web-app", "presets", "standard.patch.yml");
+    mkdirSync(dirname(stock), { recursive: true });
+    writeFileSync(
+      stock,
+      yamlDump(
+        [
+          {
+            // Same `insert` wrapper as the real shipped layer.
+            insert: [
+              {
+                id: STOCK_PRESET_ROW_ID,
+                name: "@deepseek-ai/dsh-agent-preset",
+                config: { id: STOCK_PRESET_CONFIG_ID, order: 1, plugins: stockLayout() },
+              },
+            ],
+          },
+        ],
+        { schema: entryListSchema },
+      ),
+    );
+    return { installDir, stock };
+  }
+
+  it("locates the packaged runtime and the hoisted stock preset", async () => {
+    const env = makeEnv();
+    try {
+      const resources = join(env.root, "resources");
+      const { installDir, stock } = fakeDesktopApp(resources);
+      const located = locateDshInstall({ dshHome: env.dshHome, resourcesPath: resources });
+      expect(located.dshInstallDir).toBe(installDir);
+      expect(located.stockPresetPath).toBe(stock);
+      // The version the doctor then reports must satisfy the compat contract.
+      expect(isSupportedDshVersion("0.1.7-rc.1")).toBe(true);
+    } finally {
+      await cleanup(env.root);
+    }
+  });
+
+  it("does not reach the desktop layout without a resourcesPath anchor", async () => {
+    const env = makeEnv();
+    try {
+      const resources = join(env.root, "resources");
+      fakeDesktopApp(resources);
+      const located = locateDshInstall({ dshHome: env.dshHome, resourcesPath: "" });
+      expect(located.dshInstallDir).toBeUndefined();
+      // The probed list is what the failure diagnosis prints, so it must show
+      // that no desktop anchor was available.
+      expect(located.tried.some((candidate) => candidate.includes("app.asar"))).toBe(false);
+    } finally {
+      await cleanup(env.root);
+    }
+  });
+});
+
+describe("resolveOwnPatchPath", () => {
+  it("resolves from the BUILT layout, where the code sits at dist/ root", () => {
+    const here = fileURLToPath(import.meta.url); // <pkg>/src/doctor/doctor.test.ts
+    const pkgRoot = join(dirname(here), "..", "..");
+    // The build emits dist/cli.js, one level shallower than src/doctor/, so the
+    // historical "../../cordis.patch.yml" escaped the package in every build.
+    const builtModule = pathToFileURL(join(pkgRoot, "dist", "cli.js")).href;
+    expect(resolveOwnPatchPath(builtModule)).toBe(join(pkgRoot, "cordis.patch.yml"));
+    // ...and the path that hardcoded depth produced must NOT exist, which is
+    // what made the doctor and the Remote status report a false negative.
+    expect(existsSync(join(pkgRoot, "..", "cordis.patch.yml"))).toBe(false);
+  });
+
+  it("returns undefined when no patch exists up the tree", () => {
+    const builtModule = pathToFileURL(join(tmpdir(), "no-such-pkg", "dist", "cli.js")).href;
+    expect(resolveOwnPatchPath(builtModule)).toBeUndefined();
   });
 });
