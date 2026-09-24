@@ -4,20 +4,20 @@
 
 **English** | [中文](./README.md)
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
-![DSH](https://img.shields.io/badge/DSH-0.1.0--rc.6-111827.svg)
-![Magic Context](https://img.shields.io/badge/Magic%20Context-0.36.1-7C3AED.svg)
+![Version](https://img.shields.io/badge/version-0.1.2-blue.svg)
+![DSH](https://img.shields.io/badge/DSH-0.1.7--rc.1-111827.svg)
+![Magic Context](https://img.shields.io/badge/Magic%20Context-0.42.6-7C3AED.svg)
 ![Harness](https://img.shields.io/badge/harness-dsh-5391FE.svg)
 ![Community](https://img.shields.io/badge/community-port-0F766E.svg)
-![Tests](https://img.shields.io/badge/tests-177%2F177-brightgreen.svg)
+![Unit tests](https://img.shields.io/badge/unit%20tests-212%20pass-brightgreen.svg)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)
 
-A **community port** of [Magic Context](https://github.com/cortexkit/magic-context) — tested and built in the Magic Context monorepo development worktree; this repo is the release mirror (dist prebuilt and shipped with each tag)
+A **community port** of [Magic Context](https://github.com/cortexkit/magic-context)
 to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with the official DSH or Magic Context projects; capability
 alignment is tracked in [Features](./docs/FEATURES.md).
 
-[E2E harness](./e2e/README.md)
+[E2E harness](./e2e/README.md) · [Verification tools](#verification-tools)
 
 </div>
 
@@ -35,19 +35,24 @@ Use cases:
 - Reuse existing Magic Context memories in DSH (shared with OpenCode/Pi).
 - DSH sessions that want m0/m1 knowledge injection, §N§ tags, historian
   compaction, and Dreamer scheduled tasks.
-- DSH users who want the /ctx-* tool family (search/memory/note/expand/
-  reduce/embed/recomp/wrapup).
+- DSH users who want the ctx_* tool family (search/memory/note/expand/reduce)
+  and todowrite.
+
+Parity covers injection (m0/m1 dual messages, visible on the first turn, §N§
+tagged on the first turn), compaction (small-window chunk budget, an independent
+historian model route, `<session-history>` folding after publish), the dual nudge
+channels, heuristic cleanup and the config bridge — all aligned with Magic
+Context 0.42.6 (Pi/OpenCode) semantics.
 
 ## Installation
 
 In your DSH profile's `package.json` (the profile directory is
-`$DSH_HOME/profiles/<name>/`; `dsh plugin --profile <name> install` runs
-there automatically):
+`$DSH_HOME/profiles/<name>/`):
 
 ```json
 {
   "dependencies": {
-    "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin"
+    "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.2&path:/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {
@@ -61,7 +66,21 @@ there automatically):
 > `@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app`, `@deepseek-ai/dsh-headless`)
 > and only **append** `"dsh-magic-context"`.
 
-Then install dependencies and restart dsh:
+For local development use a `file:` dependency pointing at
+`fork/stage/dsh-magic-context` (produced by `fork/tools/deploy-to-profile.mjs`):
+
+```json
+{ "dependencies": { "dsh-magic-context": "file:../../stage/dsh-magic-context" } }
+```
+
+> ⚠️ The published manifest must NOT carry the source manifest's `workspace:*`
+> dependencies: a DSH profile is a separate single-package pnpm workspace, so pnpm
+> aborts with `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND` and the GUI's plugin
+> install/uninstall surfaces an unrelated-looking error. `deploy-to-profile.mjs`
+> strips them; the bundle's `dist` is self-contained and resolves everything else
+> through `peerDependencies`.
+
+Then install dependencies and restart DSH:
 
 ```sh
 dsh plugin --profile <name> install
@@ -86,9 +105,6 @@ preset, or `settings.yaml: agent-presets.default: magic-standard`).
 > endpoints), with no Magic intervention. To make the plugin effective by
 > default, set `settings.yaml`'s `agent-presets.default` to `magic-standard`.
 
-> The adapter package (`dsh-magic-context-adapter`) is resolved
-> automatically by the main package's `github:` dependency — no separate install needed.
-
 The first session automatically creates the shared SQLite
 (`~/.local/share/cortexkit/magic-context/context.db`).
 
@@ -98,7 +114,8 @@ The first session automatically creates the shared SQLite
 - **Context management**: DshTranscript + SurfaceMutationCoordinator (CAS +
   outbox saga), historian background compartments, Magic compaction policy,
   cache classification SOFT+/SOFT/HARD
-- **Automation**: all Dreamer tasks, Sidekick /ctx-aug, /ctx-recomp /ctx-wrapup
+- **Automation**: all Dreamer tasks (including the **tool-requiring** ones, which
+  run through a `ctx.subagents` tool worker), /ctx-recomp /ctx-wrapup
   /ctx-session-upgrade, /ctx-embed, feedback bridge
 - **Maintenance**: setup/doctor, upgrade contract gate, no-write-back safety
   (shipped preset mounted read-only)
@@ -108,20 +125,61 @@ Full parity table: [docs/FEATURES.md](./docs/FEATURES.md).
 
 ## Verification status
 
-- **177/177 tests green** (dsh-plugin) + adapter-api 14/14 + typecheck 0 errors
-- **Install verified on an isolated non-global DSH**: npm install → setup (thin
-  preset) → doctor 6/6 → thin-preset mount → knowledge injection (m0/§N§ tags)
-  → **real model path** (local relay deepseek-v4-flash answered with the
-  Magic-injected context) → shared SQLite `harness='dsh'` rows written
-- OpenCode/Pi unchanged (shared DB compatible)
+| Item | Result |
+|---|---|
+| Unit tests (dsh-plugin port subset) | **212 pass / 5 fail** — the 5 are Windows-only `EBUSY` (temp-dir lock) leftovers, unrelated to port logic |
+| `tsc --noEmit` | **0 errors**, compiled against the **DSH `0.1.7-rc.1` type packages** (see the contract gate below) |
+| Host symbol audit | **24/24 present** (checked against the shipped `app.asar` runtime exports, not `@types`) |
+| dist reference graph | **CLEAN** (20 chunks, 0 dead files) |
+| Live-session verification | see `e2e/verify-live.mjs`: **all 5 checks green** (including "duplicate message id" and "injection watermark uniqueness") |
 
-## Constraints & boundaries
+**Contract gate (run before any upgrade)**: DSH's API drifts between minor
+versions, and this port pins its devDependencies exactly, so **the compiler is
+the drift detector**:
 
-- No DSH source modifications; never rewrites `llm/stream messages[]`;
+```sh
+cd packages/dsh-plugin
+# bump @deepseek-ai/* to the target DSH version, then
+bun install && bun run typecheck && bun test
+node ../../tools/audit-host-symbols.mjs     # runtime export surface (exit 0/1/2)
+```
+
+Current baseline: **DSH `0.1.7-rc.1`**, **Magic Context upstream 0.42.6** (shared
+schema fence `v85`; boot log
+`upstream migration lane at boot: database=v85, supported_fence=v85`).
+
+`peerDependencies` deliberately stay at `^0.1.7-alpha.2`: that range was checked
+with the market's own semver resolver and **admits both `0.1.7-alpha.2` and
+`0.1.7-rc.1`** (tightening it to `-rc.1` would drop support for the older one).
+
+## Verification tools
+
+| Tool | Purpose |
+|---|---|
+| `e2e/verify-live.mjs` | 5 assertions against a **real DSH session**: log integrity; surface identity-key uniqueness (a duplicate `data.id` renders the conversation blank); injection watermark uniqueness; the persisted `§N§ ` prefix matching that message's own tag number; no duplicate tag numbers. Exit `0` pass / `1` a check failed / `2` the probe itself could not run |
+| `tools/audit-host-symbols.mjs` | Verifies every host symbol the port actually imports at runtime against the shipped `app.asar` (it refuses to run rather than print a false result) |
+| `tools/check-dist-graph.mjs` | Walks `dist` transitively from the 7 package entries and proves the reference graph is closed with no dead chunks |
+
+## Known issues & boundaries
+
+- **No DSH source modifications**; never rewrites `llm/stream messages[]`;
   OpenCode/Pi behavior unchanged.
-- Compatibility baseline: DSH `0.1.0-rc.6` (run the contract gate before
-  upgrading).
-- Known boundaries: see [docs/FEATURES.md](./docs/FEATURES.md) (differences).
+- **`§N§` numbering is per session.** DSH's resume/seed path forks a seeded child
+  session (`header.parentSession`), and the child numbers tags from §1 again — so
+  a `§N§` learned before the fork no longer resolves after it. That is a
+  consequence of upstream numbering semantics, not a defect.
+- **Historical scars**: versions before 2026-09-24 keyed the §N§ preview on the
+  **bare message id**, so one message could own two tag rows and persist the
+  wrong number into the session text (fixed in `17f9da7`). Sessions written
+  before that still show such scars; `verify-live.mjs` reports them as
+  information by default and only fails on them with `--since <deploy time>`.
+- **The `opencode-go` provider depends on an upstream plugin**: on DSH
+  `0.1.7-rc.1`, `dsh-opencode-go` fails to register its model provider (its
+  registration is gated on finding a credential, and the failure is swallowed
+  into a logger DSH does not persist). Consequence: **the historian cannot call
+  that model** (`no adapter registered for provider "opencode-go"`). That is an
+  upstream packaging problem; waiting for the author's release.
+- Known differences: [docs/FEATURES.md](./docs/FEATURES.md).
 
 ## License
 
