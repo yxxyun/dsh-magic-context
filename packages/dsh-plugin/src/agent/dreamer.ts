@@ -63,6 +63,7 @@ import {
   type HistoricalSessionReader,
 } from "./session-history";
 import { rawMessageProviderFromView } from "./historian-wiring";
+import { createDshRetrospectiveProvider } from "./retrospective-provider";
 import {
   DreamerConfigSchema,
   type DreamerConfig,
@@ -563,6 +564,9 @@ function buildDreamExecutor(
       if (view === null) return null;
       return rawMessageProviderFromView({ ...view, canonicalSessionId: sessionId });
     },
+    // Friction detection across the project's other sessions. Built per run (the
+    // factory form) so its per-run read cache is never shared between runs.
+    retrospectiveRawProvider: (db) => createDshRetrospectiveProvider({ db, readHistory }),
   });
 }
 

@@ -6034,6 +6034,120 @@ function historicalSessionReader(ctx) {
   };
 }
 
+// src/agent/retrospective-provider.ts
+var SYNTHETIC_SOURCE_KINDS = new Set(["plugin", "compact-checkpoint", "system"]);
+function isRecord3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function genuineUserText(message) {
+  if (message.role !== "user")
+    return "";
+  const parts = Array.isArray(message.parts) ? message.parts : [];
+  const texts = [];
+  for (const part of parts) {
+    if (!isRecord3(part) || part.type !== "text")
+      continue;
+    if (part.synthetic === true || part.ignored === true)
+      continue;
+    const source = isRecord3(part.source) ? part.source : undefined;
+    const kind = typeof source?.kind === "string" ? source.kind : undefined;
+    if (kind !== undefined && SYNTHETIC_SOURCE_KINDS.has(kind))
+      continue;
+    if (typeof part.text === "string" && part.text.trim().length > 0)
+      texts.push(part.text.trim());
+  }
+  return texts.join(`
+`).trim();
+}
+function toolRows(messages, ordinal, ts, sessionId) {
+  const byCall = new Map;
+  for (const message of messages) {
+    const parts = Array.isArray(message.parts) ? message.parts : [];
+    for (const part of parts) {
+      if (!isRecord3(part) || part.type !== "tool" || typeof part.tool !== "string")
+        continue;
+      const callId = typeof part.callID === "string" && part.callID.length > 0 ? part.callID : part.tool;
+      const state = isRecord3(part.state) ? part.state : {};
+      const output = typeof state.output === "string" ? state.output : "";
+      const existing = byCall.get(callId);
+      if (existing === undefined || existing.output.length === 0 && output.length > 0) {
+        byCall.set(callId, { toolName: part.tool, output });
+      }
+    }
+  }
+  return [...byCall.values()].map((entry) => ({
+    sessionId,
+    ordinal,
+    role: "tool",
+    text: "",
+    toolName: entry.toolName,
+    isError: /\b(error|failed|exception|traceback)\b/i.test(entry.output),
+    ts
+  }));
+}
+function rowsForSession(sessionId, messages) {
+  const rows = [];
+  for (const [index, message] of messages.entries()) {
+    const ordinal = index + 1;
+    const raw = message.createdAt;
+    const ts = typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
+    const text = genuineUserText(message);
+    if (text.length > 0) {
+      rows.push({ sessionId, ordinal, role: "user", text, ts });
+    }
+    rows.push(...toolRows([message], ordinal, ts, sessionId));
+  }
+  return rows;
+}
+function capSinceRows(rows, capPerSession) {
+  return { messages: rows.slice(0, capPerSession), truncated: rows.length > capPerSession };
+}
+function createDshRetrospectiveProvider(deps) {
+  const cache = new Map;
+  const rowsFor = async (canonicalSessionId) => {
+    const cached = cache.get(canonicalSessionId);
+    if (cached !== undefined)
+      return cached;
+    const view = await deps.readHistory(nativeDshSessionId(canonicalSessionId));
+    if (view === null) {
+      cache.set(canonicalSessionId, []);
+      return [];
+    }
+    const provider = rawMessageProviderFromView({ ...view, canonicalSessionId });
+    const messages = provider.readMessages();
+    const rows = rowsForSession(canonicalSessionId, messages);
+    cache.set(canonicalSessionId, rows);
+    return rows;
+  };
+  return {
+    listProjectSessions(projectIdentity) {
+      try {
+        const rows = deps.db.prepare(`SELECT session_id, updated_at FROM session_projects
+             WHERE project_path = ? AND harness = 'dsh'
+             ORDER BY updated_at ASC`).all(projectIdentity);
+        return rows.map((row) => ({
+          sessionId: row.session_id,
+          updatedAt: typeof row.updated_at === "number" ? row.updated_at : undefined
+        }));
+      } catch (error) {
+        log(`[magic-context] retrospective session listing failed (degrading): ${String(error)}`);
+        return [];
+      }
+    },
+    async readUserMessagesSince(sessionId, sinceMs, capPerSession) {
+      const rows = (await rowsFor(sessionId)).filter((row) => row.ts > sinceMs);
+      return capSinceRows(rows, capPerSession);
+    },
+    async readUserMessagesBefore(sessionId, beforeMs, count) {
+      const rows = (await rowsFor(sessionId)).filter((row) => row.role === "user" && row.ts <= beforeMs);
+      return rows.slice(Math.max(0, rows.length - count));
+    },
+    dispose() {
+      cache.clear();
+    }
+  };
+}
+
 // ../plugin/src/shared/model-resolution.ts
 function asRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
@@ -13597,7 +13711,8 @@ function buildDreamExecutor(facade, state, readHistory) {
       if (view === null)
         return null;
       return rawMessageProviderFromView({ ...view, canonicalSessionId: sessionId });
-    }
+    },
+    retrospectiveRawProvider: (db) => createDshRetrospectiveProvider({ db, readHistory })
   });
 }
 async function runDreamTick(db, projectIdentity, executor, state, log) {
@@ -18012,26 +18127,26 @@ var HISTORIAN_SYSTEM_PROMPTS = new Map([
   ["historian-recomp", COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT],
   ["historian-editor", HISTORIAN_EDITOR_SYSTEM_PROMPT]
 ]);
-function isRecord3(value) {
+function isRecord4(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function readPromptInput(input) {
-  if (!isRecord3(input))
+  if (!isRecord4(input))
     return {};
-  const path = isRecord3(input.path) ? input.path : undefined;
-  const body = isRecord3(input.body) ? input.body : undefined;
-  const query = isRecord3(input.query) ? input.query : undefined;
+  const path = isRecord4(input.path) ? input.path : undefined;
+  const body = isRecord4(input.body) ? input.body : undefined;
+  const query = isRecord4(input.query) ? input.query : undefined;
   const signal = input.signal instanceof AbortSignal ? input.signal : undefined;
   return { path, query, body, signal };
 }
 function extractPromptText(parts) {
   if (!Array.isArray(parts))
     return "";
-  return parts.map((part) => isRecord3(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
+  return parts.map((part) => isRecord4(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
 `);
 }
 function readBodyModel(model) {
-  if (!isRecord3(model))
+  if (!isRecord4(model))
     return;
   const { providerID, modelID } = model;
   if (typeof providerID === "string" && providerID.length > 0 && typeof modelID === "string" && modelID.length > 0) {
@@ -18158,8 +18273,8 @@ function createDshSessionClient(deps) {
         return { data: directory ? { directory } : {} };
       },
       create: async (input) => {
-        const record = isRecord3(input) ? input : {};
-        const body = isRecord3(record.body) ? record.body : {};
+        const record = isRecord4(input) ? input : {};
+        const body = isRecord4(record.body) ? record.body : {};
         const id = `dsh-magic-context-recomp-${++counter}`;
         const parentID = typeof body.parentID === "string" ? body.parentID : "";
         if (parentID.length > 0)
