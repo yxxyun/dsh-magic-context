@@ -13040,11 +13040,11 @@ var DREAM_AGENT_TOOL_ALLOWLIST = {
   "dreamer-memory-mapper": ["read", "grep", "glob"],
   "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
   "dreamer-retrospective": ["ctx_search"],
+  "dreamer-docs": ["read", "grep", "glob", "write", "edit"],
   "dreamer-classifier": [],
   "dreamer-reviewer": [],
   "smart-note-compiler": []
 };
-var DEFERRED_WRITE_DREAM_AGENTS = ["dreamer-docs"];
 function createDreamParentRegistry() {
   const parents = new Map;
   return {
@@ -13169,9 +13169,6 @@ function createDshDreamClient(ctx, deps) {
         throw new Error("prompt aborted by external signal");
       }
       const agent = extractBodyAgent(args);
-      if (agent !== undefined && DEFERRED_WRITE_DREAM_AGENTS.includes(agent)) {
-        throw new Error(`dreamer agent "${agent}" is not wired on DSH: its core profile grants write access, and a ` + `timer-driven worker spawns with approval pinned to never under the parent's sandbox. ` + `Disable this dream task, or wire the write-capable worker deliberately.`);
-      }
       const allow = agent === undefined ? undefined : DREAM_AGENT_TOOL_ALLOWLIST[agent];
       if (allow !== undefined && allow.length > 0) {
         const workerUserText = extractUserMessage(args);
@@ -13199,7 +13196,7 @@ function createDshDreamClient(ctx, deps) {
             { type: "text", text: result.text }
           ])
         ];
-        log(`[dreamer] tool worker ran ${agent} for ${dreamSession.directory || "(unknown)"} ` + `(${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`);
+        log(`[dreamer] tool worker ran ${agent} for ${dreamSession.directory || "(unknown)"} ` + `[tools: ${allow.join("/")}] (${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`);
         return {};
       }
       const userText = extractUserMessage(args);

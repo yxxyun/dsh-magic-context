@@ -40,12 +40,12 @@
  *     portion (`runDueTasksForProject` → lease/gate/telemetry). The
  *     singleton's extra maintenance (message-history privacy sweep, compiled
  *     smart-note surfacing, embedding backfill) is deferred to a later slice.
- *   - Tool workers are now wired for every READ-ONLY and memory-tool dream agent
- *     (see {@link DREAM_AGENT_TOOL_ALLOWLIST}). `dreamer-docs` stays deferred: its
- *     core profile grants write/edit, and a timer-driven subagent runs with
- *     approval pinned to 'never' and the parent's sandbox, so letting an
- *     unsupervised background pass edit user files is an explicit integrator
- *     decision rather than a default. It fails with a message saying exactly that.
+ *   - Tool workers are wired for every tool-requiring dream agent (see
+ *     {@link DREAM_AGENT_TOOL_ALLOWLIST}). The one write-capable agent,
+ *     `dreamer-docs` (maintain-docs), gets read/grep/glob/write/edit and NO shell:
+ *     it may rewrite the two documents it maintains, but a timer-driven subagent
+ *     runs with approval pinned to 'never' under the parent's sandbox, so it must
+ *     not be able to run arbitrary commands. Every worker run logs its toolset.
  *   - `createDshDreamClient`'s `db` parameter is accepted per contract but
  *     reserved (the facade is in-memory, exactly like the Pi facade); `log` is
  *     used for diagnostics.
@@ -106,21 +106,18 @@ const DREAM_AGENT_TOOL_ALLOWLIST: Record<string, readonly string[]> = {
   "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
   // friction gate + deepen turns: reads prior sessions, never writes.
   "dreamer-retrospective": ["ctx_search"],
+  // maintain-docs: explores the tree and rewrites ARCHITECTURE.md / STRUCTURE.md.
+  // The core profile is read/grep/glob/bash/write/edit/aft_*; `aft_*` is
+  // OpenCode/Pi-only, and `bash` is DROPPED DELIBERATELY — an unsupervised
+  // timer-driven worker may edit the two documents it is asked to maintain, but
+  // must not be able to run arbitrary commands. The integrator chose to enable
+  // this agent; the missing shell is the safety margin that came with it.
+  "dreamer-docs": ["read", "grep", "glob", "write", "edit"],
   // Zero-tool single-shot transforms (locked to [] upstream).
   "dreamer-classifier": [],
   "dreamer-reviewer": [],
   "smart-note-compiler": [],
 };
-
-/**
- * Agents whose core profile grants WRITE access and are therefore NOT wired.
- *
- * `dreamer-docs` (maintain-docs) holds read/grep/glob/bash/write/edit upstream.
- * A worker runs with delegated approval pinned to 'never' and inherits the
- * parent's sandbox mode, so wiring it would let a background timer edit the
- * user's files unsupervised. Failing loudly keeps that an explicit decision.
- */
-const DEFERRED_WRITE_DREAM_AGENTS: readonly string[] = ["dreamer-docs"];
 
 /** Resolve the live top-level agent that owns a project (a worker needs one). */
 export type DreamParentResolver = (directory: string) => Agent | undefined;
@@ -398,14 +395,6 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
         throw new Error("prompt aborted by external signal");
       }
       const agent = extractBodyAgent(args);
-      if (agent !== undefined && DEFERRED_WRITE_DREAM_AGENTS.includes(agent)) {
-        // Permanent by design: see DEFERRED_WRITE_DREAM_AGENTS.
-        throw new Error(
-          `dreamer agent "${agent}" is not wired on DSH: its core profile grants write access, and a ` +
-            `timer-driven worker spawns with approval pinned to never under the parent's sandbox. ` +
-            `Disable this dream task, or wire the write-capable worker deliberately.`,
-        );
-      }
       const allow = agent === undefined ? undefined : DREAM_AGENT_TOOL_ALLOWLIST[agent];
       if (allow !== undefined && allow.length > 0) {
         const workerUserText = extractUserMessage(args);
@@ -448,7 +437,7 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
         ];
         log(
           `[dreamer] tool worker ran ${agent} for ${dreamSession.directory || "(unknown)"} ` +
-            `(${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`,
+            `[tools: ${allow.join("/")}] (${Math.round(result.durationMs / 1000)}s, ${result.text.length} chars)`,
         );
         return {};
       }

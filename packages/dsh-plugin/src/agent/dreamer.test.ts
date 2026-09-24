@@ -318,7 +318,7 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
     }
   });
 
-  it("keeps the write-capable dream agent deferred, with a reason", async () => {
+  it("runs the write-capable docs agent with file tools, but NO shell", async () => {
     const { db, cleanup } = await openDb();
     try {
       const { service, starts } = stubSubagents();
@@ -327,14 +327,20 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
       const facade = createDshDreamClient(ctx, { db, parentAgent: () => parent });
       const { id } = await facade.session.create({ query: { directory: PROJECT_A } });
 
-      await expect(
-        facade.session.prompt({
-          path: { id },
-          body: { agent: "dreamer-docs", parts: [{ type: "text", text: "x" }] },
-        }),
-      ).rejects.toThrow(/not wired on DSH/);
-      // Even with a live parent, a write-capable agent must not spawn.
-      expect(starts).toHaveLength(0);
+      await facade.session.prompt({
+        path: { id },
+        body: { agent: "dreamer-docs", parts: [{ type: "text", text: "maintain the docs" }] },
+      });
+
+      expect(starts).toHaveLength(1);
+      const allow =
+        (starts[0]?.request as { toolFilter?: { allow?: string[] } }).toolFilter?.allow ?? [];
+      // The core profile minus the OpenCode-only aft_* tools — and minus `bash`,
+      // dropped deliberately: this worker exists to maintain two documents, not
+      // to run arbitrary commands unsupervised.
+      expect(allow).toEqual(["read", "grep", "glob", "write", "edit"]);
+      expect(allow).not.toContain("bash");
+      expect(allow).not.toContain("pwsh");
     } finally {
       db.close();
       await cleanup();
