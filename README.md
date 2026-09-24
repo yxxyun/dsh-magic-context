@@ -4,7 +4,7 @@
 
 [English](./README.en.md) | **中文**
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.6-blue.svg)
 ![DSH](https://img.shields.io/badge/DSH-0.1.7--rc.1-111827.svg)
 ![Magic Context](https://img.shields.io/badge/Magic%20Context-0.42.6-7C3AED.svg)
 ![Harness](https://img.shields.io/badge/harness-dsh-5391FE.svg)
@@ -49,7 +49,7 @@ nudge 双通道、heuristic cleanup、配置桥接——均与 Magic Context 0.4
 ```json
 {
   "dependencies": {
-    "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.5&path:/packages/dsh-plugin"
+    "dsh-magic-context": "github:yxxyun/dsh-magic-context#v0.1.6&path:/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {
