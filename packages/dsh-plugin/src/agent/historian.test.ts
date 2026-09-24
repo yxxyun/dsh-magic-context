@@ -13,7 +13,7 @@ import { join } from "node:path";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
 import { appendCompartments, getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
+import { acquireCompartmentLease, releaseCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import type { ProtectedTailBoundarySnapshot } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -29,6 +29,7 @@ import {
   checkDshCompartmentTrigger,
   consumeDshDeferredSignals,
   createMagicSummarizeHook,
+  leaseHolderFor,
   runDshHistorian,
   signalDshDeferredHistoryRefresh,
   signalDshDeferredMaterialization,
@@ -727,5 +728,46 @@ describe("createMagicSummarizeHook (Magic 压缩策略)", () => {
     } finally {
       await env.cleanup();
     }
+  });
+});
+
+describe("compartment lease holders (the duplicate-seq publish race)", () => {
+  it("gives every acquire attempt its own holder, so the lease is a real mutex", async () => {
+    const env = makeEnv();
+    try {
+      const db = await createTestDb(env.dbPath);
+      initializeDshAdapterTables(db);
+
+      // The summarize mini-historian runs INSIDE the host's compaction call and
+      // an incremental pass may be in flight at the same time, so the two roles
+      // must not share a holder.
+      const incremental = leaseHolderFor(SESSION_ID, "incremental");
+      const summarize = leaseHolderFor(SESSION_ID, "summarize");
+      expect(incremental).not.toBe(summarize);
+
+      expect(acquireCompartmentLease(db, SESSION_ID, incremental)).not.toBeNull();
+      expect(acquireCompartmentLease(db, SESSION_ID, summarize)).toBeNull();
+      releaseCompartmentLease(db, SESSION_ID, incremental);
+
+      // Documents the hole this closes. The old deterministic holder was
+      // RE-ENTRANT (the UPSERT only refuses a different holder), so both passes
+      // won the lease, both computed MAX(sequence) + 1, and the second publish
+      // died with UNIQUE constraint failed: compartments.session_id,
+      // compartments.sequence (observed 2026-09-23T17:11:32Z).
+      const legacyHolder = `dsh-historian:${SESSION_ID}`;
+      expect(acquireCompartmentLease(db, SESSION_ID, legacyHolder)).not.toBeNull();
+      expect(acquireCompartmentLease(db, SESSION_ID, legacyHolder)).not.toBeNull();
+      releaseCompartmentLease(db, SESSION_ID, legacyHolder);
+
+      db.close();
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it("still honours an explicit holder override", () => {
+    expect(leaseHolderFor(SESSION_ID, "summarize", "lease-test")).toBe("lease-test");
+    // An empty override falls through to a generated holder rather than "".
+    expect(leaseHolderFor(SESSION_ID, "summarize", "").length).toBeGreaterThan(0);
   });
 });

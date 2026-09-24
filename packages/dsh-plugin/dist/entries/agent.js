@@ -2213,6 +2213,9 @@ function loadPluginConfigDetailed(directory) {
 // src/agent/knowledge-gate.ts
 import { createHash } from "node:crypto";
 
+// src/agent/historian.ts
+import { randomUUID } from "node:crypto";
+
 // ../plugin/src/features/magic-context/compartment-events.ts
 function insertCompartmentEvents(db, sessionId, events, compartmentIds) {
   if (events.length === 0)
@@ -2698,6 +2701,37 @@ function stageDshCompactionMarker(db, sessionId, marker) {
 var HISTORIAN_WINDOW_FALLBACK = 128000;
 var DEFAULT_HISTORIAN_CHUNK_TOKENS = 16000;
 var DEFAULT_LEASE_HOLDER_PREFIX = "dsh-historian";
+var SUMMARIZE_LEASE_WAIT_MS = 30000;
+var SUMMARIZE_LEASE_POLL_MS = 500;
+function leaseHolderFor(sessionId, role, override) {
+  if (typeof override === "string" && override.length > 0)
+    return override;
+  return `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}:${role}:${randomUUID().slice(0, 8)}`;
+}
+function leaseWait(ms, signal) {
+  return new Promise((resolve) => {
+    let timer;
+    const done = () => {
+      if (timer !== undefined)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+async function acquireSummarizeLease(args) {
+  const deadline = Date.now() + SUMMARIZE_LEASE_WAIT_MS;
+  for (;; ) {
+    const lease = acquireCompartmentLease(args.db, args.sessionId, args.holderId);
+    if (lease !== null)
+      return lease;
+    if (args.signal?.aborted === true || Date.now() >= deadline)
+      return null;
+    await leaseWait(SUMMARIZE_LEASE_POLL_MS, args.signal);
+  }
+}
 var deferredSignalsBySession = new Map;
 function signalDshDeferredHistoryRefresh(sessionId) {
   const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
@@ -2910,7 +2944,7 @@ function buildDshCompactionSummary(compartments) {
 async function runDshHistorian(deps) {
   const { db, sessionId } = deps;
   const log = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  const holderId = leaseHolderFor(sessionId, "incremental", deps.leaseHolderId);
   if (typeof deps.summarize !== "function") {
     log(`[magic-context] historian: missing summarize call for ${sessionId}`);
     return false;
@@ -3064,7 +3098,7 @@ function defaultResolveModel(agent) {
 function createMagicSummarizeHook(deps) {
   const sessionId = deps.sessionId;
   const log = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  const holderId = leaseHolderFor(sessionId, "summarize", deps.leaseHolderId);
   return async (input, agent, signal) => {
     const { provider, model } = (deps.resolveModel ?? defaultResolveModel)(agent);
     const messages = input.messages;
@@ -3086,50 +3120,51 @@ function createMagicSummarizeHook(deps) {
       const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
       let rawOutput;
       if (lastCompartmentEnd < lastOrdinal) {
-        const lease = acquireCompartmentLease(deps.db, sessionId, holderId);
-        if (lease === null) {
-          throw new Error(`magic-context: summarize mini-historian lease busy for ${sessionId} (another historian pass is running)`);
-        }
-        try {
-          const result = await runHistorianPassCore({
-            db: deps.db,
-            sessionId,
-            provider: deps.provider,
-            summarize: deps.summarize,
-            directory: deps.directory,
-            chunkTokens: deps.chunkTokens,
-            leaseHolderId: holderId,
-            log,
-            signal,
-            eligibleEndOrdinalOverride: lastOrdinal + 1,
-            keepLastCompartment: true
-          });
-          if (!result.ok) {
-            throw new Error(`magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`);
-          }
-          const observedKeys = await getRawSessionTagKeysThrough(sessionId, result.lastNewEnd, { db: deps.db });
-          const publish = publishHistorianResult({
-            db: deps.db,
-            sessionId,
-            directory: deps.directory,
-            leaseHolderId: holderId,
-            chunk: result.chunk,
-            newCompartments: result.newCompartments,
-            lastNewEnd: result.lastNewEnd,
-            observedKeys,
-            validated: result.validated,
-            log
-          });
-          if (!publish.ok) {
-            throw new Error("magic-context: summarize mini-historian publish failed (lease lost or transaction error)");
-          }
-          rawOutput = result.llmText ?? undefined;
-        } finally {
+        const lease = await acquireSummarizeLease({ db: deps.db, sessionId, holderId, signal });
+        if (lease !== null) {
           try {
-            releaseCompartmentLease(deps.db, sessionId, holderId);
-          } catch (error) {
-            log(`[magic-context] summarize mini-historian lease release failed: ${describeError(error).brief}`);
+            const result = await runHistorianPassCore({
+              db: deps.db,
+              sessionId,
+              provider: deps.provider,
+              summarize: deps.summarize,
+              directory: deps.directory,
+              chunkTokens: deps.chunkTokens,
+              leaseHolderId: holderId,
+              log,
+              signal,
+              eligibleEndOrdinalOverride: lastOrdinal + 1,
+              keepLastCompartment: true
+            });
+            if (!result.ok) {
+              throw new Error(`magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`);
+            }
+            const observedKeys = await getRawSessionTagKeysThrough(sessionId, result.lastNewEnd, { db: deps.db });
+            const publish = publishHistorianResult({
+              db: deps.db,
+              sessionId,
+              directory: deps.directory,
+              leaseHolderId: holderId,
+              chunk: result.chunk,
+              newCompartments: result.newCompartments,
+              lastNewEnd: result.lastNewEnd,
+              observedKeys,
+              validated: result.validated,
+              log
+            });
+            if (!publish.ok) {
+              throw new Error("magic-context: summarize mini-historian publish failed (lease lost or transaction error)");
+            }
+            rawOutput = result.llmText ?? undefined;
+          } finally {
+            try {
+              releaseCompartmentLease(deps.db, sessionId, holderId);
+            } catch (error) {
+              log(`[magic-context] summarize mini-historian lease release failed: ${describeError(error).brief}`);
+            }
           }
+        } else if (getLastCompartmentEndMessage(deps.db, sessionId) < lastOrdinal) {
+          throw new Error(`magic-context: summarize mini-historian lease busy for ${sessionId} (another historian pass is running)`);
         }
       }
       const compartments = getCompartments(deps.db, sessionId).filter((c) => c.endMessage >= firstOrdinal && c.startMessage <= lastOrdinal);

@@ -27,6 +27,7 @@
  *
  * Slice boundary: runRecomp / runWrapup seams are Phase 4 — not exported.
  */
+import { randomUUID } from "node:crypto";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import {
   appendCompartments,
@@ -98,8 +99,76 @@ import {
 /** Historian chunk token budget when the caller does not supply one. */
 export const DEFAULT_HISTORIAN_CHUNK_TOKENS = 16_000;
 
-/** Default compartment-lease holder id prefix (per-session deterministic). */
+/** Default compartment-lease holder id prefix. */
 const DEFAULT_LEASE_HOLDER_PREFIX = "dsh-historian";
+
+/** The two port passes that take the compartment lease. */
+type HistorianLeaseRole = "incremental" | "summarize";
+
+/** Bounded wait for the summarize path's lease (see {@link acquireSummarizeLease}). */
+const SUMMARIZE_LEASE_WAIT_MS = 30_000;
+const SUMMARIZE_LEASE_POLL_MS = 500;
+
+/**
+ * Holder id for ONE acquisition attempt.
+ *
+ * `acquireCompartmentLease` is re-entrant for the SAME `holder_id` — its UPSERT
+ * only refuses a different, unexpired holder — and both port passes used to
+ * default to `${prefix}:${sessionId}`. A summarize mini-historian could
+ * therefore run BESIDE an incremental pass, each computing `MAX(sequence) + 1`
+ * from the same base, and the second publish died with `UNIQUE constraint failed:
+ * compartments.session_id, compartments.sequence` (observed 2026-09-23T17:11:32Z).
+ * A unique-per-attempt holder makes the lease an actual mutex; a stale row is
+ * still reclaimed by its TTL, and `isCompartmentLeaseHeld`/`release` keep
+ * matching the row this attempt owns.
+ */
+export function leaseHolderFor(
+  sessionId: string,
+  role: HistorianLeaseRole,
+  override?: string,
+): string {
+  if (typeof override === "string" && override.length > 0) return override;
+  return `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}:${role}:${randomUUID().slice(0, 8)}`;
+}
+
+/** `delay` that also resolves on abort, clearing its timer and listener. */
+function leaseWait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * Acquire the summarize path's lease, waiting briefly when another pass holds it.
+ *
+ * The mini-historian runs INSIDE the host's compaction call, which is
+ * fail-closed by design (see this module's header), so losing the lease to an
+ * ordinary overlap would turn routine concurrency into a user-visible compaction
+ * failure. The caller re-checks coverage after this returns null: by then the
+ * pass we waited for has usually covered the range, and there is nothing to
+ * build.
+ */
+async function acquireSummarizeLease(args: {
+  db: Database;
+  sessionId: string;
+  holderId: string;
+  signal?: AbortSignal;
+}): Promise<ReturnType<typeof acquireCompartmentLease>> {
+  const deadline = Date.now() + SUMMARIZE_LEASE_WAIT_MS;
+  for (;;) {
+    const lease = acquireCompartmentLease(args.db, args.sessionId, args.holderId);
+    if (lease !== null) return lease;
+    if (args.signal?.aborted === true || Date.now() >= deadline) return null;
+    await leaseWait(SUMMARIZE_LEASE_POLL_MS, args.signal);
+  }
+}
 
 /**
  * The injected historian LLM call (production: wraps `ctx.llm.stream()` with
@@ -595,7 +664,7 @@ function buildDshCompactionSummary(
 export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
   const { db, sessionId } = deps;
   const log = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  const holderId = leaseHolderFor(sessionId, "incremental", deps.leaseHolderId);
   if (typeof deps.summarize !== "function") {
     log(`[magic-context] historian: missing summarize call for ${sessionId}`);
     return false;
@@ -825,7 +894,7 @@ function defaultResolveModel(agent: Agent): { provider: string; model: string } 
 export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHook {
   const sessionId = deps.sessionId;
   const log = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  const holderId = leaseHolderFor(sessionId, "summarize", deps.leaseHolderId);
 
   return async (input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult> => {
     const { provider, model } = (deps.resolveModel ?? defaultResolveModel)(agent);
@@ -858,63 +927,69 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
       let rawOutput: string | undefined;
       if (lastCompartmentEnd < lastOrdinal) {
         // Mini-historian: one synchronous pass over [lastCompartmentEnd+1, lastOrdinal].
-        const lease = acquireCompartmentLease(deps.db, sessionId, holderId);
-        if (lease === null) {
+        const lease = await acquireSummarizeLease({ db: deps.db, sessionId, holderId, signal });
+        if (lease !== null) {
+          try {
+            const result = await runHistorianPassCore({
+              db: deps.db,
+              sessionId,
+              provider: deps.provider,
+              summarize: deps.summarize,
+              directory: deps.directory,
+              chunkTokens: deps.chunkTokens,
+              leaseHolderId: holderId,
+              log,
+              signal,
+              eligibleEndOrdinalOverride: lastOrdinal + 1,
+              keepLastCompartment: true,
+            });
+            if (!result.ok) {
+              throw new Error(
+                `magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`,
+              );
+            }
+            // See publishHistorianResult's observedKeys note: the drop queue's
+            // paged raw-session reads must complete BEFORE the write transaction.
+            const observedKeys = await getRawSessionTagKeysThrough(
+              sessionId,
+              result.lastNewEnd!,
+              { db: deps.db },
+            );
+            const publish = publishHistorianResult({
+              db: deps.db,
+              sessionId,
+              directory: deps.directory,
+              leaseHolderId: holderId,
+              chunk: result.chunk!,
+              newCompartments: result.newCompartments!,
+              lastNewEnd: result.lastNewEnd!,
+              observedKeys,
+              validated: result.validated!,
+              log,
+            });
+            if (!publish.ok) {
+              throw new Error(
+                "magic-context: summarize mini-historian publish failed (lease lost or transaction error)",
+              );
+            }
+            rawOutput = result.llmText ?? undefined;
+          } finally {
+            try {
+              releaseCompartmentLease(deps.db, sessionId, holderId);
+            } catch (error) {
+              log(`[magic-context] summarize mini-historian lease release failed: ${describeError(error).brief}`);
+            }
+          }
+        } else if (getLastCompartmentEndMessage(deps.db, sessionId) < lastOrdinal) {
+          // Still uncovered after the bounded wait: the other pass is genuinely
+          // holding the lease, or keeps failing. Fail closed like every other
+          // summarize failure so the compaction transaction closes with error.
           throw new Error(
             `magic-context: summarize mini-historian lease busy for ${sessionId} (another historian pass is running)`,
           );
         }
-        try {
-          const result = await runHistorianPassCore({
-            db: deps.db,
-            sessionId,
-            provider: deps.provider,
-            summarize: deps.summarize,
-            directory: deps.directory,
-            chunkTokens: deps.chunkTokens,
-            leaseHolderId: holderId,
-            log,
-            signal,
-            eligibleEndOrdinalOverride: lastOrdinal + 1,
-            keepLastCompartment: true,
-          });
-          if (!result.ok) {
-            throw new Error(
-              `magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`,
-            );
-          }
-          // See publishHistorianResult's observedKeys note: the drop queue's
-          // paged raw-session reads must complete BEFORE the write transaction.
-          const observedKeys = await getRawSessionTagKeysThrough(
-            sessionId,
-            result.lastNewEnd!,
-            { db: deps.db },
-          );
-          const publish = publishHistorianResult({
-            db: deps.db,
-            sessionId,
-            directory: deps.directory,
-            leaseHolderId: holderId,
-            chunk: result.chunk!,
-            newCompartments: result.newCompartments!,
-            lastNewEnd: result.lastNewEnd!,
-            observedKeys,
-            validated: result.validated!,
-            log,
-          });
-          if (!publish.ok) {
-            throw new Error(
-              "magic-context: summarize mini-historian publish failed (lease lost or transaction error)",
-            );
-          }
-          rawOutput = result.llmText ?? undefined;
-        } finally {
-          try {
-            releaseCompartmentLease(deps.db, sessionId, holderId);
-          } catch (error) {
-            log(`[magic-context] summarize mini-historian lease release failed: ${describeError(error).brief}`);
-          }
-        }
+        // Otherwise the pass we waited for completed the coverage: fall through
+        // and render from the stored compartments — nothing left to build.
       }
 
       // Render the covered range as the summary block.
