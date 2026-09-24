@@ -5,7 +5,7 @@ This directory holds two independent verification families:
 | Family | Runs against | What it proves |
 |---|---|---|
 | **Live verification** (`verify-live.mjs`) | **your real DSH home** (`~/.dsh`) and the shared Magic SQLite | The regressions that actually shipped are not back: duplicate message ids, duplicated injection watermarks, wrong `§N§` prefixes, tag-number collisions, corrupt session logs |
-| **Scratch probe harness** (`scratch-home/`, `inspect-db.ts`, `overlay-magic-default.yml`) | an isolated `DSH_HOME` + headless profile + a local DSH install | The plugin mounts, injects, tags and writes `harness='dsh'` rows in a clean room — no writes to your real home |
+| **Scratch probe harness** (`scratch-home/`, `overlay-magic-default.yml`) | an isolated `DSH_HOME` + headless profile + a local DSH install | The plugin mounts, injects, tags and writes `harness='dsh'` rows in a clean room — no writes to your real home |
 
 ---
 
@@ -124,11 +124,20 @@ probe's Magic SQLite lives under `e2e/scratch-data` (via
 | `dsh-install/` | Local isolated DSH install (gitignored) |
 | `scratch-data/` | Magic SQLite + liveness markers for probe runs (gitignored) |
 | `overlay-magic-default.yml` | `--patch` overlay: `agent-presets` roster + the probe plugin row |
-| `inspect-db.ts` / `read-sessions.ts` | Early verification helpers (bun) |
 | `magic-e2e-probe.mjs` | The probe (unique session id per run; drives one step) |
+| `lib/session-log.mjs` + `verify-live.mjs` | The current verification suite (section 1); works against the scratch home too, via `--home`/`--db`/`--log` |
 
-> `read-sessions.ts` predates the v4 multi-frame format: it reads
-> `session.jsonl.zstd` and never decompresses. Use `lib/session-log.mjs` instead.
+> `inspect-db.ts` and `read-sessions.ts` were removed: `read-sessions.ts` decoded a
+> zstd buffer as text (it never decompressed) and read the pre-v4
+> `session.jsonl.zstd` name, and `inspect-db.ts` opened a gitignored scratch DB
+> path — so both were dead on arrival in a fresh clone. Their jobs are covered by
+> the section 1 checks plus `sqlite3`/`node:sqlite` queries.
+>
+> The committed `scratch-home/.agent-presets/magic-standard/` files carry the
+> absolute paths of the machine that generated them (that DSH release read presets
+> from a file directory; from 0.1.7 a preset is a bundle-patch declaration row),
+> so they are only useful together with that machine's gitignored `dsh-install/`.
+> Regenerate with `setup` before running the scratch probe.
 
 ### Why the junction mesh matters (class identity)
 
@@ -206,8 +215,11 @@ node packages\dsh-plugin\dist\cli.js doctor --profile test
 # 2. boot the LOCAL launcher with the overlay + probe
 node e2e\dsh-install\lib\bin.js --profile test --patch e2e\overlay-magic-default.yml "probe"
 
-# 3. verify durable evidence (harness='dsh' rows, cached m0, canonical keys)
-bun e2e\inspect-db.ts
+# 3. verify durable evidence (harness='dsh' rows, cached m0, canonical keys).
+#    verify-live.mjs takes the scratch home/DB directly, so the same checks the
+#    live suite runs also cover a probe run:
+node e2e\verify-live.mjs --home "$repo\e2e\scratch-home" `
+     --db "$repo\e2e\scratch-data\cortexkit\magic-context\context.db"
 ```
 
 Expected probe output:
