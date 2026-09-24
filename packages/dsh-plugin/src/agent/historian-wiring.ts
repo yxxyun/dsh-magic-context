@@ -173,18 +173,24 @@ export function createLlmSummarizeCall(
   };
 }
 
-/** Transcript-backed RawMessageProvider for one live session (read-only). */
-export function transcriptRawMessageProvider(
-  agent: Agent,
-  canonicalSessionId: string,
-): RawMessageProvider {
+/**
+ * Build a read-only RawMessageProvider from an already-read transcript input.
+ * Event-sourced so callers that hold history rather than a live Agent (the
+ * timer-driven dream tasks, via `session-history.ts`) get the same provider.
+ */
+export function rawMessageProviderFromView(input: {
+  events: readonly unknown[];
+  surface?: unknown;
+  header?: unknown;
+  canonicalSessionId: string;
+}): RawMessageProvider {
   const view = readDshTranscript({
-    session: {
-      events: sessionEvents(agent.session),
-      surface: agent.session.surface,
-      header: { cwd: agent.session.header.cwd },
-    },
-    canonicalSessionId,
+    // A cold `sessionQuery.readSession` observation carries the event log and
+    // need not carry a surface; readDshTranscript tolerates that (it reads
+    // `surface?.nodes` and falls back to an empty node list), so the callers
+    // that only need messages — the dream paths — can pass what they hold.
+    session: { events: input.events, surface: input.surface, header: input.header } as never,
+    canonicalSessionId: input.canonicalSessionId,
   });
   const byId = new Map(view.messages.map((message) => [message.id, message]));
   const ordinalById = new Map(view.messages.map((message, index) => [message.id, index + 1]));
@@ -194,6 +200,19 @@ export function transcriptRawMessageProvider(
     readMessageOrdinalById: (messageId: string) => ordinalById.get(messageId) ?? null,
     getMessageCount: () => view.messages.length,
   };
+}
+
+/** Transcript-backed RawMessageProvider for one live session (read-only). */
+export function transcriptRawMessageProvider(
+  agent: Agent,
+  canonicalSessionId: string,
+): RawMessageProvider {
+  return rawMessageProviderFromView({
+    events: sessionEvents(agent.session),
+    surface: agent.session.surface,
+    header: { cwd: agent.session.header.cwd },
+    canonicalSessionId,
+  });
 }
 
 /**

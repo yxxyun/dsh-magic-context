@@ -1,6 +1,7 @@
 import {
   DSH_HARNESS,
   setDshHarness,
+  parseDshSessionKey,
   dshModelRefToCanonical,
   stripJsonComments,
   isPrototypePollutionKey,
@@ -222,7 +223,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-xys9gsrg.js";
+} from "./agent-w9qgmx51.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -285,7 +286,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-m64sabbz.js";
+} from "./agent-cy44qmr2.js";
 import {
   getHarness,
   getDataDir,
@@ -5691,14 +5692,10 @@ function createLlmSummarizeCall(ctx, modelOverride) {
     return text;
   };
 }
-function transcriptRawMessageProvider(agent, canonicalSessionId) {
+function rawMessageProviderFromView(input) {
   const view = readDshTranscript({
-    session: {
-      events: sessionEvents2(agent.session),
-      surface: agent.session.surface,
-      header: { cwd: agent.session.header.cwd }
-    },
-    canonicalSessionId
+    session: { events: input.events, surface: input.surface, header: input.header },
+    canonicalSessionId: input.canonicalSessionId
   });
   const byId = new Map(view.messages.map((message) => [message.id, message]));
   const ordinalById = new Map(view.messages.map((message, index) => [message.id, index + 1]));
@@ -5708,6 +5705,14 @@ function transcriptRawMessageProvider(agent, canonicalSessionId) {
     readMessageOrdinalById: (messageId) => ordinalById.get(messageId) ?? null,
     getMessageCount: () => view.messages.length
   };
+}
+function transcriptRawMessageProvider(agent, canonicalSessionId) {
+  return rawMessageProviderFromView({
+    events: sessionEvents2(agent.session),
+    surface: agent.session.surface,
+    header: { cwd: agent.session.header.cwd },
+    canonicalSessionId
+  });
 }
 function registerMagicHistorianPlane(ctx, deps) {
   const hooksBySession = new Map;
@@ -6000,6 +6005,33 @@ ${error.stack ?? ""}` : String(error);
 function registerContextPlane(ctx, deps) {
   const state = createContextPlaneState();
   return registerPreStepGate(ctx, (payload, next) => runContextPlaneStep(state, deps, payload, next));
+}
+
+// src/agent/session-history.ts
+function nativeDshSessionId(canonicalOrNative) {
+  return parseDshSessionKey(canonicalOrNative)?.dshSessionId ?? canonicalOrNative;
+}
+function historicalSessionReader(ctx) {
+  return async (dshSessionId) => {
+    let service;
+    try {
+      service = ctx.get("sessionQuery");
+    } catch {
+      service = undefined;
+    }
+    if (typeof service?.readSession !== "function")
+      return null;
+    try {
+      const result = await service.readSession(dshSessionId);
+      const events = typeof result?.snapshotEvents === "function" ? result.snapshotEvents() : result?.events;
+      if (!Array.isArray(events))
+        return null;
+      return { events, surface: result?.surface, header: result?.header };
+    } catch (error) {
+      log(`[magic-context] session-query read failed for ${dshSessionId} (degrading): ${String(error)}`);
+      return null;
+    }
+  };
 }
 
 // ../plugin/src/shared/model-resolution.ts
@@ -13553,13 +13585,19 @@ function discoverDreamProjects(db) {
         ORDER BY project_path`).all(DSH_HARNESS);
   return rows.map((row) => row.project_path);
 }
-function buildDreamExecutor(facade, state) {
+function buildDreamExecutor(facade, state, readHistory) {
   return createDreamTaskExecutor({
     client: facade,
     sessionDirectory: state.directory,
     openOpenCodeDb: () => null,
     userMemoryCollectionEnabled: userMemoryCollectionEnabled(state.coreConfig),
-    mural: { enabled: state.mural?.enabled === true, model: state.mural?.model }
+    mural: { enabled: state.mural?.enabled === true, model: state.mural?.model },
+    primerRawProviderFactory: async (sessionId) => {
+      const view = await readHistory(nativeDshSessionId(sessionId));
+      if (view === null)
+        return null;
+      return rawMessageProviderFromView({ ...view, canonicalSessionId: sessionId });
+    }
   });
 }
 async function runDreamTick(db, projectIdentity, executor, state, log) {
@@ -13639,7 +13677,7 @@ function registerDshDreamer(ctx, deps) {
         parentAgent: deps.parentAgent,
         workerTimeoutMs: deps.workerTimeoutMs
       });
-      const executor = buildDreamExecutor(facade, state);
+      const executor = buildDreamExecutor(facade, state, historicalSessionReader(ctx));
       for (const projectIdentity of projects) {
         disposers.push(intervalFactory(() => {
           runDreamTick(db, projectIdentity, executor, state, log);
@@ -13657,7 +13695,7 @@ function registerDshDreamer(ctx, deps) {
 function dshDreamSeams(ctx, deps) {
   const state = dreamerRuntime.get(ctx) ?? defaultState();
   const facade = state.facade ??= createDshDreamClient(ctx, deps);
-  const executor = buildDreamExecutor(facade, state);
+  const executor = buildDreamExecutor(facade, state, historicalSessionReader(ctx));
   const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS).filter((task) => task.schedule.trim() !== "");
   const runnable = state.enabled && !readDreamerCompactionOff(deps);
   return {

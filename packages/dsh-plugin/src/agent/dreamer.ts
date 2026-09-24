@@ -58,6 +58,12 @@ import { magicShellToolName } from "../compat/dsh-0.1/subagent";
 import { runMagicWorker } from "./worker";
 import { DSH_HARNESS } from "dsh-magic-context-adapter";
 import {
+  historicalSessionReader,
+  nativeDshSessionId,
+  type HistoricalSessionReader,
+} from "./session-history";
+import { rawMessageProviderFromView } from "./historian-wiring";
+import {
   DreamerConfigSchema,
   type DreamerConfig,
 } from "@magic-context/core/config/schema/magic-context";
@@ -534,12 +540,14 @@ export function discoverDreamProjects(db: Database): string[] {
 
 /** The TaskExecutor the scheduler drives: core `createDreamTaskExecutor`
  *  closed over the DSH facade. `openOpenCodeDb` → null (no OpenCode store);
- *  no retrospective raw provider (retrospective becomes a clean no-op until a
- *  DSH raw-source provider lands); `mural` is passed through so `compress-cues`
+ *  history comes from the host's `sessionQuery` service (see `session-history.ts`)
+ *  so `refresh-primers` can read an arbitrary historical session instead of
+ *  falling back to closed-book; `mural` is passed through so `compress-cues`
  *  can run when the user enabled it. */
 function buildDreamExecutor(
   facade: DshDreamSessionFacade,
   state: DreamerRuntimeState,
+  readHistory: HistoricalSessionReader,
 ): ReturnType<typeof createDreamTaskExecutor> {
   return createDreamTaskExecutor({
     client: facade as never,
@@ -547,6 +555,14 @@ function buildDreamExecutor(
     openOpenCodeDb: () => null,
     userMemoryCollectionEnabled: userMemoryCollectionEnabled(state.coreConfig),
     mural: { enabled: state.mural?.enabled === true, model: state.mural?.model },
+    // "Pi only" in the core: builds a provider for an arbitrary historical
+    // session id, so the orientation seed read works without opencode.db.
+    // Returning null keeps the closed-book fallback.
+    primerRawProviderFactory: async (sessionId: string) => {
+      const view = await readHistory(nativeDshSessionId(sessionId));
+      if (view === null) return null;
+      return rawMessageProviderFromView({ ...view, canonicalSessionId: sessionId });
+    },
   });
 }
 
@@ -667,7 +683,7 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
         parentAgent: deps.parentAgent,
         workerTimeoutMs: deps.workerTimeoutMs,
       }));
-      const executor = buildDreamExecutor(facade, state);
+      const executor = buildDreamExecutor(facade, state, historicalSessionReader(ctx));
       for (const projectIdentity of projects) {
         disposers.push(
           intervalFactory(() => {
@@ -712,7 +728,7 @@ export function dshDreamSeams(
 ): NonNullable<CtxCommandSeams["dreamer"]> {
   const state = dreamerRuntime.get(ctx) ?? defaultState();
   const facade = (state.facade ??= createDshDreamClient(ctx, deps));
-  const executor = buildDreamExecutor(facade, state);
+  const executor = buildDreamExecutor(facade, state, historicalSessionReader(ctx));
   const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, DSH_HARNESS).filter(
     (task) => task.schedule.trim() !== "",
   );
