@@ -10501,7 +10501,7 @@ var importWasmOrtForRuntime = async () => {
   };
 };
 var importTransformersForRuntime = async () => {
-  return await import("./transformers.node-3zwn5k5j.js");
+  return await import("@huggingface/transformers");
 };
 var importTransformersWasmFallbackForRuntime = async () => {
   const webEntry = new URL("./transformers-web.js", import.meta.url).href;

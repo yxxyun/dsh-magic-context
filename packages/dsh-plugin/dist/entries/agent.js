@@ -219,7 +219,7 @@ import {
   readDshTranscript,
   deriveMutationPlan,
   registerCtxTools
-} from "./agent-mq47ctzw.js";
+} from "./agent-3gz09g3a.js";
 import {
   CONFIG_WARNING_CLASS,
   resolveCacheTtl,
@@ -282,7 +282,7 @@ import {
   runDueTasksForProject,
   parseRecompArgs,
   registerCtxCommands
-} from "./agent-dqdk0h0s.js";
+} from "./agent-d6qad5e1.js";
 import {
   getHarness,
   getDataDir,

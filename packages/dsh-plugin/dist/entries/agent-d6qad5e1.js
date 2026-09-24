@@ -58,7 +58,7 @@ import {
   resolveCanonicalKey,
   cwdOf,
   resolveProjectIdentity
-} from "./agent-mq47ctzw.js";
+} from "./agent-3gz09g3a.js";
 
 // ../plugin/src/features/magic-context/smart-notes/types.ts
 var SMART_NOTE_CHECK_POLICY_VERSION = 1;
